@@ -446,6 +446,13 @@ pub enum Finding {
         /// it (carrick#4670). Scan-local, as `pair` is: never written to the
         /// wire. The only reader is [`crate::pr_baseline::mark_on_main`].
         decided_by_pr_diff: bool,
+        /// The pair's protocol, carried from the pair outcome
+        /// (carrick#4770). A socket or pub/sub pair has no request or
+        /// response half, so `direction` alone cannot say which side sends;
+        /// the local join reads both. `None` where the caller states none,
+        /// which the join reads as the direction's rule. Scan-local, as
+        /// `direction` is: never written to the wire.
+        protocol: Option<crate::operation::Protocol>,
     },
     /// A consumer call matched a producer path but not its method. `method`
     /// is the consumer's attempt; `expected_method` is the producer's.
@@ -616,6 +623,7 @@ impl Finding {
             on_main: None,
             on_main_unknown: None,
             decided_by_pr_diff: false,
+            protocol: None,
         }
     }
 
@@ -789,6 +797,15 @@ impl Finding {
         } = &mut self
         {
             *decided_by_pr_diff = value;
+        }
+        self
+    }
+
+    /// State the protocol a type mismatch's pair speaks (carrick#4770). No-op
+    /// for every other kind.
+    pub fn with_protocol(mut self, value: Option<crate::operation::Protocol>) -> Self {
+        if let Finding::TypeMismatch { protocol, .. } = &mut self {
+            *protocol = value;
         }
         self
     }
@@ -1069,6 +1086,9 @@ impl Serialize for Finding {
                 // Scan-local (carrick#4670): read only by the comparison with
                 // main, whose answer `on_main` already carries.
                 decided_by_pr_diff: _,
+                // Scan-local (carrick#4770): read only by the local join, to
+                // say which side of a message pair sends.
+                protocol: _,
                 // Scan-local (carrick#1517): `detail` already names each read.
                 consumer_reads: _,
                 on_main,

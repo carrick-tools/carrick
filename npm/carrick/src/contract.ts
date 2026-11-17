@@ -116,6 +116,14 @@ export type CheckItem = {
    */
   actual_type?: string;
   /**
+   * Which side sends, where `direction` does not say it: a socket event or a
+   * pub/sub topic, whose emitter or publisher (the `call` row, `consumer`)
+   * sends and whose listener or subscriber reads. There `actual_type` is the
+   * emitter's payload and `expected_type` the listener's type. Absent on every
+   * HTTP and GraphQL row (`Item::sent_by` in `src/local_mode/contract.rs`).
+   */
+  sent_by?: "producer" | "consumer";
+  /**
    * The re-check judged this row a problem of the edit (`Item::stated` in
    * `src/local_mode/contract.rs`): it fails, or rests on an index another build
    * wrote. Absent when false, and on every answer that judged nothing.

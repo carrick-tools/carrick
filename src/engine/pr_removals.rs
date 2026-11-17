@@ -38,7 +38,7 @@ fn operation_identity(key: &OperationKey) -> String {
 }
 
 fn is_message_protocol(key: &OperationKey) -> bool {
-    matches!(key.protocol(), Protocol::Websocket | Protocol::Pubsub)
+    key.protocol().is_message()
 }
 
 /// The id a row's service is named by in a match: `service_name`, else the

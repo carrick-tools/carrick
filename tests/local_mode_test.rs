@@ -85,11 +85,21 @@ fn workspace_prepared(fixture: &str, repos: &[&str], prepare: impl Fn(&Path)) ->
 /// `socket.io-client` as the parity test's cassettes give it for
 /// `xrepo-corpus-1`'s two socket repos.
 fn socket_claims_cassette() -> tempfile::TempDir {
+    claims_cassette(
+        "socket-claims-xrepo/corpus-1",
+        &["payments-svc", "web-frontend"],
+    )
+}
+
+/// A mock fixture dir holding the store's answers for every library the
+/// named repos of one fixture claim, merged from each repo's own cassette.
+fn claims_cassette(fixture: &str, repos: &[&str]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut claims = Vec::new();
-    for repo in ["payments-svc", "web-frontend"] {
+    for repo in repos {
         let path = repo_root()
-            .join("tests/fixtures/socket-claims-xrepo/corpus-1")
+            .join("tests/fixtures")
+            .join(fixture)
             .join(repo)
             .join("__llm__/library-claims/default.json");
         let answer: serde_json::Value =
@@ -8981,4 +8991,204 @@ fn check_changed_times_each_step_of_its_parent() {
             "no timing line for {step}:\n{stderr}"
         );
     }
+}
+
+/// The pr-seeds pair (`orders-api` serves, `storefront` calls), indexed with
+/// the store's answers both repos claim: a socket listener and emit each way
+/// and a pub/sub subscriber and publisher, as facts.
+fn message_pair_workspace() -> (tempfile::TempDir, tempfile::TempDir) {
+    let workspace = workspace("pr-seeds", &["orders-api", "storefront"]);
+    let claims = claims_cassette("pr-seeds", &["orders-api", "storefront"]);
+    run_with_env(
+        workspace.path(),
+        &["refresh", "--workspace", "."],
+        &[(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            claims.path().to_str().expect("utf-8 path"),
+        )],
+    );
+    (workspace, claims)
+}
+
+/// Re-check `file`, reading the same store answers, and hand back its one
+/// mismatched row for `method path`.
+fn rechecked_mismatch(
+    root: &Path,
+    claims: &Path,
+    file: &str,
+    method: &str,
+    path: &str,
+) -> serde_json::Value {
+    let answer = recheck_json(
+        root,
+        file,
+        &[
+            ("CARRICK_RECHECK_BUDGET_MS", "600000"),
+            (
+                "CARRICK_MOCK_FIXTURE_DIR",
+                claims.to_str().expect("utf-8 path"),
+            ),
+        ],
+    );
+    let row = answer["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| {
+            item["method"] == serde_json::json!(method)
+                && item["path"] == serde_json::json!(path)
+                && item["verdict"]["result"] == serde_json::json!("type_mismatch")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no mismatched {method} {path} row:\n{answer:#}"));
+    eprintln!("rechecked {method} {path}: {row}");
+    row
+}
+
+/// The emitter's or publisher's payload is what is sent and the listener's or
+/// subscriber's type what is expected, and the row says the consumer (the
+/// emitter) sends (carrick#4770). The two sides differ by a renamed field, so
+/// a swapped pair cannot pass on a `contains`.
+fn assert_message_sides(row: &serde_json::Value, sent: &str, read: &str) {
+    let actual = row["actual_type"].as_str().unwrap_or_default();
+    let expected = row["expected_type"].as_str().unwrap_or_default();
+    assert!(
+        actual.contains(sent) && !actual.contains(read),
+        "actual_type is the sender's payload ({sent}):\n{row:#}"
+    );
+    assert!(
+        expected.contains(read) && !expected.contains(sent),
+        "expected_type is the reader's type ({read}):\n{row:#}"
+    );
+    assert_eq!(row["sent_by"], serde_json::json!("consumer"), "{row:#}");
+    // The verdict and its direction are what they were.
+    assert_eq!(row["direction"], serde_json::json!("response"), "{row:#}");
+    assert_eq!(
+        row["verdict"]["state"],
+        serde_json::json!("resolved"),
+        "{row:#}"
+    );
+}
+
+/// carrick#4770, client to server: the listener's edit is read from its own
+/// file, and the storefront's emit is what was sent.
+#[test]
+#[serial]
+fn a_client_to_server_mismatch_states_the_emitter_as_sender() {
+    let (workspace, claims) = message_pair_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join("orders-api/src/realtime.ts"),
+        "  status: string;",
+        "  state: string;",
+    );
+    let row = rechecked_mismatch(
+        root,
+        claims.path(),
+        "orders-api/src/realtime.ts",
+        "CLIENT->SERVER",
+        "order:update",
+    );
+    assert_eq!(row["kind"], serde_json::json!("route"), "{row:#}");
+    assert_message_sides(&row, "status: string", "state: string");
+}
+
+/// carrick#4770, server to client: the emit's edit is read from its own
+/// file, and the storefront's listener is what expects.
+#[test]
+#[serial]
+fn a_server_to_client_mismatch_states_the_emitter_as_sender() {
+    let (workspace, claims) = message_pair_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join("orders-api/src/realtime.ts"),
+        "carrier: \"post\" });",
+        "courier: \"post\" });",
+    );
+    let row = rechecked_mismatch(
+        root,
+        claims.path(),
+        "orders-api/src/realtime.ts",
+        "SERVER->CLIENT",
+        "order:shipped",
+    );
+    assert_eq!(row["kind"], serde_json::json!("call"), "{row:#}");
+    assert_message_sides(&row, "courier", "carrier");
+}
+
+/// carrick#4770, pub/sub: the subscriber's edit is read from its own file,
+/// and the storefront's publish is what was sent.
+#[test]
+#[serial]
+fn a_pubsub_mismatch_states_the_publisher_as_sender() {
+    let (workspace, claims) = message_pair_workspace();
+    let root = workspace.path();
+    let events = root.join("orders-api/src/events.ts");
+    edit(&events, "  amount: number;", "  total: number;");
+    edit(&events, "void event.amount;", "void event.total;");
+    let row = rechecked_mismatch(
+        root,
+        claims.path(),
+        "orders-api/src/events.ts",
+        "PUBSUB",
+        "payments.settled",
+    );
+    assert_eq!(row["kind"], serde_json::json!("route"), "{row:#}");
+    assert_message_sides(&row, "amount", "total");
+}
+
+/// carrick#4770's control: an HTTP response mismatch states the producer as
+/// sender through its direction, with no `sent_by`, and its item is byte for
+/// byte what it was before the fix.
+#[test]
+#[serial]
+fn an_http_response_mismatch_item_is_unchanged() {
+    let (workspace, claims) = message_pair_workspace();
+    let root = workspace.path();
+    let route = root.join("orders-api/app/routes/api.v1.orders.$orderId.ts");
+    edit(&route, "  total: number;", "  total: string;");
+    edit(&route, "total: 1200,", "total: \"1200\",");
+    let row = rechecked_mismatch(
+        root,
+        claims.path(),
+        "orders-api/app/routes/api.v1.orders.$orderId.ts",
+        "GET",
+        "/api/v1/orders/:orderId",
+    );
+    // The item as main states it before the fix, with each counterpart's
+    // `repo` (this run's temp dir) left out.
+    let mut pinned = row.clone();
+    for counterpart in pinned["counterparts"].as_array_mut().expect("counterparts") {
+        counterpart
+            .as_object_mut()
+            .expect("a counterpart object")
+            .remove("repo");
+    }
+    assert_eq!(
+        pinned,
+        serde_json::json!({
+            "actual_type": "{ id: string; total: string; currency: string; } & { id: string; }",
+            "col": null,
+            "counterparts": [
+                {"file": "src/checkout.ts", "line": 4, "role": "consumer", "service": "storefront"},
+                {"file": "src/orders-client.ts", "line": 14, "role": "consumer", "service": "storefront"}
+            ],
+            "direction": "response",
+            "evidence": "file_based_route, handler loader",
+            "expected_type": "{ id: string; total: number; currency: string; }",
+            "kind": "route",
+            "line": 9,
+            "method": "GET",
+            "path": "/api/v1/orders/:orderId",
+            "resolution_source": "file_based_route",
+            "source": "fact",
+            "stated": true,
+            "verdict": {
+                "detail": "GET /api/v1/orders/:orderId → Response not assignable to GET /api/v1/orders/:encoded → Response\n  Types of property 'total' are incompatible.\n    string not assignable to number",
+                "result": "type_mismatch",
+                "state": "resolved"
+            }
+        }),
+        "the HTTP item is byte for byte today's:\n{row:#}"
+    );
 }

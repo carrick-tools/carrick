@@ -4180,6 +4180,13 @@ impl Analyzer {
                 // finding carries it rather than leaving a reader to infer a
                 // direction from an alias name.
                 .with_direction(Some(outcome.type_kind))
+                // Its protocol (carrick#4770): a socket or pub/sub pair has no
+                // request or response half, so the local join needs it to say
+                // which side sends. An HTTP verb names no exact-key protocol.
+                .with_protocol(Some(
+                    exact_key_protocol(&outcome.pseudo_method)
+                        .unwrap_or(crate::operation::Protocol::Http),
+                ))
                 // The pairing, for the PR run's comparison with main
                 // (carrick-cloud#1369). Not `outcome.pair_key`: both of its
                 // aliases hash a site's line, so an edit above the call would

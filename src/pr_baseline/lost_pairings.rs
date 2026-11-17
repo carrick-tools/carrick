@@ -181,7 +181,7 @@ fn service_untouched(untouched: Option<&Untouched>, service: &str) -> Option<boo
 }
 
 fn is_message_protocol(protocol: Protocol) -> bool {
-    matches!(protocol, Protocol::Websocket | Protocol::Pubsub)
+    protocol.is_message()
 }
 
 /// One lost pairing's surviving rows, grouped to one output row.
