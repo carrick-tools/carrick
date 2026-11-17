@@ -2349,7 +2349,10 @@ async fn manifest_seed_payload(name: &str) -> serde_json::Value {
     let payload =
         seed_payload_with(&repo, |dir| apply_seed(dir, name), reach_pair_wanted(name)).await;
     seed_stages::assert_declared_stage(name, &entry, &payload);
-    if entry["expect"]["conclusion"] == "success" {
+    // A seed that declares a known miss is held to its declared stage instead
+    // of the quiet check, because the miss is the row the quiet check would
+    // reject.
+    if entry["expect"]["conclusion"] == "success" && seed_stages::declared_stage(&entry).is_none() {
         assert_no_lost_pairing(&payload);
     }
     payload

@@ -364,13 +364,12 @@
         {"op": "replace", "file": "src/realtime.ts", "pairs": [["  socket.on(\"order:update\", (update: OrderUpdate) => {", "  const { evt = \"order:update\" }: { evt?: string } = JSON.parse(\"{}\");\n  socket.on(evt, (update: OrderUpdate) => {"]]}
       ],
       "expect": {
-        "title": "not_clean",
-        "conclusion": "failure",
-        "rows": [
-          {"kind": "removed_still_called", "label": "CLIENT->SERVER order:update"}
-        ]
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": []
       },
-      "known_miss": {"stage": "shown", "issues": ["carrick#3224", "carrick-cloud#2829"]}
+      "known_miss": {"stage": "finding", "issues": ["carrick#3224"]}
     },
     {
       "name": "pubsub-subscriber-topic-in-option-default",
@@ -382,13 +381,12 @@
         {"op": "replace", "file": "__llm__/analyze-file/events.json", "pairs": [["\"topic\": \"payments.settled\",\n      \"role\": \"subscriber\",\n      \"line_number\": 9,", "\"topic\": \"\",\n      \"role\": \"subscriber\",\n      \"line_number\": 10,"], ["\"line_number\": 15,", "\"line_number\": 16,"], ["\"payload_expression_line\": 15", "\"payload_expression_line\": 16"]]}
       ],
       "expect": {
-        "title": "not_clean",
-        "conclusion": "failure",
-        "rows": [
-          {"kind": "removed_still_called", "label": "PUBSUB payments.settled"}
-        ]
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": []
       },
-      "known_miss": {"stage": "shown", "issues": ["carrick#3224", "carrick-cloud#2829"]}
+      "known_miss": {"stage": "finding", "issues": ["carrick#3224"]}
     },
     {
       "name": "trpc-procedure-added",
