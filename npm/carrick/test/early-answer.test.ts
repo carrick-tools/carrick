@@ -762,7 +762,7 @@ test("GraphQL through the hook: the early QUERY break prints once through the on
   const ws = await workspace(t);
   await liveDaemon(t, ws, () => [query(ws)]);
   const first = context((await edit(ws, "eg1", part2(ws, [item({ state: "resolved", result: "compatible" })]))).stdout);
-  assert.ok(first.includes("route QUERY task type_mismatch: Type 'string' is not assignable to type the type it expects."), first);
+  assert.ok(first.includes("route QUERY task type_mismatch: This code sends 'string'; the caller expects '{ id: string }'."), first);
   assert.ok(!/__C|\bsend\d|\bO\d/.test(first), first);
   await settled(ws, "eg1");
   const next = await carrier(ws, "eg1");
