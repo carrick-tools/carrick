@@ -11439,6 +11439,7 @@ fn site_infer_requests(
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         }
     };
     let mut requests = Vec::new();
@@ -34761,6 +34762,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));

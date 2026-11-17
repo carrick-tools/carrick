@@ -459,6 +459,7 @@ impl SitePayloads {
                 at_registration,
                 result_unanswered,
                 through_call,
+                handler_lines: None,
             });
         }
         requests

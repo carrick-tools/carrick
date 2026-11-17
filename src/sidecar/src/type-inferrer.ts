@@ -93,6 +93,7 @@ import {
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import { importedNameOf, packageNameOf, type LabelledMembers } from './library-claims.js';
 import {
+  anchorInHandler,
   callNamedBy,
   callResultNamesNoCall,
   constituentsOf,
@@ -789,7 +790,8 @@ export class TypeInferrer {
      */
     const loopRows: Array<{ request: InferRequestItem; at: number }> = [];
 
-    for (const request of requests) {
+    for (const asked of requests) {
+      let request = asked;
       const slotStarted = performance.now();
       const phasesStarted = phaseClock();
       const firstInFile = !this.filesAsked.has(request.file_path);
@@ -819,6 +821,10 @@ export class TypeInferrer {
         // carrick#1029: a route registered once per loop element is read
         // last. Its reading rewrites its file, and a rewrite forgets every
         // node of the file that the readings below still hold.
+        // Stale-position T2: every later reader of this request (the
+        // unwidened re-read included) reads the node the handler bound picked.
+        const anchored = this.anchoredRequest(request);
+        if (typeof anchored !== 'string') request = anchored;
         if (this.loopPickFor(request)) {
           loopRows.push({ request, at: inferredTypes.length });
           continue;
@@ -1424,6 +1430,53 @@ export class TypeInferrer {
   }
 
   /**
+   * Stale-position T2: the request this route row is read with, or why it
+   * has no reading. Only a producer route request that carries its handler's
+   * lines (`handler_lines`) and is located by text is checked, by the
+   * capture's rule (`anchorInHandler`). A node found outside the handler and
+   * what its return reaches, whose text names one answer inside them, is
+   * read there: the request comes back with that node's line, and is used
+   * only if the locator, asked again at that line, finds exactly that node.
+   */
+  private anchoredRequest(request: InferRequestItem): InferRequestItem | string {
+    const lines = request.handler_lines;
+    if (!lines || !request.expression_text || request.span_start !== undefined) return request;
+    if (
+      request.infer_kind !== 'request_body' &&
+      request.infer_kind !== 'response_body' &&
+      request.infer_kind !== 'function_return'
+    ) {
+      return request;
+    }
+    const sourceFile = this.getSourceFile(request.file_path);
+    if (!sourceFile) return request;
+    const node = this.findNodeByText(sourceFile, request.expression_text, request.expression_line);
+    if (!node) return request;
+    const own = anchorInHandler(
+      this.project.getTypeChecker().compilerObject,
+      sourceFile.compilerNode,
+      node.compilerNode,
+      lines,
+      request.infer_kind,
+      request.expression_text
+    );
+    if ('reason' in own) return own.reason;
+    if (own.node === node.compilerNode) return request;
+    const line =
+      sourceFile.compilerNode.getLineAndCharacterOfPosition(own.node.getStart(sourceFile.compilerNode))
+        .line + 1;
+    const moved = { ...request, expression_line: line };
+    const again = this.findNodeByText(sourceFile, request.expression_text, line);
+    if (again?.compilerNode !== own.node) {
+      return (
+        `anchor_outside_handler: the text re-found at line ${line} inside the route's handler ` +
+        'is not the node its locator reads there'
+      );
+    }
+    return moved;
+  }
+
+  /**
    * Infer a single type from a request
    */
   private inferSingle(
@@ -1435,6 +1488,17 @@ export class TypeInferrer {
       this.logError(`Source file not found: ${request.file_path}`);
       return null;
     }
+
+    // Stale-position T2: a node found by text outside the row's own handler
+    // and what its return reaches is another node's type. The answer is the
+    // one node its text names inside them, or none, final: it does not fall
+    // to the registration, the line or the containing function below.
+    const anchored = this.anchoredRequest(request);
+    if (typeof anchored === 'string') {
+      this.log(`${anchored} (${request.file_path}:${request.expression_line ?? request.line_number})`);
+      return null;
+    }
+    request = anchored;
 
     switch (request.infer_kind) {
       case 'function_return':

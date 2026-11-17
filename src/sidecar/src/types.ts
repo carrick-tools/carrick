@@ -1184,6 +1184,13 @@ export interface InferRequestItem {
    * this call instantiates it; one it leaves open is never published.
    */
   through_call?: ThroughCall;
+  /**
+   * Stale-position T2: the lines of the handler this route request is for, set
+   * where the registration hands in a function literal. A node found by
+   * `expression_text` or by line is used only inside them; otherwise the
+   * request is answered `unknown`.
+   */
+  handler_lines?: { start_line: number; end_line: number };
 }
 
 // ============================================================================

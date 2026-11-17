@@ -202,6 +202,13 @@ export interface InferAnchorRequest {
    * typed as a string here because the capture bundle imports only itself.
    */
   infer_kind?: string;
+  /**
+   * Stale-position T2: the lines of the handler this route anchor is for. A node
+   * the text or line locator finds outside them, or (for a `function_return`)
+   * in a function that is neither the handler nor on its return path,
+   * abstains rather than publish that node's type.
+   */
+  handler_lines?: { start_line: number; end_line: number };
 }
 
 export type CaptureAnchorRequest =

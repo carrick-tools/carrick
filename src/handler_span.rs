@@ -250,6 +250,27 @@ pub(crate) fn registered_identifiers(
         .collect()
 }
 
+/// The lines of the function literal each of `rows` registers, read by the
+/// one reader [`attach_handler_spans`] reads it with ([`last_handed_in`]).
+/// `None` for a row whose registration hands in anything else (a name, a
+/// wrapper call), or is not found: such a row's handler is placed later from
+/// the scan's function definitions, which type requests do not wait for, so
+/// no bounds are sent for it (stale-position T2).
+pub(crate) fn literal_handler_lines(
+    file_results: &HashMap<String, FileAnalysisResult>,
+    file_key: impl Fn(&str) -> String,
+    rows: &[(String, u32, String)],
+    read: impl Fn(&str) -> Option<String>,
+) -> Vec<Option<HandlerSpan>> {
+    last_handed_in(Some(file_results), file_key, rows, read)
+        .into_iter()
+        .map(|last| match last {
+            Some(HandedIn::Literal(span)) => valid(span),
+            _ => None,
+        })
+        .collect()
+}
+
 /// What the registration call of each of `rows` hands in last: the one
 /// reader of a registration's handler argument. A row is `(file, line,
 /// method)`, its file in `file_key`'s form of an analysis key in

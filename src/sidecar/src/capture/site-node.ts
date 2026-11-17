@@ -383,6 +383,306 @@ function startLine(sourceFile: ts.SourceFile, node: ts.Node): number {
   return sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
 }
 
+// ===========================================================================
+// Anchors outside the row's own handler (stale-position T2)
+// ===========================================================================
+
+/** The 1-based, inclusive lines of the handler a route request is for. */
+export interface HandlerLines {
+  start_line: number;
+  end_line: number;
+}
+
+type FunctionNode =
+  | ts.ArrowFunction
+  | ts.FunctionExpression
+  | ts.FunctionDeclaration
+  | ts.MethodDeclaration;
+
+function isFunctionNode(node: ts.Node): node is FunctionNode {
+  return (
+    ts.isArrowFunction(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node)
+  );
+}
+
+/** `node` itself or its nearest enclosing function. */
+function functionAtOrAbove(node: ts.Node): FunctionNode | undefined {
+  let current: ts.Node | undefined = node;
+  while (current && !isFunctionNode(current)) current = current.parent;
+  return current;
+}
+
+/** The 1-based lines `node` starts and ends on. */
+function linesOf(sourceFile: ts.SourceFile, node: ts.Node): HandlerLines {
+  return {
+    start_line: startLine(sourceFile, node),
+    end_line: sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1,
+  };
+}
+
+/**
+ * Whether `fn` is handed to a call the way a registration hands in its
+ * handler: the last of at least two arguments (a path or a middleware, then
+ * the handler). A loop callback that registers (`kinds.forEach((k) =>
+ * app.get(...))`) or a transaction callback is a call's only argument.
+ */
+function handedInLast(fn: FunctionNode): boolean {
+  const call = fn.parent;
+  return (
+    !!call &&
+    ts.isCallExpression(call) &&
+    call.arguments.length >= 2 &&
+    call.arguments[call.arguments.length - 1] === fn
+  );
+}
+
+/** Every function in `sourceFile`, by the lines it starts and ends on. */
+const functionsByLines = new WeakMap<ts.SourceFile, Map<string, FunctionNode[]>>();
+
+function linesKey(lines: HandlerLines): string {
+  return `${lines.start_line}:${lines.end_line}`;
+}
+
+/**
+ * The function the scanner stamped `lines` for, among the functions in
+ * `sourceFile` that start and end on exactly those lines: the outermost one
+ * handed in last to a call of two or more arguments, as the registration
+ * hands in its handler, else the outermost of them. Several literals can
+ * share one line: a callback inside its handler, or a handler inside the
+ * loop callback that registers it. The file is walked once per source file.
+ */
+function handlerOnLines(sourceFile: ts.SourceFile, lines: HandlerLines): FunctionNode | undefined {
+  let index = functionsByLines.get(sourceFile);
+  if (!index) {
+    const built = new Map<string, FunctionNode[]>();
+    const visit = (node: ts.Node): void => {
+      if (isFunctionNode(node)) {
+        const key = linesKey(linesOf(sourceFile, node));
+        const held = built.get(key);
+        if (held) held.push(node);
+        else built.set(key, [node]);
+      }
+      ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(sourceFile, visit);
+    functionsByLines.set(sourceFile, built);
+    index = built;
+  }
+  const onLines = index.get(linesKey(lines)) ?? [];
+  return onLines.find(handedInLast) ?? onLines[0];
+}
+
+/** The expressions `fn` returns: its expression body, or its own `return`s. */
+function returnedExpressions(fn: FunctionNode): ts.Expression[] {
+  const body = fn.body;
+  if (!body) return [];
+  if (!ts.isBlock(body)) return [body];
+  const returned: ts.Expression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionLike(node) || ts.isClassLike(node)) return;
+    if (ts.isReturnStatement(node) && node.expression) returned.push(node.expression);
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(body, visit);
+  return returned;
+}
+
+function unwrapTransparent(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (wrapsValueTransparently(current)) current = current.expression;
+  return current;
+}
+
+/** A type every type relates to both ways: no evidence two types are one. */
+const VACUOUS = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never | ts.TypeFlags.TypeParameter;
+
+/** Whether the checker holds `a` and `b` for one type (each assignable to the other). */
+function sameAnswer(checker: ts.TypeChecker, a: ts.Type | undefined, b: ts.Type | undefined): boolean {
+  if (!a || !b || a.flags & VACUOUS || b.flags & VACUOUS) return false;
+  return checker.isTypeAssignableTo(a, b) && checker.isTypeAssignableTo(b, a);
+}
+
+function awaitedReturn(checker: ts.TypeChecker, fn: FunctionNode): ts.Type | undefined {
+  const returned = checker.getSignatureFromDeclaration(fn)?.getReturnType();
+  return returned && (checker.getAwaitedType(returned) ?? returned);
+}
+
+/** Hops a handler's return is followed through calls (helper, wrapper, callback). */
+const RETURN_REACH_HOPS = 3;
+
+/**
+ * The functions whose return is `handler`'s own answer: the handler, and
+ * every function its return reaches. A function returns (directly, awaited or
+ * through a transparent wrapper) a call; that call reaches the declaration it
+ * resolves to, and each function literal passed to it, on any callee form,
+ * whose awaited return is the call's awaited type (the checker decides: each
+ * assignable to the other, neither `any`, `unknown`, `never` nor a type
+ * parameter). So `db.transaction(cb)` reaches `cb`, whose return is the
+ * call's result, and `items.map(cb)` does not, its result being a list of
+ * `cb`'s return.
+ */
+function functionsAnsweringFor(checker: ts.TypeChecker, handler: FunctionNode): Set<FunctionNode> {
+  const held = reachSets.get(handler);
+  if (held && held.checker === checker) return held.reached;
+  const reached = new Set<FunctionNode>([handler]);
+  let frontier: FunctionNode[] = [handler];
+  for (let hop = 0; hop < RETURN_REACH_HOPS && frontier.length > 0; hop += 1) {
+    const next: FunctionNode[] = [];
+    const reach = (fn: ts.Node | undefined): void => {
+      if (!fn || !isFunctionNode(fn) || !fn.body || reached.has(fn)) return;
+      reached.add(fn);
+      next.push(fn);
+    };
+    for (const fn of frontier) {
+      for (const returned of returnedExpressions(fn)) {
+        const call = unwrapTransparent(returned);
+        if (!ts.isCallExpression(call)) continue;
+        reach(checker.getResolvedSignature(call)?.getDeclaration());
+        const result = checker.getTypeAtLocation(call);
+        const answered = checker.getAwaitedType(result) ?? result;
+        for (const argument of call.arguments.map(unwrapTransparent)) {
+          if (
+            (ts.isArrowFunction(argument) || ts.isFunctionExpression(argument)) &&
+            sameAnswer(checker, awaitedReturn(checker, argument), answered)
+          ) {
+            reach(argument);
+          }
+        }
+      }
+    }
+    frontier = next;
+  }
+  reachSets.set(handler, { checker, reached });
+  return reached;
+}
+
+/** Each handler's reach set, per checker (the inferrer and the capture hold two programs). */
+const reachSets = new WeakMap<FunctionNode, { checker: ts.TypeChecker; reached: Set<FunctionNode> }>();
+
+/** The nodes a value type can be read at: the capture's own target rule. */
+export function isPreferredTarget(node: ts.Node): boolean {
+  return (
+    ts.isExpression(node) ||
+    ts.isVariableDeclaration(node) ||
+    ts.isParameter(node) ||
+    ts.isPropertyAssignment(node)
+  );
+}
+
+/**
+ * Whether `node` is a member or key name, not the value its text names:
+ * `payload` in `reply.payload`, `{ payload: true }` or a class or function
+ * member's name. A variable's or parameter's own name stays: it names the
+ * value the text does, and it is where the source states its type.
+ */
+function isMemberName(node: ts.Node): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  return (
+    (ts.isPropertyAccessExpression(parent) ||
+      ts.isPropertyAssignment(parent) ||
+      ts.isPropertyDeclaration(parent) ||
+      ts.isMethodDeclaration(parent) ||
+      ts.isFunctionDeclaration(parent)) &&
+    parent.name === node
+  );
+}
+
+/** A located node is the row's own, or why none is. */
+export type HandlerAnchor = { node: ts.Node } | { reason: string };
+
+/**
+ * The node a route row reads, given the node a text or line locator found
+ * (stale-position T2). One rule for the inferrer and the capture; a span
+ * locator is the scanner's own and is not checked.
+ *
+ * The row's own functions are the handler (the function on its stamped
+ * lines) and every function its return reaches (`functionsAnsweringFor`). A
+ * request or response body is the row's own anywhere inside one of them; a
+ * `function_return`, whose answer is the return of the function around the
+ * node, only when that function is one of them (so a `.map` callback's
+ * return is not).
+ *
+ * A node found elsewhere is looked for again by the locator's text (or its
+ * own) inside those functions, the handler first, then by hop: where every
+ * match gives one answer (one function's return; one type for a body), the
+ * first match is read, else the row abstains. Never the stale node, the
+ * registration or a function outside the reach set. With no function on the
+ * stamped lines a body keeps the line bound and a return abstains. The
+ * reason carries lines only, never a path.
+ */
+export function anchorInHandler(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+  node: ts.Node,
+  lines: HandlerLines,
+  inferKind: string | undefined,
+  expressionText: string | undefined
+): HandlerAnchor {
+  const line = startLine(sourceFile, node);
+  const where = `the route's handler (lines ${lines.start_line}-${lines.end_line})`;
+  const returns = inferKind === 'function_return';
+  const handler = handlerOnLines(sourceFile, lines);
+  if (!handler) {
+    if (returns) return { reason: `anchor_outside_handler: no function starts and ends on ${where}` };
+    return line >= lines.start_line && line <= lines.end_line
+      ? { node }
+      : { reason: `anchor_outside_handler: the located node starts at line ${line}, outside ${where}` };
+  }
+  const reached = functionsAnsweringFor(checker, handler);
+  const ownFunction = (candidate: ts.Node): FunctionNode | undefined => {
+    if (returns) {
+      const around = functionAtOrAbove(candidate);
+      return around && reached.has(around) ? around : undefined;
+    }
+    for (let current: ts.Node | undefined = candidate; current; current = current.parent) {
+      if (isFunctionNode(current) && reached.has(current)) return current;
+    }
+    return undefined;
+  };
+  if (ownFunction(node)) return { node };
+
+  const outside =
+    `anchor_outside_handler: the located node (line ${line}) is outside ${where} and ` +
+    'every function its return reaches';
+  const wanted = normalizeLocatorText(expressionText ?? node.getText(sourceFile));
+  if (!wanted) return { reason: outside };
+  const matches: ts.Node[] = [];
+  const seen = new Set<ts.Node>();
+  for (const fn of reached) {
+    const visit = (candidate: ts.Node): void => {
+      if (
+        !seen.has(candidate) &&
+        isPreferredTarget(candidate) &&
+        !isMemberName(candidate) &&
+        normalizeLocatorText(candidate.getText(sourceFile)) === wanted &&
+        ownFunction(candidate)
+      ) {
+        matches.push(candidate);
+      }
+      seen.add(candidate);
+      ts.forEachChild(candidate, visit);
+    };
+    if (fn.body) ts.forEachChild(fn.body, visit);
+  }
+  if (matches.length === 0) {
+    return { reason: `${outside}, and its text is not inside them` };
+  }
+  // One answer: a return is its function's, a body is its node's type.
+  const answers = new Set<unknown>(
+    matches.map((match) => (returns ? ownFunction(match) : checker.getTypeAtLocation(match)))
+  );
+  if (answers.size > 1) {
+    return {
+      reason: `${outside}, and its text names ${answers.size} different answers inside them`,
+    };
+  }
+  return { node: matches[0] };
+}
+
 /**
  * The capture's locator: the first node in pre-order that `accept`s, whose
  * text equals the locator's (`exactLocatorText`), and that ends on or after

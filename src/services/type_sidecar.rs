@@ -268,6 +268,15 @@ pub struct InferRequestItem {
     /// from every other request, so those serialise as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub through_call: Option<ThroughCall>,
+    /// Stale-position T2: the lines of the handler this route request is for,
+    /// in the route's own file, set on a producer's text-located request
+    /// where the registration hands in a function literal
+    /// ([`crate::handler_span::literal_handler_lines`]). The sidecar uses a
+    /// node found by text or line only if it sits inside these lines, and
+    /// answers `unknown` otherwise. Absent where the handler is named, in
+    /// another file, or not placed, and the locator is then unchecked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_lines: Option<crate::mount_graph::HandlerSpan>,
 }
 
 impl InferRequestItem {
@@ -403,6 +412,11 @@ pub enum CaptureAnchor {
         /// capture, the rule the inferrer applies to the same request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         infer_kind: Option<InferKind>,
+        /// Stale-position T2: the handler's lines
+        /// ([`InferRequestItem::handler_lines`]); a node the text or line
+        /// locator finds outside them abstains.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handler_lines: Option<crate::mount_graph::HandlerSpan>,
     },
     /// Inline literal type text (the v1 inline-alias path).
     Literal {
@@ -6444,6 +6458,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));
@@ -6549,6 +6564,7 @@ mod tests {
             param_name: None,
             result: None,
             infer_kind: Some(InferKind::CallResult),
+            handler_lines: None,
         };
         let json = serde_json::to_string(&infer).unwrap();
         assert!(json.contains(r#""kind":"infer""#));
@@ -6716,6 +6732,7 @@ mod tests {
                             span_start: 30,
                             span_end: 60,
                         }),
+                        handler_lines: None,
                     })
                     .collect(),
                 extraction_config: Some(ExtractionConfig {
@@ -6812,6 +6829,7 @@ mod tests {
                         param_name: Some("event".into()),
                         result: None,
                         infer_kind: None,
+                        handler_lines: None,
                     },
                     CaptureAnchor::Literal {
                         alias: "D".into(),
@@ -7197,6 +7215,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let others = [item(InferKind::CallResult), item(InferKind::FunctionReturn)];
         assert_eq!(claims_for_route_rows(&others, Some(&claims)), None);
@@ -8204,6 +8223,7 @@ mod tests {
             route_path: None,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
             at_registration: false,
         };
         let finding = |reason: &str| TypeProvenance {
@@ -9218,6 +9238,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let explicit = vec![
             symbol_request("ItemDto", "Returned", None),
@@ -9447,6 +9468,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
@@ -9496,6 +9518,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_path: None,
             at_registration: false,
             through_call: None,
+            handler_lines: None,
             member: None,
             result,
             result_unanswered: false,
@@ -9522,6 +9545,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             param_name: None,
             result: Some(ResultShape::Member(["data".into()])),
             infer_kind: None,
+            handler_lines: None,
         };
         let wire = serde_json::to_string(&anchor).unwrap();
         assert!(wire.contains(r#""result":{"member":["data"]}"#), "{wire}");
@@ -9639,6 +9663,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         }];
         assert!(
             sidecar.infer_types(&infer, None).is_err(),
