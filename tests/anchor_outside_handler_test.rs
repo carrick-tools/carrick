@@ -26,11 +26,17 @@ use carrick::services::type_sidecar::{InferKind, InferRequestItem, TypeSidecar};
 use carrick::url_normalizer::UrlNormalizer;
 use tempfile::TempDir;
 
-const ROUTES_TS: &str = r#"import { Server, RouteReply, RouteRequest } from './framework';
+const ROUTES_TS: &str = r#"import { Server, RouteReply, RouteRequest, Store } from './framework';
 import { GadgetBody, OrderBody } from './shapes';
 import { gated } from './gate';
+import { listReceipts } from './receipts';
 
-export function registerRoutes(server: Server, ids: string[]) {
+function listInvoices(request: RouteRequest<unknown>) {
+  const rows = [{ invoiceNo: 'n1', cents: 100 }];
+  return { invoices: rows, pages: 1 };
+}
+
+export function registerRoutes(server: Server, ids: string[], store: Store) {
   server.post('/gadgets', async (request: RouteRequest<unknown>, reply: RouteReply) => {
     const payload: GadgetBody = request.body as GadgetBody;
     const a = 1;
@@ -60,6 +66,49 @@ export function registerRoutes(server: Server, ids: string[]) {
     gated(reply, async () => {
       return { ok: true, attempts: 1 };
     }));
+
+  server.get('/invoices', (request: RouteRequest<unknown>, reply: RouteReply) => listInvoices(request));
+
+  server.get('/receipts', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    return await listReceipts(request);
+  });
+
+  server.post('/checkout', (request: RouteRequest<unknown>, reply: RouteReply) =>
+    store.transaction(async (tx) => {
+      tx.insert('sku-1');
+      return { receiptId: 'r1', settled: true };
+    }));
+
+  server.get('/tags', (request: RouteRequest<unknown>, reply: RouteReply) =>
+    ids.map((id) => ({ tag: id, weight: 1 })));
+
+  server.get('/late', // the late list
+    async (request: RouteRequest<unknown>, reply: RouteReply) => {
+      return { lateCount: 2 };
+    });
+}
+
+export class AuditRoutes {
+  constructor(private server: Server) {}
+
+  private wrap<T>(run: () => Promise<T>): Promise<T> {
+    return run();
+  }
+
+  register() {
+    this.server.get('/audit', (request: RouteRequest<unknown>, reply: RouteReply) =>
+      this.wrap(async () => {
+        return { auditId: 7, actor: 'system' };
+      }));
+  }
+}
+"#;
+
+const RECEIPTS_TS: &str = r#"import { RouteRequest } from './framework';
+
+export async function listReceipts(request: RouteRequest<unknown>) {
+  const receiptTotal = 3;
+  return { receipts: ['r1'], receiptTotal };
 }
 "#;
 
@@ -95,6 +144,14 @@ export interface RouteReply {
   send(payload: unknown): void;
 }
 
+export interface Tx {
+  insert(sku: string): void;
+}
+
+export interface Store {
+  transaction<T>(run: (tx: Tx) => Promise<T>): Promise<T>;
+}
+
 export interface Server {
   post(path: string, handler: (request: never, reply: RouteReply) => unknown): void;
   get(path: string, handler: (request: never, reply: RouteReply) => unknown): void;
@@ -126,6 +183,7 @@ export function gated<T>(reply: RouteReply, run: () => Promise<T>): Promise<T> {
 "#,
     )
     .unwrap();
+    fs::write(repo.join("src/receipts.ts"), RECEIPTS_TS).unwrap();
     fs::write(repo.join("src/routes.ts"), ROUTES_TS).unwrap();
 }
 
@@ -447,5 +505,175 @@ fn a_text_located_route_request_carries_its_inline_handlers_lines() {
     assert_eq!(
         lines.end_line as i32,
         line_of("reply.send({ total: payload.quantity }") + 1
+    );
+}
+
+/// One `ReturnValue` route whose response hint is `hint` at `line`.
+fn returning_route(
+    opening: &'static str,
+    path: &'static str,
+    hint: &'static str,
+    line: i32,
+) -> Vec<Route> {
+    vec![Route {
+        opening,
+        method: "GET",
+        path,
+        emission: Some(EmissionStyle::ReturnValue),
+        payload: None,
+        response: Some((hint, line)),
+    }]
+}
+
+fn stored_return(routes: &[Route], opening: &str) -> Option<String> {
+    stored(routes, InferKind::FunctionReturn, opening)
+        .map(|(inferred, declared)| format!("{inferred} | {declared}"))
+}
+
+/// (A) A thin handler returns a helper's call: the hint is the helper's
+/// return, outside the handler's lines, and the helper's return is the
+/// handler's own.
+#[test]
+fn a_response_hint_in_the_helper_the_handler_returns_keeps_the_return_type() {
+    let routes = returning_route(
+        "server.get('/invoices'",
+        "/invoices",
+        "{ invoices: rows, pages: 1 }",
+        line_of("return { invoices: rows, pages: 1 }"),
+    );
+    let Some(both) = stored_return(&routes, "server.get('/invoices'") else {
+        return;
+    };
+    assert!(both.contains("invoiceNo"), "helper's return lost: {both}");
+}
+
+/// (A, another file) The handler awaits a helper declared in another file;
+/// the hint is the helper's return at its line in that file.
+#[test]
+fn a_response_hint_in_a_helper_in_another_file_keeps_the_return_type() {
+    let helper_line = RECEIPTS_TS
+        .lines()
+        .position(|line| line.contains("return { receipts"))
+        .expect("helper return") as i32
+        + 1;
+    let routes = returning_route(
+        "server.get('/receipts'",
+        "/receipts",
+        "{ receipts: ['r1'], receiptTotal }",
+        helper_line,
+    );
+    let Some(both) = stored_return(&routes, "server.get('/receipts'") else {
+        return;
+    };
+    assert!(
+        both.contains("receiptTotal"),
+        "other-file helper's return lost: {both}"
+    );
+}
+
+/// (B) The handler returns a member call whose callback's return is the
+/// call's result (a transaction).
+#[test]
+fn a_response_hint_in_a_returned_transaction_callback_keeps_the_return_type() {
+    let routes = returning_route(
+        "server.post('/checkout'",
+        "/checkout",
+        "{ receiptId: 'r1', settled: true }",
+        line_of("return { receiptId: 'r1'"),
+    );
+    let routes: Vec<Route> = routes
+        .into_iter()
+        .map(|route| Route {
+            method: "POST",
+            ..route
+        })
+        .collect();
+    let Some(both) = stored_return(&routes, "server.post('/checkout'") else {
+        return;
+    };
+    assert!(
+        both.contains("settled"),
+        "transaction callback's return lost: {both}"
+    );
+}
+
+/// (B, `this`) The handler returns `this.wrap(callback)`.
+#[test]
+fn a_response_hint_in_a_returned_method_wrappers_callback_keeps_the_return_type() {
+    let routes = returning_route(
+        "this.server.get('/audit'",
+        "/audit",
+        "{ auditId: 7, actor: 'system' }",
+        line_of("return { auditId: 7"),
+    );
+    let Some(both) = stored_return(&routes, "this.server.get('/audit'") else {
+        return;
+    };
+    assert!(
+        both.contains("auditId"),
+        "method wrapper's callback return lost: {both}"
+    );
+}
+
+/// The handler returns `ids.map(callback)`: the call's result is a list of
+/// the callback's return, so the callback's return is a part, never the
+/// response.
+#[test]
+fn a_response_hint_in_a_returned_map_callback_is_not_the_handlers_return() {
+    let routes = returning_route(
+        "server.get('/tags'",
+        "/tags",
+        "({ tag: id, weight: 1 })",
+        line_of("ids.map((id) => ({ tag: id"),
+    );
+    let Some(both) = stored_return(&routes, "server.get('/tags'") else {
+        return;
+    };
+    assert!(
+        !both.contains("weight"),
+        "the map callback's return was stored as the response: {both}"
+    );
+}
+
+/// A handler whose literal opens on the line after its registration, behind
+/// a comment and `async`, keeps its own return.
+#[test]
+fn a_response_hint_in_a_handler_opening_after_a_comment_keeps_the_return_type() {
+    let routes = returning_route(
+        "server.get('/late'",
+        "/late",
+        "{ lateCount: 2 }",
+        line_of("return { lateCount: 2 }"),
+    );
+    let Some(both) = stored_return(&routes, "server.get('/late'") else {
+        return;
+    };
+    assert!(both.contains("lateCount"), "own return lost: {both}");
+}
+
+/// The stamped lines of a literal that opens behind a comment and `async`
+/// on the line after its registration are the literal's own lines, the ones
+/// the sidecar matches a function on.
+#[test]
+fn a_handler_opening_after_a_comment_is_stamped_with_the_literals_lines() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo = temp.path().join("api");
+    write_fixture_repo(&repo);
+    let routes = returning_route(
+        "server.get('/late'",
+        "/late",
+        "{ lateCount: 2 }",
+        line_of("return { lateCount: 2 }"),
+    );
+    let items = collect(&repo, &routes);
+    let late = items
+        .iter()
+        .find(|item| item.infer_kind == InferKind::FunctionReturn)
+        .expect("late request");
+    let lines = late.handler_lines.expect("handler lines on the request");
+    assert_eq!(lines.start_line as i32, line_of("server.get('/late'") + 1);
+    assert_eq!(
+        lines.end_line as i32,
+        line_of("return { lateCount: 2 }") + 1
     );
 }

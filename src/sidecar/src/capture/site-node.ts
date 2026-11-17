@@ -415,62 +415,125 @@ function functionAtOrAbove(node: ts.Node): FunctionNode | undefined {
   return current;
 }
 
+/** The 1-based lines `node` starts and ends on. */
+function linesOf(sourceFile: ts.SourceFile, node: ts.Node): HandlerLines {
+  return {
+    start_line: startLine(sourceFile, node),
+    end_line: sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1,
+  };
+}
+
 /**
- * Whether `fn` is the function a registration hands in (the lines the scanner
- * recorded for it), or one on the return path of it: handed to a call
- * (`gated(reply, async () => ...)`) that the handler returns. A callback of a
- * method call (`items.map(...)`) is not on the path: its return is a part of
- * a value, never the handler's own.
+ * The function the scanner stamped `lines` for: the outermost function in
+ * `sourceFile` that starts and ends on exactly those lines (a callback that
+ * shares both lines with its handler sits inside it).
  */
-function onHandlerReturnPath(
-  sourceFile: ts.SourceFile,
-  fn: FunctionNode,
-  lines: HandlerLines
-): boolean {
-  const lineOf = (position: number): number =>
-    sourceFile.getLineAndCharacterOfPosition(position).line + 1;
-  let current: FunctionNode = fn;
-  // The chain of wrappers is short; the bound keeps a malformed tree finite.
-  for (let step = 0; step < 8; step += 1) {
-    if (
-      lineOf(current.getStart(sourceFile)) === lines.start_line &&
-      lineOf(current.getEnd()) === lines.end_line
-    ) {
-      return true;
+function handlerOnLines(sourceFile: ts.SourceFile, lines: HandlerLines): FunctionNode | undefined {
+  const visit = (node: ts.Node): FunctionNode | undefined => {
+    if (isFunctionNode(node)) {
+      const own = linesOf(sourceFile, node);
+      if (own.start_line === lines.start_line && own.end_line === lines.end_line) return node;
     }
-    const call = current.parent;
-    if (
-      !call ||
-      !ts.isCallExpression(call) ||
-      !ts.isIdentifier(call.expression) ||
-      !call.arguments.some((argument) => argument === current)
-    ) {
-      return false;
+    return ts.forEachChild(node, visit);
+  };
+  return ts.forEachChild(sourceFile, visit);
+}
+
+/** The expressions `fn` returns: its expression body, or its own `return`s. */
+function returnedExpressions(fn: FunctionNode): ts.Expression[] {
+  const body = fn.body;
+  if (!body) return [];
+  if (!ts.isBlock(body)) return [body];
+  const returned: ts.Expression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionLike(node) || ts.isClassLike(node)) return;
+    if (ts.isReturnStatement(node) && node.expression) returned.push(node.expression);
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(body, visit);
+  return returned;
+}
+
+function unwrapTransparent(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (wrapsValueTransparently(current)) current = current.expression;
+  return current;
+}
+
+/** A type every type relates to both ways: no evidence two types are one. */
+const VACUOUS = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never | ts.TypeFlags.TypeParameter;
+
+/** Whether the checker holds `a` and `b` for one type (each assignable to the other). */
+function sameAnswer(checker: ts.TypeChecker, a: ts.Type | undefined, b: ts.Type | undefined): boolean {
+  if (!a || !b || a.flags & VACUOUS || b.flags & VACUOUS) return false;
+  return checker.isTypeAssignableTo(a, b) && checker.isTypeAssignableTo(b, a);
+}
+
+function awaitedReturn(checker: ts.TypeChecker, fn: FunctionNode): ts.Type | undefined {
+  const returned = checker.getSignatureFromDeclaration(fn)?.getReturnType();
+  return returned && (checker.getAwaitedType(returned) ?? returned);
+}
+
+/** Hops a handler's return is followed through calls (helper, wrapper, callback). */
+const RETURN_REACH_HOPS = 3;
+
+/**
+ * The functions whose return is `handler`'s own answer: the handler, and
+ * every function its return reaches. A function returns (directly, awaited or
+ * through a transparent wrapper) a call; that call reaches the declaration it
+ * resolves to and each function literal passed to it, on any callee form,
+ * whose awaited return is the handler's awaited return (the checker decides:
+ * each type assignable to the other, neither `any`, `unknown`, `never` nor a
+ * type parameter). So `db.transaction(cb)` reaches `cb`,
+ * whose return is the call's result, and `items.map(cb)` does not, its result
+ * being a list of `cb`'s return. A handler with several returns of different
+ * types reaches nothing: one helper's return is then only a part of its answer.
+ */
+function functionsAnsweringFor(checker: ts.TypeChecker, handler: FunctionNode): Set<FunctionNode> {
+  const own = awaitedReturn(checker, handler);
+  const reached = new Set<FunctionNode>([handler]);
+  let frontier: FunctionNode[] = [handler];
+  for (let hop = 0; hop < RETURN_REACH_HOPS && frontier.length > 0; hop += 1) {
+    const next: FunctionNode[] = [];
+    for (const fn of frontier) {
+      for (const returned of returnedExpressions(fn)) {
+        const call = unwrapTransparent(returned);
+        if (!ts.isCallExpression(call)) continue;
+        const declaration = checker.getResolvedSignature(call)?.getDeclaration();
+        const candidates: ts.Node[] = [
+          ...(declaration ? [declaration] : []),
+          ...call.arguments.map(unwrapTransparent),
+        ];
+        for (const candidate of candidates) {
+          if (
+            !isFunctionNode(candidate) ||
+            !candidate.body ||
+            reached.has(candidate) ||
+            !sameAnswer(checker, awaitedReturn(checker, candidate), own)
+          ) {
+            continue;
+          }
+          reached.add(candidate);
+          next.push(candidate);
+        }
+      }
     }
-    let returned: ts.Node = call;
-    while (returned.parent && wrapsValueTransparently(returned.parent)) returned = returned.parent;
-    const parent = returned.parent;
-    let host: FunctionNode | undefined;
-    if (parent && ts.isReturnStatement(parent)) {
-      host = functionAtOrAbove(parent);
-    } else if (parent && isFunctionNode(parent) && parent.body === returned) {
-      host = parent;
-    }
-    if (!host) return false;
-    current = host;
+    frontier = next;
   }
-  return false;
+  return reached;
 }
 
 /**
  * Why a node a text or line locator found cannot be this route's anchor, or
- * undefined when it can: it starts outside the handler's lines, or (for a
- * `function_return`, whose answer is the containing function's return) the
- * function around it is neither the handler nor on its return path. A span
+ * undefined when it can. A request or response body must start inside the
+ * handler's lines. A `function_return`, whose answer is the return of the
+ * function around the node, needs that function to be the handler or one its
+ * return reaches (`functionsAnsweringFor`), wherever it is declared. A span
  * locator is the scanner's own and is not checked. One rule for the inferrer
  * and the capture. The reason carries lines only, never a path.
  */
 export function anchorOutsideHandler(
+  checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
   node: ts.Node,
   lines: HandlerLines,
@@ -478,14 +541,18 @@ export function anchorOutsideHandler(
 ): string | undefined {
   const line = startLine(sourceFile, node);
   const where = `the route's handler (lines ${lines.start_line}-${lines.end_line})`;
-  if (line < lines.start_line || line > lines.end_line) {
-    return `anchor_outside_handler: the located node starts at line ${line}, outside ${where}`;
-  }
+  const inside = line >= lines.start_line && line <= lines.end_line;
   if (inferKind === 'function_return') {
-    const around = functionAtOrAbove(node);
-    if (!around || !onHandlerReturnPath(sourceFile, around, lines)) {
-      return `anchor_outside_handler: the function around the located node (line ${line}) is neither ${where} nor on its return path`;
+    const handler = handlerOnLines(sourceFile, lines);
+    if (!handler) {
+      return `anchor_outside_handler: no function starts and ends on ${where}`;
     }
+    const around = functionAtOrAbove(node);
+    if (around && functionsAnsweringFor(checker, handler).has(around)) return undefined;
+    return `anchor_outside_handler: the function around the located node (line ${line}) is neither ${where} nor one its return reaches`;
+  }
+  if (!inside) {
+    return `anchor_outside_handler: the located node starts at line ${line}, outside ${where}`;
   }
   return undefined;
 }

@@ -1446,6 +1446,7 @@ export class TypeInferrer {
     const node = this.findNodeByText(sourceFile, request.expression_text, request.expression_line);
     if (!node) return undefined;
     return anchorOutsideHandler(
+      this.project.getTypeChecker().compilerObject,
       sourceFile.compilerNode,
       node.compilerNode,
       lines,

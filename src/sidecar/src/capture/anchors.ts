@@ -445,6 +445,7 @@ export function resolveAnchor(
   // (final: it does not fall through to a later locator).
   if (found.by !== 'span' && request.handler_lines) {
     const outside = anchorOutsideHandler(
+      checker,
       sourceFile,
       found.node,
       request.handler_lines,
