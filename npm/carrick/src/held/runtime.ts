@@ -74,8 +74,8 @@ export type RuntimeDeps = {
   site?: SiteFinder;
 };
 
-type Unarmed = { label: string; protocol: string; file: string; reason: string; group: number; position: number | null };
-type Armed = { label: string; protocol: string; file: string; group: number; position: number };
+type Unarmed = { label: string; protocol: string; file: string; reason: string; group: number; position: number | null; line?: number | null };
+type Armed = { label: string; protocol: string; file: string; group: number; position: number; line?: number | null };
 
 /** A GraphQL row's checks stay unarmed: the service's table is absent, or the compiler engine refused it. */
 const GRAPHQL_TABLE_UNUSABLE = "graphql_table_unusable";
@@ -102,7 +102,11 @@ const graphqlInput = (rows: ContractRow[], table: GraphqlTypeTable | null): stri
 type GraphqlChecks = { wire: string[]; leaves: Map<string, string>; reason: string | null; input: string };
 
 /** A row's identity. Emitter rows of one event in one file differ only by their line, so theirs carries it; the others' stay as they were. */
-const identity = (row: ContractRow): string => `${row.repo}\0${row.file}\0${row.label}\0${row.site ?? ""}${isMessage(row) ? `\0${row.side}\0${row.line ?? ""}` : ""}`;
+const identity = (row: ContractRow): string => `${row.repo}\0${row.file}\0${row.label}\0${row.site ?? ""}${row.side === "consumer" ? `\0${row.side}\0${row.line ?? ""}` : ""}`;
+/** A consumer row's call line, for its placed row and its held key; every other row adds nothing (HTTP and GraphQL keep their keys). */
+const callLine = (row: ContractRow): { line?: number | null } => (row.side === "consumer" ? { line: row.line } : {});
+/** The once-per-session key of a held line: `contractKey` plus, for a consumer row, its index line (two emits of one event are two lines). */
+const heldKey = (row: ContractRow, g: number): string => `${contractKey(row, g)}${row.side === "consumer" ? `::line::${row.line ?? ""}` : ""}`;
 const groupKey = (row: ContractRow, group: number): string => `${identity(row)}\0${row.groups[group]!.type}`;
 /** One group at one position of its row's `values`. */
 const checkKey = (row: ContractRow, group: number, at: number): string => `${groupKey(row, group)}\0${at}`;
@@ -297,7 +301,7 @@ class HeldService implements ServiceEngine {
       const key = checkKey(p.row, g, p.at);
       if (onlyNew && decided(key)) return;
       this.armed.delete(key);
-      this.unarmed.set(key, { label: p.row.label, protocol: p.row.protocol, file: rel, reason, group: g, position: p.at });
+      this.unarmed.set(key, { label: p.row.label, protocol: p.row.protocol, file: rel, reason, group: g, position: p.at, ...callLine(p.row) });
     };
     const noneFor = (reason: string): void => {
       for (const p of positions) p.row.groups.forEach((_, g) => no(p, g, reason));
@@ -439,13 +443,13 @@ class HeldService implements ServiceEngine {
     const unarmed: Unarmed[] = [];
     for (const row of this.rows) {
       if (!hasValues(row)) {
-        row.groups.forEach((_, g) => unarmed.push({ label: row.label, protocol: row.protocol, file: row.file, reason: "no_values", group: g, position: null }));
+        row.groups.forEach((_, g) => unarmed.push({ label: row.label, protocol: row.protocol, file: row.file, reason: "no_values", group: g, position: null, ...callLine(row) }));
         continue;
       }
       row.values!.forEach((v, at) => {
         row.groups.forEach((_, g) => {
           const key = checkKey(row, g, at);
-          if (this.armed.has(key)) armed.push({ label: row.label, protocol: row.protocol, file: v.file, group: g, position: at });
+          if (this.armed.has(key)) armed.push({ label: row.label, protocol: row.protocol, file: v.file, group: g, position: at, ...callLine(row) });
           else if (this.unarmed.has(key)) unarmed.push(this.unarmed.get(key)!);
         });
       });
@@ -544,7 +548,7 @@ class HeldService implements ServiceEngine {
         row.groups.forEach((_, g) => {
           const key = checkKey(row, g, at);
           this.armed.delete(key);
-          this.unarmed.set(key, { label: row.label, protocol: row.protocol, file: v.file, reason, group: g, position: at });
+          this.unarmed.set(key, { label: row.label, protocol: row.protocol, file: v.file, reason, group: g, position: at, ...callLine(row) });
         });
       });
     }
@@ -578,12 +582,12 @@ class HeldService implements ServiceEngine {
         const entry = view.entries[check.n]!;
         const g = entry.groups[check.group]!;
         const row = entry.pos.row;
-        const key = `${contractKey(row, g)}\0${g}`;
+        const key = `${heldKey(row, g)}\0${g}`;
         if (said.has(key)) continue;
         said.add(key);
         const first = diags[0]!;
         out.push({
-          row_key: contractKey(row, g),
+          row_key: heldKey(row, g),
           group: g,
           label: row.label,
           consumer: [...new Set(row.groups[g]!.places.map((p) => p.service))].join(", "),
@@ -717,7 +721,7 @@ async function factTable(root: string, repo: string, service: string): Promise<G
 
 /** Every row of `rows` unarmed, each for the reason `why` gives it. */
 const allUnarmed = (rows: ContractRow[], why: (row: ContractRow) => string): Unarmed[] =>
-  rows.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, protocol: row.protocol, file: row.file, reason: why(row), group: g, position: null })));
+  rows.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, protocol: row.protocol, file: row.file, reason: why(row), group: g, position: null, ...callLine(row) })));
 
 export function createRuntime(options: RuntimeDeps): ServiceRuntime {
   const env = options.env ?? process.env;

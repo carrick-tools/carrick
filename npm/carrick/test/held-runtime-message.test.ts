@@ -279,3 +279,36 @@ test("an engine without the message rules leaves socket rows unarmed; they never
   assert.deepEqual(summary(r.placed().unarmed), [`socket ${EVENT} g0#0:message_rules_missing`, `socket ${EVENT} g0#0:message_rules_missing`]);
   assert.equal(shadowText(r, ORDERS).includes("__C."), false);
 });
+
+test("two emits of one event in one file that break together are two lines", async (t) => {
+  const r = await rig(t, socketRows());
+  const broken = ORDERS_TEXT.replace('status: "paid"', 'status: "BROKEN"').replace('status: "open"', 'status: "BROKEN"');
+  assert.equal((await r.edit(ORDERS, ORDERS_TEXT.replace('status: "paid"', 'status: "BROKEN"'))).length, 1, "the first emit breaks first");
+  const lines = await r.edit(ORDERS, broken);
+  assert.equal(lines.length, 2, JSON.stringify(lines));
+  assert.equal(new Set(lines.map((l) => l["row_key"])).size, 2, "two held keys");
+  assert.deepEqual(lines.map((l) => l["row_line"]).sort(), PAYLOADS.map((p) => lineOf(ORDERS_TEXT, p)).sort(), "each carries its own index line");
+  assert.deepEqual(lines.map((l) => l["line"]).sort(), PAYLOADS.map((p) => lineOf(ORDERS_TEXT, p)).sort());
+});
+
+test("placed rows of two emitters of one event differ by line", async (t) => {
+  const r = await rig(t, socketRows({ types: [ORDER_UPDATE, "{ id: string }"] }));
+  const armed = r.placed().armed;
+  assert.equal(new Set(armed.map((a) => `${a["file"]}:${a["line"]}:${a["group"]}:${a["position"]}`)).size, 4, "file:line:group:position has 4 entries");
+  assert.deepEqual(new Set(armed.map((a) => a["line"])), new Set(PAYLOADS.map((p) => lineOf(ORDERS_TEXT, p))));
+  const none = await rig(t, [httpRow(), ...socketRows({ spans: false })]);
+  const unarmed = none.placed().unarmed.filter((u) => u["protocol"] === "socket");
+  assert.ok(unarmed.length > 0);
+  for (const u of unarmed) assert.equal(typeof u["line"], "number", "an unarmed consumer row carries its line too");
+});
+
+test("an HTTP and a GraphQL placed row keep exactly their keys", async (t) => {
+  const r = await rig(t, [httpRow(), graphqlRow(), ...socketRows()], TABLE);
+  const placed = r.placed();
+  const others = [...placed.armed, ...placed.unarmed].filter((e) => e["protocol"] !== "socket");
+  assert.equal(others.length, 2, "one HTTP and one GraphQL placed row");
+  for (const e of others) assert.deepEqual(Object.keys(e).sort(), ["file", "group", "label", "position", "protocol"], `${e["protocol"]} row keys`);
+  const bare = await rig(t, [{ ...httpRow(), groups: [groupOf("any", [placeOf("web", "web/ok.ts", 4, null)])] }, { ...graphqlRow(), groups: [groupOf("any", [placeOf("web", "web/order.ts", 4, null)])] }], TABLE);
+  assert.equal(bare.placed().unarmed.length, 1, "the GraphQL row is unarmed (top type)");
+  for (const e of bare.placed().unarmed) assert.deepEqual(Object.keys(e).sort(), ["file", "group", "label", "position", "protocol", "reason"], `${e["protocol"]} unarmed row keys`);
+});
