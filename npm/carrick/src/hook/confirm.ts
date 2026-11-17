@@ -8,8 +8,7 @@
 // line; a part-2 consumer call row by place identity, its (file, line) being
 // one of the early row's group places. An early CALL row (a consumer-side
 // item, HM4 D2) joins the other way round: by the call's place (edited file,
-// the call's current line), method and response side, the label only breaking
-// a tie, because a consumer spells a route's params its own way; and a part-2
+// the call's current line), method, response side and label; and a part-2
 // route row at one of its producer places is its mirror. What follows from it (P10), per early
 // break:
 // - part 2 states the same break (same result kind): `same`, nothing more;
@@ -140,10 +139,10 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
   // holds the index's stored verdicts for an older file state: it judged no row, so it corrects none.
   const judged = usable?.recheck?.ran !== "none";
   const matched = new Set<CheckItem | MovedRow>();
-  // An early call item's part-2 row: the same place and method on the response side; the label only breaks a tie.
+  // An early call item's part-2 row: the same place, method and label on the response side.
   const callMatch = (own: CheckItem, label: string): CheckItem | null => {
-    const at = items.filter((item) => item.kind === "call" && item.line === own.line && item.method === own.method && responseSide(item) && !matched.has(item));
-    return at.find((item) => itemLabel(item) === label) ?? at[0] ?? null;
+    const at = items.filter((item) => item.kind === "call" && item.line === own.line && item.method === own.method && responseSide(item) && !matched.has(item) && itemLabel(item) === label);
+    return at[0] ?? null;
   };
   let compared: RowCompared[] = rows.map((row) => {
     if (row.item) {
@@ -161,7 +160,7 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
     const own = row.moved!;
     const match =
       own.role === "call"
-        ? (moved.find((m) => m.role === "call" && m.method === own.method && !matched.has(m) && samePlace(m.file, m.line, { file: own.file, line: own.line ?? -1 })) ?? null)
+        ? (moved.find((m) => m.role === "call" && m.method === own.method && `${m.method} ${m.path}` === row.label && !matched.has(m) && samePlace(m.file, m.line, { file: own.file, line: own.line ?? -1 })) ?? null)
         : (moved.find((m) => m.role === "route" && m.file === own.file && `${m.method} ${m.path}` === row.label) ?? null);
     if (match === null) return { row, outcome: "part3_only", p2_state: "absent", corrected: false, match };
     matched.add(match);

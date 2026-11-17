@@ -1,6 +1,6 @@
 // Confirm or correct for an early CALL item (HM4 T2, D1-D3): the consumer-side
-// early item joins part 2's call item by the call's place (file, line), method
-// and response side, the label only breaking a tie. Hand-built results, no
+// early item joins part 2's call item by the call's place (file, line), method,
+// response side and label. Hand-built results, no
 // runtime: no early call item is produced on main yet, so nothing here arms.
 // Every name is invented.
 
@@ -104,10 +104,47 @@ test("two early calls of one event in one file are two rows with two keys, each 
   assert.deepEqual(out.corrected, [`${SOCKET} ${EVENT} at src/orders.ts:9`]);
 });
 
-test("a part-2 call at the same line with another path spelling still joins (GET /orders/:id vs /orders/:orderId)", () => {
+test("a part-2 call at the same line with another path spelling does not join (label must agree)", () => {
   const e = early([earlyCall(12, { method: "GET", path: "/orders/:id" })]);
   const compared = compareEarly(e, result([fullCall(12, { method: "GET", path: "/orders/:orderId" })]));
-  assert.equal(compared.rows[0]?.outcome, "same");
+  assert.equal(compared.rows[0]?.outcome, "part3_only");
+  assert.equal(compared.rows[0]?.p2_state, "absent");
+});
+
+test("two emits of two events on one line each join their own re-check item", () => {
+  const a = earlyCall(6, { path: "order:a" });
+  const b = earlyCall(6, { path: "order:b" });
+  const e = early([a, b]);
+  const fa = fullCall(6, { path: "order:a" });
+  const fb = fullCall(6, { path: "order:b" });
+  const compared = compareEarly(e, result([fb, fa]));
+  assert.deepEqual(compared.rows.map((c) => c.outcome), ["same", "same"]);
+  assert.equal(compared.rows[0]?.match, fa);
+  assert.equal(compared.rows[1]?.match, fb);
+  assert.equal(compared.part2Only.length, 0);
+});
+
+test("an early call is not confirmed by another event's item at the same line", () => {
+  const e = early([earlyCall(6, { path: "order:a" }), earlyCall(6, { path: "order:b" })]);
+  const fb = fullCall(6, { path: "order:b" });
+  const full = result([fb]);
+  const compared = compareEarly(e, full);
+  assert.deepEqual(compared.rows.map((c) => [c.outcome, c.p2_state]), [["part3_only", "absent"], ["same", undefined]]);
+  assert.equal(compared.rows[1]?.match, fb);
+  const rows = earlyRows(e);
+  const said = new Set(rows.map((r) => r.key));
+  assert.deepEqual(confirmedResult(full, e, said).result.items, [fb].filter(() => false));
+  assert.equal((withEarlyBreaks(full, e).items ?? []).filter((i) => i.path === "order:b").length, 1);
+});
+
+test("an early call is not corrected by another event's compatible item at the same line", () => {
+  const e = early([earlyCall(6, { path: "order:a" })]);
+  const full = result([fullCall(6, { path: "order:b", verdict: { state: "resolved", result: "compatible" }, stated: false })]);
+  const compared = compareEarly(e, full);
+  assert.equal(compared.rows[0]?.corrected, false);
+  assert.equal(compared.rows[0]?.p2_state, "absent");
+  const said = new Set(earlyRows(e).map((r) => r.key));
+  assert.deepEqual(confirmedResult(full, e, said).corrected, []);
 });
 
 test("the label breaks a tie between two part-2 calls at one line", () => {
@@ -169,6 +206,9 @@ test("an early moved call row joins part 2's moved call row by place", () => {
   const compared = compareEarly(e, result([], [theirs]));
   assert.equal(compared.rows[0]?.outcome, "same");
   assert.equal(compared.rows[0]?.match, theirs);
+  // Another event at the same place is another call.
+  const other = compareEarly(e, result([], [moved("call", "src/orders.ts", 6, { path: "order:other" })]));
+  assert.equal(other.rows[0]?.p2_state, "absent");
   // Another line is another call; the early row stands as absent.
   const away = compareEarly(e, result([], [moved("call", "src/orders.ts", 9)]));
   assert.equal(away.rows[0]?.p2_state, "absent");
