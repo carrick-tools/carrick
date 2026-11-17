@@ -1,0 +1,10 @@
+{
+  "name": "socket-listener-handler-anchor",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/queue": "^2.4.0",
+    "@fixture/rt-client": "^4.8.0",
+    "@fixture/rt-server": "^4.8.0"
+  }
+}

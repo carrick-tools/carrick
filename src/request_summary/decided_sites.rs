@@ -2704,6 +2704,56 @@ fn module_functions(module: &Module) -> HashMap<String, Span> {
     functions
 }
 
+/// The argument a labelled socket receive hands its handler at, when the
+/// label states no handler slot (carrick#4643): the store drops a handler
+/// slot whose parameter the lister does not mark as a declared function, so
+/// the call states it. Among the arguments other than the event name, exactly
+/// one is a function expression or an identifier; none or several give no
+/// anchor. A receive that states no event name (`onAny`: the first parameter
+/// is the name) gets none, and neither does a name met through a caller.
+/// Other roles are untouched: a broker handler's first parameter is not the
+/// payload.
+fn receive_handler_arg(down: &[Placed<'_>], label: &SiteLabel) -> Option<usize> {
+    if label.role != "socket" || label.op.as_deref() != Some("receive") || label.payload.is_some() {
+        return None;
+    }
+    let slot = label.name.as_ref()?;
+    if slot.key.is_some() {
+        return None;
+    }
+    let (at, name_arg, _) = bound_at(down, slot)?;
+    if at != 0 {
+        return None;
+    }
+    let placed = &down[0];
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = swc_common::errors::Handler::with_tty_emitter(
+        swc_common::errors::ColorConfig::Never,
+        false,
+        false,
+        Some(cm.clone()),
+    );
+    let module = crate::parser::parse_file(placed.file, &cm, &handler)?;
+    let mut finder = CallAt {
+        target: (placed.call.site.span_start, placed.call.site.span_end),
+        args: None,
+    };
+    module.visit_with(&mut finder);
+    let args = finder.args?;
+    if args.iter().any(|arg| arg.spread.is_some()) {
+        return None;
+    }
+    let mut callable = args.iter().enumerate().filter(|(index, arg)| {
+        *index != name_arg
+            && matches!(
+                super::unwrap_value(&arg.expr),
+                Expr::Arrow(_) | Expr::Fn(_) | Expr::Ident(_)
+            )
+    });
+    let (index, _) = callable.next()?;
+    callable.next().is_none().then_some(index)
+}
+
 /// The function `placed`'s call hands at argument `arg`: one written there,
 /// or one the module declares under the name written there; otherwise the
 /// argument itself.
@@ -3086,9 +3136,14 @@ impl<'a> Walk<'a, '_> {
                     },
                 )
             });
-        let handler = handler_slot
-            .and_then(|slot| bound_at(down, slot))
-            .and_then(|(at, arg, _)| handler_at(self.root, &down[at], arg));
+        let handler = match handler_slot {
+            Some(slot) => {
+                bound_at(down, slot).and_then(|(at, arg, _)| handler_at(self.root, &down[at], arg))
+            }
+            None => label
+                .and_then(|label| receive_handler_arg(down, label))
+                .and_then(|arg| handler_at(self.root, placed, arg)),
+        };
         let instances = self.instances(down);
         let makes_end = self.makes_end(down);
         let chain_handed_on = down[1..].iter().any(|below| {
