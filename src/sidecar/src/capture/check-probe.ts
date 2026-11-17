@@ -291,6 +291,30 @@ export function absentBodyRule(sent: string, expected: string, toleratesAbsence:
 }
 
 /**
+ * The top and bottom type tests the probe's six gates read: `IsAny<T>`,
+ * `IsUnknown<T>` (`any` excluded first) and `IsNever<T>`. `prefix` namespaces
+ * the names, as for `jsonWireDeclarations`; `buildProbe` writes them with
+ * none. A held check that must stay silent on a top or bottom side reads them
+ * from here, never from a copy.
+ */
+export function topTypeDeclarations(prefix: string): string[] {
+  return [
+    `type ${prefix}IsAny<T> = 0 extends 1 & T ? true : false;`,
+    `type ${prefix}IsUnknown<T> = unknown extends T ? (0 extends 1 & T ? false : true) : false;`,
+    `type ${prefix}IsNever<T> = [T] extends [never] ? true : false;`,
+  ];
+}
+
+/**
+ * Whether the absent-body tolerance (`absentBodyRule`) reads a pair: the
+ * request direction of HTTP, and socket and pub/sub payloads (the subscriber
+ * is `expected`). Never an HTTP response, and not a GraphQL request.
+ */
+export function absentBodyApplies(protocol: ProbeProtocol, typeKind: ProbeTypeKind): boolean {
+  return (protocol === 'http' && typeKind === 'request') || protocol === 'socket' || protocol === 'pubsub';
+}
+
+/**
  * The judge's three tolerances, as the texts the probe is built from: the
  * literal-widened reading (`unwidened_alias_suffix`, the export suffix a stub
  * ships its unwidened response under, `unwidenedAliasOf`), and the other two
@@ -540,9 +564,7 @@ export function buildProbe(
   importLines.push(
     push(`import type { ${expectedEndpoint.alias} as Expected } from '${expectedPkg}';`)
   );
-  push(`type IsAny<T> = 0 extends 1 & T ? true : false;`);
-  push(`type IsUnknown<T> = unknown extends T ? (0 extends 1 & T ? false : true) : false;`);
-  push(`type IsNever<T> = [T] extends [never] ? true : false;`);
+  for (const line of topTypeDeclarations('')) push(line);
   push(`type Not<T extends boolean> = T extends true ? false : true;`);
   push(`type Assert<T extends true> = T;`);
   gateLines.set(push(`type _G_sent_any = Assert<Not<IsAny<Sent>>>;`), 'sent:any');
@@ -638,10 +660,7 @@ export function buildProbe(
   // remains is compared as before. The request direction of HTTP, and socket
   // and pub/sub payloads (the subscriber is `expected`); a GraphQL request is
   // not read this way.
-  const absentBodyAllowed =
-    (spec.protocol === 'http' && spec.type_kind === 'request') ||
-    spec.protocol === 'socket' ||
-    spec.protocol === 'pubsub';
+  const absentBodyAllowed = absentBodyApplies(spec.protocol, spec.type_kind);
   const toleratesAbsence = expectedToleratesAbsence?.(expectedEndpoint) === true;
   const sentBodyType = (sent: string): string => absentBodyRule(sent, 'Expected', toleratesAbsence);
   if (absentBodyAllowed) push(`type SentBody = ${sentBodyType('Sent')};`);

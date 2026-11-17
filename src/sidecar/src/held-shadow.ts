@@ -30,6 +30,8 @@ import { ts } from 'ts-morph';
 import type { ProjectLoader } from './project-loader.js';
 import {
   WriteGuard,
+  absentBodyApplies,
+  absentBodyRule,
   graphqlComparandLeafRule,
   graphqlComparandRule,
   graphqlExpectedRule,
@@ -44,6 +46,7 @@ import {
   jsonWireDeclarations,
   jsonWireRule,
   judgeTolerances,
+  topTypeDeclarations,
   fitOptionsOf,
   judgeFitOptions,
   wireFormFor,
@@ -77,6 +80,8 @@ export interface ShadowResult {
    * scan's judge answer "what travels" the same way.
    */
   wire: string[];
+  /** The judge's message rules for a socket payload, as declarations to append beside `tolerances` (`heldMessageWire`). */
+  message: string[];
   /** The judge's three tolerances, read from its own code (`judgeTolerances('__carrick_')`): declarations to append beside `wire`. */
   tolerances: JudgeTolerances;
   /**
@@ -298,6 +303,7 @@ export function writeShadow(
     wire: heldWire(),
     ...(graphql === undefined ? {} : { graphql: heldGraphql(graphql.types, graphql.roots) }),
     tolerances: judgeTolerances('__carrick_'),
+    message: heldMessageWire(),
     options: { service: fitOptionsOf(compilerOptions), judge: judgeFitOptions() },
     native_tsc: nativeTscPath(),
   };
@@ -381,6 +387,38 @@ export function heldGraphql(types: GraphqlTypes, roots: GraphqlRoot[]): HeldGrap
     types_decl: scalar ? `type __carrick_GqlTypes = ${JSON.stringify(table)};` : null,
     leaves,
   };
+}
+
+/**
+ * The judge's message rules (a socket payload: the emitter is `sent`, the
+ * listener `expected`) as declarations a held check appends beside `tolerances`
+ * (prefix `__carrick_`). Every rule is the judge's own text (`check-probe.ts`):
+ *
+ *  - `__carrick_IsAny`, `__carrick_IsUnknown`, `__carrick_IsNever`
+ *    (`topTypeDeclarations`);
+ *  - `__carrick_MsgSent<S, E>`, `S` the emitter's payload and `E` the
+ *    listener's parameter. Where the judge reads a gate unverifiable (a top,
+ *    bottom or void type on either side) the answer is `E`, so the check is
+ *    silent; otherwise it is the sent type with the absent body dropped where
+ *    the listener requires none (`absentBodyRule`, tolerant form, because the
+ *    listener's `absent_body_tolerated` mark is not stored: silent where the
+ *    judge without the mark would speak). A socket payload travels as
+ *    declared (`wireFormFor`), so no wire transform is applied.
+ *
+ * It reads `__carrick_IsVoid` (`tolerances.declarations`).
+ */
+export function heldMessageWire(): string[] {
+  const p = '__carrick_';
+  if (!absentBodyApplies('socket', 'response')) throw new Error('the absent-body rule no longer reads a socket payload');
+  const wire = wireFormFor('socket', 'response', 'consumer');
+  const sent = wire === 'json' ? `${p}Wire<S, E>` : 'S';
+  const body = absentBodyRule(sent, 'E', true);
+  const top = (t: string): string => `${p}IsAny<${t}> extends true ? true : ${p}IsUnknown<${t}> extends true ? true : ${p}IsNever<${t}> extends true ? true : ${p}IsVoid<${t}>`;
+  return [
+    ...topTypeDeclarations(p),
+    `type ${p}MsgSilent<T> = ${top('T')};`,
+    `type ${p}MsgSent<S, E> = ${p}MsgSilent<E> extends true ? E : ${p}MsgSilent<S> extends true ? E : ${body};`,
+  ];
 }
 
 function safeRealpath(p: string): string {
