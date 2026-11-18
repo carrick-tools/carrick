@@ -1864,6 +1864,7 @@ fn inside(
     } else {
         Ran::Extraction
     };
+    state_stale_counterparts(&mut items, &plan.scope.stale);
     Ok(Fresh {
         items,
         unread,
@@ -1922,6 +1923,45 @@ fn state_judged(items: &mut [IndexedItem], inside: &[super::changed::Problem]) {
                 });
             }
             item.stated = problem.stated;
+        }
+    }
+}
+
+/// A row this run computed whose counterpart sits in a service that has changed
+/// since the index and that this run did not re-read (`scope.stale`) was
+/// compared against that service's indexed code, not its working tree
+/// (carrick#4773). The comparison stays; the detail says which service it
+/// leaves out and points at `check --changed`, which re-reads every changed
+/// service. A `compatible` result is not confirmed, so its state reads
+/// `not_checked` (the state [`state_library_missing`] uses) with the result
+/// kept; a mismatch keeps its state, because it is a finding either way.
+/// Any protocol: the rule reads services, never the row's kind.
+fn state_stale_counterparts(items: &mut [IndexedItem], stale: &[String]) {
+    for item in items.iter_mut() {
+        let mut named: Vec<&str> = Vec::new();
+        for counterpart in &item.counterparts {
+            let service = counterpart.service.as_str();
+            if stale.iter().any(|s| s == service) && !named.contains(&service) {
+                named.push(service);
+            }
+        }
+        let Some(verdict) = item.verdict.as_mut() else {
+            continue;
+        };
+        if named.is_empty() {
+            continue;
+        }
+        let (who, has) = match named.as_slice() {
+            [one] => ((*one).to_string(), "has"),
+            many => (many.join(", "), "have"),
+        };
+        verdict.detail = format!(
+            "{} ({who} {has} changed since it was indexed and was not re-read: this compares \
+             against its indexed code; run `carrick check --changed`)",
+            verdict.detail
+        );
+        if verdict.state != "not_checked" && verdict.result.as_deref() == Some("compatible") {
+            verdict.state = "not_checked".to_string();
         }
     }
 }
@@ -3201,6 +3241,44 @@ mod tests {
         );
         assert!(!held[0].stated && !held[1].stated, "{held:?}");
         assert!(held[1].verdict.is_none(), "{:?}", held[1]);
+    }
+
+    /// carrick#4773: a compatible row whose counterpart sits in a changed,
+    /// not re-read service names it and stops reading as confirmed; a row
+    /// whose counterparts are all current is untouched. A socket listener and
+    /// a mismatch are covered: the rule reads services, not protocols.
+    #[test]
+    fn state_stale_counterparts_marks_only_rows_paired_with_a_stale_service() {
+        let paired = |kind: &str, result: &str, service: &str| -> IndexedItem {
+            serde_json::from_value(serde_json::json!({
+                "kind": kind, "service": "hub", "key": "socket|CLIENT->SERVER|tick", "dispatch": null,
+                "method": "CLIENT->SERVER", "path": "tick", "line": 5, "col": null, "source": "fact",
+                "resolution_source": null, "evidence": null,
+                "counterparts": [{"role": "consumer", "service": service, "file": "a.ts", "line": 1}],
+                "verdict": {"state": "resolved", "result": result, "detail": "both sides agree"}
+            }))
+            .expect("an item")
+        };
+        let stale = vec!["emitter".to_string()];
+        let mut items = vec![
+            paired("route", "compatible", "emitter"),
+            paired("route", "compatible", "steady"),
+            paired("route", "type_mismatch", "emitter"),
+        ];
+        let before = items[1].clone();
+        state_stale_counterparts(&mut items, &stale);
+        let marked = items[0].verdict.as_ref().expect("a verdict");
+        assert_eq!(marked.state, "not_checked");
+        assert_eq!(marked.result.as_deref(), Some("compatible"));
+        assert_eq!(
+            marked.detail,
+            "both sides agree (emitter has changed since it was indexed and was not re-read: \
+             this compares against its indexed code; run `carrick check --changed`)"
+        );
+        assert_eq!(items[1].verdict, before.verdict, "a current counterpart");
+        let mismatch = items[2].verdict.as_ref().expect("a verdict");
+        assert_eq!(mismatch.state, "resolved", "a mismatch stays a finding");
+        assert!(mismatch.detail.contains("run `carrick check --changed`"));
     }
 
     /// carrick#2826: a re-scan holds every sidecar to its own heap cap, which
