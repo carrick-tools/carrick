@@ -1,0 +1,3 @@
+{
+  "services": [{ "name": "unread-sites-not-asked", "directory": ".", "tsconfig": "tsconfig.json" }]
+}

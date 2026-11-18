@@ -34,6 +34,10 @@ pub enum Stop {
     PackageUnmatched,
     /// The store has no answer for the declaring package yet.
     UnansweredPackage,
+    /// The call is declared in a package the scan never asked the store about:
+    /// the service does not list it (it arrives through another package), or
+    /// it is not from the public registry.
+    PackageNotAsked,
     /// A definition the walk reached has no body this pass read.
     NoBody,
     /// An interface member with no implementation answer.
@@ -193,11 +197,12 @@ impl UnknownWord {
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 60] = [
+    pub const ALL: [Stop; 61] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
         Stop::UnansweredPackage,
+        Stop::PackageNotAsked,
         Stop::NoBody,
         Stop::InterfaceMember,
         Stop::SeveralValues,
@@ -263,6 +268,7 @@ impl Stop {
             Stop::OutsideService => "outside_service",
             Stop::PackageUnmatched => "package_unmatched",
             Stop::UnansweredPackage => "unanswered_package",
+            Stop::PackageNotAsked => "package_not_asked",
             Stop::NoBody => "no_body",
             Stop::InterfaceMember => "interface_member",
             Stop::SeveralValues => "several_values",

@@ -331,6 +331,9 @@ pub struct Labels<'a> {
     /// The packages the scan ended without an answer for ([`crate::library_store::Settled::unanswered`]),
     /// for the settled pass; `None` leaves [`Self::answered`] to decide.
     unready: Option<HashSet<&'a str>>,
+    /// Every package the scan asked the store about, for the settled pass;
+    /// `None` tells no package apart as never asked ([`Labels::asking`]).
+    asked: Option<HashSet<&'a str>>,
     /// The packages with an export of a network role.
     networked: HashSet<&'a str>,
     /// The exports the store labelled with no network role.
@@ -354,6 +357,7 @@ impl<'a> Labels<'a> {
             implementations: None,
             answered: None,
             unready: None,
+            asked: None,
             networked: exports
                 .iter()
                 .filter(|export| export.role != LibraryRole::None)
@@ -407,8 +411,21 @@ impl<'a> Labels<'a> {
         }
         if let Some(unready) = &self.unready {
             // One language key is one whole default-library file: never unready.
-            return (!is_language_key(key) && unready.contains(key))
-                .then_some(Stop::UnansweredPackage);
+            if is_language_key(key) {
+                return None;
+            }
+            if unready.contains(key) {
+                return Some(Stop::UnansweredPackage);
+            }
+            // A package the service does not list is never asked, and its
+            // calls arrive through another package. A runtime module is
+            // asked by import, and its globals need no import: not told here.
+            return (!key.starts_with("node:")
+                && self
+                    .asked
+                    .as_ref()
+                    .is_some_and(|asked| !asked.contains(key)))
+            .then_some(Stop::PackageNotAsked);
         }
         self.answered
             .as_ref()
@@ -424,6 +441,16 @@ impl<'a> Labels<'a> {
         debug_assert!(self.answered.is_none());
         Labels {
             unready: Some(unready.iter().map(String::as_str).collect()),
+            ..self
+        }
+    }
+
+    /// These labels with every package the scan asked the store about, for the
+    /// settled pass: a call into a package outside it, and outside the
+    /// default library and the runtime, is [`Stop::PackageNotAsked`].
+    pub fn asking(self, asked: &'a BTreeSet<String>) -> Self {
+        Labels {
+            asked: Some(asked.iter().map(String::as_str).collect()),
             ..self
         }
     }
@@ -6227,6 +6254,70 @@ mod tests {
                 .finished
                 .contains(&span("answered.ts", "render(body)")),
             "an answered package with nothing to label stays silent"
+        );
+    }
+
+    /// A call declared in a package the service does not list (it arrives
+    /// through the listed SDK) is never asked of the store: the settled pass
+    /// reads it `package_not_asked`, where it was dropped with no reason. A
+    /// call into the listed package, answered with nothing to label, stays
+    /// silent, and a call into a package that is not installed keeps its
+    /// reading. The answer key is
+    /// `tests/fixtures/unread-sites-not-asked/expected.json`.
+    #[test]
+    fn a_call_declared_in_a_package_never_asked_is_not_asked_when_the_scan_ends() {
+        let Some(on) = walked("unread-sites-not-asked", ".", "web", &[], true) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unread-sites-not-asked");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        let unready = BTreeSet::new();
+        let asked: BTreeSet<String> = ["@acme/sdk".to_string()].into();
+        let before = discover(
+            &on.inputs,
+            &Labels::of(&answer.exports).ended_without(&unready),
+            &on.repo,
+        );
+        let after = discover(
+            &on.inputs,
+            &Labels::of(&answer.exports)
+                .ended_without(&unready)
+                .asking(&asked),
+            &on.repo,
+        );
+        let span = |file: &str, needle: &str| -> (String, u32, u32) {
+            let text = std::fs::read_to_string(fixture.join("repo/src").join(file)).unwrap();
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (format!("src/{file}"), lo, lo + needle.len() as u32)
+        };
+        let stop_at = |discovery: &Discovery, at: &(String, u32, u32)| {
+            discovery
+                .unfollowed
+                .iter()
+                .find(|site| (site.file.clone(), site.span_start, site.span_end) == *at)
+                .and_then(|site| site.stop)
+        };
+        let invoke = span(
+            "invoke.ts",
+            "client.functions.invoke(\"send-welcome\", { body: { user } })",
+        );
+        let context = format!("{:?}", after.unfollowed);
+        assert_eq!(stop_at(&before, &invoke), None, "no reason before");
+        assert_eq!(
+            stop_at(&after, &invoke),
+            Some(Stop::PackageNotAsked),
+            "{context}"
+        );
+        let ping = span("invoke.ts", "client.ping()");
+        assert_eq!(stop_at(&after, &ping), None, "a listed package: {context}");
+        let gone = span("gone.ts", "vanish(who)");
+        assert_eq!(
+            stop_at(&after, &gone),
+            stop_at(&before, &gone),
+            "a package that is not installed: {context}"
         );
     }
 

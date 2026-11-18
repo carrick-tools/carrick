@@ -1,0 +1,10 @@
+{
+  "library_claims": [
+    {
+      "package": "@acme/sdk",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": []
+    }
+  ]
+}

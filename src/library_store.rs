@@ -330,6 +330,11 @@ impl Asked {
         })
     }
 
+    /// Every package the scan asked the store about, as the store keys it.
+    pub fn packages(&self) -> BTreeSet<String> {
+        every_asked(self)
+    }
+
     /// The packages this scan ends without a store answer for, beyond those
     /// the answer names as pending or failed (carrick#3992): the asked
     /// packages `answer` holds no entry for, and those left out at the cap.

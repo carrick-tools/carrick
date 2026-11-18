@@ -3,6 +3,7 @@
   "outside_service": "it is declared in a file outside the services Carrick reads",
   "package_unmatched": "it calls a package that has network calls, and this call matches none of them",
   "unanswered_package": "Carrick has no answer yet for the package this calls",
+  "package_not_asked": "it calls a package the library store was never asked about (one this service does not list, or one not from the public registry)",
   "no_body": "the function it reaches has no body Carrick read",
   "interface_member": "it calls a member of an interface, and no implementation was found",
   "several_values": "the function called is a value that can be several different functions, and they do not agree on where it goes",

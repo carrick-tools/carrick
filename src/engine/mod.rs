@@ -6356,6 +6356,7 @@ async fn analyze_current_repo_incremental(
                 &semantics_root,
             );
             let file_orchestrator = file_orchestrator.with_result_index(results.clone());
+            let asked_packages = library_ask.as_ref().map(|ask| ask.asked.packages());
             let (site_rows, site_payloads) = site_rows_of(
                 &request_inputs,
                 repo_path,
@@ -6371,6 +6372,7 @@ async fn analyze_current_repo_incremental(
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
                     unready: unready.as_ref(),
+                    asked: asked_packages.as_ref(),
                     answered: None,
                     held_at_module: &held_at_module,
                 },
@@ -8318,6 +8320,10 @@ struct SiteContext<'a> {
     /// ([`crate::library_store::Settled::unanswered`]); `None` for no ask or a
     /// read-only ask, where no call reads unready (carrick#3684).
     unready: Option<&'a BTreeSet<String>>,
+    /// Every package the scan asked the store about, read with
+    /// [`Self::unready`] so a call into a package never asked is told from
+    /// one answered with nothing to label.
+    asked: Option<&'a BTreeSet<String>>,
     /// The packages the store's first answer holds as answered, for the
     /// first answer's discovery (carrick#2613, carrick#4077); `None` for the
     /// settled pass, which reads [`Self::unready`] instead.
@@ -8595,6 +8601,10 @@ fn discovery_of(
     };
     let labels = match context.unready {
         Some(unready) => labels.ended_without(unready),
+        None => labels,
+    };
+    let labels = match context.asked {
+        Some(asked) => labels.asking(asked),
         None => labels,
     };
     crate::request_summary::discovery::discover_with(inputs, context.siblings, &labels, root)
@@ -16086,6 +16096,7 @@ async fn analyze_current_repo(
         sidecar,
         &service_root,
     );
+    let asked_packages = library_ask.as_ref().map(|ask| ask.asked.packages());
     let (site_rows, site_payloads) = site_rows_of(
         &request_inputs,
         repo_path,
@@ -16101,6 +16112,7 @@ async fn analyze_current_repo(
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
             unready: unready.as_ref(),
+            asked: asked_packages.as_ref(),
             answered: None,
             held_at_module: &held_at_module,
         },
