@@ -313,11 +313,14 @@ impl UrlNormalizer {
             && let Some(end) = url.find('}')
         {
             let var_name = &url[2..end];
+            // The declared name is the one after an env prefix
+            // (`import.meta.env.X`), else the text itself.
+            let declared_name = crate::call_base::env_prefixed_name(var_name).unwrap_or(var_name);
             // Check if this is a known env var
-            if self.internal_env_vars.contains(var_name) {
+            if self.internal_env_vars.contains(declared_name) {
                 is_internal = true;
                 stripped_host = Some(format!("${{{}}}", var_name));
-            } else if self.external_env_vars.contains(var_name) {
+            } else if self.external_env_vars.contains(declared_name) {
                 is_external = true;
                 stripped_host = Some(format!("${{{}}}", var_name));
             }
@@ -813,6 +816,31 @@ mod tests {
         assert_eq!(
             canonical(&["OTHER_URL"], target),
             "${process.env.VITE_API_BASE_URL}/v1/register/search"
+        );
+    }
+
+    /// An env read spelled `import.meta.env.X` strips when `X` is declared
+    /// internal, as `process.env.X` does.
+    #[test]
+    fn a_declared_variable_read_through_import_meta_env_strips() {
+        let config = Config {
+            internal_env_vars: ["VITE_ORDERS_URL".to_string()].into(),
+            ..Config::default()
+        };
+        let normalizer = UrlNormalizer::new(&config);
+        assert_eq!(
+            normalizer.consumer_call_path("${import.meta.env.VITE_ORDERS_URL}/v1/orders", None),
+            "/v1/orders"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_import_meta_env_base_stays_verbatim() {
+        let config = Config::default();
+        let normalizer = UrlNormalizer::new(&config);
+        assert_eq!(
+            normalizer.consumer_call_path("${import.meta.env.VITE_ORDERS_URL}/v1/orders", None),
+            "${import.meta.env.VITE_ORDERS_URL}/v1/orders"
         );
     }
 
