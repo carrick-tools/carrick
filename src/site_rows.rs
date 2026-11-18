@@ -326,27 +326,42 @@ pub struct TracedRoutes {
     /// `unread_own_part` (the path writes its first segment whole and then a
     /// value the code does not read, carrick#3237).
     pub untraced: std::collections::BTreeMap<String, usize>,
-    /// Route sites whose own path the code writes in no whole way: a
-    /// reader row there guesses at a value the code never states, so it is
-    /// no route and the site stays a possible call ([`GuessedRoute`]).
-    pub guessed: Vec<GuessedRoute>,
+    /// Registrations whose name the code writes in no whole way. A route
+    /// site's reader row there guesses at a value the code never states, so
+    /// it is no route and the site stays a possible call; a socket or
+    /// pub/sub receive keeps its place as a lead ([`UnreadRegistration`]).
+    pub unread: Vec<UnreadRegistration>,
 }
 
-/// A route site whose own path the code writes in no whole way (the
-/// record's name is unstated, or the call's own path holds a value no way
-/// of a conditional or a default reads whole):`` `${base}health` ``, `base.replace(…)`, a local holding a value
-/// read at runtime (ruling on PR #3182, 2026-11-02). The label states that
-/// a route of `method` is registered here; the path it serves is a value
-/// only the running program knows. Not a path that writes its first segment
-/// whole before the value (`unread_own_part`, carrick#3237): its row stands.
-/// A reader row of the method at the line is withdrawn ([`crate::engine`]'s `withdraw_guessed_routes`).
+/// A registration whose name the code writes in no whole way: a route site
+/// whose own path is a value only the running program knows (`` `${base}health` ``,
+/// `base.replace(…)`, a local holding a value read at runtime; ruling on PR
+/// #3182, 2026-11-02), or a socket or pub/sub receive whose event or topic
+/// the scan could not read (carrick#3224). The record states that something
+/// of `kind` is registered here; the name it serves is a value the scan does
+/// not hold, so a removed row of that protocol the PR's edit may have
+/// rewritten is a candidate, not a fact. Not a path that writes its first
+/// segment whole before the value (`unread_own_part`, carrick#3237): its row
+/// stands. A reader row of an HTTP route's method at the line is withdrawn
+/// ([`crate::engine`]'s `withdraw_guessed_routes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GuessedRoute {
+pub struct UnreadRegistration {
     /// Repo-relative, `/`-separated.
     pub file: String,
     pub line: u32,
-    /// The method the label forces, upper case.
-    pub method: String,
+    pub kind: UnreadKind,
+}
+
+/// What an [`UnreadRegistration`] registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnreadKind {
+    /// An HTTP route of this method, upper case as the label forces it.
+    Http(String),
+    /// A socket event listener. The label carries no direction, so a socket
+    /// registration serves any socket removal of its service.
+    Socket,
+    /// A pub/sub or queue subscriber or worker.
+    Pubsub,
 }
 
 /// The routes the receiver trace serves at a full path (carrick#2474 R3
@@ -366,6 +381,9 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
     }
     for record in records {
         if !label_states_a_route(record) {
+            if let Some(unread) = unread_message_receive(decided, record) {
+                out.unread.push(unread);
+            }
             continue;
         }
         let Some(site) = site_of(decided, &record.anchors) else {
@@ -388,10 +406,10 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
                         .or_default() += 1;
                     continue;
                 }
-                out.guessed.push(GuessedRoute {
+                out.unread.push(UnreadRegistration {
                     file: site.file.clone(),
                     line: site.line,
-                    method: method.to_uppercase(),
+                    kind: UnreadKind::Http(method.to_uppercase()),
                 });
             }
             continue;
@@ -412,10 +430,10 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
                 } else if let Ok(method) = forced_method(record) {
                     // The scan saved this site as unread: a removed row it
                     // may serve is a guess, as for an unread HTTP route.
-                    out.guessed.push(GuessedRoute {
+                    out.unread.push(UnreadRegistration {
                         file: site.file.clone(),
                         line: site.line,
-                        method: method.to_uppercase(),
+                        kind: UnreadKind::Http(method.to_uppercase()),
                     });
                 }
                 continue;
@@ -429,14 +447,41 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
         match traced_route(site, record) {
             Ok(routes) => out.routes.extend(routes),
             Err(Untraced::Counted(reason)) => *out.untraced.entry(reason).or_default() += 1,
-            Err(Untraced::Guessed(method)) => out.guessed.push(GuessedRoute {
+            Err(Untraced::Guessed(method)) => out.unread.push(UnreadRegistration {
                 file: site.file.clone(),
                 line: site.line,
-                method,
+                kind: UnreadKind::Http(method),
             }),
         }
     }
     out
+}
+
+/// The registration a socket or pub/sub receive is when the scan cannot read
+/// its name (carrick#3224): a lead whose label forces the receive side and
+/// whose end is a socket, a broker or an in-process bus (a queue worker is a
+/// broker receive). A send is no registration, and a name the trace read
+/// whole is no lead.
+fn unread_message_receive(decided: &Decided, record: &SiteRecord) -> Option<UnreadRegistration> {
+    // No `composed.own` check as the HTTP branch's `ways_read` keeps: a Lead
+    // receive exists only when the name is unstated, so a name read through
+    // whole ways never reaches this record.
+    if record.bucket != Bucket::Lead
+        || record.state.forced.get(&Slot::Role).map(String::as_str) != Some("handles")
+    {
+        return None;
+    }
+    let site = site_of(decided, &record.anchors)?;
+    let kind = match site.end.role.as_str() {
+        "socket" => UnreadKind::Socket,
+        "broker" | "in_process_bus" => UnreadKind::Pubsub,
+        _ => return None,
+    };
+    Some(UnreadRegistration {
+        file: site.file.clone(),
+        line: site.line,
+        kind,
+    })
 }
 
 /// The HTTP method the label forces at `record`'s site.
@@ -482,7 +527,7 @@ enum Untraced {
     /// Left to the reader, counted by this reason.
     Counted(String),
     /// The call's own path holds a value the code writes in no whole way:
-    /// a guessed site of this method, upper case ([`GuessedRoute`]).
+    /// an unread HTTP registration of this method, upper case ([`UnreadRegistration`]).
     Guessed(String),
 }
 

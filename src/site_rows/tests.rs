@@ -3227,12 +3227,61 @@ fn an_unread_procedure_site_is_a_guessed_route_of_the_method_its_label_forces() 
     let routes = traced(&decided, &records);
     assert!(routes.routes.is_empty());
     assert_eq!(
-        routes.guessed,
-        vec![GuessedRoute {
+        routes.unread,
+        vec![UnreadRegistration {
             file: "src/unread.ts".to_string(),
             line: LINE,
-            method: "GET".to_string(),
+            kind: UnreadKind::Http("GET".to_string()),
         }]
+    );
+}
+
+/// carrick#3224: a socket, broker or in-process bus receive whose name the
+/// scan cannot read is an unread registration of its protocol. A send is no
+/// registration, and a receive whose name is read (not a lead) is none.
+#[test]
+fn an_unread_message_receive_is_an_unread_registration_of_its_protocol() {
+    let lead = |file: &str, role: &str, op: &str| {
+        let site = site(file, role, op, "Bus");
+        let mut record = record(
+            &site,
+            &[(
+                Slot::Role,
+                if op == "receive" { "handles" } else { "sends" },
+            )],
+            &[Slot::Name],
+        );
+        record.bucket = Bucket::Lead;
+        record.lead = Some("name_unstated");
+        (site, record)
+    };
+    let mut parts = vec![
+        lead("src/socket.ts", "socket", "receive"),
+        lead("src/broker.ts", "broker", "receive"),
+        lead("src/bus.ts", "in_process_bus", "receive"),
+        lead("src/send.ts", "socket", "send"),
+        lead("src/other.ts", "http_client", "receive"),
+        lead("src/forced.ts", "broker", "receive"),
+    ];
+    parts[5].1.bucket = Bucket::Forced;
+    let decided = Decided {
+        sites: parts.iter().map(|(site, _)| site.clone()).collect(),
+        ..Decided::default()
+    };
+    let records: Vec<SiteRecord> = parts.into_iter().map(|(_, record)| record).collect();
+    let routes = traced(&decided, &records);
+    let at = |file: &str, kind: UnreadKind| UnreadRegistration {
+        file: file.to_string(),
+        line: LINE,
+        kind,
+    };
+    assert_eq!(
+        routes.unread,
+        vec![
+            at("src/socket.ts", UnreadKind::Socket),
+            at("src/broker.ts", UnreadKind::Pubsub),
+            at("src/bus.ts", UnreadKind::Pubsub),
+        ]
     );
 }
 

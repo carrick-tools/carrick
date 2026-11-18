@@ -356,6 +356,39 @@
       }
     },
     {
+      "name": "socket-listener-name-in-option-default",
+      "protocol": "socket",
+      "change": "quiet",
+      "repo": "orders-api",
+      "edits": [
+        {"op": "replace", "file": "src/realtime.ts", "pairs": [["  socket.on(\"order:update\", (update: OrderUpdate) => {", "  const { evt = \"order:update\" }: { evt?: string } = JSON.parse(\"{}\");\n  socket.on(evt, (update: OrderUpdate) => {"]]}
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": []
+      },
+      "known_miss": {"stage": "finding", "issues": ["carrick#3224"]}
+    },
+    {
+      "name": "pubsub-subscriber-topic-in-option-default",
+      "protocol": "pubsub",
+      "change": "quiet",
+      "repo": "orders-api",
+      "edits": [
+        {"op": "replace", "file": "src/events.ts", "pairs": [["  bus.subscribe(\"payments.settled\", (event: PaymentSettled) => {", "  const { topic = \"payments.settled\" }: { topic?: string } = JSON.parse(\"{}\");\n  bus.subscribe(topic, (event: PaymentSettled) => {"]]},
+        {"op": "replace", "file": "__llm__/analyze-file/events.json", "pairs": [["\"topic\": \"payments.settled\",\n      \"role\": \"subscriber\",\n      \"line_number\": 9,", "\"topic\": \"\",\n      \"role\": \"subscriber\",\n      \"line_number\": 10,"], ["\"line_number\": 15,", "\"line_number\": 16,"], ["\"payload_expression_line\": 15", "\"payload_expression_line\": 16"]]}
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": []
+      },
+      "known_miss": {"stage": "finding", "issues": ["carrick#3224"]}
+    },
+    {
       "name": "trpc-procedure-added",
       "protocol": "trpc",
       "change": "delta_only",

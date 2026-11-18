@@ -185,10 +185,10 @@ pub struct ServiceAnalysis {
     /// Its type-reach record, for the store to keep beside its blob
     /// (carrick#3101). Never serialised into the blob.
     pub type_reach: Option<crate::cloud_storage::TypeReachObject>,
-    /// Its route sites whose own path the receiver trace could not read
-    /// ([`crate::site_rows::GuessedRoute`]), for a PR's endpoint delta
-    /// (carrick#3222). Never serialised.
-    pub unread_routes: Vec<crate::site_rows::GuessedRoute>,
+    /// Its registrations whose name the scan could not read
+    /// ([`crate::site_rows::UnreadRegistration`]), for a PR's endpoint delta
+    /// and removal marking (carrick#3222, #3224). Never serialised.
+    pub unread_registrations: Vec<crate::site_rows::UnreadRegistration>,
     /// The call edges discovery's walk entered, paths repo-relative,
     /// written into its definitions once every service's call-through is
     /// settled ([`crate::call_graph::plan_edges`]). Never serialised.
