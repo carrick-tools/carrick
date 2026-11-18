@@ -170,6 +170,9 @@ const NODE_BUILTINS: &[&str] = &[
     "zlib",
 ];
 
+/// Dependency version prefixes that name code in the repo, not a registry.
+const LOCAL_PROTOCOLS: &[&str] = &["file:", "link:", "portal:", "workspace:"];
+
 /// The Node builtins that exist only under `node:`.
 const NODE_PREFIXED_BUILTINS: &[&str] = &["sea", "sqlite", "test", "test/reporters"];
 
@@ -234,6 +237,10 @@ pub struct WorkspaceIndex {
     /// egress, so not in `external_packages`; still a package, not one of the
     /// repo's own modules ([`WorkspaceIndex::names_an_unknown_module`]).
     dev_packages: BTreeSet<String>,
+    /// Every name a manifest declares at a path or workspace version
+    /// (`file:`, `link:`, `portal:`, `workspace:`): its code is in the repo,
+    /// so it is no package a registry serves ([`WorkspaceIndex::names_only_a_package`]).
+    local_protocol_packages: BTreeSet<String>,
     /// Workspace package name -> its directory.
     internal_packages: BTreeMap<String, InternalPackage>,
     /// The aliases the repo's config declares. `None` for an index built by
@@ -275,6 +282,7 @@ impl WorkspaceIndex {
     fn build_inner(repo_root: &Path, aliases: Option<Option<&ServiceScope>>) -> Self {
         let mut declared: BTreeSet<String> = BTreeSet::new();
         let mut dev_declared: BTreeSet<String> = BTreeSet::new();
+        let mut local_protocol: BTreeSet<String> = BTreeSet::new();
         let mut internal_names: BTreeSet<String> = BTreeSet::new();
         let mut internal_packages: BTreeMap<String, InternalPackage> = BTreeMap::new();
 
@@ -293,6 +301,22 @@ impl WorkspaceIndex {
             declared.extend(facts.package.peer_dependencies.keys().cloned());
             declared.extend(facts.package.optional_dependencies.keys().cloned());
             dev_declared.extend(facts.package.dev_dependencies.keys().cloned());
+            for map in [
+                &facts.package.dependencies,
+                &facts.package.peer_dependencies,
+                &facts.package.optional_dependencies,
+                &facts.package.dev_dependencies,
+            ] {
+                local_protocol.extend(
+                    map.iter()
+                        .filter(|(_, version)| {
+                            LOCAL_PROTOCOLS
+                                .iter()
+                                .any(|protocol| version.trim_start().starts_with(protocol))
+                        })
+                        .map(|(name, _)| name.clone()),
+                );
+            }
             let Some(name) = facts.package.name.as_deref() else {
                 continue;
             };
@@ -345,6 +369,7 @@ impl WorkspaceIndex {
                 .unwrap_or_else(|_| repo_root.to_path_buf()),
             external_packages: declared,
             dev_packages: dev_declared,
+            local_protocol_packages: local_protocol,
             internal_packages,
             aliases,
         }
@@ -507,6 +532,40 @@ impl WorkspaceIndex {
                     && !self.alias_names_a_file(from_file, specifier)
             }
         }
+    }
+
+    /// Whether `specifier`, as `from_file` writes it, names only a package: a
+    /// runtime builtin, or a name some manifest declares as a registry
+    /// dependency. Such an import cannot reach a module of the repo
+    /// (a declared package's code is not ours), whatever the compiler could
+    /// read of it. Anything else that may be one of the repo's own modules is
+    /// not: a relative or `#` specifier, one an alias claims (even with its
+    /// target missing: a generated module may sit there), a workspace member,
+    /// an undeclared name, and a name declared at a `file:`, `link:`,
+    /// `portal:` or `workspace:` version. `resolve` answering `External` is
+    /// not enough: it also answers so for an alias claim whose target is
+    /// missing ([`WorkspaceIndex::resolve`]).
+    pub fn names_only_a_package(&self, from_file: &Path, specifier: &str) -> bool {
+        if specifier.is_empty()
+            || specifier.starts_with(['.', '/', '#'])
+            || !matches!(
+                self.resolve_alias(from_file, specifier),
+                AliasOutcome::Unclaimed
+            )
+            || longest_match(specifier, self.internal_packages.keys()).is_some()
+        {
+            return false;
+        }
+        if is_runtime_builtin(specifier) {
+            return true;
+        }
+        longest_match(
+            specifier,
+            self.external_packages
+                .iter()
+                .chain(self.dev_packages.iter()),
+        )
+        .is_some_and(|name| !self.local_protocol_packages.contains(&name))
     }
 
     /// Whether an alias the repo's config declares maps `specifier` onto a
@@ -1268,6 +1327,46 @@ mod tests {
 
     fn aliased(repo: &tempfile::TempDir, from: &str, specifier: &str) -> Resolution {
         WorkspaceIndex::build_with_aliases(repo.path(), None).resolve(Path::new(from), specifier)
+    }
+
+    /// A name only a package can be: a declared dependency of any kind or a
+    /// builtin. Anything that may be one of the repo's own modules is not.
+    #[test]
+    fn names_only_a_package_is_true_for_a_declared_dependency_or_a_builtin_only() {
+        let repo = tree(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"paths":{"claimed-pkg":["./src/gen/claimed"]}}}"#,
+            ),
+            (
+                "package.json",
+                r#"{"name":"app","dependencies":{"reg-pkg":"^1.0.0","claimed-pkg":"^1.0.0","local-pkg":"file:../local","linked-pkg":"link:../l","moved-pkg":"portal:../p","ws-dep":"workspace:*"},"devDependencies":{"dev-pkg":"^2.0.0"}}"#,
+            ),
+            ("lib/package.json", r#"{"name":"member"}"#),
+            ("src/app.ts", "export const app = 1;"),
+        ]);
+        let index = WorkspaceIndex::build_with_aliases(repo.path(), None);
+        let from = Path::new("src/app.ts");
+        for yes in ["reg-pkg", "reg-pkg/sub", "dev-pkg", "fs", "node:fs"] {
+            assert!(index.names_only_a_package(from, yes), "{yes}");
+        }
+        for no in [
+            "undeclared",
+            "./x",
+            "../x",
+            "/x",
+            "#x",
+            "member",
+            "member/sub",
+            "claimed-pkg",
+            "local-pkg",
+            "linked-pkg",
+            "moved-pkg",
+            "ws-dep",
+            "",
+        ] {
+            assert!(!index.names_only_a_package(from, no), "{no}");
+        }
     }
 
     fn internal(path: &str) -> Resolution {

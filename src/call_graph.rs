@@ -472,6 +472,17 @@ pub fn resolve_call_edges(
         };
         let wanted = &bindings_wanted[canonical];
         for local in &wanted.locals {
+            if index.imports.get(local).is_some_and(|symbol| {
+                resolver
+                    .workspace
+                    .names_only_a_package(&index.path, &symbol.source)
+            }) {
+                bindings
+                    .packages
+                    .entry(index.path.clone())
+                    .or_default()
+                    .insert(local.clone());
+            }
             if let Some(binding) = resolver.imported_binding(index, local) {
                 bindings
                     .by_file
@@ -953,9 +964,20 @@ pub struct ImportedBindings {
     by_file: HashMap<PathBuf, HashMap<String, ImportedBinding>>,
     loads: HashMap<PathBuf, HashMap<String, ImportedBinding>>,
     unresolved: BTreeMap<PathBuf, BTreeSet<String>>,
+    /// The locals each file imports from a specifier that names only a
+    /// package ([`WorkspaceIndex::names_only_a_package`]).
+    packages: HashMap<PathBuf, BTreeSet<String>>,
 }
 
 impl ImportedBindings {
+    /// Whether `local`, imported by `importer`, comes from a specifier that
+    /// names only a package: it cannot reach a module of the repo.
+    pub fn names_only_a_package(&self, importer: &Path, local: &str) -> bool {
+        self.packages
+            .get(importer)
+            .is_some_and(|locals| locals.contains(local))
+    }
+
     /// What `local`, imported by `importer`, names, when resolution reached a
     /// module of the service.
     pub fn get(&self, importer: &Path, local: &str) -> Option<&ImportedBinding> {
