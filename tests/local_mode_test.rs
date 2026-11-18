@@ -6221,6 +6221,128 @@ fn a_re_check_leaves_a_verdict_alone_when_the_counterpart_is_unchanged() {
     );
 }
 
+/// [`shop`]'s producer and its client as two repositories of one workspace
+/// (one repo per service, the usual customer shape), each committed.
+fn shop_in_two_repos() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = repo_root().join("tests/fixtures").join(SHOP).join("shop");
+    for service in ["catalog", "inventory"] {
+        let repo = dir.path().join(service);
+        copy_tree(&source.join(service), &repo);
+        git(&repo, &["init", "-q", "."]);
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=fixture@carrick.test",
+                "-c",
+                "user.name=fixture",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+    }
+    std::fs::write(
+        dir.path().join("carrick-workspace.json"),
+        "{ \"repos\": [\"./catalog\", \"./inventory\"] }\n",
+    )
+    .expect("write the workspace file");
+    dir
+}
+
+const TWO_REPO_ROUTE: &str = "catalog/app/routes/api.v1.widgets.$widgetId.ts";
+const TWO_REPO_CLIENT: &str = "inventory/src/client.ts";
+const STALE_NOTE: &str = "has changed since it was indexed and this check did not re-read it, \
+     so the verdict uses its indexed code. `carrick check --changed` gives the current verdict.)";
+
+/// carrick#4819: the counterpart sits in ANOTHER repository, with an
+/// uncommitted edit this re-check did not read. The row says so, as it does
+/// for a service of the edited file's own repository.
+#[test]
+#[serial]
+fn a_re_check_marks_a_verdict_against_a_changed_service_in_another_repository() {
+    let workspace = shop_in_two_repos();
+    let root = workspace.path();
+    index(root);
+    edit(
+        &root.join(TWO_REPO_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    statement_in(&root.join(TWO_REPO_ROUTE), "route edit");
+    let answer = recheck_json(root, TWO_REPO_ROUTE, &AMPLE);
+    let verdict = &answer["items"][0]["verdict"];
+    assert_eq!(
+        verdict["state"],
+        serde_json::json!("not_checked"),
+        "{answer:#}"
+    );
+    assert_eq!(
+        verdict["result"],
+        serde_json::json!("compatible"),
+        "the result is kept:\n{answer:#}"
+    );
+    assert!(
+        verdict["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(STALE_NOTE)),
+        "{answer:#}"
+    );
+}
+
+/// carrick#4819: the counterpart's repository is clean, so the row reads as it
+/// did before: resolved, no note.
+#[test]
+#[serial]
+fn a_re_check_leaves_a_verdict_alone_when_the_other_repository_is_clean() {
+    let workspace = shop_in_two_repos();
+    let root = workspace.path();
+    index(root);
+    statement_in(&root.join(TWO_REPO_ROUTE), "route edit");
+    let answer = recheck_json(root, TWO_REPO_ROUTE, &AMPLE);
+    let verdict = &answer["items"][0]["verdict"];
+    assert_eq!(
+        verdict["state"],
+        serde_json::json!("resolved"),
+        "{answer:#}"
+    );
+    assert!(
+        !verdict["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not re-read"),
+        "{answer:#}"
+    );
+}
+
+/// carrick#4819: git cannot say what changed in the counterpart's repository
+/// (it is no longer a checkout). That reads as changed, never as a silent
+/// pass: the same rule as an unlisted service of the edited repository.
+#[test]
+#[serial]
+fn a_re_check_marks_a_verdict_against_a_repository_git_cannot_read() {
+    let workspace = shop_in_two_repos();
+    let root = workspace.path();
+    index(root);
+    std::fs::remove_dir_all(root.join("inventory/.git")).expect("remove the git directory");
+    statement_in(&root.join(TWO_REPO_ROUTE), "route edit");
+    let answer = recheck_json(root, TWO_REPO_ROUTE, &AMPLE);
+    let verdict = &answer["items"][0]["verdict"];
+    assert_eq!(
+        verdict["state"],
+        serde_json::json!("not_checked"),
+        "{answer:#}"
+    );
+    assert!(
+        verdict["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(STALE_NOTE)),
+        "{answer:#}"
+    );
+}
+
 /// `check --recheck --no-rescan` is the probe the post-edit hook asks first:
 /// what needs no re-scan is answered as before, and an edit that does comes
 /// back `deferred` at once with the indexed rows, no re-scan started and no

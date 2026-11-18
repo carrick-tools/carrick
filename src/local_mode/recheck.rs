@@ -522,7 +522,14 @@ pub fn run(
         return Err(Box::new(deferred(new_functions, started)));
     };
     let began = Instant::now();
-    let plan = Plan::make(workspace, &tree.checkout, reach, index_generation, &held);
+    let plan = Plan::make(
+        workspace,
+        (&tree.repo, &tree.checkout),
+        before,
+        reach,
+        index_generation,
+        &held,
+    );
     took("plan-make", began);
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
     let outcome = inside(
@@ -1260,7 +1267,8 @@ fn forget_working(workspace: &Workspace, generation: &str, service: &str) {
 impl Plan {
     fn make(
         workspace: &Workspace,
-        repo: &Path,
+        (edited_repo, repo): (&Path, &Path),
+        index: &super::read_model::LocalIndex,
         reach: &Reach,
         generation: &str,
         held: &Held,
@@ -1329,6 +1337,21 @@ impl Plan {
                 reason: reason.to_string(),
             });
         }
+        // Every other repository of the workspace: a service there with edits
+        // since its index is compared as indexed too, and no re-check reads it
+        // (carrick#4819). The same listing as the edited repo's
+        // ([`digests_of`]); one git status-level read per repo, no scan. A repo
+        // git cannot list reads as changed, as an unlisted service does above.
+        let began_others = Instant::now();
+        for other in index
+            .repos
+            .iter()
+            .filter(|other| !super::checkout::same_dir(Path::new(&other.path), edited_repo))
+        {
+            let (changed, unlisted) = digests_of(Path::new(&other.path), &other.services, |_| true);
+            scope.stale.extend(changed.into_keys().chain(unlisted));
+        }
+        took("plan-make/other-repos-stale", began_others);
         let current = copies.current(workspace, &reach.reread);
         took("plan-make/digests-and-working-reads", began);
         Self {
