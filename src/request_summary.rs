@@ -1671,6 +1671,11 @@ impl FnIr {
 /// [`CallSiteTargets`] entry names them directly.
 #[derive(Debug, Default)]
 pub struct FileIr {
+    /// Some module builder's top-level call took more steps than
+    /// [`BUILDER_FUEL`] and read as refused (carrick#3766).
+    pub(crate) builder_fuel_spent: bool,
+    /// The most steps any top-level builder call of this file took.
+    pub(crate) builder_fuel_max: usize,
     functions: HashMap<String, FnIr>,
     /// What this module's module-scope bindings hold, for this file's own
     /// calls and for every module that imports one (carrick#1568): each
@@ -2016,6 +2021,22 @@ pub fn extract_file_ir(
     source_map: &Lrc<SourceMap>,
     definition_keys: &HashSet<String>,
 ) -> FileIr {
+    extract_file_ir_with_fuel(module, source_map, definition_keys, BUILDER_FUEL)
+}
+
+/// How many builder entries one top-level builder call may take before the
+/// whole call reads as the depth cap reads (carrick#3766). Real code needs a
+/// few (the fixture census peaks at 9); the exponential read of a function
+/// whose returns call each other needs millions.
+const BUILDER_FUEL: usize = 50_000;
+
+/// [`extract_file_ir`] with the builder step budget named.
+fn extract_file_ir_with_fuel(
+    module: &Module,
+    source_map: &Lrc<SourceMap>,
+    definition_keys: &HashSet<String>,
+    fuel_limit: usize,
+) -> FileIr {
     let jsx = jsx_names(module);
     let mut uses = BindingUses::default();
     module.visit_with(&mut uses);
@@ -2163,6 +2184,11 @@ pub fn extract_file_ir(
     let reader = Reader {
         source_map,
         builder_depth: std::cell::Cell::new(0),
+        fuel: std::cell::Cell::new(None),
+        fuel_max: std::cell::Cell::new(0),
+        fuel_limit,
+        fuel_out: std::cell::Cell::new(false),
+        over_budget: Default::default(),
         returned_objects: crate::return_flow::returned_objects(module),
         return_shapes: crate::return_flow::return_shapes(module)
             .into_iter()
@@ -2687,6 +2713,15 @@ pub fn extract_file_ir(
                 }
             });
         }
+    }
+    file.builder_fuel_max = reader.fuel_max.get();
+    file.builder_fuel_spent = !reader.over_budget.borrow().is_empty();
+    if file.builder_fuel_spent {
+        tracing::debug!(
+            "{} module builder(s) read past {} steps and refused as a whole",
+            reader.over_budget.borrow().len(),
+            reader.fuel_limit
+        );
     }
     file.arg_pieces = reader.arg_pieces.take();
     file.held_inits = reader.held_inits.take();
@@ -5619,6 +5654,22 @@ struct Reader<'a> {
     /// How many builder calls deep [`Reader::eval`] is reading
     /// (carrick#1562): a builder that calls itself stops at the cap.
     builder_depth: std::cell::Cell<usize>,
+    /// How many builder calls the top-level call being read has entered so
+    /// far, or `None` while none is open (carrick#3766).
+    fuel: std::cell::Cell<Option<usize>>,
+    /// The most entries any top-level builder call of this file has taken.
+    fuel_max: std::cell::Cell<usize>,
+    /// How many entries one top-level builder call may take
+    /// ([`BUILDER_FUEL`], or less in a test).
+    fuel_limit: usize,
+    /// Set when an entry was refused for want of fuel, until the top-level
+    /// call that spent it returns.
+    fuel_out: std::cell::Cell<bool>,
+    /// The builders whose top-level call ran out of fuel: each reads as
+    /// refused, whole, wherever it is called from. Keyed like
+    /// [`ModuleScope::builders`], so the answer depends on the builder and
+    /// never on which one the walk reached first.
+    over_budget: std::cell::RefCell<HashSet<(BindingKey, Vec<String>)>>,
     /// The object literals some function of the module returns, by span
     /// ([`crate::return_flow::returned_objects`], carrick#3470).
     returned_objects: HashSet<(u32, u32)>,
@@ -7515,7 +7566,6 @@ impl Reader<'_> {
     /// argument moves every position, so such a call reads as no builder's;
     /// a missing argument holds nothing the source states.
     fn builder_call(&self, call: &CallExpr, scope: &Scope<'_>) -> Option<Value> {
-        const MAX_BUILDER_DEPTH: usize = 8;
         let Callee::Expr(callee) = &call.callee else {
             return None;
         };
@@ -7527,7 +7577,40 @@ impl Reader<'_> {
         if scope.param_index(root).is_some() {
             return None;
         }
-        let builder = scope.module.builders.get(&(ident_key(root), path))?;
+        let key = (ident_key(root), path);
+        let builder = scope.module.builders.get(&key)?;
+        let top = self.fuel.get().is_none();
+        if top {
+            if self.over_budget.borrow().contains(&key) {
+                return None;
+            }
+            self.fuel.set(Some(0));
+        }
+        let read = self.builder_read(call, scope, builder);
+        if !top {
+            return read;
+        }
+        let spent = self.fuel.take().unwrap_or(0);
+        self.fuel_max.set(self.fuel_max.get().max(spent));
+        if self.fuel_out.take() {
+            // Ran out of steps: the depth cap's reading, for the whole call.
+            self.over_budget.borrow_mut().insert(key);
+            return None;
+        }
+        read
+    }
+
+    /// One entry of [`Self::builder_call`]: the builder read with the
+    /// parameters the call passes.
+    fn builder_read(&self, call: &CallExpr, scope: &Scope<'_>, builder: &Builder) -> Option<Value> {
+        const MAX_BUILDER_DEPTH: usize = 8;
+        if let Some(spent) = self.fuel.get() {
+            if spent >= self.fuel_limit {
+                self.fuel_out.set(true);
+                return None;
+            }
+            self.fuel.set(Some(spent + 1));
+        }
         let depth = self.builder_depth.get();
         if depth >= MAX_BUILDER_DEPTH || call.args.iter().any(|arg| arg.spread.is_some()) {
             return None;
@@ -15829,5 +15912,112 @@ function build() { return {}; }
         let notify = key_of(&index, "src/net/notify.ts");
         assert_eq!(index.held_at_fact_calls(&notify), BTreeMap::new());
         assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
+    }
+
+    /// carrick#3766: a helper whose returns call each other.
+    fn recursive_helper(branches: usize) -> String {
+        let mut text = String::from("export function render(node: any): string {\n");
+        for i in 0..branches {
+            text.push_str(&format!(
+                "  if (node.kind === 'k{i}') {{\n    return render(node.left) + ' op{i} ' + render(node.right);\n  }}\n"
+            ));
+        }
+        text.push_str("  return node.name;\n}\n");
+        text
+    }
+
+    const LOAD: &str = "export async function load(id: string) {\n  \
+        const res = await fetch(`/api/items/${id}`);\n  return res.json();\n}\n";
+    const ITEMS_PATH: &str = "function itemsPath(id: string) { return \"/api/items/\" + id; }\n\
+        export async function show(id: string) { return fetch(itemsPath(id)); }\n";
+
+    fn file_with_fuel(source: &str, fuel: usize) -> FileIr {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(&path, source).expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        extract_file_ir_with_fuel(&module, &cm, &HashSet::new(), fuel)
+    }
+
+    fn urls_of(file: &FileIr, function: &str) -> Vec<String> {
+        let ir = file
+            .functions
+            .get(function)
+            .unwrap_or_else(|| panic!("no {function}"));
+        ir.calls
+            .iter()
+            .filter_map(|call| call.request.as_ref())
+            .filter_map(|shape| render_target(&join_base(&shape.base, &shape.url)))
+            .collect()
+    }
+
+    /// Read the file on its own thread so a read that never ends fails the
+    /// test at the deadline instead of hanging the run.
+    fn read_within(source: String, fuel: usize, seconds: u64) -> FileIr {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(file_with_fuel(&source, fuel));
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(seconds))
+            .expect("the file was read within the deadline")
+    }
+
+    /// carrick#3766: past the step budget a top-level builder call reads as
+    /// refused, and no top-level call takes more steps than the budget.
+    #[test]
+    fn a_builder_read_stops_at_its_step_budget() {
+        let file = read_within(format!("{}{LOAD}", recursive_helper(2)), 1_000, 60);
+        assert!(file.builder_fuel_spent);
+        assert_eq!(file.builder_fuel_max, 1_000);
+        assert_eq!(urls_of(&file, "load"), ["/api/items/${id}"]);
+    }
+
+    /// carrick#3766: the helper whose read took hours at four branches is
+    /// read at the default budget in seconds, and the file's rows stay.
+    #[test]
+    fn a_helper_with_four_recursive_branches_is_read() {
+        let file = read_within(format!("{}{LOAD}", recursive_helper(4)), BUILDER_FUEL, 60);
+        assert!(file.builder_fuel_spent);
+        assert_eq!(file.builder_fuel_max, BUILDER_FUEL);
+        assert_eq!(urls_of(&file, "load"), ["/api/items/${id}"]);
+    }
+
+    /// carrick#3766: one helper running out of steps never reaches another
+    /// builder in the file, whichever is written first.
+    #[test]
+    fn an_exhausted_builder_does_not_reach_another() {
+        for source in [
+            format!("{}{ITEMS_PATH}", recursive_helper(2)),
+            format!("{ITEMS_PATH}{}", recursive_helper(2)),
+        ] {
+            for _ in 0..20 {
+                let file = read_within(source.clone(), 1_000, 60);
+                assert!(file.builder_fuel_spent);
+                assert_eq!(urls_of(&file, "show"), ["/api/items/${id}"]);
+            }
+        }
+    }
+
+    /// carrick#3766: a helper well under the budget reads as before.
+    #[test]
+    fn a_helper_under_the_budget_reads_as_before() {
+        let file = read_within(format!("{}{LOAD}", recursive_helper(1)), BUILDER_FUEL, 60);
+        assert!(!file.builder_fuel_spent);
+        assert!(file.builder_fuel_max > 0 && file.builder_fuel_max < 1_000);
+        let spent = file.builder_fuel_max;
+        // A budget of exactly the steps it took still reads it whole.
+        let exact = read_within(format!("{}{LOAD}", recursive_helper(1)), spent, 60);
+        assert!(!exact.builder_fuel_spent);
+        assert_eq!(exact.builder_fuel_max, spent);
+        let short = read_within(format!("{}{LOAD}", recursive_helper(1)), spent - 1, 60);
+        assert!(short.builder_fuel_spent);
     }
 }
