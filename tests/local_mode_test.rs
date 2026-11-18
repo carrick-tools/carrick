@@ -6160,6 +6160,67 @@ fn a_re_check_reads_only_the_edited_files_service_and_judges_against_the_last_re
     );
 }
 
+/// carrick#4773: the counterpart (the client) has an uncommitted edit this
+/// re-check of the route did not read, so the row's verdict compares the route
+/// with the client as indexed. It says so, and is not a confirmed compatible.
+#[test]
+#[serial]
+fn a_re_check_marks_a_verdict_against_a_changed_service_it_did_not_read() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    edit(
+        &root.join(SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    statement_in(&root.join(SHOP_ROUTE), "route edit");
+    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    let verdict = &answer["items"][0]["verdict"];
+    assert_ne!(
+        verdict["state"],
+        serde_json::json!("resolved"),
+        "{answer:#}"
+    );
+    assert!(
+        verdict["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(
+                "(inventory has changed since it was indexed and this check did not re-read it, \
+             so the verdict uses its indexed code. `carrick check --changed` gives the current \
+             verdict.)"
+            )),
+        "{answer:#}"
+    );
+}
+
+/// carrick#4773: with the counterpart unchanged the row reads as it did, no
+/// note and a resolved verdict.
+#[test]
+#[serial]
+fn a_re_check_leaves_a_verdict_alone_when_the_counterpart_is_unchanged() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    statement_in(&root.join(SHOP_ROUTE), "route edit");
+    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    let verdict = &answer["items"][0]["verdict"];
+    assert_eq!(
+        verdict["state"],
+        serde_json::json!("resolved"),
+        "{answer:#}"
+    );
+    assert!(
+        !verdict["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("was not re-read"),
+        "{answer:#}"
+    );
+}
+
 /// `check --recheck --no-rescan` is the probe the post-edit hook asks first:
 /// what needs no re-scan is answered as before, and an edit that does comes
 /// back `deferred` at once with the indexed rows, no re-scan started and no
