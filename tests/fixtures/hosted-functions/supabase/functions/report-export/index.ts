@@ -1,5 +1,5 @@
-// Sits where a function would, but hands no handler to a top-level call:
-// nothing here says what serves the route.
+// Deployed as a function, but hands no handler to a top-level call: the
+// route exists (the folder says so), and nothing here says what serves it.
 export async function buildReport(rows: string[]): Promise<string> {
   return rows.join("\n");
 }

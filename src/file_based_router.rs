@@ -14,11 +14,14 @@
 //! or by `carrick.json` overrides them. This keeps framework knowledge out of
 //! the scanner core while still shipping value today.
 //!
-//! The bootstrap is selected from the service's *declared dependencies* only,
-//! so it does not depend on an LLM having named the file-router framework.
+//! The bootstrap is selected from the service's *declared dependencies*, so it
+//! does not depend on an LLM having named the file-router framework.
 //! Detection classifies the HTTP server a service runs; a file-routed app
 //! fronted by a generic HTTP server reports only that server, and the manifest
-//! is the reliable witness.
+//! is the reliable witness. A layout with no manifest of its own (functions
+//! served one per folder) is selected instead by a file the platform itself
+//! reads, its config file ([`RoutingConvention::marker_files`],
+//! [`conventions_for_service`]).
 
 use crate::type_manifest::is_http_method;
 use serde::{Deserialize, Serialize};
@@ -887,7 +890,8 @@ const REMIX_PACKAGES: &[&str] = &[
 
 /// Bootstrap conventions for a service, selected from the package names it
 /// declares as dependencies.
-/// This is the *only* place a framework name appears in the scanner; a
+/// This, with [`MARKER_CONVENTIONS`], is the *only* place a framework name
+/// appears in the scanner; a
 /// convention supplied by detection or `carrick.json` should be preferred over
 /// these (see module docs).
 ///

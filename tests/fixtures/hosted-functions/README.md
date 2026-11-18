@@ -12,9 +12,12 @@ All names are invented.
 | `supabase/functions/price-quote/index.ts` | `ALL /functions/v1/price-quote` | inline, line 8 (`serve` imported by URL; replies 400 or 200) |
 | `supabase/functions/team-digest/index.ts` | `ALL /functions/v1/team-digest` | inline, line 1 (`Deno.serve`) |
 | `supabase/functions/purge-sessions/index.ts` | `ALL /functions/v1/purge-sessions` | `purgeSessions`, line 3 (nobody calls it) |
-| `supabase/functions/report-export/index.ts` | no row | none: one unread site, slot `handler`, reason `handler_not_located` |
+| `supabase/functions/send-invite/index.ts` | `ALL /functions/v1/send-invite` | not located: `serve(handleInvite)` hands an imported function. Unread site, slot `handler`, reason `handler_not_located`, line 4, naming `handleInvite` |
+| `supabase/functions/report-export/index.ts` | `ALL /functions/v1/report-export` | not located: no serving call. Unread site, slot `handler`, reason `handler_not_located`, line 1 |
+| `supabase/functions/send-invite/handler.ts` | no row | not an entry file |
 | `supabase/functions/_shared/*` | no row | shared code, never a function |
 
+- A row whose handler is not located asks for no request or response type.
 - The model's guess `POST /api/quote` for `price-quote/index.ts`
   (`__llm__/analyze-file/price-quote__index.ts.json`) folds onto the
   `ALL` row: it is never a second row, and its anchors travel onto it.

@@ -362,22 +362,33 @@ pub struct ModuleExports {
     pub reexports_all: bool,
 }
 
-/// A top-level call statement handed exactly one function
+/// A top-level call statement of a module
 /// ([`SwcScanner::top_level_function_calls`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServingCall {
+pub struct TopLevelCall {
     /// 1-based line the call opens on.
     pub line_number: usize,
     /// Start byte offset of the call expression.
     pub span_start: u32,
     /// End byte offset of the call expression.
     pub span_end: u32,
+    /// The one function the call is handed, when it is handed exactly one.
+    pub handler: Option<HandedFunction>,
+    /// What the call is handed in place of a function this module declares,
+    /// as written, when `handler` is `None`: a name the module does not
+    /// declare as a function (`importedHandler`), or a call (`wrap(...)`).
+    pub passed: Option<String>,
+}
+
+/// The function a top-level call is handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandedFunction {
     /// The name the function was handed by, or `"anonymous"` for a function
     /// written inline.
-    pub handler: String,
-    /// 1-based line the handed function's own declaration opens on: the
-    /// call's line for an inline function, the declaration's line for a name.
-    pub handler_line: usize,
+    pub name: String,
+    /// 1-based line the function's own declaration opens on: the call's line
+    /// for an inline function, the declaration's line for a name.
+    pub line: usize,
 }
 
 /// A route declared as data in a registry array
@@ -1040,10 +1051,10 @@ impl SwcScanner {
         }
     }
 
-    /// Every top-level call STATEMENT of a module that is handed exactly one
-    /// function, in source order: the shape of a module that serves its one
-    /// handler by passing it to a call (`serve(async (req) => ...)`,
-    /// `Deno.serve(handler)`), read for
+    /// Every top-level call STATEMENT of a module, in source order, with the
+    /// one function it is handed when it is handed exactly one: the shape of a
+    /// module that serves its one handler by passing it to a call
+    /// (`serve(async (req) => ...)`, `Deno.serve(handler)`), read for
     /// [`crate::file_based_router::MethodSource::ModuleCall`].
     ///
     /// Structure only, never the callee's name: an argument counts when it is
@@ -1053,7 +1064,8 @@ impl SwcScanner {
     /// so `serve({ port }, handler)` is still one function. A call whose
     /// value is kept (`const server = serve(...)`) or awaited is not a
     /// statement of this shape and is not read.
-    pub fn top_level_function_calls(&self, file_path: &Path, content: &str) -> Vec<ServingCall> {
+    pub fn top_level_function_calls(&self, file_path: &Path, content: &str) -> Vec<TopLevelCall> {
+        use swc_common::Spanned;
         let Some((sm, module)) = parse_standalone_module(file_path, content) else {
             return Vec::new();
         };
@@ -1095,11 +1107,15 @@ impl SwcScanner {
             if !matches!(call.callee, Callee::Expr(_)) {
                 continue;
             }
-            let handed: Vec<(String, swc_common::Span)> = call
+            let args: Vec<&Expr> = call
                 .args
                 .iter()
                 .filter(|arg| arg.spread.is_none())
-                .filter_map(|arg| match &*arg.expr {
+                .map(|arg| &*arg.expr)
+                .collect();
+            let handed: Vec<(String, swc_common::Span)> = args
+                .iter()
+                .filter_map(|arg| match arg {
                     Expr::Ident(name) => functions
                         .get(name.sym.as_ref())
                         .map(|span| (name.sym.to_string(), *span)),
@@ -1108,15 +1124,37 @@ impl SwcScanner {
                     }
                 })
                 .collect();
-            let [(handler, function)] = handed.as_slice() else {
-                continue;
+            let handler = match handed.as_slice() {
+                [(name, function)] => Some(HandedFunction {
+                    name: name.clone(),
+                    line: sm.lookup_char_pos(function.lo).line,
+                }),
+                _ => None,
             };
-            out.push(ServingCall {
+            // What stands where a function would, as written: a name the
+            // module does not declare as one, or a call that builds one.
+            let passed = handler
+                .is_none()
+                .then(|| {
+                    args.iter().find_map(|arg| match arg {
+                        Expr::Ident(name) => Some(name.sym.to_string()),
+                        Expr::Call(inner) => match &inner.callee {
+                            Callee::Expr(callee) => sm
+                                .span_to_snippet(callee.span())
+                                .ok()
+                                .map(|text| format!("{text}(...)")),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                })
+                .flatten();
+            out.push(TopLevelCall {
                 line_number: sm.lookup_char_pos(call.span.lo).line,
                 span_start: call.span.lo.0,
                 span_end: call.span.hi.0,
-                handler: handler.clone(),
-                handler_line: sm.lookup_char_pos(function.lo).line,
+                handler,
+                passed,
             });
         }
         out

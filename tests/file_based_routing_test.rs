@@ -512,16 +512,22 @@ fn a_compared_request_method_narrows_a_role_named_export() {
 /// path, handler, line, convention).
 type FunctionRow = (String, String, String, String, i32, String);
 
+/// A route whose handler was not located: (repo-relative file, line, what
+/// the serving call was handed).
+type Unplaced = (String, u32, Option<String>);
+
+/// The `handler_name` of a row whose handler was not located.
+const NOT_LOCATED: &str = "__handler_not_located__";
+
 /// What the file-based pass states for every file under `service_root` of
 /// `repo`, with the conventions that service runs under
 /// ([`conventions_for_service`], the selection every caller reads): the rows,
-/// and the repo-relative files where a convention matched and located no
-/// handler.
+/// and where a convention stated a route and located no handler.
 fn service_function_rows(
     repo: &Path,
     service_root: &Path,
     conventions: &[RoutingConvention],
-) -> (BTreeSet<FunctionRow>, BTreeSet<String>) {
+) -> (BTreeSet<FunctionRow>, BTreeSet<Unplaced>) {
     let scanner = SwcScanner::new();
     let mut files = Vec::new();
     walk(service_root, &mut files);
@@ -539,22 +545,32 @@ fn service_function_rows(
         };
         let derivation =
             FileOrchestrator::file_based_endpoints(&scanner, rel, file, &content, conventions);
-        if derivation.handler_not_located.is_some() {
-            unplaced.insert(in_repo.clone());
+        if let Some(at) = &derivation.handler_not_located {
+            unplaced.insert((in_repo.clone(), at.line, at.passed.clone()));
         }
         assert_eq!(
             derivation.claimed,
             !derivation.endpoints.is_empty(),
-            "{in_repo}: a located handler claims the module, and only then"
+            "{in_repo}: a stated route claims the module, and only then"
         );
         for ep in derivation.endpoints {
             assert_eq!(ep.owner_node, "__file_based_route__", "{in_repo}");
-            assert!(ep.call_expression_span_start.is_some(), "{in_repo}");
+            let located = ep.handler_name != NOT_LOCATED;
             assert_eq!(
-                ep.handler_declaration_line,
-                Some(ep.line_number as u32),
+                located,
+                derivation.handler_not_located.is_none(),
                 "{in_repo}"
             );
+            if located {
+                assert!(ep.call_expression_span_start.is_some(), "{in_repo}");
+                assert_eq!(
+                    ep.handler_declaration_line,
+                    Some(ep.line_number as u32),
+                    "{in_repo}"
+                );
+            } else {
+                assert_eq!(ep.handler_declaration_line, None, "{in_repo}");
+            }
             rows.insert((
                 in_repo.clone(),
                 ep.method,
@@ -588,6 +604,20 @@ fn function_rows_expected() -> BTreeSet<FunctionRow> {
             "purgeSessions",
             3,
         ),
+        // An imported handler: the route is stated, the handler is not.
+        (
+            "supabase/functions/send-invite/index.ts",
+            "/functions/v1/send-invite",
+            NOT_LOCATED,
+            4,
+        ),
+        // No serving call at all: still the folder's route, with no handler.
+        (
+            "supabase/functions/report-export/index.ts",
+            "/functions/v1/report-export",
+            NOT_LOCATED,
+            1,
+        ),
     ]
     .into_iter()
     .map(|(file, path, handler, line)| {
@@ -606,15 +636,28 @@ fn function_rows_expected() -> BTreeSet<FunctionRow> {
 /// A function served by its folder (`supabase/functions/<name>/index.ts`) is
 /// one row at `ALL /functions/v1/<name>`, its handler the function the module
 /// hands to its one top-level call, whether that call is `serve` from a URL
-/// import or `Deno.serve`, and whether the function is inline or named. The
-/// shared folder states nothing; a module with no such call states no row
-/// and is an unplaced handler. The same rows come out whether the folder is
-/// its own service or sits inside one at the repository root.
+/// import or `Deno.serve`, and whether the function is inline or named. An
+/// entry file whose handler is not located (an imported handler, no serving
+/// call) still states its one row, with no handler, and is an unplaced
+/// handler naming what the call was handed. Only entry files make rows: the
+/// shared `_` folder and a helper module beside an entry state nothing. The
+/// same rows come out whether the folder is its own service or sits inside
+/// one at the repository root.
 #[test]
 fn a_folder_named_function_states_one_any_method_route() {
     let repo = fixture_root("hosted-functions");
-    let unplaced_expected =
-        BTreeSet::from(["supabase/functions/report-export/index.ts".to_string()]);
+    let unplaced_expected = BTreeSet::from([
+        (
+            "supabase/functions/send-invite/index.ts".to_string(),
+            4,
+            Some("handleInvite".to_string()),
+        ),
+        (
+            "supabase/functions/report-export/index.ts".to_string(),
+            1,
+            None,
+        ),
+    ]);
     for service_root in [repo.clone(), repo.join("supabase/functions")] {
         let conventions =
             conventions_for_service(&["@supabase/supabase-js".to_string()], &repo, &service_root);
@@ -629,6 +672,63 @@ fn a_folder_named_function_states_one_any_method_route() {
         "{:?}",
         elsewhere.iter().map(|c| &c.name).collect::<Vec<_>>()
     );
+}
+
+/// The derivation of one fixture file under the root service.
+fn derive_function_file(rel: &str) -> carrick::agents::file_orchestrator::FileRouteDerivation {
+    let repo = fixture_root("hosted-functions");
+    let conventions = conventions_for_service(&[], &repo, &repo);
+    let file = repo.join(rel);
+    let content = fs::read_to_string(&file).unwrap();
+    FileOrchestrator::file_based_endpoints(
+        &SwcScanner::new(),
+        Path::new(rel),
+        &file,
+        &content,
+        &conventions,
+    )
+}
+
+/// `serve(importedHandler)`: the layout states the route, so the entry file
+/// is one claimed row at its real address with no handler, and the unread
+/// site names what `serve` was handed.
+#[test]
+fn an_imported_handler_states_the_route_with_no_handler() {
+    let derivation = derive_function_file("supabase/functions/send-invite/index.ts");
+    assert!(derivation.claimed);
+    let rows: Vec<_> = derivation
+        .endpoints
+        .iter()
+        .map(|ep| {
+            (
+                ep.method.as_str(),
+                ep.path.as_str(),
+                ep.handler_name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("ALL", "/functions/v1/send-invite", NOT_LOCATED)]
+    );
+    let at = derivation.handler_not_located.expect("an unread site");
+    assert_eq!((at.line, at.passed.as_deref()), (4, Some("handleInvite")));
+}
+
+/// A helper module in a `_` folder, or beside an entry file, is never a
+/// function: no row, no claim, no unread site.
+#[test]
+fn a_helper_file_states_nothing() {
+    for rel in [
+        "supabase/functions/_shared/cors.ts",
+        "supabase/functions/_shared/index.ts",
+        "supabase/functions/send-invite/handler.ts",
+    ] {
+        let derivation = derive_function_file(rel);
+        assert!(derivation.endpoints.is_empty(), "{rel}");
+        assert!(!derivation.claimed, "{rel}");
+        assert!(derivation.handler_not_located.is_none(), "{rel}");
+    }
 }
 
 /// Copy `src` to `dst`, leaving out the repository-relative `skip`.

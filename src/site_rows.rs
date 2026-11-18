@@ -2136,8 +2136,13 @@ pub fn fold_rows(
     };
     for unread in &site.unread {
         // A stop read inside a sibling's function beside the call's ends is
-        // on a row line by construction and is kept (carrick#4474).
+        // on a row line by construction and is kept (carrick#4474). So is a
+        // producer's stop: it says the row's own handler was not located
+        // (a route stated by its file with no handler,
+        // [`crate::unread_sites::unplaced_producer`]), not that the row is
+        // some call's.
         if !unread.beside
+            && unread.role.as_deref() != Some("producer")
             && (held_at(calls, &unread.file, unread.line)
                 || held_at(endpoints, &unread.file, unread.line))
         {

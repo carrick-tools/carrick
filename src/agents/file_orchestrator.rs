@@ -605,7 +605,9 @@ pub struct FileCentricAnalysisResult {
 #[derive(Debug, Default)]
 pub struct FileRouteDerivation {
     /// Whether a convention claimed this file AND states its whole route set
-    /// from the module's exports. False for a file no convention matched; for
+    /// from the module's structure (its exports, or the one route of a
+    /// [`MethodSource::ModuleCall`] module, handler located or not). False
+    /// for a file no convention matched; for
     /// a convention that routes a single default export, where the served
     /// methods are a runtime branch; and for a module that re-exports another
     /// wholesale, where the export list is a lower bound rather than the whole
@@ -616,13 +618,30 @@ pub struct FileRouteDerivation {
     /// handlers. Empty when nothing was claimed, and empty when a claimed
     /// module exports no handler.
     pub endpoints: Vec<EndpointResult>,
-    /// Where a convention matched the file's place but found no handler it
-    /// serves (line, byte offset): a
-    /// [`MethodSource::ModuleCall`] module with no top-level call handed one
-    /// function, or several. Saved as an unread producer site
-    /// ([`crate::unread_sites::unplaced_producer`]).
-    pub handler_not_located: Option<(u32, u32)>,
+    /// Where a convention stated a file's route but located no handler for
+    /// it: a [`MethodSource::ModuleCall`] module whose top-level calls are
+    /// not one call handed one function it declares. Saved as an unread
+    /// producer site ([`crate::unread_sites::unplaced_producer`]).
+    pub handler_not_located: Option<HandlerNotLocated>,
 }
+
+/// The place of a route whose handler was not located
+/// ([`FileRouteDerivation::handler_not_located`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerNotLocated {
+    /// 1-based line: the call handed something other than a function the
+    /// module declares, else line 1.
+    pub line: u32,
+    /// Byte offset of that call, else 0.
+    pub offset: u32,
+    /// What the call was handed, as written (`importedHandler`,
+    /// `wrap(...)`), when there is a call.
+    pub passed: Option<String>,
+}
+
+/// `handler_name` of a file-based row whose handler was not located: the row
+/// states the route and no handler, and asks the type layer for nothing.
+const FILE_ROUTE_HANDLER_NOT_LOCATED: &str = "__handler_not_located__";
 
 /// The request members a file's calls joined, by call span, each with the
 /// module it was read from (carrick#4120).
@@ -2500,9 +2519,9 @@ impl FileOrchestrator {
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
         // Routing conventions for file-based routes (Next.js app/pages router,
-        // etc.). Empty when neither the detected frameworks nor the declared
-        // dependencies name a convention-bearing framework, in which case the
-        // file-based pass below is a no-op.
+        // functions served one per folder, etc.). Empty when neither the
+        // declared dependencies nor a platform config file in the repository
+        // select one, in which case the file-based pass below is a no-op.
         let conventions = conventions_for_service(dependency_names, repo_root, service_root);
         debug!(
             "File-based routing conventions active: {:?}",
@@ -3186,13 +3205,17 @@ impl FileOrchestrator {
                 endpoints: route_endpoints,
                 handler_not_located,
             } = derivation;
-            if let Some((line, offset)) = handler_not_located {
-                unread_route_sites.push(crate::unread_sites::unplaced_producer(
+            if let Some(at) = handler_not_located {
+                let mut site = crate::unread_sites::unplaced_producer(
                     &crate::site_rows::relative(repo_root, &file_path.to_string_lossy()),
-                    line,
-                    offset,
+                    at.line,
+                    at.offset,
                     "http",
-                ));
+                );
+                // What the serving call was handed in place of a function
+                // this module declares, so the reader sees what to follow.
+                site.callee = at.passed;
+                unread_route_sites.push(site);
             }
 
             // Route-descriptor routes: a route declared as data
@@ -5820,6 +5843,12 @@ impl FileOrchestrator {
                 // annotated binding, a schema), and answers nothing where it
                 // does not (carrick#807).
                 if endpoint.owner_node == FILE_BASED_ROUTE_OWNER {
+                    // A route whose handler was not located has nothing to
+                    // ask about: both sides stay absent, and the unread site
+                    // the derivation saved says why.
+                    if endpoint.handler_name == FILE_ROUTE_HANDLER_NOT_LOCATED {
+                        continue;
+                    }
                     // A no-payload claim is about what the handler SENDS, so
                     // the response entry stays honestly unknown while the
                     // request side, which the claim says nothing about, is
@@ -8322,52 +8351,78 @@ impl FileOrchestrator {
             // leave these to a follow-up rather than emit an endpoint with an
             // unknown method (which the mount graph would drop anyway).
             MethodSource::DefaultExport => Vec::new(),
-            // One handler, handed to the module's one top-level call: that
-            // module states its whole route set, the one row. The row's line
-            // is where the handler's own declaration opens, which is where
-            // the type layer finds the function by line; the span is the
-            // call's. Zero such calls, or several, locate no handler: no row
-            // is stated, the module is not claimed (so the model's reading of
-            // it stands as it did), and the place is saved as an unread site.
+            // The route exists because the layout says so, whatever the
+            // module hands its call: the platform serves the entry file at
+            // the derived path. So the module is claimed and states exactly
+            // one row either way, and a model guess for it never stands
+            // beside or instead of that row.
+            //
+            // With one top-level call handed one function, that function is
+            // the handler: the row's line is where its declaration opens
+            // (the type layer finds the function by line), its span the
+            // call's. Otherwise (an imported or wrapped handler, several
+            // candidates, no call) the row states no handler and asks for no
+            // type, and the place is saved as an unread site naming what was
+            // handed.
             MethodSource::ModuleCall { method } => {
+                claimed = true;
                 let calls = scanner.top_level_function_calls(file_path, content);
-                match calls.as_slice() {
-                    [call] => {
-                        claimed = true;
-                        vec![EndpointResult {
-                            handler_declaration_line: Some(call.handler_line as u32),
-                            registration_literal: None,
-                            candidate_id: format!("file-route:{}:{}", method, call.span_start),
-                            line_number: call.handler_line as i32,
-                            owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
-                            method: method.clone(),
-                            path: route.path.clone(),
-                            handler_name: call.handler.clone(),
-                            pattern_matched: route.convention.clone(),
-                            call_expression_span_start: Some(call.span_start),
-                            call_expression_span_end: Some(call.span_end),
-                            payload_expression_text: None,
-                            payload_expression_line: None,
-                            response_expression_text: None,
-                            response_expression_line: None,
-                            emission_style: None,
-                            primary_type_symbol: None,
-                            type_import_source: None,
-                            dispatch: None,
-                            resolution_source: None,
-                            view_module: false,
-                        }]
-                    }
+                let serving: Vec<_> = calls
+                    .iter()
+                    .filter_map(|call| call.handler.as_ref().map(|handler| (call, handler)))
+                    .collect();
+                let (handler_name, line, span) = match serving.as_slice() {
+                    [(call, handler)] => (
+                        handler.name.clone(),
+                        handler.line as u32,
+                        Some((call.span_start, call.span_end)),
+                    ),
                     _ => {
-                        handler_not_located = Some(
-                            calls
-                                .first()
-                                .map(|call| (call.line_number as u32, call.span_start))
-                                .unwrap_or((1, 0)),
-                        );
-                        Vec::new()
+                        let at = calls
+                            .iter()
+                            .find(|call| call.passed.is_some())
+                            .or_else(|| serving.first().map(|(call, _)| *call));
+                        let line = at.map_or(1, |call| call.line_number as u32);
+                        handler_not_located = Some(HandlerNotLocated {
+                            line,
+                            offset: at.map_or(0, |call| call.span_start),
+                            passed: at.and_then(|call| call.passed.clone()),
+                        });
+                        (
+                            FILE_ROUTE_HANDLER_NOT_LOCATED.to_string(),
+                            line,
+                            at.map(|call| (call.span_start, call.span_end)),
+                        )
                     }
-                }
+                };
+                let located = handler_not_located.is_none();
+                vec![EndpointResult {
+                    handler_declaration_line: located.then_some(line),
+                    registration_literal: None,
+                    candidate_id: format!(
+                        "file-route:{}:{}",
+                        method,
+                        span.map_or(0, |(start, _)| start)
+                    ),
+                    line_number: line as i32,
+                    owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
+                    method: method.clone(),
+                    path: route.path.clone(),
+                    handler_name,
+                    pattern_matched: route.convention.clone(),
+                    call_expression_span_start: span.map(|(start, _)| start),
+                    call_expression_span_end: span.map(|(_, end)| end),
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    response_expression_text: None,
+                    response_expression_line: None,
+                    emission_style: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    dispatch: None,
+                    resolution_source: None,
+                    view_module: false,
+                }]
             }
         };
         FileRouteDerivation {

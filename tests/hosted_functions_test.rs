@@ -1,9 +1,10 @@
 //! Functions served one per folder (`supabase/functions/<name>/index.ts`)
 //! reach the index as one fact row each, `ALL /functions/v1/<name>`, stated
 //! by the routing convention the platform's config file selects. The model's
-//! guess for the same file folds onto that row and is never a second one. A
-//! module in the folder with no handler handed to a top-level call states no
-//! row and is saved as an unread site.
+//! guess for the same file folds onto that row and is never a second one. An
+//! entry file whose handler is not located (an imported handler, no serving
+//! call) still states its row, with no handler, and is saved as an unread
+//! site.
 //!
 //! Drives the real scanner binary on `.`, offline, over a committed copy of
 //! `tests/fixtures/hosted-functions` (its answer key is the README there),
@@ -169,6 +170,9 @@ fn each_folder_function_is_one_fact_row_at_its_real_address() {
         ("price-quote", 8, "/functions/v1/price-quote"),
         ("team-digest", 1, "/functions/v1/team-digest"),
         ("purge-sessions", 3, "/functions/v1/purge-sessions"),
+        // Handler not located: the route is still the folder's.
+        ("send-invite", 4, "/functions/v1/send-invite"),
+        ("report-export", 1, "/functions/v1/report-export"),
     ]
     .into_iter()
     .map(|(folder, line, path)| {
@@ -180,11 +184,16 @@ fn each_folder_function_is_one_fact_row_at_its_real_address() {
         )
     })
     .collect();
-    let unread_expected = BTreeSet::from([(
-        "supabase/functions/report-export/index.ts".to_string(),
-        "handler".to_string(),
-        "handler_not_located".to_string(),
-    )]);
+    let unread_expected: BTreeSet<(String, String, String)> = ["send-invite", "report-export"]
+        .into_iter()
+        .map(|folder| {
+            (
+                format!("supabase/functions/{folder}/index.ts"),
+                "handler".to_string(),
+                "handler_not_located".to_string(),
+            )
+        })
+        .collect();
     for with_config in [true, false] {
         let blobs = scan_blobs(with_config);
         assert_eq!(
