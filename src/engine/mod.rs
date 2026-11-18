@@ -13509,11 +13509,14 @@ fn discover_with_positions(
     // `per_file_calls`: resolved by the call graph's own walk (carrick#1568).
     let mut wanted_from: Vec<(PathBuf, PathBuf)> = Vec::new();
 
-    // Names the file a step is stuck on once it passes the threshold; silent
-    // on a normal scan (carrick#3766).
+    // Names the file a step is stuck on once it passes the threshold, and
+    // stops the scan on a step that makes no progress for the stall limit;
+    // silent on a normal scan (carrick#3766).
     let slow_step = crate::slow_step::Watch::discovery();
     for file_path in &files {
         slow_step.file(std::path::Path::new(repo_path), file_path, "parse");
+        #[cfg(debug_assertions)]
+        crate::slow_step::test_stall_here(file_path);
         let parsed = match positions.as_mut() {
             Some(index) => crate::parser::read_source(file_path).and_then(|text| {
                 index.bind(file_path, &text);

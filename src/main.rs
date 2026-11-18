@@ -254,11 +254,16 @@ async fn main() {
     let finished = match raced {
         Ok(result) => result,
         Err(signal) => {
-            error!(
-                "Scan interrupted by {} during {}",
-                signal.name(),
-                scan_stage::current().as_str()
-            );
+            // A run that stopped itself on a step that made no progress
+            // (carrick#3766) says where, rather than naming its own signal.
+            match shutdown::stall() {
+                Some(stall) => error!("{}", stall.line()),
+                None => error!(
+                    "Scan interrupted by {} during {}",
+                    signal.name(),
+                    scan_stage::current().as_str()
+                ),
+            }
             let ended = shutdown::within_budget(
                 report_interruption(&repo_path),
                 shutdown.recv(),
@@ -266,7 +271,7 @@ async fn main() {
             )
             .await;
             debug!("This run's report of its own interruption: {ended:?}");
-            std::process::exit(signal.exit_code());
+            std::process::exit(shutdown::exit_code_for(signal));
         }
     };
 
@@ -278,12 +283,15 @@ async fn main() {
         // after it. What is left is to say so and to leave with the code the
         // signal names rather than with 1.
         if let Some(signal) = shutdown::requested() {
-            error!(
-                "Scan interrupted by {} during {}: {}",
-                signal.name(),
-                scan_stage::current().as_str(),
-                e
-            );
+            match shutdown::stall() {
+                Some(stall) => error!("{}", stall.line()),
+                None => error!(
+                    "Scan interrupted by {} during {}: {}",
+                    signal.name(),
+                    scan_stage::current().as_str(),
+                    e
+                ),
+            }
             progress::failed(scan_stage::current().as_str(), &e.to_string());
             // A run interrupted before `start-scan` opened a scan has had
             // nothing reported for it, and this is the one event it can send.
@@ -298,7 +306,7 @@ async fn main() {
             )
             .await;
             debug!("This run's report of its own interruption: {ended:?}");
-            std::process::exit(signal.exit_code());
+            std::process::exit(shutdown::exit_code_for(signal));
         }
         // The stage is in the line a user pastes. The same token goes to the
         // cloud as the fail marker's `stage` (carrick#1063), so a terminal and
@@ -409,7 +417,7 @@ async fn run_build(command: local_mode::cli::LocalCommand) -> i32 {
     if local_mode::cli::forward_to_running_scan(signal) {
         let _ = tokio::time::timeout(local_mode::cli::forwarded_exit_grace(), build).await;
     }
-    signal.exit_code()
+    shutdown::exit_code_for(signal)
 }
 
 /// Run a read-only command, passing a SIGTERM on to the subprocess it is
@@ -438,7 +446,7 @@ async fn run_read(command: local_mode::cli::LocalCommand) -> i32 {
     if local_mode::cli::forward_to_running_scan(signal) {
         let _ = tokio::time::timeout(local_mode::cli::forwarded_exit_grace(), read).await;
     }
-    signal.exit_code()
+    shutdown::exit_code_for(signal)
 }
 
 /// Tell the cloud about a laptop run that died before `start-scan` opened a
@@ -542,11 +550,14 @@ async fn report_interruption_to<T: cloud_storage::CloudStorage + Sync>(
         InterruptionReport::Nothing => return,
         InterruptionReport::ScanFailed => {
             storage
-                .report_scan_failed(scan_stage::current().as_str(), shutdown::INTERRUPTED_REASON)
+                .report_scan_failed(
+                    scan_stage::current().as_str(),
+                    &shutdown::interruption_reason(),
+                )
                 .await
         }
         InterruptionReport::PreflightFailed => {
-            let error = std::io::Error::other(shutdown::INTERRUPTED_REASON);
+            let error = std::io::Error::other(shutdown::interruption_reason());
             engine::report_preflight_failure(storage, repo_path, scan_stage::current(), &error)
                 .await
         }
