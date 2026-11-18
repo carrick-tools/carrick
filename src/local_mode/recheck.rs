@@ -1830,7 +1830,7 @@ fn inside(
     if !lost.is_empty() {
         return Err(lost.join(" "));
     }
-    if let Some(sentence) = library_unavailable(&rejoined.index, [&name]) {
+    if let Some(sentence) = library_unavailable(&rejoined.index, [&name], &rejoined.rescanned) {
         return Err(sentence.to_string());
     }
 
@@ -1852,6 +1852,10 @@ fn inside(
         .unwrap_or_default();
     let (moved, inside) = judge_edit(workspace, before, &rejoined, tree, relative, plan);
     state_judged(&mut items, &inside);
+    state_library_missing(
+        &mut items,
+        &library_marked(&rejoined.index, &rejoined.rescanned),
+    );
     // No rows where the index held some is an answer, not a failure: the edit
     // took the last route out of this file, and the fresh (empty) list is what
     // says so.
@@ -1922,6 +1926,29 @@ fn state_judged(items: &mut [IndexedItem], inside: &[super::changed::Problem]) {
     }
 }
 
+/// A row paired with a service whose library rows are missing from the index
+/// reads not checked, with that reason, in place of the verdict the pair held
+/// (carrick#4807). The shape is [`state_judged`]'s `not_checked`, and `stated`
+/// stays false: the judge states nothing for it.
+fn state_library_missing(items: &mut [IndexedItem], marked: &std::collections::BTreeSet<String>) {
+    for item in items.iter_mut() {
+        if item.counterparts.is_empty() {
+            continue;
+        }
+        let side = std::iter::once(item.service.as_str())
+            .chain(item.counterparts.iter().map(|c| c.service.as_str()))
+            .find(|service| marked.contains(*service));
+        if let Some(service) = side {
+            item.verdict = Some(super::read_model::StoredVerdict {
+                state: "not_checked".to_string(),
+                result: None,
+                detail: library_missing_reason(service),
+            });
+            item.stated = false;
+        }
+    }
+}
+
 /// The rows outside the edited file that this edit moved, by the rule
 /// `check --changed` applies to the files it was given (`changed.rs`,
 /// `judge`; carrick#2998): a pair the index held compatible that now
@@ -1967,6 +1994,7 @@ fn judge_edit(
         &rejoined.join,
         &wanted,
         &super::changed::touched_since_index(before, std::slice::from_ref(tree)),
+        &library_marked(&rejoined.index, &rejoined.rescanned),
     );
     let (outside, inside): (Vec<_>, Vec<_>) = judged
         .problems
@@ -2012,13 +2040,16 @@ pub const LIBRARY_UNREACHABLE: &str =
     "library facts unavailable: Carrick's library store could not be reached.";
 
 /// What a re-scan of `repos` could not read of the library store, as the
-/// sentence a check prints. A not-signed-in mark counts only while this
-/// machine still holds no credential: a service carried from an earlier
-/// unsigned `refresh` keeps its mark until the next refresh, and must not
-/// outlive the sign-in.
+/// sentence a check prints. Only a service this run re-scanned (`rescanned`)
+/// can stop the check: its own ask failed. A mark stored on a service the run
+/// carried is read by [`library_marked`] instead (carrick#4807). A
+/// not-signed-in mark counts only while this machine still holds no
+/// credential: a service carried from an earlier unsigned `refresh` keeps its
+/// mark until the next refresh, and must not outlive the sign-in.
 pub(super) fn library_unavailable<'a>(
     rebuilt: &super::read_model::LocalIndex,
     repos: impl IntoIterator<Item = &'a String>,
+    rescanned: &std::collections::BTreeSet<String>,
 ) -> Option<&'static str> {
     use crate::library_store::AskFailure;
     let repos: std::collections::BTreeSet<&String> = repos.into_iter().collect();
@@ -2027,6 +2058,7 @@ pub(super) fn library_unavailable<'a>(
         .iter()
         .filter(|repo| repos.contains(&repo.name))
         .flat_map(|repo| repo.services.iter())
+        .filter(|service| rescanned.contains(&service.name))
         .filter_map(|service| service.boundary.as_ref()?.library_ask_failed)
         .collect();
     if failures.contains(&AskFailure::NotSignedIn)
@@ -2040,6 +2072,43 @@ pub(super) fn library_unavailable<'a>(
     }
 }
 
+/// The services of `rebuilt` this run carried whose stored boundary says their
+/// library rows are missing from the index (carrick#4807). A pair with one of
+/// them on either side is not judged: its library rows are not there to pair
+/// against. A re-scanned service's own failed ask stops the check instead
+/// ([`library_unavailable`]), and the sign-in rule is that function's.
+pub(super) fn library_marked(
+    rebuilt: &super::read_model::LocalIndex,
+    rescanned: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    use crate::library_store::AskFailure;
+    let signed_out = crate::credentials::CloudAuth::detect().is_err();
+    rebuilt
+        .repos
+        .iter()
+        .flat_map(|repo| repo.services.iter())
+        .filter(|service| !rescanned.contains(&service.name))
+        .filter(|service| {
+            match service
+                .boundary
+                .as_ref()
+                .and_then(|boundary| boundary.library_ask_failed)
+            {
+                Some(AskFailure::Unreachable) => true,
+                Some(AskFailure::NotSignedIn) => signed_out,
+                None => false,
+            }
+        })
+        .map(|service| service.name.clone())
+        .collect()
+}
+
+/// What a pair says when a service on one side has no library rows in the
+/// index: not a mismatch, not a match, and not a missing route.
+pub(super) fn library_missing_reason(service: &str) -> String {
+    format!("not checked: {service} was indexed without its library facts.")
+}
+
 /// What one re-extraction of some repos produced, joined against everything
 /// else the index already holds.
 pub(super) struct Rejoined {
@@ -2050,6 +2119,10 @@ pub(super) struct Rejoined {
     pub join: super::LocalJoin,
     /// How many distinct services the join read, re-scanned and retained.
     pub services: usize,
+    /// The services this run asked the library store for, as opposed to the
+    /// ones it carried: only their own failed ask stops a check
+    /// ([`library_unavailable`]).
+    pub rescanned: std::collections::BTreeSet<String>,
 }
 
 /// Re-scan each of `repos` over its working tree, and join the result against
@@ -2330,6 +2403,7 @@ fn rejoin_held(
     let names: std::collections::BTreeSet<String> =
         repos.iter().map(|tree| repo_label(&tree.repo)).collect();
     let mut services = std::collections::BTreeSet::new();
+    let mut rescanned = std::collections::BTreeSet::new();
 
     // Everything except the re-scanned repos, exactly as the last index left it.
     let Held {
@@ -2446,6 +2520,22 @@ fn rejoin_held(
         let hosted_data = read_staged(&staged(generation, "hosted", position))?;
         let previous_data = read_staged(&previous)?;
         took("after-scan/read-staged-lists", began);
+        // A service this run asked the library store for: a fresh blob the
+        // scan analysed, not one it only wrote as it carried it.
+        rescanned.extend(
+            fresh
+                .iter()
+                .filter(|blob| {
+                    how.listed
+                        .is_none_or(|listed| listed.contains(&service_id(blob)))
+                })
+                .filter(|blob| {
+                    !previous_data
+                        .iter()
+                        .any(|stored| written_as_carried(blob, stored))
+                })
+                .map(service_id),
+        );
         let began = Instant::now();
         let carried =
             super::index::carried_services(&tree.checkout, &hosted_data, &previous_data, &fresh)?;
@@ -2522,7 +2612,50 @@ fn rejoin_held(
         index,
         join: joined,
         services: services.len(),
+        rescanned,
     })
+}
+
+/// Whether `written` is `stored` carried by a `--changed-only` scan and
+/// written because its join moved: the same blob with this run's verdicts,
+/// SDK edges and stamps (`change_scope::refreshed_carried`). A service the scan
+/// analysed states its own run, so it differs. Used to tell a mark this run's
+/// ask wrote from a mark the stored blob already held (carrick#4807).
+fn written_as_carried(
+    written: &crate::cloud_storage::CloudRepoData,
+    stored: &crate::cloud_storage::CloudRepoData,
+) -> bool {
+    if service_id(written) != service_id(stored) {
+        return false;
+    }
+    let (Ok(mut written), Ok(mut stored)) =
+        (serde_json::to_value(written), serde_json::to_value(stored))
+    else {
+        return false;
+    };
+    for blob in [&mut written, &mut stored] {
+        let Some(blob) = blob.as_object_mut() else {
+            return false;
+        };
+        for key in [
+            "compat_verdicts",
+            "pair_outcomes",
+            "sdk_edges",
+            "sdk_unresolved",
+            "commit_hash",
+            "dirty",
+            "last_updated",
+            "scanner_build",
+        ] {
+            blob.remove(key);
+        }
+        if let Some(boundary) = blob.get_mut("boundary").and_then(|b| b.as_object_mut()) {
+            for key in ["commit_hash", "files_attempted", "sdk_unresolved"] {
+                boundary.remove(key);
+            }
+        }
+    }
+    written == stored
 }
 
 /// The V8 heap each of a re-scan's sidecars may grow to, in MB, unless the

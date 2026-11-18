@@ -588,7 +588,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     if !lost.is_empty() {
         output.not_checked = Some(lost.join(" "));
     } else if let Some(sentence) =
-        super::recheck::library_unavailable(&rejoined.index, changed.keys())
+        super::recheck::library_unavailable(&rejoined.index, changed.keys(), &rejoined.rescanned)
     {
         // The re-scan asked the library store and got no answer: a route
         // registered through a server package is missing, so "checked 0
@@ -615,6 +615,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &rejoined.join,
         &wanted,
         &touched_since_index(&index, &trees),
+        &super::recheck::library_marked(&rejoined.index, &rejoined.rescanned),
     );
     super::recheck::took("check/judge", began);
     let began = Instant::now();
@@ -1114,6 +1115,7 @@ fn edge_source_stated(wire: Option<&str>) -> Option<EdgeSource> {
 /// only on that silence is marked `other_build` and does not fail. What
 /// `before` did read still decides: a call it matched that now reaches no
 /// route fails whichever build wrote it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn judge(
     root: &Path,
     before: &LocalIndex,
@@ -1122,6 +1124,7 @@ pub(super) fn judge(
     join: &super::LocalJoin,
     changed: &BTreeMap<String, &BTreeSet<String>>,
     touched: &Touched,
+    marked: &BTreeSet<String>,
 ) -> Judged {
     // Which repo each service belongs to, and where that repo is, so a row's
     // repo-relative file can be tested against the changed set and printed
@@ -1185,6 +1188,22 @@ pub(super) fn judge(
         let Some(item) = item_of(repo, operation) else {
             continue;
         };
+        // A pair with a service whose library rows are missing from the index
+        // is not judged, whatever its stored verdict says (carrick#4807).
+        if let Some(service) = missing_library_side(marked, operation, item) {
+            if in_change {
+                judged.not_type_checked.push(NotTypeChecked {
+                    file: shown(root, repo_path, &operation.file),
+                    line: operation.line,
+                    role: item.kind.as_str().to_string(),
+                    method: operation.method.clone(),
+                    path: operation.path.clone(),
+                    reason: super::recheck::library_missing_reason(service),
+                    descriptor: false,
+                });
+            }
+            continue;
+        }
         let mismatch = item.verdict.as_ref().is_some_and(|verdict| {
             matches!(
                 verdict.result.as_deref(),
@@ -1554,6 +1573,22 @@ pub(super) fn judge(
     judged.not_type_checked.sort();
     judged.not_type_checked.dedup();
     judged
+}
+
+/// The service among `marked` that one side of this paired row sits in: the
+/// row's own or a counterpart's. `None` for a row with no counterpart, which
+/// pairs with nothing.
+pub(super) fn missing_library_side<'a>(
+    marked: &'a BTreeSet<String>,
+    operation: &JoinedOperation,
+    item: &'a IndexedItem,
+) -> Option<&'a str> {
+    if item.counterparts.is_empty() {
+        return None;
+    }
+    std::iter::once(operation.service.as_str())
+        .chain(item.counterparts.iter().map(|c| c.service.as_str()))
+        .find_map(|service| marked.get(service).map(String::as_str))
 }
 
 /// Whether any row of the index states a dispatch case. An index written
@@ -2437,6 +2472,7 @@ mod tests {
             &join,
             &changed,
             &Touched::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
         judged.problems.into_iter().next().unwrap()
@@ -2522,6 +2558,7 @@ mod tests {
             &join,
             &changed,
             &touched,
+            &BTreeSet::new(),
         )
         .problems
     }
@@ -2654,6 +2691,7 @@ mod tests {
             &join,
             &changed,
             &Touched::new(),
+            &BTreeSet::new(),
         );
 
         assert_eq!(judged.problems.len(), 2, "{:?}", judged.problems);
@@ -2722,6 +2760,7 @@ mod tests {
             &join,
             &changed,
             &Touched::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
         judged.problems[0].clone()
@@ -2785,6 +2824,7 @@ mod tests {
             &join,
             &changed,
             &Touched::new(),
+            &BTreeSet::new(),
         )
         .problems
     }
