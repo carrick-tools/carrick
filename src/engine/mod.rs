@@ -6548,6 +6548,7 @@ async fn analyze_current_repo_incremental(
                 &mut manifest_entries,
                 &protocol_extractions,
                 &library_sites,
+                repo_path,
             );
             append_pubsub_manifest_entries(
                 &mut manifest_entries,
@@ -11223,6 +11224,7 @@ fn append_protocol_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     extractions: &ProtocolExtractions,
     library: &LibrarySiteIndex,
+    repo_root: &str,
 ) {
     let sockets = library.typed_sockets(&extractions.sockets);
     for op in &extractions.graphql.producers {
@@ -11291,22 +11293,29 @@ fn append_protocol_manifest_entries(
         );
     }
     for op in &sockets.emitters {
+        let file_path = op.file_path.to_string_lossy();
+        // An emit is a call, so it is one entry per site, as a pub/sub
+        // publisher's is: two emits of one event in a service each carry their
+        // own alias, type ask and verdict (carrick#4779). The listener above
+        // stays one per event per repo, like an HTTP route.
+        let call_id = build_site_id(&file_path, op.line, &op.key, repo_root);
         add_protocol_manifest_entry(
             entries,
             &op.key,
             ManifestRole::Consumer,
-            &op.file_path.to_string_lossy(),
+            &file_path,
             op.line,
             op.payload_type_symbol.clone(),
-            // Same deferred fan-in caveat as the graphql consumer above (#291).
-            None,
+            Some(&call_id),
         );
     }
     // The library socket rows (carrick#3255): a stated global row the pass
     // did not read gets the entry the pass's op would have had, keyed
-    // `OperationKey::socket(name, direction)` with no site id, as the pass's
-    // are. Where the pass wrote that alias, its entry (and symbol anchor)
-    // stands and no second one is written. The fact layer's slot types it.
+    // `OperationKey::socket(name, direction)`, and, for an emit, site-id'd as
+    // the pass's are. Where the pass wrote an entry at the row's own site, it
+    // (and its symbol anchor) stands and no second one is written. A listener
+    // is one entry per event, so any listener entry on the key stands for the
+    // row. The fact layer's slot types it.
     for (file, line, name, direction, listener) in &library.global_socket {
         let key = OperationKey::socket(name.clone(), *direction);
         let role = if *listener {
@@ -11314,20 +11323,26 @@ fn append_protocol_manifest_entries(
         } else {
             ManifestRole::Consumer
         };
-        if entries
-            .iter()
-            .any(|entry| entry.key == key && entry.role == role)
-        {
+        let anchor_line = (*line).max(1);
+        if entries.iter().any(|entry| {
+            entry.key == key
+                && entry.role == role
+                && (*listener
+                    || (library.relative(Path::new(&entry.file_path)) == *file
+                        && entry.line_number == anchor_line))
+        }) {
             continue;
         }
+        let file_path = file.to_string_lossy();
+        let call_id = (!*listener).then(|| build_site_id(&file_path, anchor_line, &key, repo_root));
         add_protocol_manifest_entry(
             entries,
             &key,
             role,
-            &file.to_string_lossy(),
-            (*line).max(1),
+            &file_path,
+            anchor_line,
             None,
-            None,
+            call_id.as_deref(),
         );
     }
 }
@@ -16069,7 +16084,12 @@ async fn analyze_current_repo(
         &stated_library_rows(&protocol_extractions.library, repo_path, service),
         repo_path,
     );
-    append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions, &library_sites);
+    append_protocol_manifest_entries(
+        &mut manifest_entries,
+        &protocol_extractions,
+        &library_sites,
+        repo_path,
+    );
     append_pubsub_manifest_entries(
         &mut manifest_entries,
         &analysis_result.file_results,
@@ -29935,6 +29955,7 @@ unfollowed_member_calls_total: 0,
                     &mut manifest,
                     &extractions,
                     &LibrarySiteIndex::default(),
+                    &repo_path,
                 );
                 cloud_data.type_manifest = Some(manifest);
                 data.insert(name, cloud_data);
@@ -34419,6 +34440,7 @@ unfollowed_member_calls_total: 0,
                 &stated_library_rows(&extractions.library, "/repo", &Config::default()),
                 "/repo",
             ),
+            "/repo",
         );
         let anchored: Vec<(String, bool, u32)> = {
             let mut anchored: Vec<(String, bool, u32)> = entries
@@ -36086,7 +36108,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             implementations_unanswered: Vec::new(),
         };
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::default(),
+            "/repo",
+        );
         let symbols: Vec<(String, Option<String>)> = entries
             .iter()
             .map(|entry| (entry.file_path.clone(), entry.primary_type_symbol.clone()))
@@ -36125,7 +36152,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             implementations_unanswered: Vec::new(),
         };
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::default(),
+            "/repo",
+        );
         let stamped: Vec<(ManifestTypeKind, bool)> = entries
             .iter()
             .map(|e| (e.type_kind, e.graphql_root.is_some()))
@@ -36630,7 +36662,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::default(),
+            "/repo",
+        );
 
         let socket_entry = entries
             .iter()
@@ -36707,7 +36744,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::default(),
+            "/repo",
+        );
 
         let requests: Vec<&TypeManifestEntry> = entries
             .iter()
@@ -36776,7 +36818,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::default(),
+            "/repo",
+        );
         let manifest_alias = entries
             .iter()
             .find(|e| e.key.canonical() == "socket|SERVER->CLIENT|payment:settled")
@@ -36802,10 +36849,17 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
              enrich-join silently breaks"
         );
         // Independently confirm both equal the canonical builder output.
-        let expected = crate::type_manifest::build_manifest_type_alias(
+        // An emit is one entry per site (carrick#4779).
+        let expected = crate::type_manifest::build_manifest_type_alias_with_site_id(
             &emitter.key,
             ManifestRole::Consumer,
             ManifestTypeKind::Response,
+            Some(&crate::type_manifest::build_site_id(
+                &emitter.file_path.to_string_lossy(),
+                emitter.line,
+                &emitter.key,
+                "/repo",
+            )),
         );
         assert_eq!(manifest_alias, expected);
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
@@ -36864,10 +36918,19 @@ io.on("bare:in", (event) => {});
         assert_eq!(
             emit.alias.as_deref(),
             Some(
-                alias(
-                    "inline:out",
+                crate::type_manifest::build_manifest_type_alias_with_site_id(
+                    &OperationKey::socket("inline:out", crate::operation::SocketDirection::Unknown),
                     ManifestRole::Consumer,
-                    crate::operation::SocketDirection::Unknown
+                    ManifestTypeKind::Response,
+                    Some(&crate::type_manifest::build_site_id(
+                        &file.to_string_lossy(),
+                        4,
+                        &OperationKey::socket(
+                            "inline:out",
+                            crate::operation::SocketDirection::Unknown
+                        ),
+                        &dir.path().to_string_lossy(),
+                    )),
                 )
                 .as_str()
             )
@@ -37027,7 +37090,7 @@ io.on("bare:in", (event) => {});
             implementations_unanswered: Vec::new(),
         };
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions, &library);
+        append_protocol_manifest_entries(&mut entries, &extractions, &library, "/repo");
         let found: Vec<(String, ManifestRole, u32, Option<&str>)> = entries
             .iter()
             .map(|entry| {
@@ -37062,14 +37125,145 @@ io.on("bare:in", (event) => {});
                 ),
             ]
         );
+        // A listener's alias is plain; an emit's carries its own site.
+        let push = OperationKey::socket("live:push", SocketDirection::ServerToClient);
         assert_eq!(
             entries[2].type_alias,
-            crate::type_manifest::build_manifest_type_alias(
-                &OperationKey::socket("live:push", SocketDirection::ServerToClient),
+            crate::type_manifest::build_manifest_type_alias_with_site_id(
+                &push,
                 ManifestRole::Consumer,
                 ManifestTypeKind::Response,
+                Some(&crate::type_manifest::build_site_id(
+                    "src/live.ts",
+                    9,
+                    &push,
+                    "/repo"
+                )),
             )
         );
+    }
+
+    /// The socket pass's emitters of `event` at the given lines of `file`.
+    fn emitters_at(event: &str, file: &str, lines: &[u32]) -> ProtocolExtractions {
+        let emitters = lines
+            .iter()
+            .map(|line| {
+                let mut op = socket_op(
+                    event,
+                    crate::operation::SocketDirection::ClientToServer,
+                    None,
+                    None,
+                );
+                op.file_path = PathBuf::from(file);
+                op.line = *line;
+                op
+            })
+            .collect();
+        ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
+            graphql: crate::graphql::GraphqlExtraction::default(),
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![],
+                emitters,
+            },
+            library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
+        }
+    }
+
+    /// carrick#4779, through the socket pass's own emitter path: two emits of
+    /// one event, in two files, are two consumer entries with two aliases,
+    /// each the alias of its own site, and a listener of the event stays one.
+    #[test]
+    fn two_emits_of_one_event_get_one_consumer_entry_each() {
+        use crate::operation::SocketDirection;
+
+        let mut extractions = emitters_at("order:update", "src/a.ts", &[12, 30]);
+        let mut elsewhere = extractions.sockets.emitters[0].clone();
+        elsewhere.file_path = PathBuf::from("src/b.ts");
+        elsewhere.line = 8;
+        extractions.sockets.emitters.push(elsewhere);
+        let mut listener = extractions.sockets.emitters[0].clone();
+        listener.key = OperationKey::socket("order:update", SocketDirection::ClientToServer);
+        extractions.sockets.listeners = vec![listener.clone(), {
+            let mut second = listener;
+            second.line = 40;
+            second
+        }];
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::default(),
+            "/repo",
+        );
+        let consumers: Vec<(&str, u32, &str)> = entries
+            .iter()
+            .filter(|entry| entry.role == ManifestRole::Consumer)
+            .map(|entry| {
+                (
+                    entry.file_path.as_str(),
+                    entry.line_number,
+                    entry.type_alias.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(consumers.len(), 3, "{consumers:?}");
+        let aliases: HashSet<&str> = consumers.iter().map(|(_, _, alias)| *alias).collect();
+        assert_eq!(
+            aliases.len(),
+            3,
+            "each emit has its own alias: {consumers:?}"
+        );
+        let key = OperationKey::socket("order:update", SocketDirection::ClientToServer);
+        for (file, line, alias) in &consumers {
+            let site = crate::type_manifest::build_site_id(file, *line, &key, "/repo");
+            assert!(alias.ends_with(&format!("_Call{site}")), "{alias}");
+        }
+        let producers = entries
+            .iter()
+            .filter(|entry| entry.role == ManifestRole::Producer)
+            .count();
+        assert_eq!(producers, 2, "a listener entry is the pass's, as before");
+    }
+
+    /// carrick#4779: a library row at a site the pass already wrote adds no
+    /// second entry; a row at another site of the same event adds its own.
+    #[test]
+    fn a_library_row_at_a_site_the_pass_wrote_adds_no_second_entry() {
+        use crate::library_claims::LibraryRowKind;
+        use crate::operation::SocketDirection;
+
+        let global = |line: u32| crate::library_claims::LibraryRow {
+            name_scope: Some(crate::services::type_sidecar::NameScope {
+                scope: crate::services::type_sidecar::NameScopeKind::Global,
+                namespace: None,
+            }),
+            ..library_row(
+                "/repo/src/a.ts",
+                line,
+                "order:update",
+                LibraryRowKind::Socket {
+                    direction: SocketDirection::ClientToServer,
+                    listener: false,
+                },
+            )
+        };
+        let library = LibrarySiteIndex::of(
+            &crate::library_claims::LibraryRows {
+                rows: vec![global(12), global(30)],
+                ..Default::default()
+            },
+            "/repo",
+        );
+        let extractions = emitters_at("order:update", "src/a.ts", &[12]);
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions, &library, "/repo");
+        let lines: Vec<u32> = entries.iter().map(|entry| entry.line_number).collect();
+        assert_eq!(lines, vec![12, 30], "{entries:#?}");
+        assert_ne!(entries[0].type_alias, entries[1].type_alias);
     }
 
     /// A library pub/sub row at `file:line` whose name is global, in
@@ -38149,7 +38343,12 @@ io.on("bare:in", (event) => {});
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::default(),
+            "/repo",
+        );
         let manifest_entry = entries
             .iter()
             .find(|e| {
@@ -38291,7 +38490,12 @@ io.on("bare:in", (event) => {});
 
         // The producer manifest entry's alias (Producer, Response).
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::default(),
+            "/repo",
+        );
         let manifest_entry = entries
             .iter()
             .find(|e| {
