@@ -1476,10 +1476,11 @@ struct FnIr {
     /// (carrick#1689).
     returned: Option<Returned>,
     /// What the function returns when that is one call's value read one way
-    /// ([`crate::return_flow::return_shapes`], carrick#1601, carrick#3823):
+    /// ([`crate::return_flow::return_reads`], carrick#1601, carrick#3823):
     /// the one reader of whether it hands back its request's parsed body.
-    /// `None` for anything else, or nothing returned.
-    return_shape: Option<crate::return_flow::ReturnShape>,
+    /// Where it is no shape, why: a value of its own, or one not followed
+    /// (carrick#4513 P2).
+    return_read: crate::return_flow::ReturnRead,
     /// The calls whose value the function may hand back, whole or held
     /// inside its value ([`crate::return_flow::held_returns`], carrick#4270).
     held_return: crate::return_flow::HeldReturn,
@@ -2164,9 +2165,9 @@ pub fn extract_file_ir(
         source_map,
         builder_depth: std::cell::Cell::new(0),
         returned_objects: crate::return_flow::returned_objects(module),
-        return_shapes: crate::return_flow::return_shapes(module)
+        return_reads: crate::return_flow::return_reads(module)
             .into_iter()
-            .filter_map(|(node, shape)| Some(((node.lo.0, node.hi.0), shape?)))
+            .map(|(node, read)| ((node.lo.0, node.hi.0), read))
             .collect(),
         held_returns: crate::return_flow::held_returns(module)
             .into_iter()
@@ -5623,9 +5624,9 @@ struct Reader<'a> {
     /// ([`crate::return_flow::returned_objects`], carrick#3470).
     returned_objects: HashSet<(u32, u32)>,
     /// What each function of the module returns, by the span `(lo, hi)` of
-    /// its node, where that is one call's value read one way
-    /// ([`crate::return_flow::return_shapes`], carrick#3823).
-    return_shapes: HashMap<(u32, u32), crate::return_flow::ReturnShape>,
+    /// its node ([`crate::return_flow::return_reads`], carrick#3823,
+    /// carrick#4513 P2).
+    return_reads: HashMap<(u32, u32), crate::return_flow::ReturnRead>,
     /// The calls whose value each function of the module may hand back, by
     /// the span `(lo, hi)` of its node ([`crate::return_flow::held_returns`],
     /// carrick#4270).
@@ -5845,9 +5846,12 @@ impl Reader<'_> {
     }
 
     /// What the function whose node is `span` returns
-    /// ([`Reader::return_shapes`]).
-    fn return_shape(&self, span: Span) -> Option<crate::return_flow::ReturnShape> {
-        self.return_shapes.get(&(span.lo.0, span.hi.0)).cloned()
+    /// ([`Reader::return_reads`]).
+    fn return_read(&self, span: Span) -> crate::return_flow::ReturnRead {
+        self.return_reads
+            .get(&(span.lo.0, span.hi.0))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// The calls whose value the function whose node is `span` may hand back
@@ -6572,7 +6576,7 @@ impl Reader<'_> {
             ),
             type_params: type_param_names(function.type_params.as_deref()),
             site: Some(self.site(function.span)),
-            return_shape: self.return_shape(function.span),
+            return_read: self.return_read(function.span),
             held_return: self.held_return(function.span),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
@@ -6669,7 +6673,7 @@ impl Reader<'_> {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
             site: Some(self.site(arrow.span)),
-            return_shape: self.return_shape(arrow.span),
+            return_read: self.return_read(arrow.span),
             held_return: self.held_return(arrow.span),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
@@ -11851,10 +11855,14 @@ struct Composer<'a> {
     clients: LinkedClients,
     memo: HashMap<(PathBuf, String), Summary>,
     in_progress: HashSet<(PathBuf, String)>,
-    /// Each function's [`ReturnChain`], once read.
-    returned: HashMap<(PathBuf, String), Option<ReturnChain>>,
+    /// Each function's [`ReturnChain`], once read, or why it has none.
+    returned: HashMap<(PathBuf, String), Chained>,
     returning: HashSet<(PathBuf, String)>,
 }
+
+/// A function's [`ReturnChain`], or why its returns are none
+/// ([`crate::return_flow::NoChain`], carrick#4513 P2).
+pub type Chained = Result<ReturnChain, crate::return_flow::NoChain>;
 
 /// The call a chain of returns ends at ([`ReturnChain::end`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11882,20 +11890,103 @@ pub struct ReturnChain {
 /// Every function's [`ReturnChain`], by its file as walked and its key.
 #[derive(Debug, Clone, Default)]
 pub struct ReturnChains {
-    by_function: HashMap<(PathBuf, String), Option<ReturnChain>>,
+    by_function: HashMap<(PathBuf, String), Chained>,
     /// The calls this pass reads as the platform's own `fetch`
     /// ([`RequestKind::Fetch`]), by file as walked and SWC span.
     fetches: HashSet<(PathBuf, u32, u32)>,
 }
 
+/// The labelled call a site's request is made at, as
+/// [`ReturnChains::hands_back`] reads it.
+pub struct LabelledCall<'a> {
+    /// The file as the site names it (walked or repo-relative).
+    pub file: &'a Path,
+    pub line: u32,
+    /// SWC's span of the call.
+    pub span: (u32, u32),
+}
+
 impl ReturnChains {
     /// `None` for a function this pass did not read (another service's);
-    /// `Some(None)` for one whose return is no chain of returned calls: a
-    /// literal, an operator, an object, a function, or nothing.
-    pub fn of(&self, file: &Path, key: &str) -> Option<Option<&ReturnChain>> {
+    /// `Some(Err(_))` for one whose return is no chain of returned calls,
+    /// with why ([`crate::return_flow::NoChain`]).
+    pub fn of(
+        &self,
+        file: &Path,
+        key: &str,
+    ) -> Option<Result<&ReturnChain, crate::return_flow::NoChain>> {
         self.by_function
             .get(&(file.to_path_buf(), key.to_string()))
-            .map(Option::as_ref)
+            .map(|chained| chained.as_ref().map_err(|why| *why))
+    }
+
+    /// Where the caller holds the response body when it calls through its
+    /// own wrapper (carrick#4513 P2, READY-4513-finish §2 Q1): the one
+    /// answer the site pass reads. `deciding` is the function the deciding
+    /// call runs (its file as walked and its key), `labelled` the call the
+    /// request is made at, `above_labelled` the `file:line` of each call on
+    /// the site's own chain above the labelled call.
+    ///
+    /// | The wrapper hands back | Answer |
+    /// |---|---|
+    /// | the labelled call's body, as its label reads it, down a chain of returns ([`crate::return_flow::hands_back_body`]) | [`HandBack::Body`]: read at the deciding call, whole |
+    /// | a value of its own (a literal, an operator, an object, a function, nothing, `.catch` with its own value), or a member the label does not name | [`HandBack::Other`]: read at the labelled call |
+    /// | a member of an unlabelled call's value, the platform `fetch` whole, or a value it does not follow: a `new` expression, several calls, a call of a function this pass does not read (`schema.parse(body)`, `retry(run)`, `.then(fn)`, a library call holding the chain in its callback), a callee whose returns are no chain | [`HandBack::Undecided`]: read at the deciding call, whole |
+    /// | a chain that leaves the functions this pass reads, at a call above the labelled one (carrick#4755 T0), or a function this pass did not read | `None`: read at the deciding call, whole |
+    ///
+    /// [`HandBack::Body`]: crate::return_flow::HandBack::Body
+    /// [`HandBack::Other`]: crate::return_flow::HandBack::Other
+    /// [`HandBack::Undecided`]: crate::return_flow::HandBack::Undecided
+    pub fn hands_back(
+        &self,
+        root: &Path,
+        deciding: (&Path, &str),
+        labelled: &LabelledCall<'_>,
+        above_labelled: &[&str],
+        results: &crate::result_shapes::ResultIndex,
+    ) -> Option<crate::return_flow::HandBack> {
+        use crate::return_flow::{EndRead, HandBack, NoChain, hands_back_body};
+        let record = self.of(deciding.0, deciding.1)?;
+        let root_text = root.to_string_lossy();
+        let relative = |file: &Path| {
+            crate::utils::repo_relative_source_path(&file.to_string_lossy(), &root_text).to_string()
+        };
+        // What the store says the call at `span` of `file` resolves to. The
+        // index is keyed by the repo-relative file, whatever form the file
+        // takes (carrick#2974).
+        let read_at = |file: &Path, line: u32, span: (u32, u32)| {
+            let file = relative(file);
+            match results.at(&file, Some(span), line) {
+                Some(label) => EndRead::Labelled(label.clone()),
+                None if self.is_platform_fetch(&root.join(&file), span) => EndRead::PlatformFetch,
+                None => EndRead::Unlabelled,
+            }
+        };
+        let record = match record {
+            Ok(record) => record,
+            Err(NoChain::Own) => return Some(HandBack::Other),
+            Err(NoChain::Unfollowed) => return Some(HandBack::Undecided),
+        };
+        let end_span = (record.end.span_start, record.end.span_end);
+        if relative(&record.end.file) == relative(labelled.file) && end_span == labelled.span {
+            let read = read_at(labelled.file, labelled.line, labelled.span);
+            return Some(hands_back_body(&record.steps, &read));
+        }
+        // The record ends at a call on the site's own chain, above the
+        // labelled call: the function that call runs is one this pass did not
+        // read (another service's), so the record stops where the walk went
+        // on. No answer (carrick#4755 T0).
+        let end_at = format!("{}:{}", relative(&record.end.file), record.end.line);
+        if above_labelled.contains(&end_at.as_str()) {
+            return None;
+        }
+        // The record ends at another request: what the wrapper hands back is
+        // that request's value, not this one's.
+        if read_at(&record.end.file, record.end.line, end_span) != EndRead::Unlabelled {
+            return Some(HandBack::Other);
+        }
+        // A call this pass does not follow, around or over the chain.
+        Some(HandBack::Undecided)
     }
 
     /// Whether the call at `span` of `file` (as walked) is the platform's
@@ -11906,38 +11997,48 @@ impl ReturnChains {
 
     /// [`Self::of`] for the function `key` of the file ending in `file`.
     #[cfg(test)]
-    pub(crate) fn find(&self, file: &str, key: &str) -> Option<Option<&ReturnChain>> {
+    pub(crate) fn find(
+        &self,
+        file: &str,
+        key: &str,
+    ) -> Option<Result<&ReturnChain, crate::return_flow::NoChain>> {
         self.by_function
             .iter()
             .find(|((path, name), _)| path.ends_with(file) && name == key)
-            .map(|(_, chain)| chain.as_ref())
+            .map(|(_, chained)| chained.as_ref().map_err(|why| *why))
     }
 }
 
 impl Composer<'_> {
-    /// `key`'s [`ReturnChain`] in `file`, memoised. `None` on a cycle.
-    fn returned(&mut self, file: &Path, key: &str) -> Option<ReturnChain> {
+    /// `key`'s [`ReturnChain`] in `file`, memoised. `None` for a function this
+    /// pass does not read; not followed on a cycle.
+    fn returned(&mut self, file: &Path, key: &str) -> Option<Chained> {
         let id = (file.to_path_buf(), key.to_string());
         if let Some(known) = self.returned.get(&id) {
-            return known.clone();
+            return Some(known.clone());
         }
         let files = self.files;
         let ir = files.get(file)?.functions.get(key)?;
         if !self.returning.insert(id.clone()) {
-            return None;
+            return Some(Err(crate::return_flow::NoChain::Unfollowed));
         }
         let record = self.returned_of(file, ir);
         self.returning.remove(&id);
         self.returned.insert(id, record.clone());
-        record
+        Some(record)
     }
 
-    fn returned_of(&mut self, file: &Path, ir: &FnIr) -> Option<ReturnChain> {
-        let shape = ir.return_shape.as_ref()?;
+    fn returned_of(&mut self, file: &Path, ir: &FnIr) -> Chained {
+        use crate::return_flow::{NoChain, ReturnRead};
+        let shape = match &ir.return_read {
+            ReturnRead::Shape(shape) => shape,
+            ReturnRead::NoShape(why) => return Err(*why),
+        };
         let call = ir
             .calls
             .iter()
-            .find(|call| call.site.lo == shape.base.lo.0 && call.site.hi == shape.base.hi.0)?;
+            .find(|call| call.site.lo == shape.base.lo.0 && call.site.hi == shape.base.hi.0)
+            .ok_or(NoChain::Unfollowed)?;
         let files = self.files;
         // A call of a parameter runs whatever a caller hands in: the chain
         // ends there.
@@ -11951,8 +12052,16 @@ impl Composer<'_> {
                     .get(&callee_file)
                     .is_some_and(|read| read.functions.contains_key(&key)) =>
             {
-                self.returned(&callee_file, &key)?
+                // A callee whose own returns are no chain: not followed
+                // (READY-4513-finish D2).
+                match self.returned(&callee_file, &key) {
+                    Some(Ok(record)) => record,
+                    _ => return Err(NoChain::Unfollowed),
+                }
             }
+            // `call.catch(() => [])`: the call's value or one of the
+            // function's own.
+            _ if shape.caught_own => return Err(NoChain::Own),
             _ => ReturnChain {
                 steps: Vec::new(),
                 end: ReturnEnd {
@@ -11964,7 +12073,7 @@ impl Composer<'_> {
             },
         };
         record.steps.extend(shape.step());
-        Some(record)
+        Ok(record)
     }
 
     fn summary(&mut self, file: &Path, key: &str) -> Option<Summary> {
@@ -12204,17 +12313,17 @@ impl Composer<'_> {
         }
         summary.passes_body = summary.effects.len() == 1
             && ir
-                .return_shape
-                .as_ref()
+                .return_read
+                .shape()
                 .is_some_and(|shape| self.hands_back_body(file, ir, shape));
         summary.returns_request_value = summary.effects.len() == 1
             && ir
-                .return_shape
-                .as_ref()
+                .return_read
+                .shape()
                 .is_some_and(|shape| self.hands_back_request_value(file, ir, shape));
         summary.hands_back_transport = ir
-            .return_shape
-            .as_ref()
+            .return_read
+            .shape()
             .is_some_and(|shape| self.hands_back_transport(file, ir, shape));
         summary.holds_transport = self.holds_transport(file, ir);
         for (effect, through) in lifted {
@@ -12440,7 +12549,10 @@ pub fn summarize(
         let mut keys: Vec<&String> = files[*path].functions.keys().collect();
         keys.sort();
         for key in keys {
-            let record = composer.returned(path, key);
+            // Every key here is a function this pass reads.
+            let record = composer
+                .returned(path, key)
+                .unwrap_or(Err(crate::return_flow::NoChain::Unfollowed));
             index
                 .returned
                 .by_function

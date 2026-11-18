@@ -5696,75 +5696,34 @@ fn receiver_written(
 }
 
 impl Decided {
-    /// Where each site's response is read (carrick#4371, READY-4371 R1-R3):
-    /// a site whose labelled call is below its deciding call reads it at the
-    /// deciding call only where the function that call runs hands the
-    /// labelled call's body back. That function's [`super::ReturnChain`]
-    /// must end at the labelled call, and its steps must hand back
-    /// the body under the store's label for that call
-    /// ([`crate::return_flow::hands_back_body`]). A function with no record
-    /// (it returns a literal, an object, an operator, a function it makes,
-    /// nothing) hands back something else:
-    /// [`crate::return_flow::HandBack::Other`]. So does one whose chain
-    /// ends at another call (`.catch(...)`, a closure's call), except over
-    /// the platform's `fetch` with no result label: its `Response` is read
-    /// on the way back (`res.arrayBuffer()`), which only the deciding call
-    /// follows, so it stays undecided. A function this pass did not read
-    /// (another service's) is left unanswered, read at the deciding call as
-    /// before; so is a chain whose record ends at a call on the site's own
-    /// chain above the labelled call (a helper in another service). Runs before [`Self::yield_to_summaries`], so the yielded
-    /// sites carry the answer too.
+    /// Where each site's response is read (carrick#4371, carrick#4513 P2): a
+    /// site whose labelled call is below its deciding call asks
+    /// [`super::ReturnChains::hands_back`], the one answer to where the
+    /// caller holds the body, of the function the deciding call runs. Runs
+    /// before [`Self::yield_to_summaries`], so the yielded sites carry the
+    /// answer too.
     pub fn read_responses(
         &mut self,
         root: &Path,
         returned: &super::ReturnChains,
         results: &crate::result_shapes::ResultIndex,
     ) {
-        use crate::return_flow::{EndRead, HandBack, hands_back_body};
         for site in &mut self.sites {
             site.hands_back = site.deciding_callee.as_ref().and_then(|(file, key)| {
-                let record = returned.of(file, key)?;
                 let end = &site.end;
-                let span = (end.span_start, end.span_end);
-                // The index is keyed by the repo-relative file, whatever form
-                // the end's file takes (carrick#2974).
-                let end_file =
-                    crate::utils::repo_relative_source_path(&end.file, &root.to_string_lossy())
-                        .to_string();
-                let read = match results.at(&end_file, Some(span), end.line) {
-                    Some(label) => EndRead::Labelled(label.clone()),
-                    None if returned.is_platform_fetch(&root.join(&end_file), span) => {
-                        EndRead::PlatformFetch
-                    }
-                    None => EndRead::Unlabelled,
-                };
-                let Some(record) = record else {
-                    return Some(HandBack::Other);
-                };
-                let at_end = relative(root, &record.end.file) == end_file
-                    && (record.end.span_start, record.end.span_end) == span;
-                if !at_end {
-                    // The record ends at a call on the site's own chain, above
-                    // the labelled call: the function that call runs is one
-                    // this pass did not read (another service's), so the
-                    // record stops where the walk went on. No answer, read at
-                    // the deciding call (carrick#4755 T0).
-                    let end_at =
-                        format!("{}:{}", relative(root, &record.end.file), record.end.line);
-                    let above_labelled = site.via.len().saturating_sub(1);
-                    if site.via[..above_labelled]
-                        .iter()
-                        .any(|via| via.at == end_at)
-                    {
-                        return None;
-                    }
-                    return Some(if read == EndRead::PlatformFetch {
-                        HandBack::Undecided
-                    } else {
-                        HandBack::Other
-                    });
-                }
-                Some(hands_back_body(&record.steps, &read))
+                let above_labelled = &site.via[..site.via.len().saturating_sub(1)];
+                let above: Vec<&str> = above_labelled.iter().map(|via| via.at.as_str()).collect();
+                returned.hands_back(
+                    root,
+                    (file, key),
+                    &super::LabelledCall {
+                        file: Path::new(&end.file),
+                        line: end.line,
+                        span: (end.span_start, end.span_end),
+                    },
+                    &above,
+                    results,
+                )
             });
         }
     }
@@ -9271,8 +9230,8 @@ pub(crate) mod tests {
         .returned_records();
         // The chains themselves (READY-4371 step 0): each as its steps, the
         // end's line and whether the end is `fetch`.
-        use crate::return_flow::Step;
-        type Read = Option<Option<(Vec<Step>, u32, bool)>>;
+        use crate::return_flow::{NoChain, Step};
+        type Read = Option<Result<(Vec<Step>, u32, bool), NoChain>>;
         let chain = |file: &str, key: &str| -> Read {
             returned.find(file, key).map(|chain| {
                 chain.map(|chain| {
@@ -9283,35 +9242,29 @@ pub(crate) mod tests {
             })
         };
         let json = vec![Step::Parse("json".to_string())];
-        assert_eq!(chain("t-parsed.ts", "read"), Some(Some((json, 2, true))));
-        assert_eq!(chain("t-wrapper.ts", "send"), Some(Some((vec![], 2, true))));
-        assert_eq!(
-            chain("t-two-hop.ts", "inner"),
-            Some(Some((vec![], 2, true)))
-        );
+        assert_eq!(chain("t-parsed.ts", "read"), Some(Ok((json, 2, true))));
+        assert_eq!(chain("t-wrapper.ts", "send"), Some(Ok((vec![], 2, true))));
+        assert_eq!(chain("t-two-hop.ts", "inner"), Some(Ok((vec![], 2, true))));
         // Followed through the call of `inner` to the same `fetch`.
-        assert_eq!(
-            chain("t-two-hop.ts", "outer"),
-            Some(Some((vec![], 2, true)))
-        );
+        assert_eq!(chain("t-two-hop.ts", "outer"), Some(Ok((vec![], 2, true))));
         // `.catch(() => null)` hands back no body (carrick#4513), so the chain
         // goes through it to the same `fetch`.
-        assert_eq!(chain("t-caught.ts", "tryIt"), Some(Some((vec![], 2, true))));
+        assert_eq!(chain("t-caught.ts", "tryIt"), Some(Ok((vec![], 2, true))));
         // Ends at the call of `retry`'s parameter, which runs what a caller
         // hands in.
         assert_eq!(
             chain("t-handed.ts", "retried"),
-            Some(Some((vec![], 1, false)))
+            Some(Ok((vec![], 1, false)))
         );
         let ok = vec![Step::Member("ok".to_string())];
-        assert_eq!(chain("t-ok.ts", "okOf"), Some(Some((ok, 2, true))));
-        // A maker returns a function.
-        assert_eq!(chain("t-maker.ts", "makeGate"), Some(None));
+        assert_eq!(chain("t-ok.ts", "okOf"), Some(Ok((ok, 2, true))));
+        // A maker returns a function: a value of its own.
+        assert_eq!(chain("t-maker.ts", "makeGate"), Some(Err(NoChain::Own)));
         // A local closure is no function this pass reads by key: the chain
         // ends at its call.
         assert_eq!(
             chain("t-local-run.ts", "runJob"),
-            Some(Some((vec![], 3, false)))
+            Some(Ok((vec![], 3, false)))
         );
         let text = std::fs::read_to_string(
             manifest().join("tests/fixtures/factory-closure/library-claims.json"),
@@ -9369,6 +9322,134 @@ pub(crate) mod tests {
         ] {
             assert_eq!(reads(file, wanted.0), vec![wanted], "{file}: {every:#?}");
         }
+    }
+
+    /// carrick#4513 P2 (READY-4513-finish D2, §2 Q1): a wrapper whose returns
+    /// are no chain says why. A value it makes itself (`true`, an envelope
+    /// object, until P3) is read at the labelled call; one it does not follow
+    /// (`new P(executor)`, `new P(promise)`, a library call holding the chain
+    /// in its callback) at the deciding call, whole. `c ? body : null` is the
+    /// body or no body, and `.catch(() => [])` a value of its own.
+    #[test]
+    fn a_wrapper_with_no_chain_says_whether_it_made_its_value_or_did_not_follow_it() {
+        use crate::return_flow::HandBack;
+        const EXECUTOR: &str = "class Call<T> extends Promise<T> {}\n\
+             function viaExecutor(base: string) {\n\
+             \x20 return new Call((resolve, reject) => fetch(`${base}/exec`).then(resolve, reject));\n\
+             }\n\
+             export const executed = () => viaExecutor(\"/x\");\n";
+        const PROMISE: &str = "class Pending<T> extends Promise<T> {}\n\
+             async function load(base: string) { return (await fetch(`${base}/arg`)).json(); }\n\
+             function viaPromise(base: string) {\n\
+             \x20 return new Pending(load(base));\n\
+             }\n\
+             export const pended = () => viaPromise(\"/p\");\n";
+        const SPAN: &str = "import { startSpan } from \"tracing-lib\";\n\
+             function traced(base: string) {\n\
+             \x20 return startSpan({ name: \"t\" }, () => fetch(`${base}/span`));\n\
+             }\n\
+             export const spanned = () => traced(\"/s\");\n";
+        const FLAG: &str = "async function ping(base: string) {\n\
+             \x20 await fetch(`${base}/ping`);\n\
+             \x20 return true;\n\
+             }\n\
+             export const pinged = () => ping(\"/p\");\n";
+        const ENVELOPE: &str = "async function wrapped(base: string) {\n\
+             \x20 const body = await (await fetch(`${base}/env`)).json();\n\
+             \x20 return { status: 200, body };\n\
+             }\n\
+             export const enveloped = () => wrapped(\"/e\");\n";
+        const COND: &str = "async function maybe(base: string, on: boolean) {\n\
+             \x20 const res = await fetch(`${base}/cond`);\n\
+             \x20 return on ? res.json() : null;\n\
+             }\n\
+             export const maybeRead = () => maybe(\"/c\", true);\n";
+        const COND_NAMED: &str = "async function held(base: string, on: boolean) {\n\
+             \x20 const res = await fetch(`${base}/named`);\n\
+             \x20 const out = on ? await res.json() : undefined;\n\
+             \x20 return (out);\n\
+             }\n\
+             export const heldRead = () => held(\"/n\", true);\n";
+        const CAUGHT_OWN: &str = "function listOr(base: string) {\n\
+             \x20 return fetch(`${base}/list`).catch(() => []);\n\
+             }\n\
+             export const listed = () => listOr(\"/l\");\n";
+        let on = super::super::fixture_walk::walked(
+            "factory-closure",
+            "services/web",
+            "web",
+            &[
+                ("src/n-executor.ts", EXECUTOR),
+                ("src/n-promise.ts", PROMISE),
+                ("src/n-span.ts", SPAN),
+                ("src/n-flag.ts", FLAG),
+                ("src/n-envelope.ts", ENVELOPE),
+                ("src/n-cond.ts", COND),
+                ("src/n-cond-named.ts", COND_NAMED),
+                ("src/n-caught-own.ts", CAUGHT_OWN),
+            ],
+            true,
+        )
+        .expect("the fixture walks with rows: a skipped test proves nothing");
+        let returned = super::super::summarize(
+            &on.inputs,
+            &crate::client_semantics::LibrarySemantics::default(),
+        )
+        .returned_records();
+        let text = std::fs::read_to_string(
+            manifest().join("tests/fixtures/factory-closure/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let labels = super::super::discovery::Labels::of_answer(&answer);
+        let discovery = super::super::discovery::discover(&on.inputs, &labels, &on.repo);
+        let sites: Vec<DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| {
+                serde_json::from_value(serde_json::to_value(site).unwrap()).expect("a site")
+            })
+            .collect();
+        let mut decided = decided_sites(
+            &on.inputs,
+            &on.repo,
+            &sites,
+            &SiteLabel::from_exports(&answer.exports),
+        );
+        decided.read_responses(
+            &on.repo,
+            &returned,
+            &crate::result_shapes::ResultIndex::default(),
+        );
+        let reads = |file: &str, line: u32| -> Vec<Option<HandBack>> {
+            decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .map(|site| site.hands_back)
+                .collect()
+        };
+        let every: Vec<String> = decided
+            .sites
+            .iter()
+            .map(|site| format!("{}:{} {:?}", site.file, site.line, site.hands_back))
+            .collect();
+        let mut wrong = Vec::new();
+        for (file, line, wanted) in [
+            ("n-executor.ts", 5, HandBack::Undecided),
+            ("n-promise.ts", 6, HandBack::Undecided),
+            ("n-span.ts", 5, HandBack::Undecided),
+            ("n-flag.ts", 5, HandBack::Other),
+            ("n-envelope.ts", 5, HandBack::Other),
+            ("n-cond.ts", 5, HandBack::Body),
+            ("n-cond-named.ts", 6, HandBack::Body),
+            ("n-caught-own.ts", 4, HandBack::Other),
+        ] {
+            if reads(file, line) != vec![Some(wanted)] {
+                wrong.push(format!("{file}:{line} wanted {wanted:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}\n{every:#?}");
     }
 
     /// The `factory-closure` fixture (an HTTP client, `fetch`, and a broker

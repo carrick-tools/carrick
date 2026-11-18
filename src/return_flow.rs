@@ -160,9 +160,18 @@ struct Scope {
     /// For a name taken from an object pattern's own key (`{ data }`,
     /// `{ data: body }`), that key; a name bound deeper has none.
     part_keys: HashMap<String, String>,
+    /// The functions and classes the body declares by name: a value of its
+    /// own when handed back ([`NoChain::Own`]).
+    declared: HashSet<String>,
 }
 
 impl Visit for Scope {
+    fn visit_fn_decl(&mut self, decl: &swc_ecma_ast::FnDecl) {
+        self.declared.insert(decl.ident.sym.to_string());
+    }
+    fn visit_class_decl(&mut self, decl: &swc_ecma_ast::ClassDecl) {
+        self.declared.insert(decl.ident.sym.to_string());
+    }
     fn visit_call_expr(&mut self, call: &CallExpr) {
         self.calls.push(call.span);
         call.visit_children_with(self);
@@ -392,6 +401,49 @@ pub struct ReturnShape {
     /// `None` where the source names none (an array pattern). Read by
     /// [`hands_back_body`]'s steps (carrick#4371). In memory only.
     pub member: Option<String>,
+    /// The base is `call.catch(handler)` whose handler hands back a value of
+    /// its own (`.catch(() => [])`): the function hands back the call's value
+    /// or that value, so its chain ends in a value of its own
+    /// ([`NoChain::Own`], carrick#4513 P2). In memory only.
+    pub caught_own: bool,
+}
+
+/// Why a function's returns are no chain to one call's value (carrick#4513
+/// P2, READY-4513-finish D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NoChain {
+    /// The function provably hands back a value it makes itself: a literal,
+    /// a template, an operator, an object or array literal, a member of a
+    /// member, a function, or nothing.
+    Own,
+    /// What it hands back is not followed: a `new` expression, several
+    /// calls, a name given more than one value or none this pass reads, or a
+    /// callee whose own returns are no chain.
+    Unfollowed,
+}
+
+/// What a function returns, as [`return_reads`] reads it: one call's value
+/// read one way, or why it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnRead {
+    Shape(ReturnShape),
+    NoShape(NoChain),
+}
+
+impl Default for ReturnRead {
+    /// A function this pass did not read: not followed.
+    fn default() -> Self {
+        Self::NoShape(NoChain::Unfollowed)
+    }
+}
+
+impl ReturnRead {
+    pub fn shape(&self) -> Option<&ReturnShape> {
+        match self {
+            Self::Shape(shape) => Some(shape),
+            Self::NoShape(_) => None,
+        }
+    }
 }
 
 impl ReturnShape {
@@ -506,6 +558,17 @@ pub fn hands_back_body(steps: &[Step], end: &EndRead) -> HandBack {
 /// has one answer (carrick#3823): [`crate::call_through`] for model rows,
 /// and the request summaries' `passes_body` for summary rows.
 pub fn return_shapes(module: &swc_ecma_ast::Module) -> Vec<(Span, Option<ReturnShape>)> {
+    return_reads(module)
+        .into_iter()
+        .map(|(span, read)| (span, read.shape().cloned()))
+        .collect()
+}
+
+/// [`return_shapes`], with why a function has no shape where it has none
+/// ([`NoChain`], carrick#4513 P2): the request summaries' return chains read
+/// it, so a value the function makes itself is told from one this pass does
+/// not follow.
+pub fn return_reads(module: &swc_ecma_ast::Module) -> Vec<(Span, ReturnRead)> {
     let mut reader = ShapeReader::default();
     module.visit_with(&mut reader);
     reader.shapes.sort_by_key(|(span, _)| (span.lo, span.hi));
@@ -514,14 +577,14 @@ pub fn return_shapes(module: &swc_ecma_ast::Module) -> Vec<(Span, Option<ReturnS
 
 #[derive(Default)]
 struct ShapeReader {
-    shapes: Vec<(Span, Option<ReturnShape>)>,
+    shapes: Vec<(Span, ReturnRead)>,
 }
 
 impl ShapeReader {
     fn read(&mut self, node: Span, returned: Vec<&Expr>, body: &dyn VisitWithScope) {
         let mut scope = Scope::default();
         body.collect(&mut scope);
-        self.shapes.push((node, shape_of(&returned, &scope)));
+        self.shapes.push((node, read_of(&returned, &scope)));
     }
 }
 
@@ -923,26 +986,118 @@ impl HeldWalk {
     }
 }
 
-fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {
+/// One function's [`ReturnRead`]. A return that is no shape is a value of
+/// the function's own or one not followed ([`unshaped`]); any return not
+/// followed makes the whole unfollowed, and so do shapes that are not one
+/// (several calls, two members). Otherwise a value of its own on any path
+/// makes the whole its own (READY-4513-finish D2).
+fn read_of(returned: &[&Expr], scope: &Scope) -> ReturnRead {
     let mut shapes = Vec::new();
+    let mut own = false;
     for expr in returned {
-        match classify(expr, scope)? {
-            Returned::NoBody => {}
-            Returned::Shape(shape) => shapes.push(shape),
+        match classify(expr, scope) {
+            Some(Returned::NoBody) => {}
+            Some(Returned::Shape(shape)) => shapes.push(shape),
+            None => match unshaped(expr, scope) {
+                NoChain::Own => own = true,
+                NoChain::Unfollowed => return ReturnRead::NoShape(NoChain::Unfollowed),
+            },
         }
+    }
+    if own {
+        return ReturnRead::NoShape(NoChain::Own);
     }
     // Several returns that hand back the same call's value, or its parse,
     // are one shape (carrick#3823): `if (ok) return (await res.json()) as T;
     // return res.json();` hands back one parse. Two member reads stay two:
     // a shape does not say which member.
     match shapes.split_first() {
-        Some((first, [])) => Some(first.clone()),
+        Some((first, [])) => ReturnRead::Shape(first.clone()),
         Some((first, rest))
             if first.kind != ShapeKind::Member && rest.iter().all(|shape| shape == first) =>
         {
-            Some(first.clone())
+            ReturnRead::Shape(first.clone())
         }
-        _ => None,
+        // Nothing handed back but no body: nothing of the call's.
+        None => ReturnRead::NoShape(NoChain::Own),
+        _ => ReturnRead::NoShape(NoChain::Unfollowed),
+    }
+}
+
+/// Why one returned value [`classify`] gives no shape is no chain: a value
+/// the function makes itself, or one this pass does not follow.
+fn unshaped(returned: &Expr, scope: &Scope) -> NoChain {
+    use swc_ecma_ast::Lit;
+    let value = resolve(returned, scope);
+    // A value that is one of two (`c ? a : b`, `a || b`, `a ?? b`) is its
+    // own where neither side is unfollowed: a call's value on one path and a
+    // value of its own on another is not that call's value alone, as two
+    // returns of the same are not ([`read_of`]).
+    let either = |left: &Expr, right: &Expr| {
+        let side = |expr: &Expr| match classify(expr, scope) {
+            Some(_) => NoChain::Own,
+            None => unshaped(expr, scope),
+        };
+        match (side(left), side(right)) {
+            (NoChain::Own, NoChain::Own) => NoChain::Own,
+            _ => NoChain::Unfollowed,
+        }
+    };
+    match value.expr {
+        Expr::Bin(bin)
+            if matches!(
+                bin.op,
+                swc_ecma_ast::BinaryOp::LogicalOr
+                    | swc_ecma_ast::BinaryOp::LogicalAnd
+                    | swc_ecma_ast::BinaryOp::NullishCoalescing
+            ) =>
+        {
+            either(&bin.left, &bin.right)
+        }
+        Expr::Cond(cond) => either(&cond.cons, &cond.alt),
+        Expr::Lit(Lit::Str(_) | Lit::Bool(_) | Lit::Num(_) | Lit::BigInt(_) | Lit::Regex(_))
+        | Expr::Tpl(_)
+        | Expr::Bin(_)
+        | Expr::Unary(_)
+        | Expr::Update(_)
+        | Expr::Object(_)
+        | Expr::Array(_)
+        | Expr::Fn(_)
+        | Expr::Arrow(_)
+        | Expr::Class(_) => NoChain::Own,
+        // A function or class the body declares (`return run;`).
+        Expr::Ident(ident)
+            if scope.declared.contains(&*ident.sym) && !scope.given.contains_key(&*ident.sym) =>
+        {
+            NoChain::Own
+        }
+        // A member of a member, or of a value already read once
+        // (`res.data.items`, `(await res.json()).data`): no one read names it.
+        Expr::Member(read)
+            if reads_one_member(&read.prop) && reads_off_a_value(&read.obj, scope) =>
+        {
+            NoChain::Own
+        }
+        Expr::OptChain(chain) => match &*chain.base {
+            OptChainBase::Member(read)
+                if reads_one_member(&read.prop) && reads_off_a_value(&read.obj, scope) =>
+            {
+                NoChain::Own
+            }
+            _ => NoChain::Unfollowed,
+        },
+        _ => NoChain::Unfollowed,
+    }
+}
+
+/// Whether `obj` resolves to a call's value, or to a part or a member of
+/// one: what is read off it is a value the function made by reading.
+fn reads_off_a_value(obj: &Expr, scope: &Scope) -> bool {
+    let obj = resolve(obj, scope);
+    match obj.expr {
+        Expr::Call(_) | Expr::OptChain(_) => true,
+        Expr::Member(read) => reads_off_a_value(&read.obj, scope),
+        _ => obj.part,
     }
 }
 
@@ -1012,18 +1167,26 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
 }
 
 fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
-    // `return body || null`, `return body ?? undefined`: the value or no
-    // body, as a second `return null` would hand back (carrick#4513).
-    if let Expr::Bin(bin) = returned
-        && matches!(
-            bin.op,
-            swc_ecma_ast::BinaryOp::LogicalOr | swc_ecma_ast::BinaryOp::NullishCoalescing
-        )
-        && matches!(classify(&bin.right, scope), Some(Returned::NoBody))
-    {
-        return classify(&bin.left, scope);
-    }
     let value = resolve(returned, scope);
+    let no_body = |expr: &Expr| matches!(classify(expr, scope), Some(Returned::NoBody));
+    // `return body || null`, `return body ?? undefined`, `return c ? body :
+    // null`: the value or no body, as a second `return null` would hand back
+    // (carrick#4513), awaited, in parentheses or through a name alike.
+    if !value.part {
+        match value.expr {
+            Expr::Bin(bin)
+                if matches!(
+                    bin.op,
+                    swc_ecma_ast::BinaryOp::LogicalOr | swc_ecma_ast::BinaryOp::NullishCoalescing
+                ) && no_body(&bin.right) =>
+            {
+                return classify(&bin.left, scope);
+            }
+            Expr::Cond(cond) if no_body(&cond.alt) => return classify(&cond.cons, scope),
+            Expr::Cond(cond) if no_body(&cond.cons) => return classify(&cond.alt, scope),
+            _ => {}
+        }
+    }
     let base_of = |obj: &Expr| -> Option<Span> {
         let obj = resolve(obj, scope);
         match obj.expr {
@@ -1037,6 +1200,7 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
             kind,
             base,
             member: None,
+            caught_own: false,
         }))
     };
     let member = |base, name: Option<String>| {
@@ -1044,6 +1208,7 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
             kind: ShapeKind::Member,
             base,
             member: name,
+            caught_own: false,
         }))
     };
     match value.expr {
@@ -1060,6 +1225,14 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
                 };
                 shape(ShapeKind::Parsed, base_of(&read.obj)?)
             }
+            // `call.catch(() => [])`: the call's value or one of the
+            // function's own (a no-body handler was resolved through above).
+            _ if catches_own_value(call) => Some(Returned::Shape(ReturnShape {
+                kind: ShapeKind::Value,
+                base: call.span,
+                member: None,
+                caught_own: true,
+            })),
             _ => shape(ShapeKind::Value, call.span),
         },
         Expr::OptChain(chain) => match &*chain.base {
@@ -1106,21 +1279,7 @@ fn is_parse(call: &CallExpr) -> bool {
 /// The value `.catch` is called on, where the handler hands back no body:
 /// `null`, `undefined`, `void 0`, or nothing (`() => {}`, a bare `return`).
 fn no_body_catch(call: &CallExpr) -> Option<&Expr> {
-    let Callee::Expr(callee) = &call.callee else {
-        return None;
-    };
-    let Expr::Member(member) = &**callee else {
-        return None;
-    };
-    if !matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "catch") {
-        return None;
-    }
-    let [handler] = call.args.as_slice() else {
-        return None;
-    };
-    if handler.spread.is_some() {
-        return None;
-    }
+    let (receiver, handler) = catch_handler(call)?;
     let no_body = |expr: &Expr| match expr {
         Expr::Ident(ident) => &*ident.sym == "undefined",
         Expr::Lit(swc_ecma_ast::Lit::Null(_)) => true,
@@ -1146,7 +1305,55 @@ fn no_body_catch(call: &CallExpr) -> Option<&Expr> {
             .is_some_and(|block| block_no_body(&block.stmts)),
         _ => false,
     };
-    hands_back_none.then_some(&*member.obj)
+    hands_back_none.then_some(receiver)
+}
+
+/// `receiver.catch(handler)`: the value `.catch` is called on and its one
+/// handler.
+fn catch_handler(call: &CallExpr) -> Option<(&Expr, &swc_ecma_ast::ExprOrSpread)> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(member) = &**callee else {
+        return None;
+    };
+    if !matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "catch") {
+        return None;
+    }
+    let [handler] = call.args.as_slice() else {
+        return None;
+    };
+    if handler.spread.is_some() {
+        return None;
+    }
+    Some((&*member.obj, handler))
+}
+
+/// Whether `call` is `.catch(handler)` whose handler hands back a value of
+/// its own on every path (`() => []`, `() => ({ rows: [] })`), read with no
+/// name followed: one that rethrows or hands back a call is not.
+fn catches_own_value(call: &CallExpr) -> bool {
+    let Some((_, handler)) = catch_handler(call) else {
+        return false;
+    };
+    let scope = Scope::default();
+    let own =
+        |expr: &Expr| classify(expr, &scope).is_none() && unshaped(expr, &scope) == NoChain::Own;
+    match &*handler.expr {
+        Expr::Arrow(arrow) => match &*arrow.body {
+            ArrowFunctionBody::Expr(expr) => own(expr),
+            ArrowFunctionBody::FunctionBody(block) => {
+                let mut returns = Returns::default();
+                block.visit_with(&mut returns);
+                let all_return = block
+                    .stmts
+                    .last()
+                    .is_some_and(|stmt| matches!(stmt, swc_ecma_ast::Stmt::Return(_)));
+                all_return && returns.exprs.iter().all(own)
+            }
+        },
+        _ => false,
+    }
 }
 
 /// A property named in the source: `.data` or `["data"]`.

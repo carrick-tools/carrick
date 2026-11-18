@@ -815,3 +815,24 @@ fn a_wrapper_over_a_sibling_helper_reads_its_response_at_the_deciding_call() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// carrick#4513 P2: `tests/fixtures/site-wrapper-promise-class/`. A wrapper
+/// that hands back a Promise class it builds around the chain (`return new
+/// CallPromise((resolve, reject) => doFetch(...).then(resolve, reject))`)
+/// is a value this pass does not follow, so the caller's response is read
+/// at the deciding call, whole: the client method's declared body. Read at
+/// the platform `fetch` below, it was transport (`machinery_envelope`).
+#[test]
+fn a_wrapper_handing_back_a_promise_class_reads_its_response_at_the_deciding_call() {
+    let repo =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-wrapper-promise-class");
+    let on = scan(&repo, &[]);
+    let file = "src/seed-promise-class-lib.ts";
+    let entry = entry_at(&on, "response", file, 17);
+    assert_ne!(entry["type_state"], "unknown", "{entry:#?}");
+    assert_eq!(
+        captured_flat(&on, &alias_at(&on, "response", file, 17)),
+        "{ format: \"json\"; results: unknown[]; } | { format: \"csv\"; results: string; }",
+        "{entry:#?}"
+    );
+}
