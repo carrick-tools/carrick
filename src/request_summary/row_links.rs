@@ -17,8 +17,11 @@
 //! and what a module loaded by a literal specifier publishes, are still the
 //! module graph's: no row lists a module's exports.
 //!
-//! An import whose declaration no row gives may still be any module of the
-//! service. It changes nothing when it is only called or read; when it may
+//! An import whose declaration no row gives, and whose specifier may name a
+//! module of the repo, may still be any module of the service. A specifier
+//! that names only a package (a declared dependency or a runtime builtin,
+//! claimed by no alias) reaches none, so it contests nothing
+//! ([`ImportedBindings::names_only_a_package`]). It changes nothing when it is only called or read; when it may
 //! change what it holds ([`super::BindingUse::may_change`]), or a file loads
 //! a module by a computed specifier, every exported object, instance and
 //! published getter is contested ([`RowLinks::open`]).
@@ -68,7 +71,8 @@ impl RowLink {
 /// contested ([`RowLinks::open`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Open {
-    /// An import whose declaration no row gives may change what it holds.
+    /// An import whose declaration no row gives, and whose specifier may
+    /// name a module of the repo, may change what it holds.
     UnreadImport,
     /// A file loads a module by a specifier it computes.
     ComputedLoad,
@@ -82,7 +86,16 @@ pub(crate) struct RowLinks {
     /// Bindings whose row names a recorded name at another line than the
     /// declaring file records it on.
     line_disagreements: usize,
+    /// Holes that may change what they hold, skipped because their
+    /// specifier names only a package.
+    package_holes: usize,
+    /// The first imports that opened [`Self::open`]: file, local name,
+    /// specifier. Debug log only ([`Self::describe`]).
+    open_holes: Vec<(PathBuf, String, String)>,
 }
+
+/// How many opening imports [`RowLinks::describe`] names.
+const OPEN_HOLES_SHOWN: usize = 5;
 
 impl RowLinks {
     /// What each import of `files` reaches, as `positions` says. `None`
@@ -118,7 +131,18 @@ impl RowLinks {
                     return None;
                 }
                 if matches!(link, RowLink::Hole(_)) && ir.imported[local].may_change() {
-                    links.open = Some(Open::UnreadImport);
+                    if bindings.names_only_a_package(file, local) {
+                        links.package_holes += 1;
+                    } else {
+                        links.open = Some(Open::UnreadImport);
+                        if links.open_holes.len() < OPEN_HOLES_SHOWN {
+                            links.open_holes.push((
+                                file.clone(),
+                                local.clone(),
+                                bindings.source_of(file, local).unwrap_or("?").to_string(),
+                            ));
+                        }
+                    }
                 }
                 links.links.insert((file.clone(), local.clone()), link);
             }
@@ -219,7 +243,7 @@ impl RowLinks {
 
     /// One line for the run log: the links by kind, the holes by reason,
     /// and why the service's exported values are contested, if they are.
-    pub(crate) fn describe(&self) -> String {
+    pub(crate) fn describe(&self, root: &Path) -> String {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for link in self.links.values() {
             let key = match link {
@@ -238,14 +262,33 @@ impl RowLinks {
             };
             *counts.entry(key).or_default() += 1;
         }
+        let open_holes = if self.open_holes.is_empty() {
+            String::new()
+        } else {
+            let named: Vec<String> = self
+                .open_holes
+                .iter()
+                .map(|(file, local, source)| {
+                    format!(
+                        "{}: {local} from \"{source}\"",
+                        file.strip_prefix(root).unwrap_or(file).display()
+                    )
+                })
+                .collect();
+            format!("; open holes: {}", named.join("; "))
+        };
         format!(
-            "{} import binding(s) {counts:?}, {} on another line; exported values contested: {}",
+            "{} import binding(s) {counts:?}, {} on another line; exported values contested: {}{open_holes}",
             self.links.len(),
             self.line_disagreements,
             match self.open {
-                None => "no",
-                Some(Open::UnreadImport) => "an import no row follows may change one",
-                Some(Open::ComputedLoad) => "a module is loaded by a computed specifier",
+                None if self.package_holes > 0 => {
+                    format!("no ({} hole(s) name only a package)", self.package_holes)
+                }
+                None => "no".to_string(),
+                Some(Open::UnreadImport) => "an import no row follows may change one".to_string(),
+                Some(Open::ComputedLoad) =>
+                    "a module is loaded by a computed specifier".to_string(),
             }
         )
     }
@@ -429,6 +472,160 @@ mod tests {
                 "{edit:?}"
             );
         }
+    }
+
+    /// What `use.ts` reads when nothing is contested.
+    fn all_read() -> Vec<(&'static str, Option<String>)> {
+        vec![
+            read("TOPICS.orders", "orders.created"),
+            read("PREFIX", "svc"),
+            read("BROKEN", "broken.topic"),
+            read("ALIASED.send", "aliased.send"),
+            ("LEGACY.send", None),
+            read("emails", "welcome"),
+            read("getQueue", "later"),
+        ]
+    }
+
+    /// What `use.ts` reads when every exported object and instance is
+    /// contested.
+    fn all_contested() -> Vec<(&'static str, Option<String>)> {
+        vec![
+            ("TOPICS.orders", None),
+            read("PREFIX", "svc"),
+            read("BROKEN", "broken.topic"),
+            ("ALIASED.send", None),
+            ("LEGACY.send", None),
+            ("emails", None),
+            ("getQueue", None),
+        ]
+    }
+
+    /// An import of an unreadable name from a specifier that names only a
+    /// package (a declared dependency, a runtime builtin) reaches no module
+    /// of the repo, so it contests no exported object, however it is used.
+    #[test]
+    fn an_unfollowable_import_that_names_only_a_package_contests_nothing() {
+        for edit in [
+            (
+                "src/other.ts",
+                "import { Kind } from \"@fixture/bus\";\nexport const value = Kind;\n",
+            ),
+            (
+                "src/other.ts",
+                "import { readFileSync } from \"fs\";\nexport const value = readFileSync;\n",
+            ),
+        ] {
+            let Some(on) = walked(&[edit], true) else {
+                return;
+            };
+            let local = if edit.1.contains("Kind") {
+                "Kind"
+            } else {
+                "readFileSync"
+            };
+            assert_eq!(
+                on.link("src/other.ts", local),
+                Some(RowLink::Hole(HoleReason::UnresolvedImport)),
+                "{edit:?}"
+            );
+            let links = on.inputs.links.as_ref().unwrap();
+            assert!(!links.open(), "{edit:?}");
+            assert!(
+                links
+                    .describe(&on.repo)
+                    .contains("1 hole(s) name only a package")
+            );
+            assert_eq!(reads(&on), all_read(), "{edit:?}");
+        }
+    }
+
+    /// A specifier that may name a module of the repo still contests every
+    /// object: an alias with no file behind it, a declared name an alias
+    /// claims with a missing target, a `file:` dependency, and a relative
+    /// barrel nothing resolves.
+    #[test]
+    fn an_unfollowable_import_that_may_name_a_module_of_the_repo_still_contests_every_one() {
+        let alias_claim = "{\"compilerOptions\":{\"target\":\"es2022\",\"module\":\"esnext\",\"moduleResolution\":\"bundler\",\"strict\":true,\"skipLibCheck\":true,\"allowJs\":true,\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"src/lib/*\"],\"@fixture/bus\":[\"src/gen/bus\"]},\"lib\":[\"es2022\",\"dom\"],\"types\":[]},\"include\":[\"src/**/*\"]}";
+        let local_manifest = "{\"name\":\"names-api\",\"private\":true,\"dependencies\":{\"@fixture/bus\":\"^1.0.0\",\"@fixture/queue\":\"^2.0.0\",\"local-pkg\":\"file:../local\"}}";
+        let cases: [(&str, Vec<(&str, &str)>); 4] = [
+            (
+                "thing",
+                vec![(
+                    "src/other.ts",
+                    "import { thing } from \"@lib/missing\";\nexport const value = thing;\n",
+                )],
+            ),
+            (
+                "Kind",
+                vec![
+                    (
+                        "src/other.ts",
+                        "import { Kind } from \"@fixture/bus\";\nexport const value = Kind;\n",
+                    ),
+                    ("tsconfig.json", alias_claim),
+                ],
+            ),
+            (
+                "thing",
+                vec![
+                    (
+                        "src/other.ts",
+                        "import { thing } from \"local-pkg\";\nexport const value = thing;\n",
+                    ),
+                    ("package.json", local_manifest),
+                ],
+            ),
+            (
+                "thing",
+                vec![(
+                    "src/other.ts",
+                    "import { thing } from \"./generated/barrel\";\nexport const value = thing;\n",
+                )],
+            ),
+        ];
+        for (local, edit) in cases {
+            let Some(on) = walked(&edit, true) else {
+                return;
+            };
+            assert_eq!(
+                on.link("src/other.ts", local),
+                Some(RowLink::Hole(HoleReason::UnresolvedImport)),
+                "{edit:?}"
+            );
+            let links = on.inputs.links.as_ref().unwrap();
+            assert!(links.open(), "{edit:?}");
+            // The debug line names the import that opened it.
+            let described = links.describe(&on.repo);
+            assert!(
+                described.contains(&format!(
+                    "open holes: services/names/src/other.ts: {local} from \""
+                )),
+                "{described}"
+            );
+            assert_eq!(reads(&on), all_contested(), "{edit:?}");
+        }
+    }
+
+    /// A package import that hands an exported object to an unread callee
+    /// contests that object (a use of the object itself), and nothing else.
+    #[test]
+    fn a_package_import_handed_an_object_contests_only_that_object() {
+        let edit = (
+            "src/other.ts",
+            "import { stamp } from \"@fixture/bus\";\nimport { ALIASED } from \"@lib/aliased\";\nstamp(ALIASED);\n",
+        );
+        let Some(on) = walked(&[edit], true) else {
+            return;
+        };
+        assert_eq!(
+            on.link("src/other.ts", "stamp"),
+            Some(RowLink::Hole(HoleReason::UnresolvedImport))
+        );
+        assert!(!on.inputs.links.as_ref().unwrap().open());
+        let mut want = all_read();
+        want[3] = ("ALIASED.send", None);
+        assert_eq!(reads(&on), want);
     }
 
     /// A module that writes an object through its import, or a namespace
