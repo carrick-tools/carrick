@@ -6187,8 +6187,9 @@ fn a_re_check_marks_a_verdict_against_a_changed_service_it_did_not_read() {
         verdict["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains(
-                "(inventory has changed since it was indexed and was not re-read: this compares \
-             against its indexed code; run `carrick check --changed`)"
+                "(inventory has changed since it was indexed and this check did not re-read it, \
+             so the verdict uses its indexed code. `carrick check --changed` gives the current \
+             verdict.)"
             )),
         "{answer:#}"
     );

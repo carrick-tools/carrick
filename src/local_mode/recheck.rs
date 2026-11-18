@@ -1951,13 +1951,23 @@ fn state_stale_counterparts(items: &mut [IndexedItem], stale: &[String]) {
         if named.is_empty() {
             continue;
         }
-        let (who, has) = match named.as_slice() {
-            [one] => ((*one).to_string(), "has"),
-            many => (many.join(", "), "have"),
+        let (who, changed, re_read, uses) = match named.as_slice() {
+            [one] => (
+                (*one).to_string(),
+                "has changed since it was indexed",
+                "did not re-read it",
+                "its",
+            ),
+            many => (
+                many.join(", "),
+                "have changed since they were indexed",
+                "did not re-read them",
+                "their",
+            ),
         };
         verdict.detail = format!(
-            "{} ({who} {has} changed since it was indexed and was not re-read: this compares \
-             against its indexed code; run `carrick check --changed`)",
+            "{} ({who} {changed} and this check {re_read}, so the verdict uses {uses} indexed \
+             code. `carrick check --changed` gives the current verdict.)",
             verdict.detail
         );
         if verdict.state != "not_checked" && verdict.result.as_deref() == Some("compatible") {
@@ -3272,13 +3282,18 @@ mod tests {
         assert_eq!(marked.result.as_deref(), Some("compatible"));
         assert_eq!(
             marked.detail,
-            "both sides agree (emitter has changed since it was indexed and was not re-read: \
-             this compares against its indexed code; run `carrick check --changed`)"
+            "both sides agree (emitter has changed since it was indexed and this check did not \
+             re-read it, so the verdict uses its indexed code. `carrick check --changed` gives \
+             the current verdict.)"
         );
         assert_eq!(items[1].verdict, before.verdict, "a current counterpart");
         let mismatch = items[2].verdict.as_ref().expect("a verdict");
         assert_eq!(mismatch.state, "resolved", "a mismatch stays a finding");
-        assert!(mismatch.detail.contains("run `carrick check --changed`"));
+        assert!(
+            mismatch
+                .detail
+                .contains("`carrick check --changed` gives the current verdict.")
+        );
     }
 
     /// carrick#2826: a re-scan holds every sidecar to its own heap cap, which
