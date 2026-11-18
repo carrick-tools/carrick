@@ -53,15 +53,21 @@ the function you asked about. Sort every row into one of these:
   `mutationFields_handler` spans a whole file of resolvers. Read the source at
   `call_site_line` to name the field, then confirm it with
   `get_operation({{SCOPE}}, method: "QUERY" or "MUTATION", path: "<field>")`.
+  A `call_entries` above 1 means more than one field in that file makes the
+  call: read every call in the span, not only `call_site_line`.
 - **Middleware.** A `use_handler` row gates a router. Grep that router's file
   for `.route(` and `.use(` to find what is mounted behind it, list those routes
-  with `get_api_endpoints` and `path_contains` on each mount path, and give the
-  count.
+  with `get_api_endpoints` and `path_contains` on the outermost mount path (one
+  call also returns the routers mounted under it), and give the count.
+- **Uses the check without gating on it.** A handler that only branches on the
+  result, or lets some callers past it, is not a gate. List it apart, under
+  "uses X without enforcing it", with file:line and what it does instead.
 - **Dead end.** A chain whose top is an anonymous callback (a name like
   `andThen_handler`), a class method, a webhook or event registry, or `<module>`
   (top-level code, whose result is passed around as a value the index does not
-  follow). Grep its file for the router or registration call that runs it. If
-  that finds the route, add it, marked "found by grep". If not, list it under
+  follow). Grep the repo for the top function's name and follow its importers,
+  one hop at a time, until you reach the router or registration call that runs
+  it. If that finds the route, add it, marked "found by grep". If not, list it under
   "chains that stop", with file:line and where it stops.
 
 Rows under `unfollowed_calls` may also call the function: read each one in
@@ -74,6 +80,8 @@ get_operation({{SCOPE}}, method: "<METHOD>", path: "<path>")
 ```
 
 Read `consumers` only: service and `call_file_location`. Skip `unread_sites`.
+Where more than 10 endpoints were reached, do this for the 10 the question
+cares about most and say how many were not looked up.
 
 ## 4. Report
 
@@ -84,6 +92,7 @@ Read `consumers` only: service and `call_file_location`. Skip `unread_sites`.
 Then, apart from the table:
 
 - chains that stop, each with file:line and where it stops;
+- handlers that use X without enforcing it, each with file:line;
 - the lines that do X but reach no endpoint (scripts, top-level code, frontend
   pages), from grep, each with file:line;
 - for a question about frontend code only (pages, components), say that the
