@@ -24,11 +24,9 @@
 
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import * as readline from 'node:readline';
 import { Project } from 'ts-morph';
 import {
   SLOWEST_SLOTS,
@@ -39,7 +37,7 @@ import {
 } from '../src/infer-timing.js';
 import { TypeInferrer } from '../src/type-inferrer.js';
 import type { InferRequestItem, InferSlotTiming, InferTiming } from '../src/types.js';
-import { SIDECAR_PATH } from './helpers.js';
+import { ENGINE_WAIT_MS, SidecarClient } from './helpers.js';
 
 const TSCONFIG = JSON.stringify({
   compilerOptions: { target: 'es2020', module: 'commonjs', strict: true, skipLibCheck: true, types: [] },
@@ -424,27 +422,13 @@ describe('an infer batch names its slowest requests (carrick#1985)', () => {
 
     /** Send `requests` to a fresh sidecar, one at a time, and return each terminal frame. */
     const answers = async (requests: Array<Record<string, unknown>>): Promise<Frame[]> => {
-      const child: ChildProcessWithoutNullStreams = spawn('node', [SIDECAR_PATH], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      child.stderr.resume();
-      const lines = readline.createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+      const client = new SidecarClient();
+      await client.start();
       const out: Frame[] = [];
       try {
-        for (const request of requests) {
-          child.stdin.write(JSON.stringify(request) + '\n');
-          for (;;) {
-            const next = await lines.next();
-            assert.ok(!next.done, `the sidecar closed before answering ${String(request.request_id)}`);
-            if (!next.value.trim()) continue;
-            const frame = JSON.parse(next.value) as Frame;
-            if (frame.request_id !== request.request_id || frame.status === 'progress') continue;
-            out.push(frame);
-            break;
-          }
-        }
+        for (const request of requests) out.push(await client.send<Frame>(request, ENGINE_WAIT_MS));
       } finally {
-        child.kill();
+        await client.stop();
       }
       return out;
     };

@@ -14,14 +14,12 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import * as assert from 'node:assert';
-import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import * as readline from 'node:readline';
 import type { InferRequestItem } from '../src/types.js';
 import { INFER_CACHE_ENV } from '../src/infer-cache.js';
-import { SIDECAR_PATH } from './helpers.js';
+import { ENGINE_WAIT_MS, SidecarClient } from './helpers.js';
 
 interface Frame {
   request_id: string;
@@ -53,30 +51,15 @@ interface Run {
 
 /** Send `requests` to a fresh sidecar with `env`, one at a time. */
 async function run(requests: Array<Record<string, unknown>>, env: NodeJS.ProcessEnv): Promise<Run> {
-  const child = spawn('node', [SIDECAR_PATH], { stdio: ['pipe', 'pipe', 'pipe'], env });
-  let stderr = '';
-  child.stderr.on('data', (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-  const lines = readline.createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  const client = new SidecarClient();
+  await client.start(env);
   const frames: Frame[] = [];
   try {
-    for (const request of requests) {
-      child.stdin.write(JSON.stringify(request) + '\n');
-      for (;;) {
-        const next = await lines.next();
-        assert.ok(!next.done, `the sidecar closed before answering ${String(request.request_id)}`);
-        if (!next.value.trim()) continue;
-        const frame = JSON.parse(next.value) as Frame;
-        if (frame.request_id !== request.request_id || frame.status === 'progress') continue;
-        frames.push(frame);
-        break;
-      }
-    }
+    for (const request of requests) frames.push(await client.send<Frame>(request, ENGINE_WAIT_MS));
   } finally {
-    child.kill();
+    await client.stop();
   }
-  return { frames, served: stderr.includes('from the kept answer') };
+  return { frames, served: client.stderr().includes('from the kept answer') };
 }
 
 describe('a kept infer answer (carrick#2843)', () => {

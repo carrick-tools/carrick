@@ -194,11 +194,225 @@ export function useRegistry(registry: LocalRegistry, scratch: string): () => voi
 }
 
 /**
+ * The longest any test waits for the engine to answer one request (carrick#4781).
+ * The slowest real answer in the suite is a capture_v2 or check_v2 over the
+ * fixture corpus, about 20 s on a loaded CI runner; two minutes is far above
+ * that, so only a silent engine reaches it.
+ */
+export const ENGINE_WAIT_MS = 120_000;
+
+/**
+ * Start the compiler engine as a test child. `--inspect-port=0` arms the
+ * inspector on a free port without opening it: a stuck engine can then be
+ * asked for its JavaScript stack with SIGUSR1 (see `EngineWatch.stack`),
+ * which a plain Node child does not answer with a dump and which a busy loop
+ * cannot refuse, because the inspector runs on its own thread.
+ */
+export function spawnEngine(
+  script: string = SIDECAR_PATH,
+  env?: NodeJS.ProcessEnv,
+  execPath: string = 'node'
+): ChildProcessWithoutNullStreams {
+  return spawn(execPath, ['--inspect-port=0', script], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    ...(env === undefined ? {} : { env: { ...process.env, ...env } }),
+  });
+}
+
+/** One line of engine output, cut so a frame with no newline cannot flood a failure message. */
+const EVIDENCE_LINE_CHARS = 2000;
+/** Engine stderr kept, as raw text: a partial last line counts as a line. */
+const STDERR_KEPT_CHARS = 128 * 1024;
+const STDERR_TAIL_LINES = 40;
+
+const cut = (text: string): string =>
+  text.length <= EVIDENCE_LINE_CHARS ? text : `${text.slice(0, EVIDENCE_LINE_CHARS)}... (${text.length - EVIDENCE_LINE_CHARS} more chars)`;
+
+/**
+ * What an engine child has said so far, kept as evidence for the test that
+ * waits on it: the tail of its stderr as raw text (so a line it never ended
+ * still shows) and the last frame on its stdout, with any unfinished frame.
+ */
+export class EngineWatch {
+  private stderrText = '';
+  private lastLine = '';
+  private partial = '';
+
+  /** `stdout: false` for a test that reads stdout itself and may pause it. */
+  constructor(
+    readonly child: ChildProcessWithoutNullStreams,
+    options: { stdout?: boolean } = {}
+  ) {
+    child.stderr.on('data', (data: Buffer) => {
+      this.stderrText = (this.stderrText + data.toString()).slice(-STDERR_KEPT_CHARS);
+    });
+    if (options.stdout !== false) {
+      child.stdout.on('data', (data: Buffer) => {
+        const lines = (this.partial + data.toString()).split('\n');
+        this.partial = lines.pop() ?? '';
+        for (const line of lines) if (line.trim()) this.lastLine = line;
+      });
+    }
+  }
+
+  /** Everything the engine wrote to stderr in its life (up to the kept tail). */
+  stderr(): string {
+    return this.stderrText;
+  }
+
+  /** The last `lines` lines of stderr, an unfinished last line included. */
+  stderrTail(lines: number = STDERR_TAIL_LINES): string {
+    const all = this.stderrText.split('\n');
+    if (all[all.length - 1] === '') all.pop();
+    return all.slice(-lines).map(cut).join('\n');
+  }
+
+  /** The last whole frame on stdout, and the unfinished one if there is one. */
+  lastFrame(): string {
+    const whole = this.lastLine ? cut(this.lastLine) : '(none)';
+    return this.partial ? `${whole}\n  unfinished (no newline yet): ${cut(this.partial)}` : whole;
+  }
+
+  alive(): boolean {
+    const child = this.child;
+    return child.exitCode === null && child.signalCode === null;
+  }
+
+  /**
+   * The engine's JavaScript stack, top first, or why there is none. SIGUSR1
+   * opens the inspector the spawn armed; Debugger.pause stops the engine
+   * wherever it is, in a synchronous loop too.
+   */
+  async stack(limitMs: number = 3000): Promise<string> {
+    const pid = this.child.pid;
+    if (!this.alive() || pid === undefined) return 'unavailable: the engine had already exited';
+    if (typeof WebSocket === 'undefined') return 'unavailable: no WebSocket in this Node';
+    const mark = this.stderrText.length;
+    const deadline = Date.now() + limitMs;
+    try {
+      process.kill(pid, 'SIGUSR1');
+      let url: string | undefined;
+      while (Date.now() < deadline && url === undefined) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        url = /ws:\/\/\S+/.exec(this.stderrText.slice(Math.max(0, mark - 1)))?.[0];
+      }
+      if (url === undefined) return `unavailable: no inspector address within ${limitMs} ms`;
+      const ws = new WebSocket(url);
+      const frames = await new Promise<string>((resolve) => {
+        const scripts = new Map<string, string>();
+        const timer = setTimeout(() => {
+          resolve('unavailable: the inspector did not pause the engine in time');
+        }, Math.max(500, deadline - Date.now()));
+        ws.onerror = () => {
+          clearTimeout(timer);
+          resolve('unavailable: the inspector connection failed');
+        };
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ id: 1, method: 'Debugger.enable' }));
+          ws.send(JSON.stringify({ id: 2, method: 'Debugger.pause' }));
+        };
+        ws.onmessage = (event) => {
+          const message = JSON.parse(String(event.data)) as {
+            method?: string;
+            params?: {
+              url?: string;
+              scriptId?: string;
+              callFrames?: Array<{ functionName: string; location: { scriptId: string; lineNumber: number; columnNumber: number } }>;
+            };
+          };
+          if (message.method === 'Debugger.scriptParsed' && message.params?.scriptId) {
+            scripts.set(message.params.scriptId, message.params.url ?? '');
+          }
+          if (message.method === 'Debugger.paused' && message.params?.callFrames) {
+            clearTimeout(timer);
+            resolve(
+              message.params.callFrames
+                .slice(0, 12)
+                .map((f) => `  at ${f.functionName || '(anonymous)'} (${scripts.get(f.location.scriptId) || 'unknown script'}:${f.location.lineNumber + 1}:${f.location.columnNumber + 1})`)
+                .join('\n')
+            );
+          }
+        };
+      });
+      try {
+        ws.close();
+      } catch {
+        // The engine is killed next.
+      }
+      return frames;
+    } catch (err) {
+      return `unavailable: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  /**
+   * The error for a wait that ran out: what was waited for, for how long,
+   * whether the engine was still alive, its last stderr lines and last
+   * frame, and (`diagnose`) its JavaScript stack. The engine is killed after
+   * the evidence is read (`kill`), so a stuck child cannot hold the test
+   * process, and the shard, until the per-file limit.
+   */
+  async expire(
+    what: { action: string; id: string },
+    limitMs: number,
+    waitedMs: number,
+    options: { kill?: boolean; diagnose?: boolean } = {}
+  ): Promise<Error> {
+    const alive = this.alive();
+    // Its own words first: the stack request makes the inspector write to stderr.
+    const lastFrame = this.lastFrame();
+    const stderrTail = this.stderrTail() || '  (nothing)';
+    const stack = options.diagnose === false ? 'not asked' : await this.stack();
+    const file = path.relative(process.cwd(), process.argv[1] ?? '') || '(unknown test file)';
+    const message = [
+      `Request timeout: no answer to '${what.action}' (${what.id}) within ${limitMs} ms (waited ${waitedMs} ms)`,
+      `  test file: ${file}`,
+      `  engine pid ${String(this.child.pid)}: ${alive ? 'still alive' : `already exited (code ${String(this.child.exitCode)}, signal ${String(this.child.signalCode)})`}`,
+      `  last frame it sent: ${lastFrame}`,
+      `  JavaScript stack of the engine:\n${stack}`,
+      `  last ${STDERR_TAIL_LINES} lines of its stderr:\n${stderrTail}`,
+    ].join('\n');
+    if (options.kill !== false && this.alive()) this.child.kill('SIGKILL');
+    return new Error(message);
+  }
+}
+
+/**
+ * Wait for `wait` (the engine's answer, or its exit) for at most `limitMs`.
+ * On the limit the engine is killed and the wait fails with `watch`'s
+ * evidence (carrick#4781). Every test that waits on an engine child goes
+ * through this, so none can sit silent until the shard's per-file kill.
+ */
+export async function boundedEngineWait<T>(
+  watch: EngineWatch,
+  wait: Promise<T>,
+  what: { action: string; id: string },
+  limitMs: number = ENGINE_WAIT_MS,
+  options: { kill?: boolean; diagnose?: boolean } = {}
+): Promise<T> {
+  const began = Date.now();
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      watch.expire(what, limitMs, Date.now() - began, options).then(reject, reject);
+    }, limitMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([wait, limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Helper class to manage sidecar process communication
  */
 export class SidecarClient {
   private process: ChildProcessWithoutNullStreams | null = null;
+  private watch: EngineWatch | null = null;
   private responseBuffer: string = '';
+  private readonly seen: unknown[] = [];
   private responsePromises: Array<{
     resolve: (response: unknown) => void;
     reject: (error: Error) => void;
@@ -207,18 +421,29 @@ export class SidecarClient {
   /** `script` is the program to run; tests of this class give a stand-in. */
   constructor(private readonly script: string = SIDECAR_PATH) {}
 
+  /** Every frame the engine has sent, progress frames included. */
+  frames(): unknown[] {
+    return [...this.seen];
+  }
+
+  /** Everything the engine wrote to stderr so far. */
+  stderr(): string {
+    return this.watch?.stderr() ?? '';
+  }
+
   /**
    * Start the sidecar process, with `env` added to this process's environment
    */
   async start(env?: NodeJS.ProcessEnv): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.process = spawn('node', [this.script], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        ...(env === undefined ? {} : { env: { ...process.env, ...env } }),
-      });
+      const child = spawnEngine(this.script, env);
+      this.process = child;
+      this.watch = new EngineWatch(child);
+      // A write to an engine that is gone is the answer's failure, not a crash.
+      child.stdin.on('error', () => {});
 
       // Handle stdout (JSON responses)
-      this.process.stdout.on('data', (data: Buffer) => {
+      child.stdout.on('data', (data: Buffer) => {
         this.responseBuffer += data.toString();
 
         // Process complete lines
@@ -229,6 +454,7 @@ export class SidecarClient {
           if (line.trim()) {
             try {
               const response = JSON.parse(line);
+              this.seen.push(response);
               // A progress frame is not an answer (carrick#1914).
               if (response?.status === 'progress') continue;
               const promise = this.responsePromises.shift();
@@ -243,7 +469,7 @@ export class SidecarClient {
       });
 
       // Handle stderr (logs)
-      this.process.stderr.on('data', (data: Buffer) => {
+      child.stderr.on('data', (data: Buffer) => {
         // Log to console for debugging
         const msg = data.toString().trim();
         if (msg) {
@@ -251,15 +477,22 @@ export class SidecarClient {
         }
       });
 
-      this.process.on('error', (err) => {
+      child.on('error', (err) => {
         reject(err);
       });
 
       // A sidecar that dies mid-request answers nothing: fail the waiting
-      // requests now, naming the death, instead of leaving them pending.
-      this.process.on('exit', (code, signal) => {
+      // requests now, naming the death and what it said, instead of leaving
+      // them pending.
+      child.on('exit', (code, signal) => {
         for (const p of this.responsePromises.splice(0)) {
-          p.reject(new Error(`sidecar exited (code ${code}, signal ${signal}) before it answered`));
+          p.reject(
+            new Error(
+              `sidecar exited (code ${code}, signal ${signal}) before it answered\n` +
+                `  last frame it sent: ${this.watch?.lastFrame() ?? '(none)'}\n` +
+                `  last ${STDERR_TAIL_LINES} lines of its stderr:\n${this.watch?.stderrTail() || '  (nothing)'}`
+            )
+          );
         }
       });
 
@@ -269,33 +502,40 @@ export class SidecarClient {
   }
 
   /**
-   * Send a request and wait for response
+   * Send a request and wait for the response. On the limit (default 10 s;
+   * compiler-heavy actions like capture_v2 build multiple ts programs and
+   * need longer on slow CI runners; `ENGINE_WAIT_MS` for the longest) the
+   * engine is killed and the failure carries `EngineWatch.expire`'s evidence.
+   * `options` turn the kill and the stack off, for a caller that handles a
+   * stuck engine itself.
    */
   async send<T = unknown>(
     request: Record<string, unknown>,
-    timeoutMs: number = 10000
+    timeoutMs: number = 10000,
+    options: { kill?: boolean; diagnose?: boolean } = {}
   ): Promise<T> {
-    if (!this.process) {
+    if (!this.process || !this.watch) {
       throw new Error('Sidecar not started');
     }
-
-    return new Promise((resolve, reject) => {
-      this.responsePromises.push({ resolve: resolve as (r: unknown) => void, reject });
-
-      const json = JSON.stringify(request);
-      this.process!.stdin.write(json + '\n');
-
-      // Timeout (default 10s; compiler-heavy actions like capture_v2 build
-      // multiple ts programs and need longer on slow CI runners).
-      const timer = setTimeout(() => {
-        const index = this.responsePromises.findIndex((p) => p.resolve === resolve);
-        if (index !== -1) {
-          this.responsePromises.splice(index, 1);
-          reject(new Error(`Request timeout: no answer to '${String(request.action)}' (${String(request.request_id)}) within ${timeoutMs} ms`));
-        }
-      }, timeoutMs);
-      timer.unref();
+    let entry: { resolve: (response: unknown) => void; reject: (error: Error) => void } | undefined;
+    const answer = new Promise<T>((resolve, reject) => {
+      entry = { resolve: resolve as (r: unknown) => void, reject };
+      this.responsePromises.push(entry);
+      this.process!.stdin.write(JSON.stringify(request) + '\n');
     });
+    try {
+      return await boundedEngineWait(
+        this.watch,
+        answer,
+        { action: String(request.action), id: String(request.request_id) },
+        timeoutMs,
+        options
+      );
+    } catch (err) {
+      const index = this.responsePromises.indexOf(entry!);
+      if (index !== -1) this.responsePromises.splice(index, 1);
+      throw err;
+    }
   }
 
   /**
@@ -307,16 +547,16 @@ export class SidecarClient {
   async stop(graceMs: number = 5000): Promise<void> {
     const child = this.process;
     if (!child) return;
-    this.process = null;
-    const gone = new Promise<void>((resolve) => {
+    const closed = new Promise<void>((resolve) => {
       if (child.exitCode !== null || child.signalCode !== null) resolve();
       else child.once('exit', () => resolve());
     });
-    this.process = child;
-    try {
-      await this.send({ action: 'shutdown', request_id: 'shutdown' }, 3000);
-    } catch {
-      // Ignore shutdown errors
+    if (this.watch?.alive()) {
+      try {
+        await this.send({ action: 'shutdown', request_id: 'shutdown' }, 3000, { kill: false, diagnose: false });
+      } catch {
+        // Ignore shutdown errors
+      }
     }
     this.process = null;
     child.kill();
@@ -324,8 +564,10 @@ export class SidecarClient {
       console.error(`[helpers] sidecar ignored SIGTERM for ${graceMs} ms (pid ${child.pid}); killing it`);
       child.kill('SIGKILL');
     }, graceMs);
-    await gone;
+    await closed;
     clearTimeout(timer);
+    // The pipes may still hold its last words for a tick after the exit.
+    await new Promise((resolve) => setImmediate(resolve));
   }
 }
 
