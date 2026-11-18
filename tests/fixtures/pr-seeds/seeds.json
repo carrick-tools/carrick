@@ -6,7 +6,8 @@
     "rpc": ["rpc-api"],
     "shelf": ["rpc-shelf"],
     "jobs": ["jobs-sender", "jobs-worker"],
-    "parcel": ["parcel-desk"]
+    "parcel": ["parcel-desk"],
+    "desk": ["desk-api", "desk-web"]
   },
   "main_scans": {
     "shared": ["orders-api", "storefront", "orders-api"],
@@ -14,7 +15,8 @@
     "rpc": ["rpc-api"],
     "shelf": ["rpc-shelf"],
     "jobs": ["jobs-sender", "jobs-worker", "jobs-sender"],
-    "parcel": ["parcel-desk"]
+    "parcel": ["parcel-desk"],
+    "desk": ["desk-api", "desk-web", "desk-api"]
   },
   "seeds": [
     {
@@ -387,6 +389,23 @@
         "rows": []
       },
       "known_miss": {"stage": "finding", "issues": ["carrick#3224"]}
+    },
+    {
+      "name": "http-route-path-into-runtime-head",
+      "protocol": "http",
+      "change": "quiet",
+      "repo": "desk-api",
+      "edits": [
+        {"op": "replace", "file": "src/desk.ts", "pairs": [["app.get(\"/api/v1/desk/tickets\", listTickets);", "export function mountTickets(heads: readonly string[]): void {\n  for (const head of heads) {\n    app.get(`${head}desk/tickets`, listTickets);\n  }\n}"]]},
+        {"op": "replace", "file": "__llm__/analyze-file/desk.json", "pairs": [["\"line_number\": 8", "\"line_number\": 10"], ["\"@line:8\"", "\"@line:10\""]]}
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": []
+      },
+      "known_miss": {"stage": "finding", "issues": ["carrick#4800"]}
     },
     {
       "name": "trpc-procedure-added",
