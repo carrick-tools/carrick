@@ -1369,6 +1369,42 @@ mod tests {
         }
     }
 
+    /// A bare builtin without the `node:` prefix, in every import form.
+    #[test]
+    fn names_only_a_package_is_true_for_a_bare_builtin_in_every_import_form() {
+        let repo = tree(&[
+            ("package.json", r#"{"name":"app"}"#),
+            ("src/app.ts", "export const app = 1;"),
+        ]);
+        let index = WorkspaceIndex::build_with_aliases(repo.path(), None);
+        // The specifier is the same whether the file writes a named,
+        // namespace, default or type-only import of it.
+        for specifier in ["crypto", "fs/promises", "node:crypto", "path"] {
+            assert!(
+                index.names_only_a_package(Path::new("src/app.ts"), specifier),
+                "{specifier}"
+            );
+        }
+    }
+
+    /// A dependency declared only in the repo root manifest, imported from a
+    /// service directory with no manifest of its own.
+    #[test]
+    fn names_only_a_package_reads_the_root_manifest_for_a_manifestless_service() {
+        let repo = tree(&[
+            (
+                "package.json",
+                r#"{"name":"root","dependencies":{"root-dep":"^1.0.0"}}"#,
+            ),
+            ("apps/svc/src/main.ts", "export const main = 1;"),
+        ]);
+        let index = WorkspaceIndex::build_with_aliases(repo.path(), None);
+        let from = Path::new("apps/svc/src/main.ts");
+        assert!(index.names_only_a_package(from, "root-dep"));
+        assert!(index.names_only_a_package(from, "root-dep/sub"));
+        assert!(!index.names_only_a_package(from, "undeclared"));
+    }
+
     fn internal(path: &str) -> Resolution {
         Resolution::Internal(PathBuf::from(path))
     }

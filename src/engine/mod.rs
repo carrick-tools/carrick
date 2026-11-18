@@ -13718,7 +13718,7 @@ fn discover_with_positions(
         debug!(
             "Position rows for service {}: {}",
             service.service_name.as_deref().unwrap_or("(root)"),
-            links.describe()
+            links.describe(repo_root)
         );
     }
     if let Some(row_calls) = &request_inputs.row_calls {

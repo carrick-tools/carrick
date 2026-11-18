@@ -472,6 +472,13 @@ pub fn resolve_call_edges(
         };
         let wanted = &bindings_wanted[canonical];
         for local in &wanted.locals {
+            if let Some(symbol) = index.imports.get(local) {
+                bindings
+                    .sources
+                    .entry(index.path.clone())
+                    .or_default()
+                    .insert(local.clone(), symbol.source.clone());
+            }
             if index.imports.get(local).is_some_and(|symbol| {
                 resolver
                     .workspace
@@ -967,6 +974,9 @@ pub struct ImportedBindings {
     /// The locals each file imports from a specifier that names only a
     /// package ([`WorkspaceIndex::names_only_a_package`]).
     packages: HashMap<PathBuf, BTreeSet<String>>,
+    /// The specifier each wanted local was imported from, kept so a debug
+    /// line can name the import that holds an object open.
+    sources: HashMap<PathBuf, BTreeMap<String, String>>,
 }
 
 impl ImportedBindings {
@@ -976,6 +986,11 @@ impl ImportedBindings {
         self.packages
             .get(importer)
             .is_some_and(|locals| locals.contains(local))
+    }
+
+    /// The specifier `local` was imported from in `importer`, for logs only.
+    pub fn source_of(&self, importer: &Path, local: &str) -> Option<&str> {
+        self.sources.get(importer)?.get(local).map(String::as_str)
     }
 
     /// What `local`, imported by `importer`, names, when resolution reached a

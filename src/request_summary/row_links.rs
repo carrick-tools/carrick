@@ -89,7 +89,13 @@ pub(crate) struct RowLinks {
     /// Holes that may change what they hold, skipped because their
     /// specifier names only a package.
     package_holes: usize,
+    /// The first imports that opened [`Self::open`]: file, local name,
+    /// specifier. Debug log only ([`Self::describe`]).
+    open_holes: Vec<(PathBuf, String, String)>,
 }
+
+/// How many opening imports [`RowLinks::describe`] names.
+const OPEN_HOLES_SHOWN: usize = 5;
 
 impl RowLinks {
     /// What each import of `files` reaches, as `positions` says. `None`
@@ -129,6 +135,13 @@ impl RowLinks {
                         links.package_holes += 1;
                     } else {
                         links.open = Some(Open::UnreadImport);
+                        if links.open_holes.len() < OPEN_HOLES_SHOWN {
+                            links.open_holes.push((
+                                file.clone(),
+                                local.clone(),
+                                bindings.source_of(file, local).unwrap_or("?").to_string(),
+                            ));
+                        }
                     }
                 }
                 links.links.insert((file.clone(), local.clone()), link);
@@ -230,7 +243,7 @@ impl RowLinks {
 
     /// One line for the run log: the links by kind, the holes by reason,
     /// and why the service's exported values are contested, if they are.
-    pub(crate) fn describe(&self) -> String {
+    pub(crate) fn describe(&self, root: &Path) -> String {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for link in self.links.values() {
             let key = match link {
@@ -249,8 +262,23 @@ impl RowLinks {
             };
             *counts.entry(key).or_default() += 1;
         }
+        let open_holes = if self.open_holes.is_empty() {
+            String::new()
+        } else {
+            let named: Vec<String> = self
+                .open_holes
+                .iter()
+                .map(|(file, local, source)| {
+                    format!(
+                        "{}: {local} from \"{source}\"",
+                        file.strip_prefix(root).unwrap_or(file).display()
+                    )
+                })
+                .collect();
+            format!("; open holes: {}", named.join("; "))
+        };
         format!(
-            "{} import binding(s) {counts:?}, {} on another line; exported values contested: {}",
+            "{} import binding(s) {counts:?}, {} on another line; exported values contested: {}{open_holes}",
             self.links.len(),
             self.line_disagreements,
             match self.open {
@@ -503,7 +531,11 @@ mod tests {
             );
             let links = on.inputs.links.as_ref().unwrap();
             assert!(!links.open(), "{edit:?}");
-            assert!(links.describe().contains("1 hole(s) name only a package"));
+            assert!(
+                links
+                    .describe(&on.repo)
+                    .contains("1 hole(s) name only a package")
+            );
             assert_eq!(reads(&on), all_read(), "{edit:?}");
         }
     }
@@ -561,7 +593,16 @@ mod tests {
                 Some(RowLink::Hole(HoleReason::UnresolvedImport)),
                 "{edit:?}"
             );
-            assert!(on.inputs.links.as_ref().unwrap().open(), "{edit:?}");
+            let links = on.inputs.links.as_ref().unwrap();
+            assert!(links.open(), "{edit:?}");
+            // The debug line names the import that opened it.
+            let described = links.describe(&on.repo);
+            assert!(
+                described.contains(&format!(
+                    "open holes: services/names/src/other.ts: {local} from \""
+                )),
+                "{described}"
+            );
             assert_eq!(reads(&on), all_contested(), "{edit:?}");
         }
     }

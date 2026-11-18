@@ -235,7 +235,7 @@ fn census_repo(root: &Path, positions: &Path) -> RepoCensus {
         if links.open() {
             census
                 .open_services
-                .push(format!("{label}: {}", links.describe()));
+                .push(format!("{label}: {}", links.describe(&root)));
         }
         let mut files: Vec<&PathBuf> = inputs.files.keys().collect();
         files.sort();
