@@ -1625,8 +1625,10 @@ pub enum LibraryClaim {
         /// `/functions/v1/price-quote`). Written by the store's picker from
         /// the library's own source; the verifier holds it to its context and
         /// never checks its value. An empty value drops the op on read.
+        /// Boxed, as `runs` is, so an op stays near the size of the other
+        /// claims.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        name_prefix: Option<String>,
+        name_prefix: Option<Box<String>>,
         /// HTTP (label v2): where the base URL the path joins sits.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<ClaimSlot>,
@@ -7062,7 +7064,7 @@ mod tests {
                         method: Some("POST".into()),
                         method_key: Some(slot()),
                         method_default: Some("GET".into()),
-                        name_prefix: Some("/functions/v1/".into()),
+                        name_prefix: Some(Box::new("/functions/v1/".into())),
                         base: Some(slot()),
                         runs: Some(Box::new(RunsSlot {
                             arg: 0,
@@ -7947,7 +7949,10 @@ mod tests {
         let LibraryClaim::Op { name_prefix, .. } = &claim else {
             panic!("not an op: {claim:?}");
         };
-        assert_eq!(name_prefix.as_deref(), Some("/functions/v1/"));
+        assert_eq!(
+            name_prefix.as_deref().map(String::as_str),
+            Some("/functions/v1/")
+        );
         assert_eq!(serde_json::to_value(&claim).unwrap(), written);
 
         let mut before = written;

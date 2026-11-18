@@ -566,7 +566,7 @@ impl SiteLabel {
                     // A prefix goes before the value of a name slot; on any
                     // other name it has nothing to stand before.
                     name_prefix: match name.as_deref() {
-                        Some(OpName::Slot(_)) => name_prefix.clone(),
+                        Some(OpName::Slot(_)) => name_prefix.as_deref().cloned(),
                         _ => None,
                     },
                     payload: payload.as_ref().map(slot),
