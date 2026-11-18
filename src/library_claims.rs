@@ -961,6 +961,73 @@ fn readable_sites<'a>(
         .filter(move |site| site.contest(|on, used| export.classify(on, used)).is_none())
 }
 
+/// Whether `site` is a method decorator of `export` that nothing contests
+/// except that no claim of the export is written in the decorate form for
+/// it: every use of the receiver is on the wire or off it, or is this same
+/// unlisted decorate use. A plain call of the export, a write, a hand-off
+/// or any other unlisted member contests as before and stays silent.
+fn is_unclaimed_decorate_site(site: &LibrarySite, export: &ExportClaims) -> bool {
+    if site.form != MakerForm::Decorate || site.contested {
+        return false;
+    }
+    let receivers = site.receiver_ids();
+    let uses = site
+        .uses
+        .iter()
+        .flat_map(|used| receivers.iter().map(move |on| (on.as_str(), used)))
+        .chain(site.export_uses.iter().map(|used| ("export", used)));
+    let mut unclaimed = false;
+    for (on, used) in uses {
+        match export.classify(on, used) {
+            MemberWire::OnWire | MemberWire::OffWire => {}
+            MemberWire::Unlisted if used.form == MakerForm::Decorate => unclaimed = true,
+            MemberWire::Unlisted | MemberWire::ChangesName => return false,
+        }
+    }
+    unclaimed
+}
+
+/// A decorated method of a message export that no claim reads as an op in
+/// the decorate form (a handler, listener or worker written as a method
+/// decorator): saved as an unread site, reason `no_op_claim`, at the
+/// decorated method, never a row. Call-form sites of an export with no op
+/// are saved by the site questions (`decided_sites.rs`), so a site has one
+/// answerer: this reads only the decorate form.
+fn unclaimed_decorate_leads(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryLead> {
+    let verified = HashSet::new();
+    let mut leads: Vec<LibraryLead> = Vec::new();
+    for export in exports.iter().filter(|export| is_read_export(export)) {
+        for site in &sites.sites {
+            if site.specifier != export.specifier
+                || site.export != export.export
+                || !is_unclaimed_decorate_site(site, export)
+            {
+                continue;
+            }
+            let reading = Reading {
+                site,
+                export,
+                claims: &[],
+                verified: &verified,
+                names: None,
+                at: None,
+                outcome: Cell::new(None),
+                placed: RefCell::new(BTreeSet::new()),
+                leads: RefCell::new(Vec::new()),
+                led: RefCell::new(Vec::new()),
+                sites: &sites.sites,
+                unverified: RefCell::new(Vec::new()),
+                unnamed: Cell::new(None),
+            };
+            let lead = reading.lead_of(None, Stop::NoOpClaim, LibraryOp::Receive);
+            if !leads.contains(&lead) {
+                leads.push(lead);
+            }
+        }
+    }
+    leads
+}
+
 /// A verified library site the reader states no name at (carrick#3504
 /// B10-3), placed where the name would be stated: the library call, or the
 /// outermost call of the caller chain the text reader read it through.
@@ -995,8 +1062,12 @@ pub fn read(
     verify: impl FnOnce(&[LibraryCheck]) -> Result<Vec<SemanticsResult>, String>,
 ) -> LibraryRows {
     let checks = checks(sites, exports);
+    let unclaimed = unclaimed_decorate_leads(sites, exports);
     if checks.is_empty() {
-        return LibraryRows::default();
+        return LibraryRows {
+            leads: unclaimed,
+            ..LibraryRows::default()
+        };
     }
     // A verdict counts only for the check at its own position that it names
     // (the sidecar client also refuses an answer of another length).
@@ -1016,6 +1087,7 @@ pub fn read(
             );
             return LibraryRows {
                 unanswered,
+                leads: unclaimed,
                 ..LibraryRows::default()
             };
         }
@@ -1056,7 +1128,7 @@ pub fn read(
         .collect();
     let mut stated: Vec<(LibraryRow, ReceiverKey)> = Vec::new();
     let mut outcomes = LibraryNames::default();
-    let mut leads: Vec<LibraryLead> = Vec::new();
+    let mut leads: Vec<LibraryLead> = unclaimed;
     for export in exports.iter().filter(|export| is_read_export(export)) {
         let claims = export.claims_by_id();
         let of_export: Vec<&LibrarySite> = readable_sites(sites, export).collect();
@@ -2229,7 +2301,7 @@ mod tests {
     use crate::request_summary::library_sites;
 
     /// A manifest declaring every package the tests import.
-    const MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/jobs\": \"^1.0.0\", \"@fixture/queue\": \"^2.0.0\", \"@fixture/bus\": \"^1.0.0\", \"@fixture/socket\": \"^1.0.0\", \"@fixture/http\": \"^1.0.0\", \"@fixture/gql\": \"^1.0.0\" } }\n";
+    const MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/jobs\": \"^1.0.0\", \"@fixture/queue\": \"^2.0.0\", \"@fixture/bus\": \"^1.0.0\", \"@fixture/broker\": \"^1.0.0\", \"@fixture/socket\": \"^1.0.0\", \"@fixture/http\": \"^1.0.0\", \"@fixture/gql\": \"^1.0.0\" } }\n";
 
     fn sites_of(files: &[(&str, &str)]) -> LibrarySites {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2660,6 +2732,70 @@ mod tests {
             export const byHand = OnMessage(\"lobby.called\");\n",
         )]);
         assert!(rows_of(&called, &[gateway_claims()], all).is_empty());
+    }
+
+    /// A method decorator of a message export with no op written in the
+    /// decorate form is saved as an unread site, reason `no_op_claim`, at
+    /// the decorated method, and states no row. Any message role alike: a
+    /// broker handler and an in-process bus listener. A plain call of the
+    /// same export contests the decorator as before, and stays silent.
+    #[test]
+    fn a_decorate_site_with_no_decorate_claim_is_saved_no_op_claim() {
+        let broker = export(json!({
+            "package": "@fixture/broker", "version": "1.0.0", "specifier": "@fixture/broker",
+            "export": "OnOrder", "role": "broker", "side": "server",
+            "claims": []
+        }));
+        let bus = export(json!({
+            "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
+            "export": "OnOrderEvent", "role": "in_process_bus",
+            "claims": []
+        }));
+        let source = "import { OnOrder } from \"@fixture/broker\";\n\
+            import { OnOrderEvent } from \"@fixture/bus\";\n\
+            import { ORDER_JOBS } from \"./jobs\";\n\
+            export class Orders {\n\
+            \x20 @OnOrder({ cmd: ORDER_JOBS.CREATE })\n\
+            \x20 create(dto: CreateOrder) {}\n\
+            \x20 @OnOrderEvent(\"orders.created\")\n\
+            \x20 created(dto: CreateOrder) {}\n\
+            }\n";
+        let sites = sites_of(&[("src/orders.ts", source)]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let saved = read(
+            &sites,
+            &[broker.clone(), bus.clone()],
+            None,
+            verifier(&asked, all),
+        );
+        assert!(saved.rows.is_empty(), "{:#?}", saved.rows);
+        assert_eq!(
+            leads_of(&saved),
+            vec![
+                ("orders.ts".to_string(), 6, Stop::NoOpClaim),
+                ("orders.ts".to_string(), 8, Stop::NoOpClaim)
+            ],
+            "{:#?}",
+            saved.leads
+        );
+        // One answerer: the decorate form is answered here only. A call-form
+        // site of the same export is a contest that stays silent in this
+        // module (the site questions answer it), so no site has both.
+        let called = sites_of(&[(
+            "src/orders.ts",
+            "import { OnOrder } from \"@fixture/broker\";\n\
+            export class Orders {\n\
+            \x20 @OnOrder({ cmd: 1 })\n\
+            \x20 create(dto: CreateOrder) {}\n\
+            }\n\
+            export const byHand = OnOrder({ cmd: 2 });\n",
+        )]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let saved = read(&called, &[broker], None, verifier(&asked, all));
+        assert!(
+            saved.rows.is_empty() && saved.leads.is_empty(),
+            "{saved:#?}"
+        );
     }
 
     /// One root-field decorator export, labelled the way the store labels a
