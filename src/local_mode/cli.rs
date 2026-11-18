@@ -851,8 +851,9 @@ fn analysing_lines(index_dir: &Path) -> Vec<String> {
 /// model comes from the run that produced it (carrick#956 §8.3). `index`
 /// always infers; `refresh` never does, which is the whole difference between
 /// them.
-/// `carrick refresh --hosted-only`: one line on stderr saying whether this
-/// machine's copy of the hosted index moved. Exit 0 unless there is no
+/// `carrick refresh --hosted-only`: a line on stderr per repo saying whether
+/// this machine's copy of its hosted index moved or was kept, or one line when
+/// nothing moved. Exit 0 unless there is no
 /// workspace: a move that did not happen leaves the index as it was, which is
 /// not a failure.
 fn forward(root: Option<&Path>) -> i32 {
@@ -864,13 +865,17 @@ fn forward(root: Option<&Path>) -> i32 {
         }
     };
     match super::hosted::forward(&workspace) {
-        super::hosted::Forward::Moved(moved) => {
+        super::hosted::Forward::Moved { moved, kept } => {
             for (repo, commit) in moved {
                 crate::errln!(
                     "carrick refresh: {} now compares against the hosted index at {}",
                     super::index::repo_label(&repo),
                     commit.get(..7).unwrap_or(&commit)
                 );
+            }
+            // Each reason names its repo.
+            for (_, reason) in kept {
+                crate::errln!("carrick refresh: kept the hosted index on this machine: {reason}");
             }
         }
         super::hosted::Forward::Current => {

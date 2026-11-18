@@ -603,18 +603,19 @@ impl Reader {
     /// `check --changed` re-reads a service when a file it reads changed since
     /// the commit the snapshot's blobs were scanned at, and a manifest or
     /// lockfile counts for every service. Nothing else moves that commit, so
-    /// on a busy main branch every check re-read the whole repository. The
-    /// move is all or nothing, and only forward along HEAD's history: for
-    /// every local repo whose hosted commits moved, the newest of them
-    /// ([`newest_commit`]) must hold the newest held one and be held by HEAD.
-    /// Each service's blob keeps its own commit. A branch behind main keeps the base
-    /// it has, and so does a checkout that has not fetched the new commit.
+    /// on a busy main branch every check re-read the whole repository. Each
+    /// repo is decided alone ([`may_move`]), and only forward along HEAD's
+    /// history: the newest of its hosted commits ([`newest_commit`]) must hold
+    /// the newest held one and be held by HEAD. Each service's blob keeps its
+    /// own commit. A branch behind main keeps the base it has, and so does a
+    /// checkout that has not fetched the new commit, while every other repo
+    /// of the workspace moves ([`hold_back`]).
     ///
-    /// Asks `resolve-repos` first and downloads only when something moved and
-    /// every move passed, so a refusal costs one metadata request. Returns the
-    /// snapshot to persist with [`Forward::Moved`], and none otherwise, and,
-    /// whenever the cloud answered for this workspace, where each repo's
-    /// hosted index and this machine's copy stand ([`synced_repos`]).
+    /// Asks `resolve-repos` first and downloads only when some repo moved, so
+    /// a refusal costs one metadata request. Returns the snapshot to persist
+    /// with [`Forward::Moved`], and none otherwise, and, whenever the cloud
+    /// answered for this workspace, where each repo's hosted index and this
+    /// machine's copy stand ([`synced_repos`]), with each kept repo's reason.
     async fn forward(
         &self,
         credential: &Credential,
@@ -640,14 +641,17 @@ impl Reader {
             remotes: remotes.clone(),
             ..Default::default()
         };
-        let synced = Some(synced_repos(&resolution, &before));
-        let (outcome, snapshot) = self
+        let mut synced = synced_repos(&resolution, &before);
+        let (outcome, snapshot, kept) = self
             .forward_from(credential, remotes, &repos, resolution, &before, old)
             .await;
-        (outcome, snapshot, synced)
+        stamp_kept(&mut synced, remotes, &kept);
+        (outcome, snapshot, Some(synced))
     }
 
     /// [`Reader::forward`] once the cloud has answered for this workspace.
+    /// Also returns every repo [`may_move`] refused, with its reason, whatever
+    /// the outcome.
     async fn forward_from(
         &self,
         credential: &Credential,
@@ -656,9 +660,10 @@ impl Reader {
         resolution: Resolution,
         before: &HostedInput,
         old: Snapshot,
-    ) -> (Forward, Option<Snapshot>) {
+    ) -> (Forward, Option<Snapshot>, Vec<(PathBuf, String)>) {
         let mut approved: BTreeMap<PathBuf, std::collections::BTreeSet<String>> = BTreeMap::new();
         let mut moved: Vec<(PathBuf, String)> = Vec::new();
+        let mut kept: Vec<(PathBuf, String)> = Vec::new();
         for (path, name) in remotes {
             let now: std::collections::BTreeSet<String> = resolution
                 .repos
@@ -676,7 +681,8 @@ impl Reader {
                 continue;
             }
             match may_move(path, name, &held, &now) {
-                Err(reason) => return (Forward::Kept(reason), None),
+                // This repo keeps its copy; the others are decided alone.
+                Err(reason) => kept.push((path.clone(), reason)),
                 Ok(None) => {
                     approved.insert(path.clone(), now);
                 }
@@ -687,13 +693,28 @@ impl Reader {
             }
         }
         if moved.is_empty() {
-            return (Forward::Current, None);
+            let outcome = if kept.is_empty() {
+                Forward::Current
+            } else {
+                Forward::Kept(joined_reasons(&kept))
+            };
+            return (outcome, None, kept);
         }
-        let (snapshot, failure, _) = self
-            .assemble(credential, repos, resolution, Some(old))
-            .await;
+        let held_names: Vec<String> = kept
+            .iter()
+            .filter_map(|(path, _)| remotes.get(path).cloned())
+            .collect();
+        // The kept repos are asked for as `old` holds them, so a project that
+        // only they changed is reused rather than downloaded.
+        let mut asked = resolution.clone();
+        hold_entries(&mut asked, &old.resolution, &held_names);
+        let (mut snapshot, failure, _) = self.assemble(credential, repos, asked, Some(old)).await;
         if let Some(failure) = failure {
-            return (Forward::Kept(failure), None);
+            return (Forward::Kept(failure), None, kept);
+        }
+        // `before` holds the same snapshot `old` was.
+        if let Some(held) = before.snapshot.as_ref() {
+            hold_back(&mut snapshot, held, &resolution, &held_names);
         }
         let after = HostedInput {
             snapshot: Some(snapshot),
@@ -717,10 +738,18 @@ impl Reader {
                         "the downloaded hosted index is not the one that was checked".into(),
                     ),
                     None,
+                    kept,
                 );
             }
         }
-        (Forward::Moved(moved), after.snapshot)
+        (
+            Forward::Moved {
+                moved,
+                kept: kept.clone(),
+            },
+            after.snapshot,
+            kept,
+        )
     }
 }
 
@@ -802,12 +831,125 @@ fn short(commit: &str) -> &str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Forward {
     /// The snapshot on disk now holds the hosted index at a newer commit for
-    /// each of these repos (path, commit).
-    Moved(Vec<(PathBuf, String)>),
+    /// each repo in `moved` (path, commit). Each repo in `kept` (path,
+    /// reason) may not move yet and holds the copy it had.
+    Moved {
+        moved: Vec<(PathBuf, String)>,
+        kept: Vec<(PathBuf, String)>,
+    },
     /// The hosted index is at the commits this machine already holds.
     Current,
     /// Nothing moved, and why.
     Kept(String),
+}
+
+/// The reasons of every kept repo, as one sentence per repo.
+fn joined_reasons(kept: &[(PathBuf, String)]) -> String {
+    kept.iter()
+        .map(|(_, reason)| reason.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Write each kept repo's reason onto its row of the record, where the row
+/// has none yet.
+fn stamp_kept(
+    synced: &mut [SyncedRepo],
+    remotes: &BTreeMap<PathBuf, String>,
+    kept: &[(PathBuf, String)],
+) {
+    for (path, reason) in kept {
+        let Some(name) = remotes.get(path) else {
+            continue;
+        };
+        for row in synced
+            .iter_mut()
+            .filter(|row| row.repo == *name && row.kept_reason.is_none())
+        {
+            row.kept_reason = Some(reason.clone());
+        }
+    }
+}
+
+/// Hold each repo named in `kept` (`owner/repo`) at what `old` held for it,
+/// in `snapshot` the forward assembled: its `resolution.repos` entry (so
+/// `local_blobs` filters by the service list its blobs were read under), its
+/// blobs and its `stored_rows` entries, matched by repo basename within its
+/// project as `local_blobs` matches them. A repo `old` held nothing for holds
+/// nothing. Every other repo keeps what came down, so the snapshot holds each
+/// repo at its own commit, and every reader of the snapshot reads that.
+///
+/// `fresh` is the cloud's answer, whose project for a repo is where its new
+/// blobs came down.
+fn hold_back(snapshot: &mut Snapshot, old: &Snapshot, fresh: &Resolution, kept: &[String]) {
+    hold_entries(&mut snapshot.resolution, &old.resolution, kept);
+    let entry = |resolution: &Resolution, name: &str| -> Option<String> {
+        resolution
+            .repos
+            .iter()
+            .find(|repo| repo.full_name.eq_ignore_ascii_case(name))
+            .and_then(|repo| repo.project_id.clone())
+    };
+    for name in kept {
+        let basename = name
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let held_in = entry(&old.resolution, name);
+        let ids: std::collections::BTreeSet<String> = [entry(fresh, name), held_in.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
+        for id in &ids {
+            if let Some(blobs) = snapshot.projects.get_mut(id) {
+                blobs.retain(|blob| !blob.repo_name.eq_ignore_ascii_case(&basename));
+            }
+            if let Some(rows) = snapshot.stored_rows.get_mut(id) {
+                rows.retain(|row| row.repo != basename);
+            }
+        }
+        let Some(id) = held_in else {
+            continue;
+        };
+        if let Some(blobs) = old.projects.get(&id) {
+            snapshot.projects.entry(id.clone()).or_default().extend(
+                blobs
+                    .iter()
+                    .filter(|blob| blob.repo_name.eq_ignore_ascii_case(&basename))
+                    .cloned(),
+            );
+        }
+        if let Some(rows) = old.stored_rows.get(&id) {
+            snapshot
+                .stored_rows
+                .entry(id)
+                .or_default()
+                .extend(rows.iter().filter(|row| row.repo == basename).cloned());
+        }
+    }
+}
+
+/// Put back `old`'s `resolution.repos` entry for each repo named in `kept`.
+/// A repo `old` has no entry for keeps the new one with no services, so it
+/// reads as holding nothing, as it did.
+fn hold_entries(resolution: &mut Resolution, old: &Resolution, kept: &[String]) {
+    for name in kept {
+        let held = old
+            .repos
+            .iter()
+            .find(|repo| repo.full_name.eq_ignore_ascii_case(name));
+        if let Some(entry) = resolution
+            .repos
+            .iter_mut()
+            .find(|repo| repo.full_name.eq_ignore_ascii_case(name))
+        {
+            match held {
+                Some(held) => *entry = held.clone(),
+                None => entry.services = Some(Vec::new()),
+            }
+        }
+    }
 }
 
 /// Move this machine's copy of the hosted index forward to the one the cloud
@@ -853,27 +995,29 @@ fn forward_with(
         return Forward::Kept("this machine holds no hosted index to move".into());
     };
     let healed = heal(workspace, &remotes, &old, rebuild);
+    let asked = remotes.clone();
     let result = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| "Could not start hosted reader".to_string())?;
         let reader = Reader::new()?;
-        Ok::<_, String>(runtime.block_on(reader.forward(&credential, &remotes, old)))
+        Ok::<_, String>(runtime.block_on(reader.forward(&credential, &asked, old)))
     })
     .join()
     .unwrap_or_else(|_| Err("Hosted reader failed".into()));
-    let (outcome, synced) = match result {
-        Ok((Forward::Moved(moved), Some(snapshot), synced)) => (
+    let (outcome, mut synced) = match result {
+        Ok((Forward::Moved { moved, kept }, Some(snapshot), synced)) => (
             move_and_rebuild(
                 &workspace.index_dir().join("hosted/snapshot.json"),
                 &snapshot,
                 moved,
+                kept,
                 rebuild,
             ),
             synced,
         ),
-        Ok((Forward::Moved(_), None, synced)) => {
+        Ok((Forward::Moved { .. }, None, synced)) => {
             (Forward::Kept("no snapshot to write".into()), synced)
         }
         Ok((outcome, _, synced)) => (outcome, synced),
@@ -884,8 +1028,13 @@ fn forward_with(
     // A heal that rebuilt moved the read model, whatever the cloud said; one
     // that failed is the run's news unless the network move rebuilt after it.
     let outcome = match (outcome, healed) {
-        (outcome @ Forward::Moved(_), _) => outcome,
-        (_, Some(Ok(moved))) => Forward::Moved(moved),
+        (outcome @ Forward::Moved { .. }, _) => outcome,
+        (_, Some(Ok((moved, kept)))) => {
+            if let Some(synced) = synced.as_mut() {
+                stamp_kept(synced, &remotes, &kept);
+            }
+            Forward::Moved { moved, kept }
+        }
         (_, Some(Err(reason))) => not_rebuilt(&reason),
         (outcome, None) => outcome,
     };
@@ -900,11 +1049,14 @@ fn forward_with(
 
 /// Write the moved snapshot, then rebuild the read model from it. A rebuild
 /// that fails puts the old snapshot bytes back, so the snapshot and the read
-/// model never split: the move is kept, with the rebuild's reason.
+/// model never split: the move is kept, with the rebuild's reason. Only the
+/// moved repos are rebuilt: a kept repo's read model is the one it had, as its
+/// part of the snapshot is ([`hold_back`]).
 fn move_and_rebuild(
     path: &Path,
     snapshot: &Snapshot,
     moved: Vec<(PathBuf, String)>,
+    kept: Vec<(PathBuf, String)>,
     rebuild: &dyn Fn(&[PathBuf]) -> Result<(), String>,
 ) -> Forward {
     let old = std::fs::read(path).ok();
@@ -913,7 +1065,7 @@ fn move_and_rebuild(
     }
     let paths: Vec<PathBuf> = moved.iter().map(|(path, _)| path.clone()).collect();
     match rebuild(&paths) {
-        Ok(()) => Forward::Moved(moved),
+        Ok(()) => Forward::Moved { moved, kept },
         Err(reason) => {
             if let Some(old) = old {
                 let _ = put_back(path, &old);
@@ -944,11 +1096,17 @@ fn put_back(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
+/// What a [`heal`] that rebuilt did: the repos it healed (path, commit) and
+/// the ones it skipped (path, reason).
+type Healed = (Vec<(PathBuf, String)>, Vec<(PathBuf, String)>);
+
 /// Rebuild a local index left behind the snapshot it should read, with no
 /// network: where `index.json`'s commits for a repo differ from the
 /// snapshot's and [`may_move`] lets the copy move from the first to the
-/// second, for every such repo. `None` when nothing differs or a repo may not
-/// move (the network move then decides), otherwise the rebuild's outcome.
+/// second. Each repo is decided alone: one that may not move is skipped, with
+/// its reason, and the others heal. `None` when no repo heals (the network
+/// move then decides), otherwise the rebuild's outcome: the healed repos and
+/// the skipped ones.
 ///
 /// Before the move rebuilt the read model, a move wrote only the snapshot, so
 /// a workspace can hold an index at one commit and a snapshot at a later one.
@@ -957,7 +1115,7 @@ fn heal(
     remotes: &BTreeMap<PathBuf, String>,
     snapshot: &Snapshot,
     rebuild: &dyn Fn(&[PathBuf]) -> Result<(), String>,
-) -> Option<Result<Vec<(PathBuf, String)>, String>> {
+) -> Option<Result<Healed, String>> {
     let index = super::read_model::LocalIndex::read(&workspace.index_file()).ok()?;
     let input = HostedInput {
         snapshot: Some(snapshot.clone()),
@@ -965,6 +1123,7 @@ fn heal(
         ..Default::default()
     };
     let mut moved: Vec<(PathBuf, String)> = Vec::new();
+    let mut kept: Vec<(PathBuf, String)> = Vec::new();
     for (path, name) in remotes {
         let built: std::collections::BTreeSet<String> = index
             .repos
@@ -979,10 +1138,16 @@ fn heal(
             continue;
         }
         match may_move(path, name, &built, &held) {
-            Err(_) => return None,
+            Err(reason) => kept.push((path.clone(), reason)),
             Ok(None) => {}
             // What the network move would refuse to carry, the heal refuses.
-            Ok(Some(_)) if !carried_as_is(&blobs) => return None,
+            Ok(Some(_)) if !carried_as_is(&blobs) => kept.push((
+                path.clone(),
+                format!(
+                    "{name}: this machine's copy was written by another cache format or from \
+                     a tree with uncommitted changes"
+                ),
+            )),
             Ok(Some(to)) => moved.push((path.clone(), to)),
         }
     }
@@ -990,7 +1155,7 @@ fn heal(
         return None;
     }
     let paths: Vec<PathBuf> = moved.iter().map(|(path, _)| path.clone()).collect();
-    Some(rebuild(&paths).map(|()| moved))
+    Some(rebuild(&paths).map(|()| (moved, kept)))
 }
 
 /// Where [`forward`] records what it found, under the index directory. Small,
@@ -1017,6 +1182,10 @@ pub(super) struct SyncedRepo {
     /// and HEAD does not.
     behind: Option<u64>,
     head_detached: bool,
+    /// Why this repo's copy did not move in this run, when it may not:
+    /// [`may_move`]'s reason. Set only on a repo that was refused, whatever
+    /// the other repos did; `None` on one that moved or had nothing to move.
+    kept_reason: Option<String>,
 }
 
 /// `.carrick/hosted/last-sync.json`, rewritten by every [`forward`] the cloud
@@ -1032,10 +1201,11 @@ pub(super) struct SyncRecord {
 
 impl SyncRecord {
     /// The record of `outcome`. A repo the copy moved for now holds the hosted
-    /// commit, so its copy is stated as that one.
+    /// commit, so its copy is stated as that one; a kept repo's copy is the
+    /// one it had. A move that kept some repos states their reasons too.
     fn of(outcome: &Forward, mut repos: Vec<SyncedRepo>, at: String) -> Self {
         let (outcome, reason) = match outcome {
-            Forward::Moved(moved) => {
+            Forward::Moved { moved, kept } => {
                 for repo in &mut repos {
                     if moved
                         .iter()
@@ -1045,7 +1215,7 @@ impl SyncRecord {
                         repo.copy_scanned_at = repo.hosted_scanned_at.clone();
                     }
                 }
-                ("moved", None)
+                ("moved", (!kept.is_empty()).then(|| joined_reasons(kept)))
             }
             Forward::Current => ("current", None),
             Forward::Kept(reason) => ("kept", Some(reason.clone())),
@@ -1123,6 +1293,7 @@ fn synced_repos(resolution: &Resolution, before: &HostedInput) -> Vec<SyncedRepo
             fetched,
             behind,
             head_detached: crate::git_state::head_is_detached(&repo),
+            kept_reason: None,
         });
     }
     synced
@@ -3378,14 +3549,21 @@ mod tests {
     /// service), then the branch's own work at C, checked out. Returns the
     /// directory and the three commits.
     fn moved_on_repo() -> (tempfile::TempDir, String, String, String) {
+        moved_on_repo_named("api")
+    }
+
+    /// [`moved_on_repo`] for a repo called `name`, whose files say so, so two
+    /// such repos never share a commit.
+    fn moved_on_repo_named(name: &str) -> (tempfile::TempDir, String, String, String) {
         use crate::git_state::tests::git_in;
+        let manifest = format!(r#"{{"name":"{name}","dependencies":{{}}}}"#);
         let (dir, a) = committed_repo(&[
-            ("package.json", r#"{"name":"api","dependencies":{}}"#),
+            ("package.json", manifest.as_str()),
             ("src/app.ts", "export const value = 1;"),
         ]);
         std::fs::write(
             dir.path().join("package.json"),
-            r#"{"name":"api","dependencies":{"left-pad":"1.0.0"}}"#,
+            format!(r#"{{"name":"{name}","dependencies":{{"left-pad":"1.0.0"}}}}"#),
         )
         .unwrap();
         git_in(dir.path(), &["commit", "-qam", "main moves on"]);
@@ -3435,7 +3613,10 @@ mod tests {
             .await;
         assert_eq!(
             outcome,
-            Forward::Moved(vec![(dir.path().to_path_buf(), b.clone())])
+            Forward::Moved {
+                moved: vec![(dir.path().to_path_buf(), b.clone())],
+                kept: Vec::new()
+            }
         );
         assert_eq!(requests.join().unwrap().len(), 2);
         let input = HostedInput {
@@ -3518,6 +3699,7 @@ mod tests {
             &path,
             &held_at("b"),
             vec![(repo.clone(), "b".to_string())],
+            Vec::new(),
             &|paths| {
                 asked.borrow_mut().push(paths.to_vec());
                 Err("the join failed".into())
@@ -3537,9 +3719,16 @@ mod tests {
             &path,
             &held_at("b"),
             vec![(repo.clone(), "b".to_string())],
+            Vec::new(),
             &|_| Ok(()),
         );
-        assert_eq!(outcome, Forward::Moved(vec![(repo, "b".to_string())]));
+        assert_eq!(
+            outcome,
+            Forward::Moved {
+                moved: vec![(repo, "b".to_string())],
+                kept: Vec::new()
+            }
+        );
         let written: Snapshot = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             serde_json::to_value(&written).unwrap(),
@@ -3577,6 +3766,11 @@ mod tests {
                 fetched: true,
                 behind: Some(1),
                 head_detached: true,
+                kept_reason: Some(format!(
+                    "example/api: the hosted index is at {}, which this checkout's HEAD does \
+                     not hold",
+                    &b[..7]
+                )),
             }]
         );
 
@@ -3675,7 +3869,10 @@ mod tests {
             .await;
         assert_eq!(
             outcome,
-            Forward::Moved(vec![(dir.path().to_path_buf(), b.clone())])
+            Forward::Moved {
+                moved: vec![(dir.path().to_path_buf(), b.clone())],
+                kept: Vec::new()
+            }
         );
         assert_eq!(requests.join().unwrap().len(), 2);
         let input = HostedInput {
@@ -3758,5 +3955,498 @@ mod tests {
             .await;
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
         assert!(snapshot.is_none());
+    }
+
+    /// When the move's download says each blob was stored.
+    const MOVED_AT: &str = "2026-10-02T10:00:00.000Z";
+
+    /// A `resolve-repos` answer for connected repos of one project, `p`, each
+    /// `(owner/repo, [(service, hash)])`.
+    fn in_one_project(repos: &[(&str, Vec<(&str, &str)>)]) -> serde_json::Value {
+        json!({"schema":"carrick.resolve-repos/0",
+            "workspace":{"slug":"fixture","billing_tier":"free","installed":true},
+            "allowance_sentence":null,
+            "repos": repos.iter().map(|(name, services)| json!({
+                "full_name": name, "connected": true, "project_id": "p", "project_slug": "fixture",
+                "services": services.iter().map(|(s, h)| service_row(s, h)).collect::<Vec<_>>()}))
+                .collect::<Vec<_>>(),
+            "project_repos":[{"project_slug":"fixture",
+                "repos": repos.iter().map(|(name, _)| *name).collect::<Vec<_>>()}]})
+    }
+
+    type Repo = (tempfile::TempDir, String, String, String);
+
+    /// Three repos of one project, each with its own history
+    /// ([`moved_on_repo_named`]), checked out at their own work (C), which
+    /// holds the hosted commit (B).
+    struct Three {
+        api: Repo,
+        web: Repo,
+        jobs: Repo,
+    }
+
+    impl Three {
+        fn new() -> Self {
+            Self {
+                api: moved_on_repo_named("api"),
+                web: moved_on_repo_named("web"),
+                jobs: moved_on_repo_named("jobs"),
+            }
+        }
+
+        fn remotes(&self) -> BTreeMap<PathBuf, String> {
+            BTreeMap::from([
+                (self.api.0.path().to_path_buf(), "example/api".to_string()),
+                (self.web.0.path().to_path_buf(), "example/web".to_string()),
+                (self.jobs.0.path().to_path_buf(), "example/jobs".to_string()),
+            ])
+        }
+
+        /// What this machine holds: every repo at A, `web` with one service.
+        fn held(&self) -> Snapshot {
+            snapshot(
+                in_one_project(&[
+                    ("example/api", vec![("api", &self.api.1)]),
+                    ("example/web", vec![("web", &self.web.1)]),
+                    ("example/jobs", vec![("jobs", &self.jobs.1)]),
+                ]),
+                BTreeMap::from([(
+                    "p".to_string(),
+                    vec![
+                        named_blob("api", "api", &self.api.1),
+                        named_blob("web", "web", &self.web.1),
+                        named_blob("jobs", "jobs", &self.jobs.1),
+                    ],
+                )]),
+            )
+        }
+
+        /// The cloud now: every repo at B, where `web` gained a second
+        /// service, so a kept `web` must keep the service list it had.
+        fn hosted(&self) -> serde_json::Value {
+            in_one_project(&[
+                ("example/api", vec![("api", &self.api.2)]),
+                (
+                    "example/web",
+                    vec![("web", &self.web.2), ("web-worker", &self.web.2)],
+                ),
+                ("example/jobs", vec![("jobs", &self.jobs.2)]),
+            ])
+        }
+
+        /// The download of project `p` at B, every row stored at
+        /// [`MOVED_AT`].
+        fn downloaded(&self) -> Vec<u8> {
+            answered(&[
+                (named_blob("api", "api", &self.api.2), MOVED_AT),
+                (named_blob("web", "web", &self.web.2), MOVED_AT),
+                (named_blob("web", "web-worker", &self.web.2), MOVED_AT),
+                (named_blob("jobs", "jobs", &self.jobs.2), MOVED_AT),
+            ])
+        }
+
+        /// One forward from `held` against [`Self::hosted`], and the number
+        /// of requests it made.
+        async fn forward(
+            &self,
+            held: Snapshot,
+            download: bool,
+        ) -> (Forward, Option<Snapshot>, Option<Vec<SyncedRepo>>, usize) {
+            let mut replies = vec![("200 OK", serde_json::to_vec(&self.hosted()).unwrap())];
+            if download {
+                replies.push(("200 OK", self.downloaded()));
+            }
+            let (url, requests) = serve_sequence(replies);
+            let (outcome, snapshot, synced) = reader(url)
+                .forward(&credential("test"), &self.remotes(), held)
+                .await;
+            (outcome, snapshot, synced, requests.join().unwrap().len())
+        }
+
+        fn web_reason(&self) -> String {
+            format!(
+                "example/web: the hosted index is at {}, which this checkout's HEAD does not hold",
+                &self.web.2[..7]
+            )
+        }
+    }
+
+    fn commits_of(input: &HostedInput, repo: &Path) -> Vec<(Option<String>, String)> {
+        let mut commits: Vec<_> = input
+            .local_blobs(repo)
+            .into_iter()
+            .map(|blob| (blob.service_name, blob.commit_hash))
+            .collect();
+        commits.sort();
+        commits
+    }
+
+    /// What every reader reads of one repo from a snapshot: its blobs, the
+    /// hosted state each blob is enriched with, and the blobs the edit-time
+    /// lead reads under its label.
+    fn read_of(input: &HostedInput, repo: &Path) -> serde_json::Value {
+        let blobs = input.local_blobs(repo);
+        let enriched: Vec<_> = blobs
+            .iter()
+            .map(|blob| serde_json::to_value(input.service(repo, blob)).unwrap())
+            .collect();
+        let label = super::super::index::repo_label(repo);
+        let every: Vec<_> = input
+            .every_blob()
+            .into_iter()
+            .filter(|(l, _)| *l == label)
+            .map(|(_, blob)| serde_json::to_value(blob).unwrap())
+            .collect();
+        json!({"blobs": blobs, "enriched": enriched, "every": every})
+    }
+
+    /// One repo of three is behind its hosted commit (`detached`: a detached
+    /// checkout, otherwise a branch that was not pulled). The other two move;
+    /// the behind one keeps its blobs, its stored rows and its resolution
+    /// entry, and is recorded as kept with its reason. Returns the moved
+    /// snapshot.
+    async fn one_of_three_behind(t: &Three, detached: bool) -> Snapshot {
+        use crate::git_state::tests::git_in;
+        let web = t.web.0.path();
+        if detached {
+            git_in(web, &["checkout", "-q", &t.web.1]);
+        } else {
+            git_in(web, &["checkout", "-q", "-b", "behind", &t.web.1]);
+        }
+        let (outcome, snapshot, synced, requests) = t.forward(t.held(), true).await;
+        assert_eq!(requests, 2);
+        let moved: Vec<(PathBuf, String)> = t
+            .remotes()
+            .keys()
+            .filter(|path| path.as_path() != web)
+            .map(|path| {
+                let commit = if path == t.api.0.path() {
+                    &t.api.2
+                } else {
+                    &t.jobs.2
+                };
+                (path.clone(), commit.clone())
+            })
+            .collect();
+        assert_eq!(
+            outcome,
+            Forward::Moved {
+                moved,
+                kept: vec![(web.to_path_buf(), t.web_reason())]
+            }
+        );
+        let snapshot = snapshot.expect("a move writes a snapshot");
+        let input = HostedInput {
+            snapshot: Some(snapshot.clone()),
+            remotes: t.remotes(),
+            ..Default::default()
+        };
+        assert_eq!(
+            commits_of(&input, t.api.0.path()),
+            vec![(Some("api".into()), t.api.2.clone())]
+        );
+        assert_eq!(
+            commits_of(&input, t.jobs.0.path()),
+            vec![(Some("jobs".into()), t.jobs.2.clone())]
+        );
+        // The blobs: web holds its copy at A, and nothing of B.
+        assert_eq!(
+            commits_of(&input, web),
+            vec![(Some("web".into()), t.web.1.clone())]
+        );
+        assert!(
+            snapshot.projects["p"]
+                .iter()
+                .filter(|blob| blob.repo_name == "web")
+                .all(|blob| blob.commit_hash == t.web.1),
+            "a blob of web at B stayed in the snapshot"
+        );
+        // The stored rows: web's is the row its copy was read as.
+        let row_of = |repo: &str| -> Vec<StoredRow> {
+            let mut rows: Vec<StoredRow> = snapshot.stored_rows["p"]
+                .iter()
+                .filter(|row| row.repo == repo)
+                .cloned()
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            row_of("web"),
+            vec![StoredRow {
+                repo: "web".into(),
+                service: "web".into(),
+                hash: t.web.1.clone(),
+                updated_at: Some(STORED_AT.into()),
+            }]
+        );
+        assert_eq!(row_of("api")[0].updated_at.as_deref(), Some(MOVED_AT));
+        // The resolution: web's entry is the one its copy was read under.
+        let web_services: Vec<(String, Option<String>)> = snapshot
+            .resolution
+            .repos
+            .iter()
+            .find(|repo| repo.full_name == "example/web")
+            .and_then(|repo| repo.services.clone())
+            .unwrap()
+            .into_iter()
+            .map(|service| (service.service, service.hash))
+            .collect();
+        assert_eq!(
+            web_services,
+            vec![("web".to_string(), Some(t.web.1.clone()))]
+        );
+        // The record: the moved repos at their hosted commit, web kept.
+        let record = SyncRecord::of(&outcome, synced.unwrap(), "now".into());
+        assert_eq!(record.outcome, "moved");
+        assert_eq!(record.reason, Some(t.web_reason()));
+        for row in &record.repos {
+            if row.repo == "example/web" {
+                assert_eq!(row.copy_commit, t.web.1);
+                assert_eq!(row.kept_reason, Some(t.web_reason()));
+                assert_eq!(row.head_detached, detached);
+            } else {
+                assert_eq!(row.copy_commit, row.hosted_commit, "{row:?}");
+                assert_eq!(row.kept_reason, None, "{row:?}");
+            }
+        }
+        snapshot
+    }
+
+    /// r1: a branch that was not pulled holds back its own repo only. The
+    /// next forward over the spliced snapshot keeps it again for one
+    /// metadata request.
+    #[tokio::test]
+    async fn one_repo_behind_does_not_hold_the_others_back() {
+        let t = Three::new();
+        let moved = one_of_three_behind(&t, false).await;
+        let (outcome, snapshot, synced, requests) = t.forward(moved, false).await;
+        assert_eq!(outcome, Forward::Kept(t.web_reason()));
+        assert!(snapshot.is_none());
+        assert_eq!(requests, 1, "it downloaded anyway");
+        let synced = synced.unwrap();
+        let web = synced.iter().find(|r| r.repo == "example/web").unwrap();
+        assert_eq!(web.kept_reason, Some(t.web_reason()));
+        let record = SyncRecord::of(&outcome, synced, "now".into());
+        assert_eq!(record.outcome, "kept");
+    }
+
+    /// r2: a detached checkout behind holds back its own repo only.
+    #[tokio::test]
+    async fn a_detached_checkout_behind_holds_back_only_its_own_repo() {
+        let t = Three::new();
+        one_of_three_behind(&t, true).await;
+    }
+
+    /// r0: every HEAD holds its hosted commit, so every repo moves, as before.
+    #[tokio::test]
+    async fn every_repo_current_moves_every_repo() {
+        let t = Three::new();
+        let (outcome, snapshot, synced, requests) = t.forward(t.held(), true).await;
+        assert_eq!(requests, 2);
+        let moved: Vec<(PathBuf, String)> = t
+            .remotes()
+            .keys()
+            .map(|path| {
+                let repo = [&t.api, &t.web, &t.jobs]
+                    .into_iter()
+                    .find(|repo| repo.0.path() == path)
+                    .unwrap();
+                (path.clone(), repo.2.clone())
+            })
+            .collect();
+        assert_eq!(
+            outcome,
+            Forward::Moved {
+                moved,
+                kept: Vec::new()
+            }
+        );
+        let input = HostedInput {
+            snapshot,
+            remotes: t.remotes(),
+            ..Default::default()
+        };
+        assert_eq!(
+            commits_of(&input, t.web.0.path()),
+            vec![
+                (Some("web".into()), t.web.2.clone()),
+                (Some("web-worker".into()), t.web.2.clone())
+            ]
+        );
+        let record = SyncRecord::of(&outcome, synced.unwrap(), "now".into());
+        assert_eq!((record.outcome, record.reason), ("moved", None));
+        assert!(
+            record
+                .repos
+                .iter()
+                .all(|row| row.copy_commit == row.hosted_commit && row.kept_reason.is_none())
+        );
+    }
+
+    /// Every reader of the mixed snapshot reads the two moved repos exactly
+    /// as it reads them from a snapshot where every repo moved, and the kept
+    /// repo exactly as it read it before the move.
+    #[tokio::test]
+    async fn a_mixed_snapshot_reads_the_moved_repos_as_an_all_current_one_does() {
+        use crate::git_state::tests::git_in;
+        let t = Three::new();
+        let mixed = HostedInput {
+            snapshot: Some(one_of_three_behind(&t, false).await),
+            remotes: t.remotes(),
+            ..Default::default()
+        };
+        git_in(t.web.0.path(), &["checkout", "-q", "main"]);
+        let (outcome, current, _, _) = t.forward(t.held(), true).await;
+        assert!(matches!(&outcome, Forward::Moved { kept, .. } if kept.is_empty()));
+        let current = HostedInput {
+            snapshot: current,
+            remotes: t.remotes(),
+            ..Default::default()
+        };
+        let before = HostedInput {
+            snapshot: Some(t.held()),
+            remotes: t.remotes(),
+            ..Default::default()
+        };
+        for repo in [t.api.0.path(), t.jobs.0.path()] {
+            assert_eq!(read_of(&mixed, repo), read_of(&current, repo));
+        }
+        assert_eq!(
+            read_of(&mixed, t.web.0.path()),
+            read_of(&before, t.web.0.path())
+        );
+    }
+
+    /// A kept repo is asked for as this machine holds it, so a project only
+    /// it changed is reused, not downloaded: `example/api` (project `pa`)
+    /// moves, `example/web` (project `pb`) is behind and costs nothing.
+    #[tokio::test]
+    async fn a_project_only_a_kept_repo_changed_is_not_downloaded() {
+        use crate::git_state::tests::git_in;
+        let (api, api_a, api_b, _) = moved_on_repo_named("api");
+        let (web, web_a, web_b, _) = moved_on_repo_named("web");
+        git_in(web.path(), &["checkout", "-q", &web_a]);
+        let two = |api: &str, web: &str| {
+            json!({"schema":"carrick.resolve-repos/0",
+                "workspace":{"slug":"fixture","billing_tier":"free","installed":true},
+                "allowance_sentence":null,
+                "repos":[
+                    {"full_name":"example/api","connected":true,"project_id":"pa","project_slug":"sa",
+                     "services":[service_row("api", api)]},
+                    {"full_name":"example/web","connected":true,"project_id":"pb","project_slug":"sb",
+                     "services":[service_row("web", web)]}],
+                "project_repos":[{"project_slug":"sa","repos":["example/api"]},
+                                 {"project_slug":"sb","repos":["example/web"]}]})
+        };
+        let held = snapshot(
+            two(&api_a, &web_a),
+            BTreeMap::from([
+                ("pa".to_string(), vec![named_blob("api", "api", &api_a)]),
+                ("pb".to_string(), vec![named_blob("web", "web", &web_a)]),
+            ]),
+        );
+        // Two replies only: a download of `pb` finds the mock gone.
+        let (url, requests) = serve_sequence(vec![
+            ("200 OK", serde_json::to_vec(&two(&api_b, &web_b)).unwrap()),
+            (
+                "200 OK",
+                answered(&[(named_blob("api", "api", &api_b), MOVED_AT)]),
+            ),
+        ]);
+        let remotes = BTreeMap::from([
+            (api.path().to_path_buf(), "example/api".to_string()),
+            (web.path().to_path_buf(), "example/web".to_string()),
+        ]);
+        let (outcome, snapshot, _) = reader(url)
+            .forward(&credential("test"), &remotes, held)
+            .await;
+        assert!(
+            matches!(&outcome, Forward::Moved { moved, kept } if moved.len() == 1 && kept.len() == 1),
+            "{outcome:?}"
+        );
+        assert_eq!(requests.join().unwrap().len(), 2);
+        let input = HostedInput {
+            snapshot,
+            remotes,
+            ..Default::default()
+        };
+        assert_eq!(
+            commits_of(&input, api.path()),
+            vec![(Some("api".into()), api_b)]
+        );
+        assert_eq!(
+            commits_of(&input, web.path()),
+            vec![(Some("web".into()), web_a)]
+        );
+    }
+
+    /// The no-network repair is per repo too: a local index left behind its
+    /// snapshot heals the repo that may move and skips, with its reason, the
+    /// one whose HEAD does not hold the snapshot's commit.
+    #[test]
+    fn heal_moves_the_repo_that_may_and_skips_the_one_that_may_not() {
+        use crate::git_state::tests::git_in;
+        let (api, api_a, api_b, _) = moved_on_repo_named("api");
+        let (web, web_a, web_b, _) = moved_on_repo_named("web");
+        git_in(web.path(), &["checkout", "-q", &web_a]);
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            root: root.path().to_path_buf(),
+            repos: vec![api.path().to_path_buf(), web.path().to_path_buf()],
+            missing: Vec::new(),
+            repos_detected_by: String::new(),
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            parent_proposal: None,
+        };
+        let built = |path: &Path, name: &str, commit: &str| {
+            json!({"path": path.to_string_lossy(), "name": name, "files": {},
+                "services": [{"name": name, "commit": commit, "indexed_at": "then",
+                    "boundary": null, "routes": 0, "calls": 0}]})
+        };
+        let index = json!({"version": super::super::read_model::READ_MODEL_VERSION,
+            "scanner_version": "test", "indexed_at": "then",
+            "repos": [built(api.path(), "api", &api_a), built(web.path(), "web", &web_a)]});
+        std::fs::create_dir_all(workspace.index_dir()).unwrap();
+        std::fs::write(workspace.index_file(), serde_json::to_vec(&index).unwrap()).unwrap();
+        // A snapshot `hosted::refresh` wrote at B for both, with no HEAD test.
+        let held = snapshot(
+            in_one_project(&[
+                ("example/api", vec![("api", &api_b)]),
+                ("example/web", vec![("web", &web_b)]),
+            ]),
+            BTreeMap::from([(
+                "p".to_string(),
+                vec![
+                    named_blob("api", "api", &api_b),
+                    named_blob("web", "web", &web_b),
+                ],
+            )]),
+        );
+        let remotes = BTreeMap::from([
+            (api.path().to_path_buf(), "example/api".to_string()),
+            (web.path().to_path_buf(), "example/web".to_string()),
+        ]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let healed = heal(&workspace, &remotes, &held, &|paths| {
+            asked.borrow_mut().push(paths.to_vec());
+            Ok(())
+        });
+        assert_eq!(
+            healed,
+            Some(Ok((
+                vec![(api.path().to_path_buf(), api_b.clone())],
+                vec![(
+                    web.path().to_path_buf(),
+                    format!(
+                        "example/web: the hosted index is at {}, which this checkout's HEAD \
+                         does not hold",
+                        &web_b[..7]
+                    )
+                )]
+            )))
+        );
+        assert_eq!(asked.into_inner(), vec![vec![api.path().to_path_buf()]]);
     }
 }
