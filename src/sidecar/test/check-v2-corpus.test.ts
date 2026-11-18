@@ -14,76 +14,16 @@
 
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CheckResult } from '../src/capture/api.js';
+import { SidecarClient } from './helpers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SIDECAR = path.join(__dirname, '..', 'src', 'index.js');
 // dist/test -> repo root is four levels up.
 const FIXTURES = path.join(__dirname, '..', '..', '..', '..', 'tests', 'fixtures');
-
-/** Minimal client that tolerates progress frames and matches by request_id. */
-class ProgressAwareClient {
-  private proc: ChildProcessWithoutNullStreams | null = null;
-  private buffer = '';
-  private waiters = new Map<string, (v: unknown) => void>();
-
-  async start(): Promise<void> {
-    this.proc = spawn('node', [SIDECAR], { stdio: ['pipe', 'pipe', 'pipe'] });
-    this.proc.stdout.on('data', (d: Buffer) => {
-      this.buffer += d.toString();
-      const lines = this.buffer.split('\n');
-      this.buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let msg: { request_id?: string; status?: string };
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (msg.status === 'progress') continue; // keepalive: keep waiting
-        const w = msg.request_id ? this.waiters.get(msg.request_id) : undefined;
-        if (w) {
-          this.waiters.delete(msg.request_id!);
-          w(msg);
-        }
-      }
-    });
-    await new Promise((r) => setTimeout(r, 150));
-  }
-
-  send<T>(request: Record<string, unknown>, timeoutMs = 120000): Promise<T> {
-    const id = request.request_id as string;
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.waiters.delete(id);
-        reject(new Error(`timeout for ${id}`));
-      }, timeoutMs);
-      timer.unref();
-      this.waiters.set(id, (v) => {
-        clearTimeout(timer);
-        resolve(v as T);
-      });
-      this.proc!.stdin.write(JSON.stringify(request) + '\n');
-    });
-  }
-
-  async stop(): Promise<void> {
-    if (!this.proc) return;
-    try {
-      this.proc.stdin.write(JSON.stringify({ action: 'shutdown', request_id: 'sd' }) + '\n');
-    } catch {
-      /* ignore */
-    }
-    this.proc.kill();
-    this.proc = null;
-  }
-}
 
 interface CaptureResp {
   status: string;
@@ -97,7 +37,7 @@ interface CheckResp {
 }
 
 describe('check_v2 corpus end-to-end (stdio, byte-stable)', () => {
-  const client = new ProgressAwareClient();
+  const client = new SidecarClient();
   let workRoot: string;
   let stubDirs: Record<string, string>;
 

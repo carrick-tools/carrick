@@ -30,17 +30,15 @@
 
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import * as readline from 'node:readline';
 import { Project } from 'ts-morph';
 import { captureStub } from '../src/capture/index.js';
 import type { CaptureAnchorRequest } from '../src/capture/api.js';
 import { TypeInferrer } from '../src/type-inferrer.js';
 import type { InferRequestItem } from '../src/types.js';
-import { SIDECAR_PATH } from './helpers.js';
+import { ENGINE_WAIT_MS, SidecarClient } from './helpers.js';
 
 const TSCONFIG = JSON.stringify({
   compilerOptions: { target: 'es2020', module: 'commonjs', strict: true, skipLibCheck: true, types: [] },
@@ -79,46 +77,26 @@ interface Frame {
 
 /** A sidecar whose every stdout frame is kept, progress frames included. */
 class RawSidecar {
-  private readonly child: ChildProcessWithoutNullStreams;
-  private readonly frames: Frame[] = [];
-  private waiting: (() => void) | null = null;
+  private readonly client = new SidecarClient();
 
-  constructor() {
-    this.child = spawn('node', [SIDECAR_PATH], { stdio: ['pipe', 'pipe', 'pipe'] });
-    this.child.stderr.resume();
-    readline.createInterface({ input: this.child.stdout }).on('line', (line) => {
-      if (!line.trim()) return;
-      this.frames.push(JSON.parse(line) as Frame);
-      this.waiting?.();
-    });
+  start(): Promise<void> {
+    return this.client.start();
   }
 
   /** Send one request and return every frame up to and including its terminal one. */
   async exchange(request: Record<string, unknown>): Promise<Frame[]> {
-    const from = this.frames.length;
-    this.child.stdin.write(JSON.stringify(request) + '\n');
-    const terminal = () =>
-      this.frames.slice(from).some((f) => f.request_id === request.request_id && f.status !== 'progress');
-    while (!terminal()) {
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`no terminal frame for ${request.request_id}`)), 60_000);
-        this.waiting = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-      });
-    }
-    this.waiting = null;
-    return this.frames.slice(from);
+    const from = this.client.frames().length;
+    await this.client.send(request, ENGINE_WAIT_MS);
+    return this.client.frames().slice(from) as Frame[];
   }
 
   /** Every frame the process has written. */
   all(): Frame[] {
-    return [...this.frames];
+    return this.client.frames() as Frame[];
   }
 
-  stop(): void {
-    this.child.kill();
+  stop(): Promise<void> {
+    return this.client.stop();
   }
 }
 
@@ -296,12 +274,13 @@ describe('long requests report progress (carrick#1914)', () => {
 
     before(async () => {
       sidecar = new RawSidecar();
+      await sidecar.start();
       const [ready] = await sidecar.exchange({ action: 'init', request_id: 'progress-init', repo_root: root });
       assert.strictEqual(ready.status, 'ready');
     });
 
-    after(() => {
-      sidecar.stop();
+    after(async () => {
+      await sidecar.stop();
     });
 
     const progressOf = (frames: Frame[]) => frames.filter((f) => f.status === 'progress');

@@ -22,12 +22,10 @@
 
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
-import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import * as readline from 'node:readline';
-import { SIDECAR_PATH, receivedAliases } from './helpers.js';
+import { ENGINE_WAIT_MS, SidecarClient, receivedAliases } from './helpers.js';
 
 interface Answer {
   request_id: string;
@@ -102,50 +100,15 @@ export function receipt(): Receipt {
 async function session(
   requests: Array<Record<string, unknown>>,
 ): Promise<{ answers: Answer[]; log: string }> {
-  const child = spawn('node', [SIDECAR_PATH], { stdio: ['pipe', 'pipe', 'pipe'] });
-  let log = '';
-  child.stderr.on('data', (chunk: Buffer) => {
-    log += chunk.toString();
-  });
-  const closed = new Promise<void>((resolve) => child.on('close', () => resolve()));
-
-  const frames: Answer[] = [];
-  let arrived: (() => void) | null = null;
-  readline.createInterface({ input: child.stdout }).on('line', (line) => {
-    if (!line.trim()) return;
-    const frame = JSON.parse(line) as Answer;
-    // A progress frame is not an answer (carrick#1914).
-    if (frame.status === 'progress') return;
-    frames.push(frame);
-    arrived?.();
-  });
-
+  const client = new SidecarClient();
+  await client.start();
   const answers: Answer[] = [];
   try {
-    for (const request of [...requests, { action: 'shutdown', request_id: 'shutdown' }]) {
-      const expected = frames.length + 1;
-      child.stdin.write(JSON.stringify(request) + '\n');
-      while (frames.length < expected) {
-        await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(
-            () => reject(new Error(`no answer to ${String(request.request_id)}`)),
-            60_000,
-          );
-          arrived = () => {
-            clearTimeout(timer);
-            resolve();
-          };
-        });
-      }
-      arrived = null;
-      answers.push(frames[expected - 1]);
-    }
-    await closed;
+    for (const request of requests) answers.push(await client.send<Answer>(request, ENGINE_WAIT_MS));
   } finally {
-    child.kill();
+    await client.stop();
   }
-  // The shutdown's own answer is not one of the caller's.
-  return { answers: answers.slice(0, requests.length), log };
+  return { answers, log: client.stderr() };
 }
 
 describe('resolve_definitions builds no service project (carrick#1927)', () => {
