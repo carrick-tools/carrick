@@ -8,8 +8,8 @@ description: Use when the ask is what is wrong in this codebase, what to clean u
 {{SCOPE_NOTE}}
 
 Cost: this skill opens source for every item it reads. Ten type mismatches and
-ten groups of similar functions took about 230,000 tokens on a project of six
-services and 2,200 files. Before reading, tell the user how many items each
+ten groups of similar functions took between 130,000 and 230,000 tokens on a
+project of six services and 2,200 files. Before reading, tell the user how many items each
 section holds and offer to narrow to one service or cap the count.
 
 The index states the leads. Your work is to prove or drop each one in source.
@@ -56,7 +56,9 @@ Class each finding:
   column or an outside service. Say where.
 
 The fields a finding names are leads. The field that breaks may be another
-one; name the one that does.
+one; name the one that does. Where it is not one the finding names, class the
+finding by the field that breaks and list the named fields beside it as
+TYPE-ONLY.
 
 ## 3. Functions written twice
 
@@ -72,8 +74,9 @@ Class each member against the first:
 - **VARIANT**: same contract, and a difference you can name in a clause.
 - **FALSE POSITIVE**: different contracts.
 
-Where the members sit in separate apps with no shared package between them, say
-so: the fix is a move into a shared package, not an import.
+Where the members sit in separate apps, check their package.json files for a
+package they already share. Where one exists, the fix is to move the function
+there and import it; where none does, say so: the fix is a new shared package.
 
 ## 4. Report
 
