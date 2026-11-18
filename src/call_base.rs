@@ -267,8 +267,6 @@ fn base_env_var(
     .then(|| last.to_string())
 }
 
-/// Whether a segment is a plain JS identifier — no call, no index, no
-/// interpolation. Anything else is an expression the scanner is not reading.
 /// The text after a `process.env.` or `import.meta.env.` prefix, or `None`
 /// when the text carries neither. The one place the two env spellings are named.
 pub(crate) fn env_prefixed_name(text: &str) -> Option<&str> {
@@ -277,6 +275,8 @@ pub(crate) fn env_prefixed_name(text: &str) -> Option<&str> {
         .find_map(|prefix| text.strip_prefix(prefix))
 }
 
+/// Whether a segment is a plain JS identifier — no call, no index, no
+/// interpolation. Anything else is an expression the scanner is not reading.
 fn is_plain_identifier(text: &str) -> bool {
     !text.is_empty()
         && text
