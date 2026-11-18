@@ -6234,7 +6234,7 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
-                async { settled_from(library_handed, library_ask.as_deref(), early_answer).await },
+                async { settled_from(library_handed, library_ask.as_ref(), early_answer).await },
                 fact_files_of(
                     library_ask.as_deref(),
                     first_answer,
@@ -7607,9 +7607,10 @@ fn library_turn(
 /// The settled answer of the ask `handed` holds, or of the ask the analysis
 /// sends itself when nothing was handed to it, or when the lane's ask
 /// panicked (a miss, never a failed scan: [`answers_ahead::LibraryHanded::settle`]).
+/// The analysis's own ask runs on a task of its own ([`own_library_ask`]).
 async fn settled_from(
     handed: Option<answers_ahead::LibraryHanded>,
-    ask: Option<&LibraryAsk>,
+    ask: Option<&std::sync::Arc<LibraryAsk>>,
     early: tokio::sync::oneshot::Sender<crate::library_store::FirstAnswer>,
 ) -> crate::library_store::Settled {
     match handed {
@@ -7619,11 +7620,48 @@ async fn settled_from(
                 // The first answer may already be sent; a spare channel
                 // takes the one this ask sends again.
                 let early = early.unwrap_or_else(|| tokio::sync::oneshot::channel().0);
-                settled_library_answer(ask, early).await
+                own_ask_settled(ask, early).await
             }
         },
-        None => settled_library_answer(ask, early).await,
+        None => own_ask_settled(ask, early).await,
     }
+}
+
+/// The settled answer of the analysis's own ask, on its own task.
+async fn own_ask_settled(
+    ask: Option<&std::sync::Arc<LibraryAsk>>,
+    early: tokio::sync::oneshot::Sender<crate::library_store::FirstAnswer>,
+) -> crate::library_store::Settled {
+    match ask {
+        // `settle` returns `Err` only for a lane ask that panicked, and this
+        // ask is not the lane's.
+        Some(ask) => own_library_ask(ask).settle(early).await.unwrap_or_default(),
+        None => crate::library_store::Settled::default(),
+    }
+}
+
+/// Run the analysis's own store ask `work` on a task of its own
+/// (carrick#4810), handed over as the lane's ask is. Awaited inline, its
+/// timer ran while synchronous work beside it in the analysis held the
+/// task, and it timed out with its answer in reach.
+fn own_task<Work>(
+    asked: crate::library_store::Asked,
+    work: impl FnOnce(tokio::sync::oneshot::Sender<crate::library_store::FirstAnswer>) -> Work,
+) -> answers_ahead::LibraryHanded
+where
+    Work: std::future::Future<Output = crate::library_store::Settled> + Send + 'static,
+{
+    let (early, first) = tokio::sync::oneshot::channel();
+    let settled = crate::current_service::spawn(work(early));
+    answers_ahead::LibraryHanded::new(asked, first, settled)
+}
+
+/// The analysis's own ask of the store for `ask`, on its own task.
+fn own_library_ask(ask: &std::sync::Arc<LibraryAsk>) -> answers_ahead::LibraryHanded {
+    let ask = std::sync::Arc::clone(ask);
+    own_task(ask.asked.clone(), move |early| async move {
+        settled_library_answer(Some(&ask), early).await
+    })
 }
 
 /// Send the service's own library-store `ask` on a task of its own, then ask
@@ -7751,6 +7789,80 @@ mod beside_tests {
         let (task, answer) = beside(None::<std::future::Ready<()>>, || 7).await;
         assert!(task.is_none());
         assert_eq!(answer, 7);
+    }
+}
+
+#[cfg(test)]
+mod own_task_tests {
+    use super::own_task;
+    use crate::library_store::{Asked, FirstAnswer, Settled};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Several polls and a hop to another task, as an HTTP request needs.
+    async fn round_trip() {
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let (send, mut receive) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(1);
+        tokio::spawn(async move {
+            if let Some(reply) = receive.recv().await {
+                let _ = reply.send(());
+            }
+        });
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        send.send(reply).await.unwrap();
+        answer.await.unwrap();
+    }
+
+    /// Yields once, then holds its thread, as the analysis's synchronous walk does.
+    async fn blocks_like_the_walk<Out>(hold: Duration, check: impl FnOnce() -> Out) -> Out {
+        tokio::task::yield_now().await;
+        std::thread::sleep(hold);
+        check()
+    }
+
+    /// The shape of the bug: an ask awaited in place beside a blocking branch
+    /// has its timer run out while it cannot be polled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ask_awaited_inline_beside_a_blocking_branch_runs_out_of_time() {
+        let (asked, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(200), round_trip()),
+            blocks_like_the_walk(Duration::from_millis(600), || ())
+        );
+        assert!(asked.is_err(), "the inline ask was answered in time");
+    }
+
+    /// The analysis's own ask is answered while a branch beside it blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_analysis_s_own_ask_is_answered_while_a_branch_blocks() {
+        let answered = Arc::new(AtomicBool::new(false));
+        let work = {
+            let answered = Arc::clone(&answered);
+            move |early: tokio::sync::oneshot::Sender<FirstAnswer>| async move {
+                round_trip().await;
+                answered.store(true, Ordering::SeqCst);
+                let _ = early.send(FirstAnswer::default());
+                Settled {
+                    asked: true,
+                    ..Default::default()
+                }
+            }
+        };
+        let (early_tx, early_rx) = tokio::sync::oneshot::channel();
+        let (settled, saw_answer) = tokio::join!(
+            own_task(Asked::naming(&["a"]), work).settle(early_tx),
+            blocks_like_the_walk(Duration::from_millis(600), || answered
+                .load(Ordering::SeqCst))
+        );
+        assert!(
+            saw_answer,
+            "the ask was not answered while the branch blocked"
+        );
+        let settled = settled.expect("the ask is not the lane's");
+        assert!(settled.asked && settled.failure.is_none());
+        assert_eq!(early_rx.await.unwrap(), FirstAnswer::default());
     }
 }
 
@@ -15825,7 +15937,7 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
-        async { settled_from(own_library, library_ask.as_deref(), early_answer).await },
+        async { settled_from(own_library, library_ask.as_ref(), early_answer).await },
         fact_files_of(
             library_ask.as_deref(),
             first_answer,
