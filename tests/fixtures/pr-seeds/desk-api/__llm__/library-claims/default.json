@@ -1,0 +1,56 @@
+{
+  "library_claims": [
+    {
+      "package": "fixture-server",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-server",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "get",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "GET",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "post",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "POST",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

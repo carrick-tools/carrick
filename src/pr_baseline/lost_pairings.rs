@@ -77,9 +77,10 @@ pub struct RemovedOperation {
     pub place: String,
     /// Whether the diff anchor listed this removal (`pr_delta_anchor::run`).
     pub placed: bool,
-    /// A socket or pub/sub registration whose name the scan could not read
-    /// sits on a line the PR wrote, in the same service: the removal may
-    /// still be there, so its row is a candidate (carrick#3224).
+    /// An HTTP route, socket or pub/sub registration whose name the scan
+    /// could not read sits on a line the PR wrote, in the same service: the
+    /// removal may still be there, so its row is a candidate (carrick#3224,
+    /// carrick#3225).
     pub unread_registration: bool,
     pub source: Option<ResolutionSource>,
 }

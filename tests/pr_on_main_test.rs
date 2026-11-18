@@ -2533,6 +2533,8 @@ struct MainSnapshot {
     jobs_reach: ReachObjects,
     parcel_rows: Vec<CloudRepoData>,
     parcel_reach: ReachObjects,
+    desk_rows: Vec<CloudRepoData>,
+    desk_reach: ReachObjects,
 }
 
 static MAIN: tokio::sync::OnceCell<MainSnapshot> = tokio::sync::OnceCell::const_new();
@@ -2573,6 +2575,8 @@ impl MainSnapshot {
             "jobs_reach": reach(&self.jobs_reach),
             "parcel_rows": self.parcel_rows,
             "parcel_reach": reach(&self.parcel_reach),
+            "desk_rows": self.desk_rows,
+            "desk_reach": reach(&self.desk_reach),
         })
     }
 }
@@ -2611,6 +2615,12 @@ async fn build_snapshot(trees: &Path) -> MainSnapshot {
     let parcel = seed_repo(trees, "parcel-desk");
     let parcel_store = Store::default();
     scan_seed_repo(&parcel_store, &parcel).await;
+    let desk_api = seed_repo(trees, "desk-api");
+    let desk_web = seed_repo(trees, "desk-web");
+    let desk_store = Store::default();
+    scan_seed_repo(&desk_store, &desk_api).await;
+    scan_seed_repo(&desk_store, &desk_web).await;
+    scan_seed_repo(&desk_store, &desk_api).await;
     MainSnapshot {
         trees: unlinked(trees),
         shared_rows: shared.repos.lock().unwrap().clone(),
@@ -2625,6 +2635,8 @@ async fn build_snapshot(trees: &Path) -> MainSnapshot {
         jobs_reach: jobs_store.type_reach.lock().unwrap().clone(),
         parcel_rows: parcel_store.repos.lock().unwrap().clone(),
         parcel_reach: parcel_store.type_reach.lock().unwrap().clone(),
+        desk_rows: desk_store.repos.lock().unwrap().clone(),
+        desk_reach: desk_store.type_reach.lock().unwrap().clone(),
     }
 }
 
@@ -2674,6 +2686,8 @@ fn read_snapshot(dir: &Path) -> MainSnapshot {
         jobs_reach: reach("jobs_reach"),
         parcel_rows: rows("parcel_rows"),
         parcel_reach: reach("parcel_reach"),
+        desk_rows: rows("desk_rows"),
+        desk_reach: reach("desk_reach"),
     }
 }
 
@@ -2785,6 +2799,7 @@ async fn snapshot_from_cache_equals_fresh_scan() {
         .chain(&cached.shelf_rows)
         .chain(&cached.jobs_rows)
         .chain(&cached.parcel_rows)
+        .chain(&cached.desk_rows)
     {
         assert_eq!(
             head(&cached.trees.join(&row.repo_name)),
@@ -2920,6 +2935,7 @@ async fn seed_payload_from(
         "rpc-shelf" => (&main.shelf_rows, &main.shelf_reach),
         "jobs-sender" | "jobs-worker" => (&main.jobs_rows, &main.jobs_reach),
         "parcel-desk" => (&main.parcel_rows, &main.parcel_reach),
+        "desk-api" | "desk-web" => (&main.desk_rows, &main.desk_reach),
         _ => (&main.shared_rows, &main.shared_reach),
     };
     let store = Store {
@@ -3622,10 +3638,10 @@ async fn seed_http_path_into_option_default() {
     assert_manifest_delta(&payload, "http-path-into-option-default");
 }
 
-/// A removed socket or pub/sub row the PR rewrote into a registration whose
-/// name the scan cannot read is a candidate in the delta, and so is the break
-/// row its lost pairing marks (carrick#3224): the registration may still be
-/// there, so neither is stated as fact.
+/// A removed HTTP route, procedure, socket or pub/sub row the PR rewrote into
+/// a registration whose name the scan cannot read is a candidate in the delta,
+/// and so is the break row its lost pairing marks (carrick#3224, carrick#3225):
+/// the registration may still be there, so neither is stated as fact.
 fn assert_unread_registration_removal_is_candidate(
     payload: &serde_json::Value,
     break_row: (&str, &str, &str),
@@ -3664,6 +3680,18 @@ async fn seed_pubsub_subscriber_topic_in_option_default() {
     assert_unread_registration_removal_is_candidate(
         &payload,
         ("missing_endpoint", "PUBSUB", "payments.settled"),
+    );
+}
+
+/// An HTTP route's path moves into a value of a parameter the scan does not
+/// hold, while a client still calls it.
+#[tokio::test]
+async fn seed_http_route_path_into_runtime_head() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-route-path-into-runtime-head").await;
+    assert_unread_registration_removal_is_candidate(
+        &payload,
+        ("missing_endpoint", "GET", "/api/v1/desk/tickets"),
     );
 }
 

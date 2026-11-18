@@ -53,6 +53,12 @@ miss moves the declaration in the same PR. A seed is removed only by
   (`shelf.gone`) is to a procedure nothing serves; it is no row. Its library
   answers are the server labels of `rpc-api` plus the client's.
 
+- `desk-api` and `desk-web` (the repos, not `parcel-desk`'s services) are two
+  repos in one store of their own: `desk-api` serves `GET
+  /api/v1/desk/tickets` through a router stub, and `desk-web`'s
+  `TicketsClient` calls it through `send` (path and verb stated at the call
+  site, so the call row is deterministic). The `http-route-path-into-runtime-head`
+  seed edits `desk-api` only (carrick#3225).
 - `parcel-desk` is two services in one repo, with a store of
   its own: `desk-api` builds a GraphQL schema in code and prints it to
   `api/dist/schema.graphql`, the one served schema file, named in its
@@ -115,6 +121,7 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `non-code-edit` | adds `docs/orders.md` | empty delta, no finding | passes |
 | `http-prefix-moved` (`rpc-api`) | sub-app mount `/api/v1` to `/api/v2` | delta new `/api/v2/reports/daily`, removed `/api/v1/...` | passes |
 | `http-edit-under-prefix` (`rpc-api`) | a handler body under the mounted prefix | empty delta | passes |
+| `http-route-path-into-runtime-head` (`desk-api`) | the route moves into a loop that registers `` `${head}desk/tickets` `` over a parameter (`src/desk.ts:8`); `desk-web` still calls it | no break row stated as fact: the delta's removed row and the lost pairing's break row are both `candidate` (carrick#3225); the correct check is quiet | passes; the candidate break row still counts as a raiser, so the seed declares `finding` (carrick#4800) |
 | `http-path-into-option-default` (`rpc-api`) | `/reports/daily` moves into a destructured option whose default is the same path (`src/server.ts:7`) | empty delta | passes |
 | `trpc-procedure-added`, `-removed`, `-renamed` (`rpc-api`) | `orders.cancel` added, `orders.create` removed, `create` to `place` | delta under the adapter's endpoint (`POST /api/trpc/orders.cancel`) | passes |
 | `trpc-resolver-body` (`rpc-api`) | a mutation's body | empty delta, no introduced risk | passes |

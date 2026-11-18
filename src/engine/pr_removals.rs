@@ -129,11 +129,11 @@ impl Removals {
                 })
                 .collect()
         };
-        // The unread registrations that could serve a removed socket or
-        // pub/sub operation: where the PR wrote one, the registration may
-        // still be there, so the break row it would mark is a candidate, as
-        // the delta's removed row is (carrick#3224). An HTTP removal's break
-        // row reads none.
+        // The unread registrations that could serve a removed HTTP route,
+        // socket or pub/sub operation: where the PR wrote one, the
+        // registration may still be there, so the break row it would mark is
+        // a candidate, as the delta's removed row is (carrick#3224,
+        // carrick#3225).
         let serving: Vec<Vec<Place>> = operations
             .iter()
             .map(|removal| serving_places(removal, unread))
@@ -205,14 +205,16 @@ impl Placeable for RemovedSend {
     }
 }
 
-/// The places of the unread registrations that could serve a removed socket
-/// or pub/sub operation of main's copy: the same service and protocol
-/// ([`UnreadAt::could_serve`]). Empty for any other protocol.
+/// The places of the unread registrations that could serve a removed HTTP
+/// route (a procedure included), socket or pub/sub operation of main's copy:
+/// the same service and protocol ([`UnreadAt::could_serve`]), the delta's own
+/// rule (carrick#3225). Empty for any other protocol, which has no unread
+/// record.
 fn serving_places(removal: &Removed<RemovedOperation>, unread: &[UnreadAt]) -> Vec<Place> {
     let Some(row) = removal.rows.first() else {
         return Vec::new();
     };
-    let Some(key) = OperationKey::from_canonical(&row.key).filter(is_message_protocol) else {
+    let Some(key) = OperationKey::from_canonical(&row.key) else {
         return Vec::new();
     };
     unread
@@ -649,5 +651,52 @@ mod tests {
         };
         assert!(!softened("src/other.ts", 2), "a line the PR did not write");
         assert!(softened("src/realtime.ts", 2), "a line the PR wrote");
+    }
+
+    /// carrick#3225: the break row of a removed HTTP route is softened by an
+    /// unread route site of the same service and a method that serves its
+    /// method, on a line the PR wrote. A site of another method, or on a line
+    /// the PR left alone, changes nothing.
+    #[test]
+    fn an_unread_route_softens_a_removed_route_only_where_the_pr_wrote_it() {
+        use crate::site_rows::{UnreadKind, UnreadRegistration};
+        let (repo, base) = crate::git_state::tests::committed_repo(&[
+            ("src/desk.ts", "a\nroute\nc\nd\n"),
+            ("src/other.ts", "p\nq\nr\n"),
+        ]);
+        std::fs::write(repo.path().join("src/desk.ts"), "a\nreworked\nc\nd\n").unwrap();
+        let main = vec![blob(
+            None,
+            vec![row("GET", "/desk/tickets", "src/desk.ts:2")],
+        )];
+        let current = vec![blob(None, vec![])];
+        let softened = |method: &str, file: &str, line: u32| {
+            let unread = [UnreadAt::of(
+                &None,
+                &UnreadRegistration {
+                    file: file.to_string(),
+                    line,
+                    kind: UnreadKind::Http(method.to_string()),
+                },
+            )];
+            let removals = Removals::of(
+                &repo.path().to_string_lossy(),
+                Some(&base),
+                &main,
+                &current,
+                &[],
+                None,
+                &unread,
+            );
+            assert_eq!(removals.operations.len(), 1);
+            removals.operations[0].unread_registration
+        };
+        assert!(softened("GET", "src/desk.ts", 2), "the same method");
+        assert!(softened("ALL", "src/desk.ts", 2), "a site of every method");
+        assert!(!softened("POST", "src/desk.ts", 2), "another method");
+        assert!(
+            !softened("GET", "src/other.ts", 2),
+            "a line the PR did not write"
+        );
     }
 }
