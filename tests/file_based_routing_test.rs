@@ -9,7 +9,7 @@
 //! gate is caught with files that look like a user's repository.
 
 use carrick::agents::file_orchestrator::FileOrchestrator;
-use carrick::file_based_router::{RoutingConvention, builtin_conventions};
+use carrick::file_based_router::{RoutingConvention, builtin_conventions, conventions_for_service};
 use carrick::swc_scanner::SwcScanner;
 use std::collections::BTreeSet;
 use std::fs;
@@ -506,4 +506,291 @@ fn a_compared_request_method_narrows_a_role_named_export() {
         "a method-guarded handler should yield exactly the guarded verb and no \
          phantom default-verb row"
     );
+}
+
+/// One stated row of a folder-named function: (repo-relative file, method,
+/// path, handler, line, convention).
+type FunctionRow = (String, String, String, String, i32, String);
+
+/// A route whose handler was not located: (repo-relative file, line, what
+/// the serving call was handed).
+type Unplaced = (String, u32, Option<String>);
+
+/// The `handler_name` of a row whose handler was not located.
+const NOT_LOCATED: &str = "__handler_not_located__";
+
+/// What the file-based pass states for every file under `service_root` of
+/// `repo`, with the conventions that service runs under
+/// ([`conventions_for_service`], the selection every caller reads): the rows,
+/// and where a convention stated a route and located no handler.
+fn service_function_rows(
+    repo: &Path,
+    service_root: &Path,
+    conventions: &[RoutingConvention],
+) -> (BTreeSet<FunctionRow>, BTreeSet<Unplaced>) {
+    let scanner = SwcScanner::new();
+    let mut files = Vec::new();
+    walk(service_root, &mut files);
+    let mut rows = BTreeSet::new();
+    let mut unplaced = BTreeSet::new();
+    for file in &files {
+        let rel = file.strip_prefix(service_root).expect("file under service");
+        let in_repo = file
+            .strip_prefix(repo)
+            .expect("file under repo")
+            .to_string_lossy()
+            .to_string();
+        let Ok(content) = fs::read_to_string(file) else {
+            continue;
+        };
+        let derivation =
+            FileOrchestrator::file_based_endpoints(&scanner, rel, file, &content, conventions);
+        if let Some(at) = &derivation.handler_not_located {
+            unplaced.insert((in_repo.clone(), at.line, at.passed.clone()));
+        }
+        assert_eq!(
+            derivation.claimed,
+            !derivation.endpoints.is_empty(),
+            "{in_repo}: a stated route claims the module, and only then"
+        );
+        for ep in derivation.endpoints {
+            assert_eq!(ep.owner_node, "__file_based_route__", "{in_repo}");
+            let located = ep.handler_name != NOT_LOCATED;
+            assert_eq!(
+                located,
+                derivation.handler_not_located.is_none(),
+                "{in_repo}"
+            );
+            if located {
+                assert!(ep.call_expression_span_start.is_some(), "{in_repo}");
+                assert_eq!(
+                    ep.handler_declaration_line,
+                    Some(ep.line_number as u32),
+                    "{in_repo}"
+                );
+            } else {
+                assert_eq!(ep.handler_declaration_line, None, "{in_repo}");
+            }
+            rows.insert((
+                in_repo.clone(),
+                ep.method,
+                ep.path,
+                ep.handler_name,
+                ep.line_number,
+                ep.pattern_matched,
+            ));
+        }
+    }
+    (rows, unplaced)
+}
+
+fn function_rows_expected() -> BTreeSet<FunctionRow> {
+    [
+        (
+            "supabase/functions/price-quote/index.ts",
+            "/functions/v1/price-quote",
+            "anonymous",
+            8,
+        ),
+        (
+            "supabase/functions/team-digest/index.ts",
+            "/functions/v1/team-digest",
+            "anonymous",
+            1,
+        ),
+        (
+            "supabase/functions/purge-sessions/index.ts",
+            "/functions/v1/purge-sessions",
+            "purgeSessions",
+            3,
+        ),
+        // An imported handler: the route is stated, the handler is not.
+        (
+            "supabase/functions/send-invite/index.ts",
+            "/functions/v1/send-invite",
+            NOT_LOCATED,
+            4,
+        ),
+        // No serving call at all: still the folder's route, with no handler.
+        (
+            "supabase/functions/report-export/index.ts",
+            "/functions/v1/report-export",
+            NOT_LOCATED,
+            1,
+        ),
+    ]
+    .into_iter()
+    .map(|(file, path, handler, line)| {
+        (
+            file.to_string(),
+            "ALL".to_string(),
+            path.to_string(),
+            handler.to_string(),
+            line,
+            "supabase-functions".to_string(),
+        )
+    })
+    .collect()
+}
+
+/// A function served by its folder (`supabase/functions/<name>/index.ts`) is
+/// one row at `ALL /functions/v1/<name>`, its handler the function the module
+/// hands to its one top-level call, whether that call is `serve` from a URL
+/// import or `Deno.serve`, and whether the function is inline or named. An
+/// entry file whose handler is not located (an imported handler, no serving
+/// call) still states its one row, with no handler, and is an unplaced
+/// handler naming what the call was handed. Only entry files make rows: the
+/// shared `_` folder and a helper module beside an entry state nothing. The
+/// same rows come out whether the folder is its own service or sits inside
+/// one at the repository root.
+#[test]
+fn a_folder_named_function_states_one_any_method_route() {
+    let repo = fixture_root("hosted-functions");
+    let unplaced_expected = BTreeSet::from([
+        (
+            "supabase/functions/send-invite/index.ts".to_string(),
+            4,
+            Some("handleInvite".to_string()),
+        ),
+        (
+            "supabase/functions/report-export/index.ts".to_string(),
+            1,
+            None,
+        ),
+    ]);
+    for service_root in [repo.clone(), repo.join("supabase/functions")] {
+        let conventions =
+            conventions_for_service(&["@supabase/supabase-js".to_string()], &repo, &service_root);
+        let (rows, unplaced) = service_function_rows(&repo, &service_root, &conventions);
+        assert_eq!(rows, function_rows_expected(), "{}", service_root.display());
+        assert_eq!(unplaced, unplaced_expected, "{}", service_root.display());
+    }
+    // A service elsewhere in the repository holds none of the folder.
+    let elsewhere = conventions_for_service(&[], &repo, &repo.join("src"));
+    assert!(
+        elsewhere.is_empty(),
+        "{:?}",
+        elsewhere.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+}
+
+/// The derivation of one fixture file under the root service.
+fn derive_function_file(rel: &str) -> carrick::agents::file_orchestrator::FileRouteDerivation {
+    let repo = fixture_root("hosted-functions");
+    let conventions = conventions_for_service(&[], &repo, &repo);
+    let file = repo.join(rel);
+    let content = fs::read_to_string(&file).unwrap();
+    FileOrchestrator::file_based_endpoints(
+        &SwcScanner::new(),
+        Path::new(rel),
+        &file,
+        &content,
+        &conventions,
+    )
+}
+
+/// `serve(importedHandler)`: the layout states the route, so the entry file
+/// is one claimed row at its real address with no handler, and the unread
+/// site names what `serve` was handed.
+#[test]
+fn an_imported_handler_states_the_route_with_no_handler() {
+    let derivation = derive_function_file("supabase/functions/send-invite/index.ts");
+    assert!(derivation.claimed);
+    let rows: Vec<_> = derivation
+        .endpoints
+        .iter()
+        .map(|ep| {
+            (
+                ep.method.as_str(),
+                ep.path.as_str(),
+                ep.handler_name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("ALL", "/functions/v1/send-invite", NOT_LOCATED)]
+    );
+    let at = derivation.handler_not_located.expect("an unread site");
+    assert_eq!((at.line, at.passed.as_deref()), (4, Some("handleInvite")));
+}
+
+/// A helper module in a `_` folder, or beside an entry file, is never a
+/// function: no row, no claim, no unread site.
+#[test]
+fn a_helper_file_states_nothing() {
+    for rel in [
+        "supabase/functions/_shared/cors.ts",
+        "supabase/functions/_shared/index.ts",
+        "supabase/functions/send-invite/handler.ts",
+    ] {
+        let derivation = derive_function_file(rel);
+        assert!(derivation.endpoints.is_empty(), "{rel}");
+        assert!(!derivation.claimed, "{rel}");
+        assert!(derivation.handler_not_located.is_none(), "{rel}");
+    }
+}
+
+/// Copy `src` to `dst`, leaving out the repository-relative `skip`.
+fn copy_tree(src: &Path, dst: &Path, root: &Path, skip: &str) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.strip_prefix(root).unwrap() == Path::new(skip) {
+            continue;
+        }
+        let to = dst.join(path.file_name().unwrap());
+        if path.is_dir() {
+            copy_tree(&path, &to, root, skip);
+        } else {
+            fs::copy(&path, &to).unwrap();
+        }
+    }
+}
+
+/// The platform's config file is what selects the layout: the same tree
+/// without it states no function row and saves no unplaced handler.
+#[test]
+fn no_marker_file_states_no_function_route() {
+    let fixture = fixture_root("hosted-functions");
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    copy_tree(&fixture, &repo, &fixture, "supabase/config.toml");
+    assert!(
+        repo.join("supabase/functions/price-quote/index.ts")
+            .is_file()
+    );
+    let conventions = conventions_for_service(&["@supabase/supabase-js".to_string()], &repo, &repo);
+    assert!(conventions.is_empty());
+    let (rows, unplaced) = service_function_rows(&repo, &repo, &conventions);
+    assert!(rows.is_empty(), "{rows:?}");
+    assert!(unplaced.is_empty(), "{unplaced:?}");
+}
+
+/// A second layout of the same kind is data only: another root, another
+/// marker, another prefix, through the same executor.
+#[test]
+fn a_second_folder_layout_is_a_convention_entry_of_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    fs::create_dir_all(repo.join("edge/handlers/ping")).unwrap();
+    fs::write(repo.join("edge.toml"), "").unwrap();
+    fs::write(
+        repo.join("edge/handlers/ping/index.ts"),
+        "addHandler(async () => new Response(\"pong\"));\n",
+    )
+    .unwrap();
+    let invented = RoutingConvention {
+        name: "invented-edge".to_string(),
+        root_globs: vec!["edge/handlers".to_string()],
+        path_prefix: "/fn".to_string(),
+        marker_files: vec!["edge.toml".to_string()],
+        ..RoutingConvention::supabase_functions()
+    };
+    let (rows, _) = service_function_rows(repo, repo, &[invented]);
+    let rows: Vec<_> = rows
+        .into_iter()
+        .map(|(file, method, path, ..)| format!("{file} {method} {path}"))
+        .collect();
+    assert_eq!(rows, vec!["edge/handlers/ping/index.ts ALL /fn/ping"]);
 }

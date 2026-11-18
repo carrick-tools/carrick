@@ -2136,8 +2136,11 @@ pub fn fold_rows(
     };
     for unread in &site.unread {
         // A stop read inside a sibling's function beside the call's ends is
-        // on a row line by construction and is kept (carrick#4474).
+        // on a row line by construction and is kept (carrick#4474). So is the
+        // site of a route its file states with no handler located: it is the
+        // row's own reason, not some call's ([`crate::unread_sites::UnreadSite::is_route_without_handler`]).
         if !unread.beside
+            && !unread.is_route_without_handler()
             && (held_at(calls, &unread.file, unread.line)
                 || held_at(endpoints, &unread.file, unread.line))
         {

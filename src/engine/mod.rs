@@ -6377,9 +6377,9 @@ async fn analyze_current_repo_incremental(
             )
             .await;
             protocol_extractions.site = site_rows;
-            add_unread_decorator_paths(
+            add_unread_route_sites(
                 &mut protocol_extractions.site,
-                &analysis.unread_decorator_paths,
+                &analysis.unread_route_sites,
                 repo_path,
                 service,
             );
@@ -8057,11 +8057,12 @@ fn server_claims_of(
     })
 }
 
-/// The elements of a decorator's array of paths that state no route join the
-/// site pass's unread sites, but none in a mock or test tree, as every unread
+/// The route sites the route readers could not read (a decorator's array of
+/// paths that states no route, a route file whose handler was not located)
+/// join the site pass's unread sites, but none in a mock or test tree, as every unread
 /// site is filtered (carrick#3688 U3). Nothing happens for a service the site
 /// pass did not read.
-fn add_unread_decorator_paths(
+fn add_unread_route_sites(
     site: &mut crate::site_rows::SiteRows,
     unread: &[crate::unread_sites::UnreadSite],
     repo_path: &str,
@@ -16107,9 +16108,9 @@ async fn analyze_current_repo(
     )
     .await;
     protocol_extractions.site = site_rows;
-    add_unread_decorator_paths(
+    add_unread_route_sites(
         &mut protocol_extractions.site,
-        &analysis_result.unread_decorator_paths,
+        &analysis_result.unread_route_sites,
         repo_path,
         service,
     );

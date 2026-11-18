@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "serviceName": "web", "directory": ".", "exclude": ["supabase/functions/"] },
+    { "serviceName": "edge-functions", "directory": "supabase/functions" }
+  ]
+}

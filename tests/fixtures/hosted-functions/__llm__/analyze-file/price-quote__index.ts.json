@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "no-listed-site",
+      "line_number": 8,
+      "owner_node": "serve",
+      "method": "POST",
+      "path": "/api/quote",
+      "handler_name": "anonymous",
+      "pattern_matched": "serve(",
+      "payload_expression_text": "body",
+      "payload_expression_line": 9,
+      "response_expression_text": "{ total: body.items.length }",
+      "response_expression_line": 16,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}
