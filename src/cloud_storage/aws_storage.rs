@@ -1565,6 +1565,10 @@ impl AwsStorage {
                 .http_client
                 .put(upload_url)
                 .header("Content-Type", content_type)
+                // S3 refuses a PUT that names no length with a 411. reqwest
+                // sends none for an empty body, so say it out loud: the
+                // length is known here and is always sent, zero included.
+                .header(reqwest::header::CONTENT_LENGTH, content.len())
                 .body(content.to_vec())
                 .send()
                 .await
@@ -6528,5 +6532,65 @@ mod tests {
             assert!(records.is_empty(), "{code}");
             assert_eq!(server.join().unwrap().len(), 1, "{code} was retried");
         }
+    }
+
+    /// A stand-in for S3's presigned PUT: answers 411 `MissingContentLength`
+    /// to any request that names no `Content-Length` (a chunked body counts
+    /// as none, as it does for S3), and 200 to one that does. Answers one
+    /// request and hands back its head.
+    fn length_required_server() -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !String::from_utf8_lossy(&raw).contains("\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            let head = text.split("\r\n\r\n").next().unwrap().to_string();
+            let has_length = head
+                .lines()
+                .any(|l| l.to_ascii_lowercase().starts_with("content-length:"));
+            let (status, body) = if has_length {
+                ("200 OK", "")
+            } else {
+                (
+                    "411 Length Required",
+                    "<Error><Code>MissingContentLength</Code></Error>",
+                )
+            };
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            head
+        });
+        (base, handle)
+    }
+
+    /// carrick#4781-adjacent: one service of a scanned repo failed every
+    /// scan with `411 Length Required ... MissingContentLength`. The PUT to a
+    /// presigned URL must name its length whatever the body holds, a
+    /// zero-length one included.
+    #[tokio::test]
+    async fn an_empty_body_is_put_with_an_explicit_content_length() {
+        let (s3, server) = length_required_server();
+        let storage = storage_at("http://127.0.0.1:1");
+        let result = storage.upload_to_s3(&format!("{s3}/object"), "").await;
+        let head = server.join().unwrap();
+        assert!(result.is_ok(), "{result:?}; request head was: {head}");
+        assert!(
+            head.to_ascii_lowercase().contains("content-length: 0"),
+            "{head}"
+        );
     }
 }
