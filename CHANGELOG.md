@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.164](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.163...carrick-v0.3.164) (2026-11-18)
+
+
+### Features
+
+* **scanner:** state functions served one per folder as fact rows (named-function P1) ([#4829](https://github.com/carrick-tools/carrick/issues/4829)) ([cf6c332](https://github.com/carrick-tools/carrick/commit/cf6c33273c3cce103ff3f77acb6df3f34142c8c6))
+
+
+### Bug Fixes
+
+* **library:** save a decorated method no claim reads as no_op_claim ([#4821](https://github.com/carrick-tools/carrick/issues/4821)) ([c5cb722](https://github.com/carrick-tools/carrick/commit/c5cb722c3a137c80084133ffd3d48ccdda021dc3))
+* **sidecar:** a service under a hoisted root install is not a bare checkout ([#4820](https://github.com/carrick-tools/carrick/issues/4820)) ([ff25b23](https://github.com/carrick-tools/carrick/commit/ff25b23429b5fb01191a6dcf4ad7f182867ea178))
+
 ## [0.3.163](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.162...carrick-v0.3.163) (2026-11-18)
 
 
