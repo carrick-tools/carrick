@@ -4070,7 +4070,8 @@ impl Analyzer {
                 crate::cloud_storage::ManifestTypeKind::Request => "request",
                 crate::cloud_storage::ManifestTypeKind::Response => "response",
             };
-            let display = crate::type_manifest::build_display_name(&entry.key, type_kind);
+            let display =
+                crate::type_manifest::build_display_name(&entry.key, entry.role, type_kind);
             map.insert(entry.type_alias.clone(), display);
         }
         map
@@ -4492,6 +4493,101 @@ mod tests {
             text: Some(text.to_string()),
             display: "Endpoint_x_Response".to_string(),
         }
+    }
+
+    /// carrick#4774: the display map the mismatch detail is scrubbed with
+    /// names a message pair's two sides apart. A socket and a pub/sub pair
+    /// each get "sent payload" / "expected payload"; an HTTP pair keeps its
+    /// Response names.
+    #[test]
+    fn a_message_pair_detail_names_the_sent_and_the_expected_payload() {
+        use crate::cloud_storage::{
+            ManifestRole, ManifestTypeKind, ManifestTypeState, TypeEvidence, TypeManifestEntry,
+        };
+        use crate::operation::SocketDirection;
+        let entry = |key: OperationKey, role: ManifestRole, alias: &str| TypeManifestEntry {
+            key,
+            role,
+            type_kind: ManifestTypeKind::Response,
+            type_alias: alias.to_string(),
+            file_path: "src/a.ts".to_string(),
+            line_number: 1,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+            evidence: TypeEvidence {
+                file_path: "src/a.ts".to_string(),
+                span_start: None,
+                span_end: None,
+                expression_text: None,
+                expression_line: None,
+                line_number: 1,
+                infer_kind: crate::services::type_sidecar::InferKind::CallResult,
+                is_explicit: false,
+                type_state: ManifestTypeState::Unknown,
+                value_spans: Vec::new(),
+            },
+            resolved_definition: None,
+            expanded_definition: None,
+            primary_type_symbol: None,
+            defined_in: None,
+            any_provenance: Vec::new(),
+            unwidened_definition: None,
+            unwidened_out_of_budget: false,
+            response_modes: None,
+            stated_values: Default::default(),
+            graphql_root: None,
+            v1_before_demotion: None,
+        };
+        let socket = || OperationKey::Socket {
+            event: "orders:subscribe".to_string(),
+            direction: SocketDirection::ClientToServer,
+        };
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer.set_type_manifests(vec![
+            entry(socket(), ManifestRole::Consumer, "Endpoint_s1_Response"),
+            entry(socket(), ManifestRole::Producer, "Endpoint_s2_Response"),
+            entry(
+                OperationKey::pubsub("orders.shipped"),
+                ManifestRole::Consumer,
+                "Endpoint_p1_Response",
+            ),
+            entry(
+                OperationKey::pubsub("orders.shipped"),
+                ManifestRole::Producer,
+                "Endpoint_p2_Response",
+            ),
+            entry(
+                OperationKey::http("GET", "/api/orders"),
+                ManifestRole::Consumer,
+                "Endpoint_h1_Response",
+            ),
+            entry(
+                OperationKey::http("GET", "/api/orders"),
+                ManifestRole::Producer,
+                "Endpoint_h2_Response",
+            ),
+        ]);
+        let names = analyzer.build_display_name_map();
+        let detail = |a: &str, b: &str| {
+            analyzer.clean_error_message(
+                &format!("Type '{a}' is not assignable to type '{b}'."),
+                &names,
+            )
+        };
+        assert_eq!(
+            detail("Endpoint_s1_Response", "Endpoint_s2_Response"),
+            "orders:subscribe (client→server) → sent payload not assignable to \
+             orders:subscribe (client→server) → expected payload"
+        );
+        assert_eq!(
+            detail("Endpoint_p1_Response", "Endpoint_p2_Response"),
+            "orders.shipped (pub/sub) → sent payload not assignable to \
+             orders.shipped (pub/sub) → expected payload"
+        );
+        assert_eq!(
+            detail("Endpoint_h1_Response", "Endpoint_h2_Response"),
+            "GET /api/orders → Response not assignable to GET /api/orders → Response"
+        );
     }
 
     #[test]
