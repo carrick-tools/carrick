@@ -242,10 +242,8 @@ fn base_env_var(
     env_fallbacks: &EnvFallbackMap,
     env_schema: &EnvSchemaIndex,
 ) -> Option<String> {
-    for prefix in ["process.env.", "import.meta.env."] {
-        if let Some(name) = slot.strip_prefix(prefix) {
-            return is_plain_identifier(name).then(|| name.to_string());
-        }
+    if let Some(name) = env_prefixed_name(slot) {
+        return is_plain_identifier(name).then(|| name.to_string());
     }
     if let Some(env_name) = aliases.get(slot) {
         return Some(env_name.clone());
@@ -271,6 +269,14 @@ fn base_env_var(
 
 /// Whether a segment is a plain JS identifier — no call, no index, no
 /// interpolation. Anything else is an expression the scanner is not reading.
+/// The text after a `process.env.` or `import.meta.env.` prefix, or `None`
+/// when the text carries neither. The one place the two env spellings are named.
+pub(crate) fn env_prefixed_name(text: &str) -> Option<&str> {
+    ["process.env.", "import.meta.env."]
+        .iter()
+        .find_map(|prefix| text.strip_prefix(prefix))
+}
+
 fn is_plain_identifier(text: &str) -> bool {
     !text.is_empty()
         && text
