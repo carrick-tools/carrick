@@ -15,9 +15,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::contract::{
-    Caller, CheckOutput, Counterpart, FunctionUse, Item, MAX_STALE_FILES, ReadError, ReadFailure,
-    Recheck, SCHEMA, STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService, TypeCheckState,
-    TypeOperation, TypeUse, Uses, Verdict,
+    Caller, CheckOutput, Counterpart, FunctionUse, Item, LineNote, MAX_STALE_FILES, ReadError,
+    ReadFailure, Recheck, SCHEMA, STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService,
+    TypeCheckState, TypeOperation, TypeUse, Uses, Verdict,
 };
 use super::read_model::{FileUses, IndexedItem, IndexedRepo, LocalIndex, TypeCheckSummary};
 
@@ -364,12 +364,30 @@ pub fn answer(
         })
         .collect();
 
+    // Which lines may be stated. The index holds the line a thing had at its
+    // commit; a file the tree holds differently has moved them. `changed` is
+    // the set already read above, so this adds no git call.
+    let commit_of_service: BTreeMap<String, String> = index
+        .repos
+        .iter()
+        .flat_map(|indexed| indexed.services.iter())
+        .map(|service| (service.name.clone(), service.commit.clone()))
+        .collect();
+    let gate = LineGate {
+        changed: &changed,
+        this_repo: &repo.path,
+        repo_of_service: &repo_of_service,
+        commit_of_service: &commit_of_service,
+    };
+
     // Who uses this file is a fact about the index, not about the edit: a
     // re-check replaces the rows and leaves this as indexed (carrick#2067).
+    // Its lines are the index's too, so the queried file's own are withheld
+    // whenever the tree moved it, even where a re-check answered its rows.
     let uses = repo
         .uses
         .as_ref()
-        .map(|all| project_uses(all.get(&relative), repo, &repo_of_service));
+        .map(|all| project_uses(all.get(&relative), repo, &gate, changed.contains(&relative)));
     let uses_lines = uses
         .as_ref()
         .map(|uses| uses.lines(&service))
@@ -392,16 +410,7 @@ pub fn answer(
         deleted,
         items: items
             .iter()
-            .map(|item| {
-                project(
-                    item,
-                    mode,
-                    rows_are_indexed,
-                    deleted,
-                    repo,
-                    &repo_of_service,
-                )
-            })
+            .map(|item| project(item, mode, rows_are_indexed, deleted, repo, &gate))
             .collect(),
         recheck,
         type_check,
@@ -674,25 +683,75 @@ fn rechecked(
 
 /// A row's counterparts as the contract states them, each with the repo it
 /// can be opened in.
-fn counterparts_of(
-    item: &IndexedItem,
-    repo_of_service: &BTreeMap<String, String>,
-) -> Vec<Counterpart> {
+fn counterparts_of(item: &IndexedItem, gate: &LineGate) -> Vec<Counterpart> {
     item.counterparts
         .iter()
-        .map(|counterpart| Counterpart {
-            role: counterpart.role.clone(),
-            service: counterpart.service.clone(),
-            file: counterpart.file.clone(),
-            line: counterpart.line,
-            remote: counterpart.remote.clone(),
-            repo: if counterpart.remote.is_some() {
+        .map(|counterpart| {
+            let repo = if counterpart.remote.is_some() {
                 None
             } else {
-                repo_of_service.get(&counterpart.service).cloned()
-            },
+                gate.repo_of_service.get(&counterpart.service).cloned()
+            };
+            let (line, line_note) = match counterpart.line {
+                Some(line) if counterpart.remote.is_none() => {
+                    let (line, note) = gate.state(&counterpart.service, &counterpart.file, line);
+                    (Some(line).filter(|line| *line > 0), note)
+                }
+                other => (other, None),
+            };
+            Counterpart {
+                role: counterpart.role.clone(),
+                service: counterpart.service.clone(),
+                file: counterpart.file.clone(),
+                line,
+                line_note,
+                remote: counterpart.remote.clone(),
+                repo,
+            }
         })
         .collect()
+}
+
+/// Whether a line the index recorded can still be stated (the local-copy
+/// refresh plan, T4; D2 b).
+///
+/// A file of the queried repo that the working tree holds differently from the
+/// index's commit has no stated line: the index's number points at other code.
+/// A file of another repo is not read from its own tree here, because a git
+/// call per repo does not fit the hook's budget, so its line stays and names
+/// the commit it is true at.
+struct LineGate<'a> {
+    /// The queried repo's files the tree holds differently from the index.
+    changed: &'a HashSet<String>,
+    /// The queried repo's path in the index.
+    this_repo: &'a str,
+    repo_of_service: &'a BTreeMap<String, String>,
+    commit_of_service: &'a BTreeMap<String, String>,
+}
+
+impl LineGate<'_> {
+    /// The line to state for `file` of `service`, and the note that goes with
+    /// it. A line of zero is no line.
+    fn state(&self, service: &str, file: &str, line: u32) -> (u32, Option<String>) {
+        match self.repo_of_service.get(service) {
+            Some(path) if path == self.this_repo => {
+                if self.changed.contains(file) {
+                    (0, Some(LineNote::Changed.text()))
+                } else {
+                    (line, None)
+                }
+            }
+            Some(_) => {
+                let note = self
+                    .commit_of_service
+                    .get(service)
+                    .filter(|commit| !commit.is_empty())
+                    .map(|commit| LineNote::AsOf(commit.clone()).text());
+                (line, note)
+            }
+            None => (line, None),
+        }
+    }
 }
 
 /// What the index recorded about who uses this file (carrick#2067). A type
@@ -701,8 +760,11 @@ fn counterparts_of(
 fn project_uses(
     recorded: Option<&FileUses>,
     repo: &IndexedRepo,
-    repo_of_service: &BTreeMap<String, String>,
+    gate: &LineGate,
+    subject_changed: bool,
 ) -> Uses {
+    // The queried file's own declaration lines.
+    let own = |line: u32| if subject_changed { 0 } else { line };
     let Some(recorded) = recorded else {
         return Uses::default();
     };
@@ -711,16 +773,20 @@ fn project_uses(
         .iter()
         .map(|function| FunctionUse {
             name: function.name.clone(),
-            line: function.line,
+            line: own(function.line),
             callers_total: function.callers_total,
             callers: function
                 .callers
                 .iter()
-                .map(|caller| Caller {
-                    service: caller.service.clone(),
-                    file: caller.file.clone(),
-                    line: caller.line,
-                    function: caller.function.clone(),
+                .map(|caller| {
+                    let (line, line_note) = gate.state(&caller.service, &caller.file, caller.line);
+                    Caller {
+                        service: caller.service.clone(),
+                        file: caller.file.clone(),
+                        line,
+                        function: caller.function.clone(),
+                        line_note,
+                    }
                 })
                 .collect(),
         })
@@ -730,7 +796,7 @@ fn project_uses(
         .iter()
         .map(|used| TypeUse {
             symbol: used.symbol.clone(),
-            line: used.line,
+            line: own(used.line),
             kind: used.kind,
             operations: used
                 .operations
@@ -744,6 +810,8 @@ fn project_uses(
                                 && item.line == Some(operation.line)
                         })
                     });
+                    let (line, line_note) =
+                        gate.state(&operation.service, &operation.file, operation.line);
                     TypeOperation {
                         kind: operation.kind.as_str().to_string(),
                         direction: operation.direction.clone(),
@@ -751,9 +819,10 @@ fn project_uses(
                         method: operation.method.clone(),
                         path: operation.path.clone(),
                         file: operation.file.clone(),
-                        line: operation.line,
+                        line,
+                        line_note,
                         counterparts: row
-                            .map(|row| counterparts_of(row, repo_of_service))
+                            .map(|row| counterparts_of(row, gate))
                             .unwrap_or_default(),
                     }
                 })
@@ -769,9 +838,9 @@ fn project(
     stale: bool,
     deleted: bool,
     repo: &IndexedRepo,
-    repo_of_service: &BTreeMap<String, String>,
+    gate: &LineGate,
 ) -> Item {
-    let counterparts = counterparts_of(item, repo_of_service);
+    let counterparts = counterparts_of(item, gate);
 
     let verdict = match mode {
         // `touch` states where things are, and nothing about whether they
@@ -1324,6 +1393,90 @@ mod tests {
         assert!(note.contains("has no hosted index yet"), "{note}");
         assert!(note.contains("`carrick refresh` downloads it"), "{note}");
         assert!(!note.contains("carrick index"), "{note}");
+    }
+
+    fn gate_parts() -> (
+        HashSet<String>,
+        BTreeMap<String, String>,
+        BTreeMap<String, String>,
+    ) {
+        let changed: HashSet<String> = ["src/moved.ts".to_string()].into();
+        let repos: BTreeMap<String, String> = [
+            ("web".to_string(), "/w/web".to_string()),
+            ("lib".to_string(), "/w/web".to_string()),
+            ("api".to_string(), "/w/api".to_string()),
+        ]
+        .into();
+        let commits: BTreeMap<String, String> = [
+            ("web".to_string(), "aaaaaaa1111".to_string()),
+            ("api".to_string(), "bbbbbbb2222".to_string()),
+        ]
+        .into();
+        (changed, repos, commits)
+    }
+
+    /// T4: a file of the queried repo the tree holds differently has no line;
+    /// one it holds as indexed keeps its line; another repo's file keeps its
+    /// line and names the commit it is true at.
+    #[test]
+    fn a_line_is_stated_only_for_a_file_the_tree_holds_as_indexed() {
+        let (changed, repos, commits) = gate_parts();
+        let gate = LineGate {
+            changed: &changed,
+            this_repo: "/w/web",
+            repo_of_service: &repos,
+            commit_of_service: &commits,
+        };
+        assert_eq!(
+            gate.state("web", "src/moved.ts", 7),
+            (0, Some("changed since the index".to_string()))
+        );
+        // A second service of the same repo is read against the same tree.
+        assert_eq!(
+            gate.state("lib", "src/moved.ts", 7),
+            (0, Some("changed since the index".to_string()))
+        );
+        assert_eq!(gate.state("web", "src/steady.ts", 7), (7, None));
+        assert_eq!(
+            gate.state("api", "src/moved.ts", 7),
+            (7, Some("line as of bbbbbbb".to_string()))
+        );
+    }
+
+    /// T4: the counterparts a row names follow the same rule.
+    #[test]
+    fn a_counterpart_in_a_changed_file_is_named_without_its_line() {
+        let (changed, repos, commits) = gate_parts();
+        let gate = LineGate {
+            changed: &changed,
+            this_repo: "/w/web",
+            repo_of_service: &repos,
+            commit_of_service: &commits,
+        };
+        let item: IndexedItem = serde_json::from_value(serde_json::json!({
+            "kind": "route", "service": "web", "key": "k", "method": "GET", "path": "/x",
+            "line": 3, "col": 1, "source": "fact", "resolution_source": null, "evidence": null,
+            "verdict": null,
+            "counterparts": [
+                { "role": "consumer", "service": "lib", "file": "src/moved.ts", "line": 5 },
+                { "role": "consumer", "service": "lib", "file": "src/steady.ts", "line": 6 },
+                { "role": "consumer", "service": "api", "file": "src/moved.ts", "line": 8 },
+            ],
+        }))
+        .expect("an indexed row");
+        let found = counterparts_of(&item, &gate);
+        let seen: Vec<(Option<u32>, Option<String>)> = found
+            .iter()
+            .map(|c| (c.line, c.line_note.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (None, Some("changed since the index".to_string())),
+                (Some(6), None),
+                (Some(8), Some("line as of bbbbbbb".to_string())),
+            ]
+        );
     }
 
     #[test]

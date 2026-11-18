@@ -130,9 +130,10 @@ function counterpartText(counterparts: Counterpart[]): string {
   const shown = counterparts.slice(0, MAX_COUNTERPARTS);
   const rendered = shown
     .map((counterpart) => {
-      const where = counterpart.file
+      const place = counterpart.file
         ? `${counterpart.file}${counterpart.line ? `:${counterpart.line}` : ""}`
         : "an unnamed file";
+      const where = counterpart.line_note ? `${place} (${counterpart.line_note})` : place;
       return counterpart.service ? `${counterpart.service} ${where}` : where;
     })
     .join(", ");
@@ -276,9 +277,13 @@ function verdictText(item: CheckItem): string {
 export function itemLine(
   item: CheckItem,
   file: string | undefined,
-  options: { locatorsOnly?: boolean } = {},
+  options: { locatorsOnly?: boolean; withholdLine?: boolean } = {},
 ): string {
-  const where = `${file ?? "this file"}:${item.line ?? 1}:${item.col ?? 1}`;
+  // The row's line is the index's. In a file the tree has moved past, and no
+  // re-check read, it points at other code: name the file, not a line.
+  const where = options.withholdLine
+    ? `${file ?? "this file"}`
+    : `${file ?? "this file"}:${item.line ?? 1}:${item.col ?? 1}`;
   const operation = [item.method, item.path].filter(Boolean).join(" ") + (item.dispatch_label ?? "");
   const counterparts = item.counterparts ?? [];
   // Locators only (carrick#2069): where the row is, what it is, and who is on
@@ -670,7 +675,7 @@ export function renderPostRead(result: CheckResult, displayFile?: string): strin
   ];
   lines.push(...uses.slice(0, MAX_USE_LINES));
   // A line printed twice tells the agent nothing the first did not (carrick#3956).
-  const itemLines = [...new Set(items.map((item) => itemLine(item, where, { locatorsOnly: true })))];
+  const itemLines = [...new Set(items.map((item) => itemLine(item, where, { locatorsOnly: true, withholdLine: !answersTheEdit(result) })))];
   lines.push(...itemLines.slice(0, MAX_ITEM_LINES));
   if (uses.length > MAX_USE_LINES || itemLines.length > MAX_ITEM_LINES) {
     lines.push(`- more are listed by \`carrick check ${where}\`.`);

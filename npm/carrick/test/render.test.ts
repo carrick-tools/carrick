@@ -1314,6 +1314,24 @@ test("the Read hook never prints an identical line twice, and keeps its cap", ()
   assert.match(many, /more are listed by/);
 });
 
+// Local-copy refresh T4: a row's line is the index's. In a file the tree has
+// moved past and no re-check read, the Read hook names the file, not a line;
+// a counterpart's note (changed, or another repo's commit) prints after it.
+test("the Read hook withholds the row's line in a changed file and prints counterpart notes", () => {
+  const base = dispatchRows(["start-scan"]);
+  const item = base.items?.[0] as CheckItem;
+  item.counterparts = [
+    { role: "consumer", service: "cli", file: "src/a.ts", line_note: "changed since the index" },
+    { role: "consumer", service: "web", file: "src/b.ts", line: 9, line_note: "line as of abc1234" },
+  ];
+  const steady = renderPostRead({ ...base, stale: false }, "index.ts") ?? "";
+  assert.match(steady, /- index\.ts:1:1 route/);
+  const moved = renderPostRead({ ...base, stale: true, recheck: { ran: "none" } } as CheckResult, "index.ts") ?? "";
+  assert.match(moved, /- index\.ts route POST/);
+  assert.doesNotMatch(moved, /index\.ts:1:1/);
+  assert.match(moved, /cli src\/a\.ts \(changed since the index\), web src\/b\.ts:9 \(line as of abc1234\)/);
+});
+
 // HM4 T3: an early answer's moved-rows headline follows the moved rows' roles.
 test("moved call rows head their early block as calls, routes as routes, a mix as both", () => {
   const row = (role: "route" | "call") => ({

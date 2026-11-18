@@ -64,6 +64,11 @@ export type Counterpart = {
   /** Relative to the counterpart's own repo, which is not the queried file's. */
   file?: string;
   line?: number;
+  /**
+   * Set by the CLI when `line` is withheld (the file changed since the index)
+   * or only true of another repo's indexed commit; printed after the location.
+   */
+  line_note?: string;
 };
 
 export type Verdict = {
