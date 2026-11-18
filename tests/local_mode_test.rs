@@ -1664,6 +1664,20 @@ fn a_line_about_a_changed_file_is_not_stated() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
     index(root);
+    // With the compiler engine built, a type line comes first; the function
+    // line is what this test pins either way.
+    let function_line = |body: &serde_json::Value| -> serde_json::Value {
+        body["uses_lines"]
+            .as_array()
+            .and_then(|lines| {
+                lines.iter().find(|line| {
+                    line.as_str()
+                        .is_some_and(|text| text.starts_with("- CatalogClient"))
+                })
+            })
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
     let client_file = root.join("inventory-svc/src/client.ts");
     let caller_file = root.join("inventory-svc/src/inventory.ts");
 
@@ -1692,7 +1706,7 @@ fn a_line_about_a_changed_file_is_not_stated() {
     assert_eq!(function["callers_total"], serde_json::json!(2));
     assert_eq!(function["callers"][0]["line"], serde_json::json!(0));
     assert_eq!(
-        caller_moved["uses_lines"][0],
+        function_line(&caller_moved),
         serde_json::json!(
             "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts (changed since the index), src/inventory.ts (changed since the index)"
         ),
@@ -1712,12 +1726,23 @@ fn a_line_about_a_changed_file_is_not_stated() {
     );
     let own_moved = check_json(root, "inventory-svc/src/client.ts");
     assert_eq!(
-        own_moved["uses_lines"][0],
+        function_line(&own_moved),
         serde_json::json!(
             "- CatalogClient.readWidget has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17"
         ),
         "{own_moved:#}"
     );
+    // The type line exists only where the compiler engine ran; where it did,
+    // the queried file's changed declaration has no line either.
+    for line in own_moved["uses_lines"].as_array().expect("lines") {
+        let text = line.as_str().expect("a line");
+        if text.starts_with("- type Widget") {
+            assert!(
+                text.starts_with("- type Widget is the response type"),
+                "{text}"
+            );
+        }
+    }
 
     // The file that calls the changed one names it by file, and its own
     // function keeps its line.
@@ -9732,10 +9757,10 @@ fn an_http_response_mismatch_item_is_unchanged() {
     // `repo` (this run's temp dir) left out.
     let mut pinned = row.clone();
     for counterpart in pinned["counterparts"].as_array_mut().expect("counterparts") {
-        counterpart
-            .as_object_mut()
-            .expect("a counterpart object")
-            .remove("repo");
+        let counterpart = counterpart.as_object_mut().expect("a counterpart object");
+        counterpart.remove("repo");
+        // Names this run's commit of the other repo (T4).
+        counterpart.remove("line_note");
     }
     assert_eq!(
         pinned,
@@ -9901,10 +9926,10 @@ fn the_first_emits_verdict_and_type_text_are_unchanged() {
     let live = order_update_items(workspace.path(), claims.path(), "storefront/src/live.ts");
     let mut first = live[&12].clone();
     for counterpart in first["counterparts"].as_array_mut().expect("counterparts") {
-        counterpart
-            .as_object_mut()
-            .expect("a counterpart object")
-            .remove("repo");
+        let counterpart = counterpart.as_object_mut().expect("a counterpart object");
+        counterpart.remove("repo");
+        // Names this run's commit of the other repo (T4).
+        counterpart.remove("line_note");
     }
     assert_eq!(
         first,
