@@ -692,6 +692,12 @@ export class TypeInferrer {
    * named one. The open-parameter check (carrick#4201) reads it.
    */
   private readonly printedTypes = new WeakMap<InferredType, Type>();
+  /**
+   * The type the source states for a call result whose text is that
+   * statement (a cast, an annotation, a narrowing). The consumer floor
+   * (carrick#4513 P1) reads it beside the printed type.
+   */
+  private readonly statedTypes = new WeakMap<InferredType, Type>();
   private readonly unwidenedLimits: UnwidenedLimits;
   private readonly now: () => number;
   /**
@@ -1540,9 +1546,81 @@ export class TypeInferrer {
     if (!inferred) return inferred;
     const printed = this.printedTypes.get(inferred);
     const node = this.readNodes.get(inferred.source_location);
+    const stated = this.statedTypes.get(inferred);
+    if (request.infer_kind === 'call_result') {
+      // carrick#4513 P1: a consumer's call result, printed or stated by the
+      // source, states no type when the type is a bare type parameter
+      // (whoever declares it) or a generic class an installed package
+      // declares. A parameter nested inside a body shape is not floored
+      // here: the shape is the caller's, and the capture prints that one
+      // position as unknown.
+      for (const type of [printed, stated]) {
+        const floor = type ? this.consumerFloorOf(type) : undefined;
+        if (floor?.kind === 'parameter') return this.boundByCallers(request, inferred.source_location, floor.name);
+        if (floor?.kind === 'library_class') return this.libraryClassAbstain(request, inferred.source_location, floor.name);
+      }
+    }
     if (!printed || !node) return inferred;
     const open = this.openTypeParameterAt(printed, node);
     return open === undefined ? inferred : this.boundByCallers(request, inferred.source_location, open);
+  }
+
+  /**
+   * What a consumer's call result is when it is no body (carrick#4513 P1),
+   * read after `await` (`Promise` and other thenables peeled):
+   *  - a bare type parameter, other than a polymorphic `this`: only the
+   *    callers of whatever declares it set it, a library class's own `T`
+   *    included;
+   *  - a union member, nullish ones aside, that is an instance of a generic
+   *    class an installed package declares (a result, future or page class
+   *    around the body). JSON never builds a class instance, so the class is
+   *    the library's carrier of the body, and its declaration prints its own
+   *    parameters open. A class without type parameters (an SDK's data
+   *    class) and a TypeScript lib type (`ArrayBuffer`, `Date`) are kept.
+   */
+  private consumerFloorOf(
+    type: Type
+  ): { kind: 'parameter'; name: string } | { kind: 'library_class'; name: string } | undefined {
+    const awaited = this.awaitedBeyondPromise(this.unwrapPromiseType(type)) ?? this.unwrapPromiseType(type);
+    const members = awaited.isUnion() ? awaited.getUnionTypes() : [awaited];
+    for (const member of members) {
+      if (isNullishType(member)) continue;
+      if (member.isTypeParameter()) {
+        if ((member.compilerType as ts.TypeParameter & { isThisType?: boolean }).isThisType) continue;
+        return { kind: 'parameter', name: member.getText() };
+      }
+      const library = this.genericLibraryClassOf(member);
+      if (library !== undefined) return { kind: 'library_class', name: library };
+    }
+    return undefined;
+  }
+
+  /** The name of the generic class an installed package declares that `type` is an instance of. */
+  private genericLibraryClassOf(type: Type): string | undefined {
+    const symbol = type.getSymbol();
+    if (!symbol || !(symbol.getFlags() & ts.SymbolFlags.Class)) return undefined;
+    const compiler = type.compilerType as ts.TypeReference;
+    const declared = (compiler.target ?? compiler) as ts.InterfaceType;
+    if (!declared.typeParameters?.length) return undefined;
+    // TypeScript's lib files declare no classes (`ArrayBuffer`, `Date` are
+    // an interface beside a value), so the class flag already leaves them.
+    return this.declaringPackageOf(type) === undefined ? undefined : symbol.getName();
+  }
+
+  /** The decided answer for a call result that is a generic library class instance (carrick#4513 P1). */
+  private libraryClassAbstain(request: InferRequestItem, location: SourceLocation, name: string): InferredType {
+    this.log(
+      `Read at ${request.file_path}:${request.line_number} is an instance of the library class '${name}', ` +
+        'which carries the body rather than being it; leaving it unknown'
+    );
+    return this.decidedAbstain(request, location, {
+      path: '',
+      kind: 'unknown',
+      reason: 'machinery_envelope',
+      detail:
+        `the type read here is an instance of the generic class '${name}' an installed package ` +
+        'declares, which carries the body rather than being it, so this site states no type',
+    });
   }
 
   /**
@@ -3642,6 +3720,18 @@ export class TypeInferrer {
     return { type: atCaller.type };
   }
 
+  /**
+   * The type of `call` as the call `through_call` names instantiates the
+   * wrapper it is made in (carrick#4375): `typeAtThroughCall`, with no
+   * answer recorded. A request that names no call, or a call that binds
+   * nothing the type holds, reads the call's own type.
+   */
+  private callTypeAsCallerBinds(call: CallExpression, request: InferRequestItem): Type {
+    if (!request.through_call) return call.getType();
+    const atCaller = this.typeAtThroughCall(call, request);
+    return atCaller.kind === 'instantiated' ? atCaller.type : call.getType();
+  }
+
   private inferCallResult(
     sourceFile: SourceFile,
     request: InferRequestItem,
@@ -4036,7 +4126,12 @@ export class TypeInferrer {
     // type. Where no rule matched that type as the names peel it, the same
     // protocol reading the text takes is read here, so a subclass of
     // `Promise` anchors the row on what it resolves to and never on itself.
-    let callPayloadType = this.unwrapPromiseType(callExpr.getType());
+    //
+    // carrick#4513: a call read below a wrapper is anchored on its payload as
+    // the call `through_call` names instantiates it, as its text is
+    // (`callResultAtThroughCall`): read inside a generic wrapper, the call's
+    // own type holds the wrapper's type parameter, which is never an anchor.
+    let callPayloadType = this.unwrapPromiseType(this.callTypeAsCallerBinds(callExpr, request));
     let callUnwrap = this.unwrapTypeWithConfig(callPayloadType, callExpr, extractionConfig);
     let readByProtocol = false;
     if (!callUnwrap.wasUnwrapped) {
@@ -4099,7 +4194,11 @@ export class TypeInferrer {
     // call is what judges such a call today.
     if (!anchor || !this.primaryTypeSymbol(anchor.element)) {
       const typeArgs = callExpr.getTypeArguments();
-      if (typeArgs.length === 1) {
+      // carrick#4513: a type argument that is the enclosing function's own
+      // type parameter (`http.get<T>(…)` inside `callApi<T>`) names no type
+      // of this site's: only that function's callers set it (the
+      // carrick#4201 rule).
+      if (typeArgs.length === 1 && this.openTypeParameterAt(typeArgs[0].getType(), callExpr) === undefined) {
         const argType = this.unwrapPromiseType(typeArgs[0].getType());
         const argUnwrap = this.unwrapTypeWithConfig(
           argType,
@@ -4135,6 +4234,12 @@ export class TypeInferrer {
       // transport's bookkeeping, not the body, so it has no home either.
       leftCarrier && !anchor ? null : undefined
     );
+    const statedNode = narrowed
+      ? narrowed.typeNode
+      : explicitType
+        ? this.explicitTypeNodeFromAncestor(terminalNode)
+        : undefined;
+    if (statedNode) this.statedTypes.set(inferred, statedNode.getType());
     // carrick#1749: say when the text is the source's own statement of the
     // body, and what that statement is rooted at, so the scanner can tell a
     // model symbol that names the body from one that names a part of it.
