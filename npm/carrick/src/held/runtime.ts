@@ -176,6 +176,13 @@ class HeldService implements ServiceEngine {
   private readonly byFile = new Map<string, Pos[]>();
   /** Where each position is on `known`'s text. */
   private readonly values = new Map<string, Value>();
+  /**
+   * A consumer position's lead (HM4 D2): how many lines its payload's first
+   * line sits below the call's line, at the index commit. The call's line on
+   * the current text is the payload's line less it. Absent when the row states
+   * no line or its payload sits in another file: that line cannot be joined.
+   */
+  private readonly leads = new Map<string, number>();
   private readonly armed = new Set<string>();
   private readonly unarmed = new Map<string, Unarmed>();
   private readonly views = new Map<string, View>();
@@ -252,6 +259,7 @@ class HeldService implements ServiceEngine {
       });
     }
     for (const id of [...this.values.keys()]) if (!live.has(id)) this.values.delete(id);
+    for (const id of [...this.leads.keys()]) if (!live.has(id)) this.leads.delete(id);
   }
 
   /** The text of `rel` at the index commit and the regions the disk text changed it by; or why neither is known. */
@@ -321,7 +329,13 @@ class HeldService implements ServiceEngine {
     const base = this.baseline(rel, text);
     if (typeof base === "string") return noneFor(base);
     const entries: Entry[] = [];
+    const oldLines = positions.some((p) => p.row.side === "consumer") ? lineMap(base.old) : null;
     for (const p of positions) {
+      if (oldLines !== null && p.row.side === "consumer") {
+        const lead = p.row.line === null || this.real(rel) !== path.join(this.init.repo_path, p.row.file) ? -1 : oldLines.line(p.row.values![p.at]!.span[0]) - p.row.line;
+        if (lead >= 0) this.leads.set(p.id, lead);
+        else this.leads.delete(p.id);
+      }
       if (isGraphql(p.row) && this.gql.reason !== null) {
         p.row.groups.forEach((_, g) => no(p, g, this.gql.reason!));
         continue;
@@ -575,6 +589,14 @@ class HeldService implements ServiceEngine {
     for (const rel of rels) {
       const view = this.views.get(rel)!;
       const at = lineMap(view.ov.text);
+      let plain: ReturnType<typeof lineMap> | null = null;
+      /** A consumer entry's call line on the current text, or null when it has no lead. */
+      const callLineOf = (entry: Entry): number | null => {
+        const lead = this.leads.get(entry.pos.id);
+        if (lead === undefined) return null;
+        plain ??= lineMap(view.text);
+        return plain.line(entry.value.start) - lead;
+      };
       const own = attribute(view.ov, offsetDiags(view.ov.text, pulled.get(this.shadow(rel))));
       // One line per (row, group), at the first position that broke.
       const broken = [...own.lines].map(([k, diags]) => ({ check: view.ov.checks.find((c) => c.k === k)!, diags })).sort((a, b) => a.diags[0]!.start - b.diags[0]!.start);
@@ -600,7 +622,8 @@ class HeldService implements ServiceEngine {
           row_path: path.join(this.init.repo_path, row.file),
           places: row.groups[g]!.places.map((p) => ({ service: p.service, file: p.file, line: p.line })),
           expected: row.groups[g]!.type,
-          ...(isMessage(row) ? { side: "consumer" as const } : {}),
+          // A consumer line names its protocol (the sentence's other side) and its call's line (part 2's join, HM4 D2).
+          ...(isMessage(row) ? { side: "consumer" as const, protocol: row.protocol, call_line: callLineOf(entry) } : {}),
         });
       }
     }

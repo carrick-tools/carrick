@@ -130,12 +130,15 @@ const common = { direction: "response", repo: REPO, name: null, site: null, unty
 const PAYLOADS = ['{ id: "o1", status: "paid" }', '{ id: "o2", status: "open" }'];
 
 /** The listener row (another service) and one emitter row per emit; `types` are the emitter rows' groups (one per listener). */
-function socketRows(opts: { types?: string[]; spans?: boolean } = {}): Wire[] {
+function socketRows(opts: { types?: string[]; spans?: boolean; text?: string; payloads?: string[]; callLine?: (payload: string) => number } = {}): Wire[] {
   const types = opts.types ?? [ORDER_UPDATE];
-  const places = PAYLOADS.map((p) => placeOf(SERVICE, ORDERS, lineOf(ORDERS_TEXT, p), opts.spans === false ? null : spanOf(ORDERS_TEXT, p)));
+  const text = opts.text ?? ORDERS_TEXT;
+  const payloads = opts.payloads ?? PAYLOADS;
+  const callLine = opts.callLine ?? ((p: string) => lineOf(text, p));
+  const places = payloads.map((p) => placeOf(SERVICE, ORDERS, callLine(p), opts.spans === false ? null : spanOf(text, p)));
   const listener = { k: "contract", side: "producer", protocol: "socket", label: EVENT, service: "listener", file: "src/listen.ts", line: 3, locator: "registration", ...common, groups: [groupOf("{ id: string; status: string }", places)], total: 1, values: [{ file: "src/listen.ts", span: [10, 20] }] };
-  const emitters = PAYLOADS.map((p) => ({
-    k: "contract", side: "consumer", protocol: "socket", label: EVENT, service: SERVICE, file: ORDERS, line: lineOf(ORDERS_TEXT, p), locator: "call", ...common,
+  const emitters = payloads.map((p) => ({
+    k: "contract", side: "consumer", protocol: "socket", label: EVENT, service: SERVICE, file: ORDERS, line: callLine(p), locator: "call", ...common,
     groups: types.map((type) => groupOf(type, [placeOf("listener", "src/listen.ts", 3, null)])), total: types.length,
   }));
   return [listener, ...emitters];
@@ -161,13 +164,13 @@ type Rig = {
   edit: (rel: string, text: string) => Promise<Array<Record<string, unknown>>>;
 };
 
-async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows: Wire[], table: unknown = null, extraEnv: Record<string, string> = {}): Promise<Rig> {
+async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows: Wire[], table: unknown = null, extraEnv: Record<string, string> = {}, ordersText: string = ORDERS_TEXT): Promise<Rig> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-msg-runtime-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, "ws");
   const home = path.join(dir, "home");
   fs.mkdirSync(path.join(root, "src"), { recursive: true });
-  fs.writeFileSync(path.join(root, ORDERS), ORDERS_TEXT);
+  fs.writeFileSync(path.join(root, ORDERS), ordersText);
   fs.writeFileSync(path.join(root, HTTP), HTTP_TEXT);
   git(root, "init", "-q");
   git(root, "add", "-A");
@@ -227,9 +230,9 @@ test("clean is silent and the twin speaks (runtime): a break is one line, attrib
   assert.equal(lines[0]!["expected"], ORDER_UPDATE);
   assert.equal(lines[0]!["side"], "consumer");
   assert.doesNotMatch(String(lines[0]!["message"]), /O\d+_\d+/, "the compiler named the expanded type, not the alias");
-  // The early answer does not state an emitter's break yet (its item shape is a later ticket).
+  // The early answer states the emitter's break as a call item at the emit's line (HM4 T4).
   const early = earlyResult({ file: path.join(r.root, ORDERS), root: r.root }, lines as never);
-  assert.deepEqual(early.items, []);
+  assert.deepEqual(early.items?.map((i) => [i.kind, i.line]), [["call", lineOf(ORDERS_TEXT, PAYLOADS[0]!)]]);
   assert.equal(early.recheck, undefined);
   assert.deepEqual(await r.edit(ORDERS, ORDERS_TEXT), [], "reverted: silent");
 });
@@ -311,4 +314,98 @@ test("an HTTP and a GraphQL placed row keep exactly their keys", async (t) => {
   const bare = await rig(t, [{ ...httpRow(), groups: [groupOf("any", [placeOf("web", "web/ok.ts", 4, null)])] }, { ...graphqlRow(), groups: [groupOf("any", [placeOf("web", "web/order.ts", 4, null)])] }], TABLE);
   assert.equal(bare.placed().unarmed.length, 1, "the GraphQL row is unarmed (top type)");
   for (const e of bare.placed().unarmed) assert.deepEqual(Object.keys(e).sort(), ["file", "group", "label", "position", "protocol", "reason"], `${e["protocol"]} unarmed row keys`);
+});
+
+// HM4 T4: the early answer states an emitter's break as a consumer-side `call`
+// item at the emit's line, joined to the full re-check's call row by place.
+
+const early = (r: Rig, lines: Array<Record<string, unknown>>, rel = ORDERS) => earlyResult({ file: path.join(r.root, rel), root: r.root }, lines as never);
+const FIRST = lineOf(ORDERS_TEXT, PAYLOADS[0]!);
+const SECOND = lineOf(ORDERS_TEXT, PAYLOADS[1]!);
+
+test("an emitter break is a call item at the emit's line, through earlyResult", async (t) => {
+  const r = await rig(t, socketRows());
+  const lines = await r.edit(ORDERS, ORDERS_TEXT.replace('status: "paid"', 'status: "BROKEN"'));
+  assert.equal(lines[0]!["protocol"], "socket");
+  assert.equal(lines[0]!["call_line"], FIRST);
+  assert.deepEqual(early(r, lines).items, [
+    {
+      kind: "call",
+      method: "CLIENT->SERVER",
+      path: "order:update",
+      line: FIRST,
+      direction: "response",
+      verdict: { state: "resolved", result: "type_mismatch", detail: "This code sends 'string'; the listener expects '{ id: number; }'." },
+      expected_type: ORDER_UPDATE,
+      sent_by: "consumer",
+      counterparts: [{ role: "producer", service: "listener", file: "src/listen.ts", line: 3 }],
+      stated: true,
+    },
+  ]);
+});
+
+test("a line inserted above the emit moves call_line with it", async (t) => {
+  const r = await rig(t, socketRows());
+  const shifted = ORDERS_TEXT.replace("export function push(): void {\n", "export function push(): void {\n  void 0;\n");
+  assert.deepEqual(await r.edit(ORDERS, shifted), [], "the inserted line breaks nothing");
+  const lines = await r.edit(ORDERS, shifted.replace('status: "paid"', 'status: "BROKEN"'));
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  assert.equal(lines[0]!["row_line"], FIRST, "the held key keeps the index line");
+  assert.equal(lines[0]!["call_line"], FIRST + 1, "the call is one line lower now");
+  assert.equal(early(r, lines).items?.[0]?.line, FIRST + 1);
+});
+
+test("a multi-line emit's call_line is the call's first line, not the payload's last", async (t) => {
+  const payload = '{\n    id: "o3",\n    status: "long",\n  }';
+  const text = `${ORDERS_TEXT}export function pushLong(): void {\n  socket.emit(\n    "order:update",\n    ${payload},\n  );\n}\n`;
+  const call = lineOf(text, "socket.emit(\n");
+  const rows = socketRows({ text, payloads: [payload], callLine: () => call });
+  const r = await rig(t, rows, null, {}, text);
+  const lines = await r.edit(ORDERS, text.replace('status: "long"', 'status: "BROKEN"'));
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  assert.ok((lines[0]!["line"] as number) > call + 2, "the compiler speaks past the payload's first line");
+  assert.equal(lines[0]!["call_line"], call);
+  assert.equal(early(r, lines).items?.[0]?.line, call);
+});
+
+test("a type edit in another file gives a moved call row at the emit", async (t) => {
+  const r = await rig(t, socketRows());
+  // The emit's payload breaks behind the edit (as a type it reads would), and the edit is to another file.
+  const orders = path.join(r.root, ORDERS);
+  fs.writeFileSync(orders, ORDERS_TEXT.replace('status: "paid"', 'status: "BROKEN"'));
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(orders, later, later);
+  const lines = await r.edit(HTTP, `${HTTP_TEXT}// edited\n`);
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  const answer = early(r, lines, HTTP);
+  assert.deepEqual(answer.items, []);
+  assert.deepEqual(answer.recheck?.moved, [
+    {
+      file: ORDERS,
+      line: FIRST,
+      role: "call",
+      method: "CLIENT->SERVER",
+      path: "order:update",
+      before: "compatible",
+      after: "type_mismatch",
+      counterparts: ["listener src/listen.ts:3"],
+      reason: "This code sends 'string'; the listener expects '{ id: number; }'.",
+      not_judged_before: false,
+      stated: true,
+    },
+  ]);
+});
+
+test("a socket emit line is not printed when the engine gave no message rules", async (t) => {
+  const r = await rig(t, socketRows(), null, { FAKE_NO_MESSAGE: "1" });
+  const lines = await r.edit(ORDERS, ORDERS_TEXT.replace('status: "paid"', 'status: "BROKEN"'));
+  assert.deepEqual(lines, []);
+  assert.deepEqual(early(r, lines).items, []);
+});
+
+test("a consumer line with no call line is not printed (part 2 could not join it)", () => {
+  const root = fs.realpathSync(os.tmpdir());
+  const line = { row_key: "k", group: 0, label: EVENT, consumer: "listener", file: ORDERS, line: 6, message: "Type 'string' is not assignable to type '{ id: number; }'.", row_file: ORDERS, row_line: 6, row_path: path.join(root, ORDERS), places: [{ service: "listener", file: "src/listen.ts", line: 3 }], expected: ORDER_UPDATE, side: "consumer" as const, protocol: "socket" };
+  for (const call_line of [undefined, null]) assert.deepEqual(earlyResult({ file: path.join(root, ORDERS), root }, [{ ...line, call_line }]).items, [], String(call_line));
+  assert.equal(earlyResult({ file: path.join(root, ORDERS), root }, [{ ...line, call_line: 6 }]).items?.length, 1);
 });

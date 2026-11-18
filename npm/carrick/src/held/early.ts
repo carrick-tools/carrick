@@ -129,6 +129,71 @@ export function splitLabel(label: string): { method: string; path: string; dispa
   return { method, path: rest.slice(0, dispatch.index), dispatch_label: dispatch[0] };
 }
 
+/** A type as an item states it: cut at `MAX_TYPE`, as the CLI cuts its own. */
+const cutType = (type: string): string => (type.length > MAX_TYPE ? `${type.slice(0, MAX_TYPE - 3)}...` : type);
+
+/**
+ * A consumer-side break (a socket emit; HM4 D1, moved with carrick#4770): a
+ * `call` row at the call's current line, shaped as the full re-check shapes
+ * the same row. On a message row the re-check states the emitter's payload as
+ * `actual_type`, the listener's type as `expected_type` and `sent_by:
+ * "consumer"` (`typed_sides`, `src/local_mode/join.rs`). The early row states
+ * only the listener's held-fixed type: the emitter's own is the edited side.
+ * Two calls of one event in one file are two rows: the key carries the line.
+ */
+function consumerRow(
+  entry: EarlyFor,
+  edited: string,
+  line: HeldLine & { call_line: number },
+  detail: string,
+  parts: ReturnType<typeof splitLabel>,
+  items: Map<string, CheckItem>,
+  moved: Map<string, MovedRow>,
+): void {
+  if (realPath(line.row_path) === edited) {
+    const counterparts: Counterpart[] = line.places.map((p) => ({ role: "producer", service: p.service, file: p.file, ...(p.line === null ? {} : { line: p.line }) }));
+    const key = `${line.label}\0${line.call_line}`;
+    const held = items.get(key);
+    if (held) {
+      held.counterparts = [...(held.counterparts ?? []), ...counterparts];
+      return;
+    }
+    items.set(key, {
+      kind: "call",
+      ...parts,
+      line: line.call_line,
+      direction: "response",
+      verdict: { state: "resolved", result: "type_mismatch", detail },
+      expected_type: cutType(line.expected),
+      sent_by: "consumer",
+      counterparts,
+      stated: true,
+    });
+    return;
+  }
+  const file = path.relative(realPath(entry.root), realPath(line.row_path));
+  const places = line.places.map((p) => `${p.service} ${p.file}${p.line === null ? "" : `:${p.line}`}`);
+  const key = `${file}\0${line.label}\0${line.call_line}`;
+  const held = moved.get(key);
+  if (held) {
+    held.counterparts.push(...places);
+    return;
+  }
+  moved.set(key, {
+    file,
+    line: line.call_line,
+    role: "call",
+    method: parts.method,
+    path: parts.path + (parts.dispatch_label ?? ""),
+    before: "compatible",
+    after: "type_mismatch",
+    counterparts: places,
+    reason: detail,
+    not_judged_before: false,
+    stated: true,
+  });
+}
+
 /** The entry an early answer is for: the edited file, absolute, and the workspace it was queued in. */
 export type EarlyFor = { file: string; root: string };
 
@@ -143,11 +208,15 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
   const items = new Map<string, CheckItem>();
   const moved = new Map<string, MovedRow>();
   for (const line of lines) {
-    // A socket emitter's break (a consumer-side row) is held back: its item shape and its join with part 2 are not built yet.
-    if (line.side === "consumer") continue;
+    // A consumer line part 2 cannot be joined to (no call line) is not printed: the full check could neither confirm nor correct it.
+    if (line.side === "consumer" && typeof line.call_line !== "number") continue;
     const detail = heldDetail(line);
     if (detail === null) continue;
     const parts = splitLabel(line.label);
+    if (line.side === "consumer") {
+      consumerRow(entry, edited, line as HeldLine & { call_line: number }, detail, parts, items, moved);
+      continue;
+    }
     if (realPath(line.row_path) === edited) {
       const counterparts: Counterpart[] = line.places.map((p) => ({
         role: "consumer",
@@ -166,7 +235,7 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
         ...(line.row_line === null ? {} : { line: line.row_line }),
         direction: "response",
         verdict: { state: "resolved", result: "type_mismatch", detail },
-        expected_type: line.expected.length > MAX_TYPE ? `${line.expected.slice(0, MAX_TYPE - 3)}...` : line.expected,
+        expected_type: cutType(line.expected),
         counterparts,
         stated: true,
       });
