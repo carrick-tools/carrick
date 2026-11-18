@@ -1115,6 +1115,7 @@ fn edge_source_stated(wire: Option<&str>) -> Option<EdgeSource> {
 /// only on that silence is marked `other_build` and does not fail. What
 /// `before` did read still decides: a call it matched that now reaches no
 /// route fails whichever build wrote it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn judge(
     root: &Path,
     before: &LocalIndex,
