@@ -2106,7 +2106,7 @@ pub(super) fn library_marked(
 /// What a pair says when a service on one side has no library rows in the
 /// index: not a mismatch, not a match, and not a missing route.
 pub(super) fn library_missing_reason(service: &str) -> String {
-    format!("not checked: the library rows of {service} are missing from the index.")
+    format!("not checked: {service} was indexed without its library facts.")
 }
 
 /// What one re-extraction of some repos produced, joined against everything

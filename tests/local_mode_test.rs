@@ -4432,7 +4432,7 @@ fn mark_stored_service(root: &Path, service: &str) {
 
 const GADGET_ROUTE: &str = "mono/catalog-web/app/routes/api.v1.gadgets.$gadgetId.ts";
 const LIBRARY_ROWS_MISSING: &str =
-    "not checked: the library rows of inventory-svc are missing from the index.";
+    "not checked: inventory-svc was indexed without its library facts.";
 
 /// carrick#4807: a mark stored on a service the run only carried does not
 /// refuse the re-check. The re-check of the gadgets route (its own ask was
