@@ -38,6 +38,7 @@ export const TASK_SKILLS = [
   "carrick-reuse",
   "carrick-drift",
   "carrick-census",
+  "carrick-audit",
 ] as const;
 
 export type TaskSkill = (typeof TASK_SKILLS)[number];

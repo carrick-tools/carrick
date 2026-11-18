@@ -1,117 +1,94 @@
 ---
 name: carrick-census
-description: Use for every place that does X questions, such as every service that reads this environment variable, every handler that checks a permission, or every client of this queue. Pages the Carrick intent index under two wordings and reports what it read and what it could not see.
+description: Use when the ask is which endpoints do X, such as every route that checks an admin role, every endpoint that sends an email or writes to a table, and which apps call them, and before changing a shared helper, to see which endpoints and apps depend on it. Finds the helper by meaning, walks the call graph up to the endpoints, and names each endpoint's callers in other services.
 ---
 
-# Every place that does X
+# Which endpoints do X, and who calls them
 
 {{SCOPE_NOTE}}
 
-The index produces the list. Your work is to open each row and confirm what it
-does.
+Grep finds the lines that do X. This skill answers what grep cannot: which
+endpoints reach those lines, and which apps call those endpoints. Grep for the
+raw lines as well; the two answers go side by side.
 
-## 1. Two wordings
+## 1. Find the shared function that does X
 
-Ask in two wordings. One says what the code is for, the other says how it does
-it. A purpose wording misses a helper whose description names only its
-mechanism, and a mechanism wording misses one described only by its job.
+Ask in two wordings, one for what the code is for and one for how it does it:
 
 ```
 search_by_intent({{SCOPE}}, query: "<what it is for>", also_phrased_as: ["<how it does it>"], compact: true, top_k: 20)
 ```
 
-`compact: true` returns locator-only rows, which is the shape a census needs.
-One answer holds both wordings, deduped, with `phrasings` naming them and
-`matched_phrasings` on each row saying which ones reached it. Page it while
-`has_more` is true:
+Where the answer carries no `phrasings`, run the second wording as its own
+search.
+
+Read each row at `file_path` from `line_number` to `end_line`. Keep the rows that
+do X, and among them find the lowest: the function the others call to do it,
+such as the function that builds the mail client and sends, or the role check
+itself. Stop paging when a page holds no row that does X. Do not change
+`similarity_threshold` while paging: a new threshold is a new list, so start it
+again at offset 0.
+
+Where the question names an identifier (a function, an env var, a table, a
+header, a package), grep for it too. For each grep hit inside a function, find
+that function with `list_function_intents({{SCOPE}}, file: "<file>", compact: true)`:
+the row whose line span holds the hit.
+
+## 2. Walk up to the endpoints
+
+For each shared function from step 1, one call:
 
 ```
-search_by_intent({{SCOPE}}, query: "<the same query>", also_phrased_as: ["<the same second wording>"], compact: true, top_k: 20, offset: <next_offset>)
+get_callers({{SCOPE}}, function_name: "<name>", file: "<file>", depth: 3)
 ```
 
-Where the answer carries no `phrasings`, or the field comes back refused, the
-server answering takes one wording per call. Run the second wording as its own
-paged search.
+Each row is a function that holds a call, and its `chain` runs from it down to
+the function you asked about. Sort every row into one of these:
 
-Stop when `has_more` is false. Lower `similarity_threshold` where the tail of a
-page is still on topic.
+- **Route handler.** Confirm it with
+  `get_api_endpoints({{SCOPE}}, service: "<service>", path_contains: "<path fragment>")`:
+  the endpoint whose `file_location` and `handler_span` hold the row is the one.
+  Take the path from that endpoint, never from the handler's name.
+- **GraphQL resolvers.** A row named `queryFields_handler` or
+  `mutationFields_handler` spans a whole file of resolvers. Read the source at
+  `call_site_line` to name the field, then confirm it with
+  `get_operation({{SCOPE}}, method: "QUERY" or "MUTATION", path: "<field>")`.
+- **Middleware.** A `use_handler` row gates a router. Grep that router's file
+  for `.route(` and `.use(` to find what is mounted behind it, list those routes
+  with `get_api_endpoints` and `path_contains` on each mount path, and give the
+  count.
+- **Dead end.** A chain whose top is an anonymous callback (a name like
+  `andThen_handler`), a class method, a webhook or event registry, or `<module>`
+  (top-level code, whose result is passed around as a value the index does not
+  follow). Grep its file for the router or registration call that runs it. If
+  that finds the route, add it, marked "found by grep". If not, list it under
+  "chains that stop", with file:line and where it stops.
 
-## 2. Union
+Rows under `unfollowed_calls` may also call the function: read each one in
+source and keep it if it does.
 
-One answer over both wordings is already deduped, and `matched_phrasings` says
-which wordings reached each row. Two answers are joined here, on `file_path` and
-`line_number`, and a row both wordings found is one row. Either way keep
-`retrieved_by` and `similarity`, and keep which wording found each row. A row
-only one wording reached is the row a single search would have lost.
-
-## 3. Receipt
-
-Report these numbers before the list, per query where the field is per query:
-
-- rows read, which is the count you paged to;
-- `total_candidates`, the exact size of the ranked list for that query;
-- `hidden_by_threshold` where the answer carries it: how many rows the floor
-  removed, and `best` where it names the closest of them. A count above zero is
-  the case for one more search at a lower `similarity_threshold`;
-- `hidden_by_lexical_floor` where the answer carries it: how many rows matched a
-  word of the query but too little of its word weight to rank, and `best` where
-  it names the nearest of them, with the weight it reached against the bar it
-  had to clear. A lower `similarity_threshold` does not reach these rows. The
-  search that does names the identifier or the rare term itself;
-- `total_without_intent`, which is index-wide: functions carrying no intent
-  text, which the search ranked on their name, signature and body tokens
-  alone, so a query that names one finds it and a query that describes what
-  it does without naming it does not;
-- `total_intent_carried_forward` where the response states it, which are intents
-  describing the code as of an earlier scan.
-
-Then say what the index does not hold for this question. It covers each repo's
-main branch, so a change on a branch is outside it. It indexes functions that
-carry an intent, so a match inside a config file, a template or generated output
-is outside it as well.
-
-## 4. Confirm
-
-Read each row at `file_path`, from `line_number` to `end_line`. Keep the rows
-that do the thing, and drop the rest with one line each saying what they turned
-out to be. `role` on a row says what the scan joined it to, such as a route
-handler or a client, and a route handler for a different operation is not a hit.
-
-## 5. Follow helpers to callers
-
-The rows from step 4 are often the mechanism: a helper that others call to do
-the thing. The places that do X are then its callers. For each kept row that is
-a helper, run:
+## 3. Who calls each endpoint
 
 ```
-get_callers({{SCOPE}}, function_name: "<helper>", file: "<file>", depth: 1)
+get_operation({{SCOPE}}, method: "<METHOD>", path: "<path>")
 ```
 
-or grep for the helper's name where the index returns nothing. A function passed
-as a value is not counted, so grep before you treat zero callers as none. Report
-the callers as the places that do X, each with `call_site_line` where the row
-carries it, and list the helper itself apart as the mechanism.
+Read `consumers` only: service and `call_file_location`. Skip `unread_sites`.
 
-Where the question names an identifier, such as an environment variable, a
-table or a header, grep the source for that identifier as well and merge the two
-lists on file and line. A match inside a config file, a template or generated
-output reaches you only this way. Mark each row with how it was found: index,
-callers, grep.
+## 4. Report
 
-## 6. Report
-
-| file:line | function | what it does | found by |
+| endpoint | how it does X (call chain) | called by (service, file:line) | found by |
 |---|---|---|---|
-| src/billing/charge.ts:88 | chargeCard | reads the billing key | purpose, mechanism |
+| GET /bills/:billId/file | handler → isAdminUser | web: src/pages/BillPage.tsx:40 | index |
 
-Close with the receipt from step 3, and the helpers followed in step 5, so the list is read against what was
-searched.
+Then, apart from the table:
 
-## 7. Act
+- chains that stop, each with file:line and where it stops;
+- the lines that do X but reach no endpoint (scripts, top-level code, frontend
+  pages), from grep, each with file:line;
+- for a question about frontend code only (pages, components), say that the
+  table stays empty because the index holds no route list for frontend routers,
+  and that the answer is the grep list plus the callers of the shared function;
+- the counts: shared functions followed, endpoints reached, callers listed.
 
-Change nothing unless you were asked to. Offer one issue per finding that needs
-work, and file the ones accepted:
-
-```
-gh issue create --title "<concept>: <n> places, <m> need changing" --body "<the table, and the receipt>"
-```
+Change nothing unless you were asked to.
