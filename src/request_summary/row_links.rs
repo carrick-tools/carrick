@@ -207,7 +207,9 @@ impl RowLinks {
         };
         if declaring == file {
             // Every use names a declaration of the importing file itself:
-            // a name declared again over the import, not the import.
+            // the file declares the import's name again at module scope (a
+            // TS merge), never an inner shadow, whose uses are not the
+            // import's (carrick#4590).
             return RowLink::Unrecorded;
         }
         // A module's own symbol is named by its file (carrick#2419).
@@ -661,5 +663,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    const SHAPES: (&str, &str) = ("src/shapes.ts", "export interface Shape { size: number }\n");
+
+    /// carrick#4590 T1c: a local `const` that shadows an imported interface
+    /// is no use of the import: its uses neither open the switch nor make the
+    /// import a hole, even when the local's type did not resolve.
+    #[test]
+    fn a_local_that_shadows_an_imported_interface_opens_nothing() {
+        let other = (
+            "src/other.ts",
+            "import { Shape } from \"./shapes\";\nimport { Kind } from \"@fixture/bus\";\nexport function sizes(input: Shape[]): Shape[] {\n  const Shape = Kind.items(input);\n  return Shape;\n}\n",
+        );
+        let Some(on) = walked(&[SHAPES, other], true) else {
+            return;
+        };
+        assert!(!on.inputs.links.as_ref().unwrap().open());
+        assert_eq!(reads(&on), all_read());
+        assert_eq!(on.link("src/other.ts", "Shape"), None);
+        // The edit ran: the package import beside it is still a hole.
+        assert_eq!(
+            on.link("src/other.ts", "Kind"),
+            Some(RowLink::Hole(HoleReason::UnresolvedImport))
+        );
+    }
+
+    /// Two shadows on different lines no longer disagree into a hole.
+    #[test]
+    fn two_locals_that_shadow_an_import_open_nothing() {
+        let other = (
+            "src/other.ts",
+            "import { Shape } from \"./shapes\";\nexport function a(): number[] {\n  const Shape = [1];\n  return Shape;\n}\nexport function b(): number[] {\n  const Shape = [2];\n  return Shape;\n}\n",
+        );
+        let Some(on) = walked(&[SHAPES, other], true) else {
+            return;
+        };
+        assert!(!on.inputs.links.as_ref().unwrap().open());
+        assert_eq!(reads(&on), all_read());
+    }
+
+    /// Guard: a value imported from a module no row names, and written to,
+    /// still contests every object, shadow or not.
+    #[test]
+    fn a_shadow_does_not_clear_the_imports_own_write() {
+        let other = (
+            "src/other.ts",
+            "import { registry } from \"./generated/registry\";\nregistry.extra = 1;\nexport function f() {\n  const registry = { a: 1 };\n  return registry;\n}\n",
+        );
+        let Some(on) = walked(&[other], true) else {
+            return;
+        };
+        assert!(on.inputs.links.as_ref().unwrap().open());
+        assert_eq!(reads(&on), all_contested());
+        assert_eq!(
+            on.link("src/other.ts", "registry"),
+            Some(RowLink::Hole(HoleReason::UnresolvedImport))
+        );
+    }
+
+    /// Guard (unchanged by T1c): a class from a module no row names, only
+    /// constructed, contests nothing.
+    #[test]
+    fn an_imported_class_only_constructed_contests_nothing() {
+        let other = (
+            "src/other.ts",
+            "import { Widget } from \"./generated/widget\";\nexport const made = new Widget();\n",
+        );
+        let Some(on) = walked(&[other], true) else {
+            return;
+        };
+        assert!(!on.inputs.links.as_ref().unwrap().open());
+        assert_eq!(reads(&on), all_read());
+    }
+
+    /// A function the import declares, called, with a local of its name in
+    /// another function: the import reads as its declaration.
+    #[test]
+    fn a_shadow_beside_a_called_import_leaves_the_import_declared() {
+        let helper = (
+            "src/helper.ts",
+            "export function helper(): string {\n  return \"x\";\n}\n",
+        );
+        let other = (
+            "src/other.ts",
+            "import { helper } from \"./helper\";\nhelper();\nexport function g(): number {\n  const helper = 1;\n  return helper;\n}\n",
+        );
+        let Some(on) = walked(&[helper, other], true) else {
+            return;
+        };
+        assert!(matches!(
+            on.link("src/other.ts", "helper"),
+            Some(RowLink::Declared(..))
+        ));
     }
 }

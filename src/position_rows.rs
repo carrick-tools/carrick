@@ -879,7 +879,8 @@ impl PositionIndex {
     /// then says only that the value's type did not resolve, as when a
     /// workspace package's own imports do not. One whose declaration is in
     /// `file` with the error type is the import itself, which reached
-    /// nothing.
+    /// nothing. That holds because the spans are the import's own uses, never
+    /// a local that shares its name (carrick#4590).
     pub fn declaration(
         &self,
         file: &Path,

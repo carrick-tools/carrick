@@ -1883,22 +1883,24 @@ enum Held {
     SeveralPaths,
 }
 
-/// Every expression-position identifier among `names`, by name, with its
-/// span: the positions a compiler row is written at. Type positions hold
-/// none.
-struct ExpressionIdents<'a> {
-    names: &'a HashMap<String, BindingUse>,
+/// Every expression-position identifier that names one of the import
+/// bindings in `keys`, with its span: the positions a compiler row is
+/// written at. An identifier that shares an import's name but names another
+/// binding (a local declared again in an inner scope) is not one of them
+/// (carrick#4590). Type positions hold none.
+struct ExpressionIdents {
+    keys: HashMap<String, BindingKey>,
     spans: HashMap<String, Vec<(u32, u32)>>,
 }
 
-impl Visit for ExpressionIdents<'_> {
+impl Visit for ExpressionIdents {
     fn visit_ts_type(&mut self, _: &TsType) {}
     fn visit_ts_interface_body(&mut self, _: &TsInterfaceBody) {}
     fn visit_ts_expr_with_type_args(&mut self, _: &TsExprWithTypeArgs) {}
 
     fn visit_expr(&mut self, expr: &Expr) {
         if let Expr::Ident(ident) = expr
-            && self.names.contains_key(ident.sym.as_ref())
+            && self.keys.get(ident.sym.as_ref()) == Some(&ident_key(ident))
         {
             self.spans
                 .entry(ident.sym.to_string())
@@ -2044,12 +2046,17 @@ fn extract_file_ir_with_fuel(
     uses.settle_aliases(&jsx);
     let (imports, bound_requires) = import_bindings(module);
     // Every import the file uses, however it uses it: a module that declares
-    // one holds what these uses may change (carrick#1568). Kept whether or
-    // not the name is declared again below, since nothing here says which
-    // of its uses mean the import.
+    // one holds what these uses may change (carrick#1568). A use belongs to
+    // the binding its identifier names (`binding_scope::ident_key`), so a
+    // name declared again in an inner scope adds nothing to the import.
     let imported: HashMap<String, BindingUse> = imports
-        .keys()
-        .filter_map(|name| Some((name.clone(), uses.uses.get(name)?.clone())))
+        .iter()
+        .filter_map(|(name, import)| {
+            Some((
+                name.clone(),
+                binding_uses_of(&uses.bindings, &uses.unbound, &import.key)?,
+            ))
+        })
         .collect();
     // Names the module assigns again: a function declaration one of them
     // names may be replaced by the time it is called.
@@ -2153,7 +2160,10 @@ fn extract_file_ir_with_fuel(
         module_scope.uses.contains_key(name) || jsx.contains(name)
     });
     let mut idents = ExpressionIdents {
-        names: &imported,
+        keys: imported
+            .keys()
+            .filter_map(|name| Some((name.clone(), imports.get(name)?.key.clone())))
+            .collect(),
         spans: HashMap::new(),
     };
     module.visit_with(&mut idents);
@@ -3165,11 +3175,7 @@ impl ModuleScope {
     /// with no binding of its own (an alias root), so that one fails closed
     /// (carrick#3547 S2).
     fn uses_of(&self, key: &BindingKey) -> BindingUse {
-        let mut used = self.binding_uses.get(key).cloned().unwrap_or_default();
-        if let Some(unbound) = self.unbound_uses.get(&key.0) {
-            used.merge(unbound);
-        }
-        used
+        binding_uses_of(&self.binding_uses, &self.unbound_uses, key).unwrap_or_default()
     }
 
     /// Whether the module exports `name` by name (`export { name }`,
@@ -4895,6 +4901,27 @@ struct Captured {
     subjects: HashMap<BindingKey, Subject>,
     /// [`Scope::held`], each parameter one function further out.
     held: HashMap<BindingKey, Vec<ValueAt>>,
+}
+
+/// The uses of the binding `key` with every use of its name recorded with no
+/// binding of its own merged in (carrick#3547 S2); `None` when neither holds
+/// one.
+fn binding_uses_of(
+    bindings: &HashMap<BindingKey, BindingUse>,
+    unbound: &HashMap<String, BindingUse>,
+    key: &BindingKey,
+) -> Option<BindingUse> {
+    let own = bindings.get(key);
+    let shared = unbound.get(&key.0);
+    match (own, shared) {
+        (None, None) => None,
+        (Some(own), None) => Some(own.clone()),
+        (own, Some(shared)) => {
+            let mut used = own.cloned().unwrap_or_default();
+            used.merge(shared);
+            Some(used)
+        }
+    }
 }
 
 /// One module-scope binding an import introduces.
@@ -16311,5 +16338,44 @@ function build() { return {}; }
         assert_eq!(exact.builder_fuel_max, spent);
         let short = read_within(format!("{}{LOAD}", recursive_helper(1)), spent - 1, 60);
         assert!(short.builder_fuel_spent);
+    }
+
+    /// carrick#4590 T1c: a local that shadows an import's name is not a use
+    /// of the import. The file is parsed with the resolver, as a scan does.
+    #[test]
+    fn a_local_that_shadows_an_import_adds_no_use_to_it() {
+        let file = file_ir_of(
+            "import { Shape } from \"./shapes\";\n\
+             export function sizes(): number[] {\n\
+               const Shape = [1, 2];\n\
+               return Shape;\n\
+             }\n",
+        );
+        assert!(
+            !file.imported.contains_key("Shape"),
+            "the only uses are the local's"
+        );
+        assert!(file.import_uses().all(|(name, _)| name != "Shape"));
+    }
+
+    /// carrick#4590 T1c: the import's own use still counts, and only it
+    /// has a span.
+    #[test]
+    fn an_import_keeps_its_own_use_beside_a_shadow() {
+        let file = file_ir_of(
+            "import { Shape } from \"./shapes\";\n\
+             export const first = Shape;\n\
+             export function sizes(): number[] {\n\
+               const Shape = [1, 2];\n\
+               return Shape;\n\
+             }\n",
+        );
+        assert!(file.imported["Shape"].may_change());
+        let spans: Vec<_> = file
+            .import_uses()
+            .filter(|(name, _)| *name == "Shape")
+            .flat_map(|(_, spans)| spans)
+            .collect();
+        assert_eq!(spans.len(), 1, "the module-scope use only: {spans:?}");
     }
 }
