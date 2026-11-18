@@ -10,9 +10,12 @@
 //! It only reports. It never stops, skips or times out a read (that is a
 //! separate decision), and the loop pays one short lock per step.
 //!
-//! The line is logged at debug, which the log file the runner uploads keeps
-//! (`logging::FILE_FILTER`) and the terminal does not show. Paths are
-//! repo-relative, never the repo's own location.
+//! The line is logged at info, so it reaches the terminal and the log the
+//! runner keeps even when the end-of-run log upload does not arrive. It
+//! appears only after a step has run past the threshold, never on a healthy
+//! scan. Paths are repo-relative, never the repo's own location. The watch
+//! also covers the stages after the per-file loop (`stage`), which name no
+//! file.
 
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
@@ -57,10 +60,18 @@ pub fn threshold_from_env() -> Duration {
 }
 
 impl Watch {
-    /// Starts the watcher with the environment's threshold, logging at debug.
+    /// Starts the watcher with the environment's threshold, logging at info.
     pub fn discovery() -> Self {
-        Self::start(threshold_from_env(), DEFAULT_REPEAT, |line| {
-            tracing::debug!("{line}")
+        Self::discovery_at(threshold_from_env(), DEFAULT_REPEAT)
+    }
+
+    /// The discovery watcher with explicit timings (a test's short ones).
+    pub(crate) fn discovery_at(threshold: Duration, repeat: Duration) -> Self {
+        // The watch thread logs through the dispatcher of the thread that
+        // started it, so a scoped subscriber (a test's) sees the line too.
+        let dispatch = tracing::Dispatch::default();
+        Self::start(threshold, repeat, move |line| {
+            tracing::dispatcher::with_default(&dispatch, || tracing::info!("{line}"))
         })
     }
 
@@ -94,10 +105,14 @@ impl Watch {
                     let now = Instant::now();
                     if !state.idle && now >= state.next_report {
                         let secs = now.duration_since(state.since).as_secs();
-                        emit(format!(
-                            "discovery: still reading {} (step {}) after {} s",
-                            state.file, state.step, secs
-                        ));
+                        emit(if state.file.is_empty() {
+                            format!("discovery: still in {} after {} s", state.step, secs)
+                        } else {
+                            format!(
+                                "discovery: still reading {} (step {}) after {} s",
+                                state.file, state.step, secs
+                            )
+                        });
                         state.next_report = now + repeat;
                     }
                     state = seen
@@ -125,6 +140,13 @@ impl Watch {
         state.file.clear();
         state.file.push_str(&shown.to_string_lossy());
         self.enter(&mut state, step);
+    }
+
+    /// The loop is past the files and in a named stage that has no file.
+    pub fn stage(&self, stage: &'static str) {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.file.clear();
+        self.enter(&mut state, stage);
     }
 
     /// The loop moved to the next step of the same file.
@@ -184,6 +206,54 @@ mod tests {
             "{lines:?}"
         );
         assert!(!lines[0].contains("/work"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_slow_file_line_reaches_the_terminal_and_the_log() {
+        let (terminal, file) = crate::logging::written_by(|| {
+            let watch = Watch::discovery_at(Duration::from_millis(20), Duration::from_secs(5));
+            watch.file(
+                Path::new("/work/repo"),
+                Path::new("/work/repo/src/a/big.ts"),
+                "request summary",
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            drop(watch);
+        });
+        let want = "still reading src/a/big.ts (step request summary)";
+        assert!(terminal.contains(want), "terminal: {terminal}");
+        assert!(file.contains(want), "file: {file}");
+        assert!(!terminal.contains("/work"), "{terminal}");
+    }
+
+    #[test]
+    fn a_fast_discovery_prints_nothing() {
+        let (terminal, file) = crate::logging::written_by(|| {
+            let watch = Watch::discovery_at(Duration::from_secs(5), Duration::from_secs(5));
+            for n in 0..50 {
+                watch.file(Path::new("/r"), Path::new(&format!("/r/f{n}.ts")), "parse");
+            }
+            watch.stage("call edges");
+            std::thread::sleep(Duration::from_millis(100));
+            drop(watch);
+        });
+        assert!(!terminal.contains("discovery:") && !file.contains("discovery:"));
+    }
+
+    #[test]
+    fn a_stage_past_the_threshold_is_named_without_a_file() {
+        let (lines, emit) = collect();
+        let watch = Watch::start(Duration::from_millis(30), Duration::from_secs(5), emit);
+        watch.file(Path::new("/r"), Path::new("/r/a.ts"), "parse");
+        watch.stage("call edges");
+        std::thread::sleep(Duration::from_millis(300));
+        drop(watch);
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines[0].starts_with("discovery: still in call edges after "),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("a.ts"), "{lines:?}");
     }
 
     #[test]
