@@ -29,6 +29,7 @@ import { classifyPair, type RawDiagnostic } from '../src/capture/check-classify.
 import {
   buildRelaxedProbe,
   evidenceFromDiagnostics,
+  REMAINS,
   type RelaxedPlan,
 } from '../src/capture/check-relaxed.js';
 import type {
@@ -42,7 +43,7 @@ import type {
 const TSCONFIG = JSON.stringify({
   compilerOptions: {
     strict: true,
-    skipLibCheck: true,
+    skipLibCheck: false,
     noEmit: true,
     module: 'esnext',
     moduleResolution: 'bundler',
@@ -212,9 +213,9 @@ const SEEDS = [...NOT_PROVEN.map((n) => n.seed), ...PROVEN];
 /** The four kinds the plan's V1 table treats as not proven (D7: R6, R11, R13 and R4 stay). */
 const V1: NotProvenKind[] = ['open_value', 'null_where_optional', 'null_where_required', 'weak_type'];
 
-/** The relabel's read of the evidence: demoted only when a passing set lies inside what it allows. */
+/** A relabel's read of the evidence that allows `allowed`: demoted only when a passing set lies inside it. */
 function demotes(e: BreakEvidence, allowed: NotProvenKind[]): boolean {
-  return !e.proven && e.passing.some((set) => set.every((k) => allowed.includes(k)));
+  return e.passing.some((set) => set.every((k) => allowed.includes(k)));
 }
 
 function spec(seed: Seed): CheckPairSpec {
@@ -325,12 +326,16 @@ describe('the relaxed re-check: evidence for incompatible pairs (incompatible-ru
     for (const { seed, passing } of NOT_PROVEN) {
       it(`${seed.protocol} ${seed.type_kind}: ${seed.key}`, () => {
         const e = judged(seed.key);
+        // A pair that fits only with a value the producer's own type lists
+        // stays proven: `proven` reads the plan's kinds only.
+        const listed = passing.every((set) => set.includes('listed_value'));
         assert.deepStrictEqual(
           { proven: e.proven, passing: e.passing, kinds: e.kinds },
-          { proven: false, passing, kinds: passing[0] }
+          { proven: listed, passing, kinds: listed ? [] : passing[0] }
         );
-        const listed = passing.every((set) => set.includes('listed_value'));
+        if (listed) assert.match(e.cause!, /listed_value allowed, outside the kinds that prove no break/);
         assert.strictEqual(demotes(e, V1), !listed, `${seed.key} under the V1 table`);
+        assert.strictEqual(demotes(e, [...V1, 'listed_value']), true, `${seed.key} with every kind allowed`);
       });
     }
   });
@@ -343,7 +348,7 @@ describe('the relaxed re-check: evidence for incompatible pairs (incompatible-ru
           proven: true,
           kinds: [],
           passing: [],
-          cause: 'a difference remains with every relaxation allowed',
+          cause: REMAINS,
         });
       });
     }

@@ -18,6 +18,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { runCheck } from '../src/capture/index.js';
 import { RELAXED_DIR } from '../src/capture/check.js';
+import { REMAINS } from '../src/capture/check-relaxed.js';
 import type { CheckPairSpec, CheckResult, CheckStubInput, CheckVerdict } from '../src/capture/api.js';
 
 let root: string;
@@ -114,7 +115,7 @@ describe('check_v2: the relaxed re-check is evidence only (incompatible-rule T1)
         proven: true,
         kinds: [],
         passing: [],
-        cause: 'a difference remains with every relaxation allowed',
+        cause: REMAINS,
       }, key);
     }
   });

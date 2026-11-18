@@ -557,23 +557,7 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         assert.deepStrictEqual({ ...v7, codes: [] }, { ...v6, codes: [] }, key);
         continue;
       }
-      // The relaxed re-check's evidence may differ, and only toward proven
-      // on TypeScript 6: there the canary catches a comparison TypeScript 6
-      // cuts short on the relaxed block (incompatible-rule T1).
-      const { break_evidence: e7, ...rest7 } = v7;
-      const { break_evidence: e6, ...rest6 } = v6;
-      assert.deepStrictEqual(rest7, rest6, key);
-      if (key === 'wiredeepreverse') {
-        assert.strictEqual(e7?.proven, true, key);
-        assert.deepStrictEqual(e6, {
-          proven: true,
-          kinds: [],
-          passing: [],
-          cause: "the relaxed compile did not raise the judge's own diagnostics on the judge's lines",
-        });
-        continue;
-      }
-      assert.deepStrictEqual(e7, e6, key);
+      assert.deepStrictEqual(v7, v6, key);
     }
   });
 });

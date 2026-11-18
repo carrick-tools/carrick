@@ -68,6 +68,18 @@ export const NOT_PROVEN_KINDS: readonly NotProvenKind[] = [
   'listed_value',
 ];
 
+/**
+ * The kinds the plan treats as not proven (rule lines R3, R8, R9, R12):
+ * `proven` and `kinds` read these only. `listed_value` (R4) is in `passing`
+ * alone, for a relabel that is ruled to allow it.
+ */
+export const PLAN_NOT_PROVEN_KINDS: readonly NotProvenKind[] = [
+  'open_value',
+  'null_where_optional',
+  'null_where_required',
+  'weak_type',
+];
+
 const P = '__rx_';
 
 /** The relaxed re-check's helper types, every name under its own prefix. */
@@ -103,11 +115,13 @@ export function relaxedDeclarations(): string[] {
 }
 
 /**
- * How many levels of nesting (an object's fields, an array's elements) the
- * relaxations reach. Below it both sides are compared as declared, which can
- * only keep a difference.
+ * How many levels of nesting (an object's fields, an array's elements, an
+ * index signature's values) the re-check reads. Whatever the sending side
+ * holds below it becomes a marker no receiving type accepts, so a pair that
+ * nests deeper (a recursive type, say) reads proven: the re-check never
+ * leaves a level to the compiler's own cut-off.
  */
-export const RELAXED_DEPTH = 10;
+export const RELAXED_DEPTH = 16;
 
 /**
  * The two helpers, one copy per level of nesting. A recursive helper that
@@ -124,8 +138,14 @@ function levels(): string[] {
     // The receiving side's null: `O` says whether the position allows
     // absence (an optional key, or a type holding `undefined`).
     `type ${P}Null<F, O> = O extends true ? ('null_where_optional' extends F ? null : never) : ('null_where_required' extends F ? null : never);`,
+    // An object is rebuilt as its index signature, written out, and its
+    // named keys: mapping a `Record` rebuilds the `Record` itself, the same
+    // type at every level, which ends the comparison unchecked three levels
+    // down (measured).
+    `type ${P}Known<K> = string extends K ? never : number extends K ? never : K;`,
     `type ${P}Weak<T, F> = 'weak_type' extends F ? ({} extends T ? { [k: string]: unknown } : unknown) : unknown;`,
-    `type ${P}Firm${RELAXED_DEPTH}<T, F> = T;`,
+    `declare const ${P}tooDeep: unique symbol;`,
+    `type ${P}Firm${RELAXED_DEPTH}<T, F> = typeof ${P}tooDeep;`,
     `type ${P}Relax${RELAXED_DEPTH}<T, F, O> = T;`,
   ];
   for (let d = 0; d < RELAXED_DEPTH; d++) {
@@ -136,9 +156,11 @@ function levels(): string[] {
       // distributes, with `undefined` set aside so an optional JSON field
       // keeps its `?`.
       `type ${P}Firm${d}<T, F> = 'open_value' extends F ? (${P}IsJson<Exclude<T, undefined>> extends true ? ${P}OpenJ | Extract<T, undefined> : ${P}FirmEach${d}<T, F>) : ${P}FirmEach${d}<T, F>;`,
-      `type ${P}FirmEach${d}<T, F> = 0 extends 1 & T ? T : T extends string ? ([string] extends [T] ? ('open_value' extends F ? ${P}OpenS : T) : ('listed_value' extends F ? ${P}ListedS : T)) : T extends number ? ([number] extends [T] ? ('open_value' extends F ? ${P}OpenN : T) : ('listed_value' extends F ? ${P}ListedN : T)) : T extends boolean ? ('listed_value' extends F ? ${P}ListedB : T) : T extends (...args: any[]) => any ? T : T extends readonly unknown[] ? (number extends T['length'] ? { readonly [${P}list]: true; readonly [i: number]: ${firm}<T[number], F> } : T) : T extends object ? { [K in keyof T]: ${firm}<T[K], F> } : T;`,
+      `type ${P}FirmEach${d}<T, F> = 0 extends 1 & T ? T : T extends string ? ([string] extends [T] ? ('open_value' extends F ? ${P}OpenS : T) : ('listed_value' extends F ? ${P}ListedS : T)) : T extends number ? ([number] extends [T] ? ('open_value' extends F ? ${P}OpenN : T) : ('listed_value' extends F ? ${P}ListedN : T)) : T extends boolean ? ('listed_value' extends F ? ${P}ListedB : T) : T extends (...args: any[]) => any ? T : T extends readonly unknown[] ? (number extends T['length'] ? { readonly [${P}list]: true; readonly [i: number]: ${firm}<T[number], F> } : T) : T extends object ? ([${P}Known<keyof T>] extends [never] ? ${P}Indexed${d}<T, F> : ${P}Indexed${d}<T, F> & { [K in keyof T as ${P}Known<K>]: ${firm}<T[K], F> }) : T;`,
+      `type ${P}Indexed${d}<T, F> = string extends keyof T ? { [k: string]: ${firm}<T[string], F> } : number extends keyof T ? { [i: number]: ${firm}<T[number], F> } : unknown;`,
+      `type ${P}RelaxIndexed${d}<T, F> = string extends keyof T ? { [k: string]: ${relax}<T[string], F, undefined extends T[string] ? true : false> } : number extends keyof T ? { [i: number]: ${relax}<T[number], F, undefined extends T[number] ? true : false> } : unknown;`,
       `type ${P}Relax${d}<T, F, O> = ${P}RelaxEach${d}<T, F> | ${P}Null<F, O>;`,
-      `type ${P}RelaxEach${d}<T, F> = 0 extends 1 & T ? T : T extends string ? T | ('open_value' extends F ? ${P}OpenS : never) | ('listed_value' extends F ? ${P}ListedS : never) : T extends number ? T | ('open_value' extends F ? ${P}OpenN : never) | ('listed_value' extends F ? ${P}ListedN : never) : T extends boolean ? T | ('listed_value' extends F ? ${P}ListedB : never) : T extends (...args: any[]) => any ? T : T extends readonly unknown[] ? (number extends T['length'] ? { readonly [${P}list]: true; readonly [i: number]: ${relax}<T[number], F, undefined extends T[number] ? true : false> } : T) | ('open_value' extends F ? ${P}OpenJ : never) : T extends object ? ({ [K in keyof T]: ${relax}<T[K], F, undefined extends T[K] ? true : false> } & ${P}Weak<T, F>) | ('open_value' extends F ? ${P}OpenJ : never) : T;`
+      `type ${P}RelaxEach${d}<T, F> = 0 extends 1 & T ? T : T extends string ? T | ('open_value' extends F ? ${P}OpenS : never) | ('listed_value' extends F ? ${P}ListedS : never) : T extends number ? T | ('open_value' extends F ? ${P}OpenN : never) | ('listed_value' extends F ? ${P}ListedN : never) : T extends boolean ? T | ('listed_value' extends F ? ${P}ListedB : never) : T extends (...args: any[]) => any ? T : T extends readonly unknown[] ? (number extends T['length'] ? { readonly [${P}list]: true; readonly [i: number]: ${relax}<T[number], F, undefined extends T[number] ? true : false> } : T) | ('open_value' extends F ? ${P}OpenJ : never) : T extends object ? (([${P}Known<keyof T>] extends [never] ? ${P}RelaxIndexed${d}<T, F> : ${P}RelaxIndexed${d}<T, F> & { [K in keyof T as ${P}Known<K>]: ${relax}<T[K], F, undefined extends T[K] ? true : false> }) & ${P}Weak<T, F>) | ('open_value' extends F ? ${P}OpenJ : never) : T;`
     );
   }
   return out;
@@ -286,7 +308,8 @@ export function provenBecause(cause: string): BreakEvidence {
   return { proven: true, kinds: [], passing: [], cause };
 }
 
-const REMAINS = 'a difference remains with every relaxation allowed';
+/** The cause on a pair the re-check ran on and found a difference that no relaxation clears. */
+export const REMAINS = `a difference remains with every relaxation allowed, or the types nest deeper than ${RELAXED_DEPTH} levels`;
 
 /**
  * The evidence for one relaxed probe, read from the diagnostics its compile
@@ -335,16 +358,30 @@ export function evidenceFromDiagnostics(relaxed: RelaxedPlan, diags: RawDiagnost
   }
   // In order of size, then of the kinds' order, so `kinds` is the smallest.
   minimal.sort((a, b) => popcount(a) - popcount(b) || a - b);
-  return {
-    proven: false,
-    kinds: kindsOfMask(minimal[0]),
-    passing: minimal.map(kindsOfMask),
-  };
+  const passing = minimal.map(kindsOfMask);
+  // `proven` and `kinds` read the plan's kinds only (incompatible-rule D7):
+  // a pair that fits only with a kind outside them, such as a value the
+  // producer's own type lists, stays proven, and `passing` keeps the sets.
+  const inPlan = minimal.find((m) => (m & PLAN_MASK) === m);
+  if (inPlan === undefined) {
+    return {
+      proven: true,
+      kinds: [],
+      passing,
+      cause: `it fits only with ${kindsOfMask(minimal[0]).join(' and ')} allowed, outside the kinds that prove no break`,
+    };
+  }
+  return { proven: false, kinds: kindsOfMask(inPlan), passing };
 }
 
 function diagnosticKeys(diags: RawDiagnostic[]): string[] {
   return [...new Set(diags.map((d) => `${d.line}:${d.code}`))].sort();
 }
+
+const PLAN_MASK = NOT_PROVEN_KINDS.reduce(
+  (mask, kind, i) => (PLAN_NOT_PROVEN_KINDS.includes(kind) ? mask | (1 << i) : mask),
+  0
+);
 
 function popcount(n: number): number {
   let c = 0;
