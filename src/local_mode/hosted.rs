@@ -1104,9 +1104,10 @@ type Healed = (Vec<(PathBuf, String)>, Vec<(PathBuf, String)>);
 /// network: where `index.json`'s commits for a repo differ from the
 /// snapshot's and [`may_move`] lets the copy move from the first to the
 /// second. Each repo is decided alone: one that may not move is skipped, with
-/// its reason, and the others heal. `None` when no repo heals (the network
-/// move then decides), otherwise the rebuild's outcome: the healed repos and
-/// the skipped ones.
+/// its reason, one whose copy cannot be carried as it is is skipped, and the
+/// others heal. `None` when no repo heals (the network move then decides),
+/// otherwise the rebuild's outcome: the healed repos and the ones [`may_move`]
+/// refused.
 ///
 /// Before the move rebuilt the read model, a move wrote only the snapshot, so
 /// a workspace can hold an index at one commit and a snapshot at a later one.
@@ -1140,14 +1141,9 @@ fn heal(
         match may_move(path, name, &built, &held) {
             Err(reason) => kept.push((path.clone(), reason)),
             Ok(None) => {}
-            // What the network move would refuse to carry, the heal refuses.
-            Ok(Some(_)) if !carried_as_is(&blobs) => kept.push((
-                path.clone(),
-                format!(
-                    "{name}: this machine's copy was written by another cache format or from \
-                     a tree with uncommitted changes"
-                ),
-            )),
+            // What the network move would refuse to carry, the heal skips:
+            // the network move then decides, and says why.
+            Ok(Some(_)) if !carried_as_is(&blobs) => {}
             Ok(Some(to)) => moved.push((path.clone(), to)),
         }
     }
@@ -4382,18 +4378,25 @@ mod tests {
     }
 
     /// The no-network repair is per repo too: a local index left behind its
-    /// snapshot heals the repo that may move and skips, with its reason, the
-    /// one whose HEAD does not hold the snapshot's commit.
+    /// snapshot heals the repo that may move, skips with its reason the one
+    /// whose HEAD does not hold the snapshot's commit, and skips the one whose
+    /// snapshot blob was written from a dirty tree (the network move decides
+    /// that one).
     #[test]
     fn heal_moves_the_repo_that_may_and_skips_the_one_that_may_not() {
         use crate::git_state::tests::git_in;
         let (api, api_a, api_b, _) = moved_on_repo_named("api");
         let (web, web_a, web_b, _) = moved_on_repo_named("web");
+        let (jobs, jobs_a, jobs_b, _) = moved_on_repo_named("jobs");
         git_in(web.path(), &["checkout", "-q", &web_a]);
         let root = tempfile::tempdir().unwrap();
         let workspace = Workspace {
             root: root.path().to_path_buf(),
-            repos: vec![api.path().to_path_buf(), web.path().to_path_buf()],
+            repos: vec![
+                api.path().to_path_buf(),
+                web.path().to_path_buf(),
+                jobs.path().to_path_buf(),
+            ],
             missing: Vec::new(),
             repos_detected_by: String::new(),
             repos_added: Vec::new(),
@@ -4407,26 +4410,33 @@ mod tests {
         };
         let index = json!({"version": super::super::read_model::READ_MODEL_VERSION,
             "scanner_version": "test", "indexed_at": "then",
-            "repos": [built(api.path(), "api", &api_a), built(web.path(), "web", &web_a)]});
+            "repos": [built(api.path(), "api", &api_a), built(web.path(), "web", &web_a),
+                built(jobs.path(), "jobs", &jobs_a)]});
         std::fs::create_dir_all(workspace.index_dir()).unwrap();
         std::fs::write(workspace.index_file(), serde_json::to_vec(&index).unwrap()).unwrap();
-        // A snapshot `hosted::refresh` wrote at B for both, with no HEAD test.
+        // A snapshot `hosted::refresh` wrote at B for all three, with no HEAD
+        // test; jobs' blob came from a tree with uncommitted changes.
+        let mut dirty = named_blob("jobs", "jobs", &jobs_b);
+        dirty.dirty = Some(true);
         let held = snapshot(
             in_one_project(&[
                 ("example/api", vec![("api", &api_b)]),
                 ("example/web", vec![("web", &web_b)]),
+                ("example/jobs", vec![("jobs", &jobs_b)]),
             ]),
             BTreeMap::from([(
                 "p".to_string(),
                 vec![
                     named_blob("api", "api", &api_b),
                     named_blob("web", "web", &web_b),
+                    dirty,
                 ],
             )]),
         );
         let remotes = BTreeMap::from([
             (api.path().to_path_buf(), "example/api".to_string()),
             (web.path().to_path_buf(), "example/web".to_string()),
+            (jobs.path().to_path_buf(), "example/jobs".to_string()),
         ]);
         let asked = std::cell::RefCell::new(Vec::new());
         let healed = heal(&workspace, &remotes, &held, &|paths| {
@@ -4448,5 +4458,45 @@ mod tests {
             )))
         );
         assert_eq!(asked.into_inner(), vec![vec![api.path().to_path_buf()]]);
+    }
+
+    /// A kept repo the old snapshot held nothing for holds nothing after the
+    /// splice: no blob, no stored row, and an entry with no services, while
+    /// the moved repo keeps what came down.
+    #[test]
+    fn a_kept_repo_that_held_nothing_holds_nothing() {
+        let old = snapshot(
+            in_one_project(&[("example/api", vec![("api", "a1")])]),
+            BTreeMap::from([("p".to_string(), vec![named_blob("api", "api", "a1")])]),
+        );
+        let fresh = in_one_project(&[
+            ("example/api", vec![("api", "a2")]),
+            ("example/web", vec![("web", "w2")]),
+        ]);
+        let mut moved = snapshot(
+            fresh.clone(),
+            BTreeMap::from([(
+                "p".to_string(),
+                vec![
+                    named_blob("api", "api", "a2"),
+                    named_blob("web", "web", "w2"),
+                ],
+            )]),
+        );
+        let fresh = Resolution::parse(fresh).unwrap();
+        hold_back(&mut moved, &old, &fresh, &["example/web".to_string()]);
+        let repos: Vec<(String, String)> = moved.projects["p"]
+            .iter()
+            .map(|blob| (blob.repo_name.clone(), blob.commit_hash.clone()))
+            .collect();
+        assert_eq!(repos, vec![("api".to_string(), "a2".to_string())]);
+        assert!(moved.stored_rows["p"].iter().all(|row| row.repo == "api"));
+        let web = moved
+            .resolution
+            .repos
+            .iter()
+            .find(|repo| repo.full_name == "example/web")
+            .unwrap();
+        assert_eq!(web.services.as_ref().map(Vec::len), Some(0));
     }
 }
