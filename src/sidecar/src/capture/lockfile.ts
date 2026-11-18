@@ -22,6 +22,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { nearestNodeModules } from './installed-root.js';
 
 /** package-lock.json (v2/v3 `packages` map, v1 `dependencies` fallback). */
 function npmLockfileVersions(lockPath: string): Map<string, string> {
@@ -406,13 +407,18 @@ function bunLockfileVersions(lockPath: string): Map<string, string> {
  */
 export function installedVersions(
   repoRoot: string,
-  names: Iterable<string>
+  names: Iterable<string>,
+  scanRoot?: string
 ): Map<string, string> {
   const versions = new Map<string, string>();
-  const nodeModules = path.join(path.resolve(repoRoot), 'node_modules');
+  // The install is the nearest `node_modules` up to the scan root, so a
+  // package a hoisted root install holds is read from there, and a link in it
+  // is held to the scan root, not to the service folder.
+  const nodeModules = nearestNodeModules(repoRoot, scanRoot);
+  if (!nodeModules) return versions;
   let realRepoRoot: string;
   try {
-    realRepoRoot = fs.realpathSync(path.resolve(repoRoot));
+    realRepoRoot = fs.realpathSync(path.resolve(path.dirname(nodeModules)));
   } catch {
     return versions;
   }

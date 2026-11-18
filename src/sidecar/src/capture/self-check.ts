@@ -80,8 +80,8 @@ export interface SelfCheckArgs {
   surfaces: SelfCheckSurface[];
   pinned: Record<string, string>;
   bareCheckout: boolean;
-  /** Producer repo root; its node_modules (if any) backs resolution. */
-  repoRoot: string;
+  /** The producer's installed packages (its nearest `node_modules`), if any. */
+  nodeModules: string | undefined;
   compilerHost?: (options: ts.CompilerOptions) => ts.CompilerHost;
   /**
    * Absolute stub path of each declaration emitted for a source outside the

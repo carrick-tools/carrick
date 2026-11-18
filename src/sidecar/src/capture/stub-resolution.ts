@@ -29,8 +29,8 @@ export interface StubResolution {
   guard: WriteGuard;
   stubDir: string;
   bareCheckout: boolean;
-  /** Producer repo root; its node_modules (if any) backs resolution. */
-  repoRoot: string;
+  /** The producer's installed packages (its nearest `node_modules`), if any. */
+  nodeModules: string | undefined;
   compilerHost?: (options: ts.CompilerOptions) => ts.CompilerHost;
   /**
    * Absolute stub path of each declaration emitted for a source outside the
@@ -43,13 +43,13 @@ export interface StubResolution {
 
 /**
  * Point the stub at the producer's installed packages: a `node_modules` link
- * in the stub to the producer's own, unless the checkout is bare or the stub
+ * in the stub to the producer's nearest one, unless the checkout is bare or the stub
  * already has one. Returns what removes the link again.
  */
 export function linkInstalledPackages(resolution: StubResolution): () => void {
-  const repoNodeModules = path.join(resolution.repoRoot, 'node_modules');
+  const repoNodeModules = resolution.nodeModules;
   const linkPath = path.join(resolution.stubDir, 'node_modules');
-  if (resolution.bareCheckout || !fs.existsSync(repoNodeModules) || fs.existsSync(linkPath)) return () => {};
+  if (resolution.bareCheckout || !repoNodeModules || fs.existsSync(linkPath)) return () => {};
   resolution.guard.symlink(repoNodeModules, linkPath, 'dir');
   // unlinkSync, not rmSync: the link target is a directory and rmSync
   // refuses symlinks-to-directories with EISDIR.

@@ -46,6 +46,7 @@ import type {
 } from './api.js';
 import { entryRelativeSpecifier, resolveAnchor, resolveSourceFile, type ResolvedAnchor } from './anchors.js';
 import { findAugmentationFiles } from './augmentations.js';
+import { ancestorsWithin, nearestNodeModules } from './installed-root.js';
 import { installedVersions, lockfileVersions } from './lockfile.js';
 import { installedResolutionEdges, RESOLUTION_FILE } from './resolution-edges.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
@@ -551,11 +552,14 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   // ---- What the checkout installs (shared by both stubs) ----
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
-  const nodeModulesPresent = fs.existsSync(path.join(dependencyRoot, 'node_modules'));
+  // The install is the nearest `node_modules` up to the scan root: a hoisted
+  // root install is the install of its subfolder services.
+  const installedModules = nearestNodeModules(dependencyRoot, opts.scanRoot);
+  const nodeModulesPresent = installedModules !== undefined;
   const declared =
     deno || !nodeModulesPresent
       ? { unresolved: [], runtimeDeclared: 0, runtimeResolved: 0 }
-      : declaredDependencyResolution(dependencyRoot);
+      : declaredDependencyResolution(dependencyRoot, opts.scanRoot);
   const unresolvedDependencies = declared.unresolved;
   // Bare: no node_modules, or every declared runtime dependency dangles (a
   // missing pnpm store). One missing package, or missing devDependencies,
@@ -616,7 +620,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     surfaces: [{ surfaceAbsPath: written.surfaceAbsPath, resolved: written.resolved }],
     pinned: written.pinned,
     bareCheckout,
-    repoRoot: dependencyRoot,
+    nodeModules: installedModules,
     compilerHost,
     outsideSources: written.outsideSources,
   });
@@ -909,7 +913,7 @@ function writeStub(surface: SurfaceEmit, stubDir: string, ctx: StubContext): Wri
   // remains the bare-checkout fallback. Both paths pin only
   // the directly-referenced externals; what those depend on is recorded
   // from the installed tree below (RESOLUTION_FILE).
-  const installed = installedVersions(ctx.repoRoot, externalSpecs);
+  const installed = installedVersions(ctx.repoRoot, externalSpecs, ctx.labelRoot);
   const lockVersions = lockfileVersions(ctx.repoRoot);
   for (const name of Object.keys(deno?.pinned ?? {})) externalSpecs.add(name);
   // A package an absolute specifier was rewritten into carries the version
@@ -1137,13 +1141,14 @@ const UNRESOLVED_DEPENDENCIES_NAMED = 5;
 
 /**
  * How `root/package.json` dependencies resolve from `root`: no
- * `node_modules/<name>` in `root` or any parent directory means unresolved.
+ * `node_modules/<name>` in `root` or any parent directory up to the scan root
+ * means unresolved.
  * `existsSync` follows links, so a pnpm link into a missing store reads as
  * unresolved (carrick#2999). `unresolved` is the first few names across
  * dependencies and devDependencies, sorted; the runtime counts cover
  * `dependencies` only. Declared names only, one stat per ancestor.
  */
-function declaredDependencyResolution(root: string): {
+function declaredDependencyResolution(root: string, scanRoot: string | undefined): {
   unresolved: string[];
   runtimeDeclared: number;
   runtimeResolved: number;
@@ -1161,13 +1166,7 @@ function declaredDependencyResolution(root: string): {
     return group !== null && typeof group === 'object' ? Object.keys(group) : [];
   };
   const resolves = (name: string): boolean => {
-    let dir = path.resolve(root);
-    for (;;) {
-      if (fs.existsSync(path.join(dir, 'node_modules', name))) return true;
-      const parent = path.dirname(dir);
-      if (parent === dir) return false;
-      dir = parent;
-    }
+    return ancestorsWithin(root, scanRoot).some((dir) => fs.existsSync(path.join(dir, 'node_modules', name)));
   };
   const runtime = new Set(names('dependencies'));
   const all = new Set([...runtime, ...names('devDependencies')]);
