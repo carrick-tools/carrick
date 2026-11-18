@@ -412,7 +412,9 @@ enum BetaDies {
     /// an error and dies of nothing (carrick#4247). Every other process lives.
     WalkFails,
     /// Only at type resolution (`infer` or `bundle`), and only while
-    /// `home/die` exists: `plain` in it is a plain `exit(1)`, `under <N>` a
+    /// `home/die` exists: `capture` in it spares resolution and kills every
+    /// `capture_v2` request instead, with a full heap (carrick#4145);
+    /// `plain` in it is a plain `exit(1)`, `under <N>` a
     /// full heap in a process started with a heap cap below `N` MB only
     /// (carrick#4180), anything else a full heap. Every `beta` request writes `died`, so a run whose `beta`
     /// lives still shows it was asked (carrick#3992).
@@ -478,7 +480,11 @@ process.stdin.on("data", (chunk) => {{
       const how = fs.existsSync({die:?}) ? fs.readFileSync({die:?}, "utf8").trim() : "";
       const under = /^under (\d+)$/.exec(how);
       const cap = Number((/--max-old-space-size=(\d+)/.exec(process.execArgv.join(" ")) || [])[1] || 0);
-      if ((request.action === "infer" || request.action === "bundle") && how && (!under || cap < Number(under[1]))) {{
+      const atCapture = how === "capture";
+      const asked = atCapture
+        ? request.action === "capture_v2"
+        : request.action === "infer" || request.action === "bundle";
+      if (asked && how && (!under || cap < Number(under[1]))) {{
         if (how === "plain") process.exit(1);
         fs.writeSync(2, "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n");
         process.abort();
@@ -1188,6 +1194,87 @@ fn a_crash_that_is_not_memory_holds_it_too() {
         "beta's typed index was replaced"
     );
     assert_eq!(landed["alpha"]["commit_hash"], head.as_str());
+}
+
+/// carrick#4145: an engine that dies at the capture, not at resolution, with
+/// a typed stored index: the stored index stays, the other service uploads,
+/// and the run says what it kept and why. Exit codes are the resolution
+/// hold's: 1 on CI.
+#[test]
+fn a_death_at_the_capture_keeps_the_stored_typed_index() {
+    let fixture = LateTypeLoss::new();
+    typed_first_index(&fixture);
+    let stored = stored_blobs(&fixture.store);
+    let head = fixture.change_both();
+
+    let run = fixture.scan(Some("capture"), false, &[]);
+    assert_eq!(run.code, Some(1), "{}\n{}", run.stderr, run.log);
+    assert!(run.stderr.contains(KEPT_FOR_TYPES), "{}", run.stderr);
+    assert!(run.log.contains(NOT_UPLOADING_BETA), "{}", run.log);
+    assert!(
+        run.log.contains("during the capture"),
+        "the held line names the stage: {}",
+        run.log
+    );
+    let landed = stored_blobs(&fixture.store);
+    assert_eq!(
+        serde_json::to_string_pretty(&landed["beta"]).unwrap(),
+        serde_json::to_string_pretty(&stored["beta"]).unwrap(),
+        "beta's typed index was replaced"
+    );
+    // The other service is unaffected and uploads at this run's commit.
+    assert_eq!(landed["alpha"]["commit_hash"], head.as_str());
+    assert!(
+        landed["alpha"]["types_degraded"].is_null(),
+        "{}",
+        landed["alpha"]
+    );
+
+    // The opt-out lands the capture's loss, as it does for resolution.
+    let let_through = fixture.scan(
+        Some("capture"),
+        false,
+        &[("CARRICK_ALLOW_MISSING_TYPES", "1")],
+    );
+    assert_eq!(
+        let_through.code,
+        Some(0),
+        "{}\n{}",
+        let_through.stderr,
+        let_through.log
+    );
+    assert_eq!(
+        degraded_stage(&fixture.blob("beta")).as_deref(),
+        Some("capture")
+    );
+}
+
+/// carrick#4145: no stored index, nothing to keep: the first index lands
+/// with the capture's loss stated.
+#[test]
+fn a_first_index_that_died_at_the_capture_lands_degraded() {
+    let fixture = LateTypeLoss::new();
+    let run = fixture.scan(Some("capture"), false, &[]);
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
+    let beta = fixture.blob("beta");
+    assert_eq!(degraded_stage(&beta).as_deref(), Some("capture"), "{beta}");
+    assert!(fixture.blob("alpha")["types_degraded"].is_null());
+}
+
+/// carrick#4145: a stored index that already lost its types has none to
+/// keep, so a run that loses them at the capture replaces it.
+#[test]
+fn a_typeless_stored_index_is_replaced_by_a_death_at_the_capture() {
+    let fixture = LateTypeLoss::new();
+    let first = fixture.scan(Some("capture"), false, &[]);
+    assert_eq!(first.code, Some(0), "{}\n{}", first.stderr, first.log);
+    let head = fixture.change_both();
+
+    let run = fixture.scan(Some("capture"), false, &[]);
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
+    let beta = fixture.blob("beta");
+    assert_eq!(beta["commit_hash"], head.as_str(), "{beta}");
+    assert_eq!(degraded_stage(&beta).as_deref(), Some("capture"), "{beta}");
 }
 
 /// Every file in the store's `positions/` directory, by name, with its bytes.

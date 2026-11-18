@@ -348,14 +348,20 @@ pub fn holds_back(owed: &OwedWork, has_index: bool, laptop: bool, allow_partial:
     mendable > 0 && (has_index || !laptop)
 }
 
+/// The stages of `types_degraded` at which a typed stored index is kept.
+const HELD_STAGES: [&str; 2] = ["resolve", "capture"];
+
 /// Whether a service whose types this run lost is kept out of its upload, so
 /// its stored index keeps them (carrick#3992). The model-loss rule above,
 /// for the compiler engine: an index stale but typed, and true for its
 /// commit, stands rather than one current but typeless.
 ///
 /// Held when every one of these holds:
-/// - `lost` is a loss at type resolution (`resolve`). The other stages are
-///   carrick#4145: a machine with no engine loses every service at `spawn`.
+/// - `lost` is a loss at type resolution (`resolve`) or at the capture
+///   (`capture`, carrick#4145): both are the engine dying (or timing out)
+///   in a service it had started on, and both leave a typeless blob. The
+///   stages left are `spawn` and `init`: a machine with no engine loses
+///   every service there, and holding them all would freeze it (carrick#4145).
 /// - `memory_death` (the service's first, if it died of memory) is one that
 ///   would stop a runner run ([`TypeMemoryDeath::stops_the_run`]). A death
 ///   under a cap below the run's is not held: the cap came from the stored
@@ -376,7 +382,7 @@ pub fn holds_back_for_types(
     stored: Option<&CloudRepoData>,
     allow_missing_types: bool,
 ) -> bool {
-    if allow_missing_types || lost.is_none_or(|lost| lost.stage != "resolve") {
+    if allow_missing_types || lost.is_none_or(|lost| !HELD_STAGES.contains(&lost.stage.as_str())) {
         return false;
     }
     if memory_death.is_some_and(|death| !death.stops_the_run(run_cap_mb)) {
@@ -852,9 +858,11 @@ mod tests {
         }
         // The case: types lost at resolution, a typed index stored.
         assert!(held(Some(&resolve), None, Some(&typed), false));
-        // Nothing lost, or lost at another stage (carrick#4145): it lands.
+        // Lost at the capture is held too (carrick#4145).
+        assert!(held(Some(&lost_at("capture")), None, Some(&typed), false));
+        // Nothing lost, or lost at a stage with no engine to blame: it lands.
         assert!(!held(None, None, Some(&typed), false));
-        for stage in ["spawn", "init", "capture"] {
+        for stage in ["spawn", "init"] {
             assert!(
                 !held(Some(&lost_at(stage)), None, Some(&typed), false),
                 "{stage}"
