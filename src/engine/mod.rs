@@ -13472,7 +13472,6 @@ fn discover_with_positions(
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
         }
     }
-    drop(slow_step);
     if let Some(index) = &positions {
         debug!(
             "Position rows bound to discovery's reads: {:?}",
@@ -13482,6 +13481,7 @@ fn discover_with_positions(
 
     // One row per definition, with same-named definitions in different files
     // re-keyed rather than collapsed onto each other (#582).
+    slow_step.stage("merge definitions");
     let crate::call_graph::MergedDefinitions {
         definitions: mut all_function_definitions,
         keys,
@@ -13515,6 +13515,7 @@ fn discover_with_positions(
             (canonical, wanted)
         })
         .collect();
+    slow_step.stage("call edges");
     let resolution = crate::call_graph::resolve_call_edges(
         &mut all_function_definitions,
         &per_file_calls,
@@ -13528,6 +13529,7 @@ fn discover_with_positions(
     }
     // The files only tests import: the receiver trace ignores the router
     // mounts made in them (carrick#2775). Read for the trace alone.
+    slow_step.stage("test-only files");
     let test_only = if test_only_files {
         let started = Instant::now();
         let test_only = crate::test_only_files::of(
@@ -13585,6 +13587,7 @@ fn discover_with_positions(
         // the `call` row: member calls on a receiver a call initialised
         // (carrick#2615), and bare calls through a binding only the compiler
         // follows (carrick#3446).
+        slow_step.stage("row edges");
         let crate::call_graph::RowEdges {
             added,
             added_bare,
@@ -13612,6 +13615,7 @@ fn discover_with_positions(
         files.len()
     );
 
+    drop(slow_step);
     Ok(FileDiscovery {
         files,
         import_facts: all_import_facts,
