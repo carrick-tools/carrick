@@ -38,6 +38,14 @@ pub enum MethodSource {
     /// request at runtime (e.g. pages-router `req.method`). The concrete method
     /// is not derivable from structure and is left to the LLM / downstream.
     DefaultExport,
+    /// The module serves one handler by handing it to its one top-level call
+    /// statement (`serve(async (req) => ...)`), whatever that call is named:
+    /// the handler is the one function that call is given
+    /// ([`crate::swc_scanner::SwcScanner::top_level_function_calls`]). The
+    /// platform routes every method of the route to it, so `method` is the
+    /// one the row states (`ALL` for a handler that serves them all, which
+    /// [`carrick_match::method_matches`] pairs with every consumer method).
+    ModuleCall { method: String },
 }
 
 /// Whether route path segments come from the directory chain (with a fixed
@@ -155,6 +163,28 @@ pub struct RoutingConvention {
     /// static folder.
     #[serde(default)]
     pub static_roots: Vec<StaticRoot>,
+    /// Directory-name prefixes that mark a folder as not a route (a folder of
+    /// shared code beside the routed ones, `_shared`). Matched against every
+    /// directory between the root and the file. Empty: every folder routes.
+    #[serde(default)]
+    pub private_dir_prefixes: Vec<String>,
+    /// How many directories sit between the root and a route file, exactly,
+    /// when the layout fixes it (one folder per route: `<root>/<name>/index.ts`
+    /// is 1). `None`: any depth.
+    #[serde(default)]
+    pub directory_depth: Option<usize>,
+    /// Whether `root_globs` are relative to the REPOSITORY root rather than to
+    /// the service directory. A layout that lives at a fixed place in the
+    /// repository (and has no package manifest of its own to select it by) is
+    /// written this way; [`conventions_for_service`] rebases its roots onto
+    /// each service, so the executor always reads service-relative paths.
+    #[serde(default)]
+    pub roots_repo_relative: bool,
+    /// Repository-relative files whose presence selects this convention: the
+    /// platform's own config file, for a layout no package manifest declares.
+    /// Empty: the convention is selected by declared dependencies only.
+    #[serde(default)]
+    pub marker_files: Vec<String>,
 }
 
 /// A folder served statically and the URL prefix it is served under.
@@ -373,6 +403,10 @@ impl RoutingConvention {
             terminal_stems: Vec::new(),
             private_file_prefixes: Vec::new(),
             static_roots: vec![StaticRoot::public_folder()],
+            private_dir_prefixes: Vec::new(),
+            directory_depth: None,
+            roots_repo_relative: false,
+            marker_files: Vec::new(),
         }
     }
 
@@ -405,6 +439,10 @@ impl RoutingConvention {
             // reserves for itself and never routes.
             private_file_prefixes: vec!["_".to_string()],
             static_roots: vec![StaticRoot::public_folder()],
+            private_dir_prefixes: Vec::new(),
+            directory_depth: None,
+            roots_repo_relative: false,
+            marker_files: Vec::new(),
         }
     }
 
@@ -444,6 +482,10 @@ impl RoutingConvention {
             // Astro excludes `_`-prefixed files from routing outright.
             private_file_prefixes: vec!["_".to_string()],
             static_roots: vec![StaticRoot::public_folder()],
+            private_dir_prefixes: Vec::new(),
+            directory_depth: None,
+            roots_repo_relative: false,
+            marker_files: Vec::new(),
         }
     }
 
@@ -511,7 +553,85 @@ impl RoutingConvention {
             // segment and the module stays routed (carrick#702).
             private_file_prefixes: Vec::new(),
             static_roots: vec![StaticRoot::public_folder()],
+            private_dir_prefixes: Vec::new(),
+            directory_depth: None,
+            roots_repo_relative: false,
+            marker_files: Vec::new(),
         }
+    }
+
+    /// Hosted functions named by their folder: each folder under
+    /// `supabase/functions` holding an `index` module is one function, served
+    /// at `/functions/v1/<folder>` for every method, by the handler the module
+    /// hands to its one top-level call. `_`-prefixed folders hold shared code
+    /// and are not functions. These folders have no package manifest, so the
+    /// platform's own config file selects the convention.
+    pub fn supabase_functions() -> Self {
+        Self {
+            name: "supabase-functions".to_string(),
+            root_globs: vec!["supabase/functions".to_string()],
+            segment_source: SegmentSource::DirectoryChain {
+                terminal_files: vec![
+                    "index.ts".to_string(),
+                    "index.js".to_string(),
+                    "index.tsx".to_string(),
+                    "index.mjs".to_string(),
+                ],
+            },
+            path_prefix: "/functions/v1".to_string(),
+            // A folder name is a literal segment: no dynamic, catch-all or
+            // group syntax.
+            dynamic_open: String::new(),
+            dynamic_close: String::new(),
+            catch_all_marker: String::new(),
+            group_open: String::new(),
+            group_close: String::new(),
+            method_source: MethodSource::ModuleCall {
+                method: carrick_match::ANY_METHOD.to_string(),
+            },
+            method_exports: BTreeMap::new(),
+            request_method: None,
+            terminal_stems: Vec::new(),
+            private_file_prefixes: Vec::new(),
+            static_roots: Vec::new(),
+            private_dir_prefixes: vec!["_".to_string()],
+            directory_depth: Some(1),
+            roots_repo_relative: true,
+            marker_files: vec!["supabase/config.toml".to_string()],
+        }
+    }
+
+    /// This convention as `service_dir` (the service's directory, relative to
+    /// the repository root, `""` for the root) reads it: repo-relative roots
+    /// become service-relative, and a root outside the service is dropped.
+    /// `None` when no root is left. A convention already written
+    /// service-relative is returned unchanged.
+    fn for_service(mut self, service_dir: &str) -> Option<Self> {
+        if !self.roots_repo_relative {
+            return Some(self);
+        }
+        let service_dir = match service_dir.trim_matches('/') {
+            "." => "",
+            dir => dir,
+        };
+        self.root_globs = self
+            .root_globs
+            .iter()
+            .filter_map(|root| {
+                let root = root.trim_matches('/');
+                if service_dir.is_empty() {
+                    return Some(root.to_string());
+                }
+                if root == service_dir {
+                    return Some(String::new());
+                }
+                root.strip_prefix(service_dir)?
+                    .strip_prefix('/')
+                    .map(str::to_string)
+            })
+            .collect();
+        self.roots_repo_relative = false;
+        (!self.root_globs.is_empty()).then_some(self)
     }
 
     /// Strip the longest matching root prefix from a `/`-normalized relative
@@ -600,6 +720,19 @@ impl RoutingConvention {
             .filter(|c| !c.is_empty())
             .collect();
         let (file, dirs) = components.split_last()?;
+        if self
+            .directory_depth
+            .is_some_and(|depth| dirs.len() != depth)
+        {
+            return None;
+        }
+        if dirs.iter().any(|dir| {
+            self.private_dir_prefixes
+                .iter()
+                .any(|prefix| !prefix.is_empty() && dir.starts_with(prefix.as_str()))
+        }) {
+            return None;
+        }
 
         match &self.segment_source {
             SegmentSource::DirectoryChain { terminal_files } => {
@@ -784,6 +917,60 @@ pub fn builtin_conventions(dependency_names: &[String]) -> Vec<RoutingConvention
         out.push(RoutingConvention::flat_routes());
     }
     out
+}
+
+/// Bootstrap conventions selected by a file in the repository rather than by
+/// a declared dependency, each carrying its own
+/// [`RoutingConvention::marker_files`]. A further layout of this kind is one
+/// more entry here: its selection, roots, path and handler are all data on
+/// the convention.
+const MARKER_CONVENTIONS: &[fn() -> RoutingConvention] = &[RoutingConvention::supabase_functions];
+
+/// The routing conventions one service runs under: the bootstrap its declared
+/// dependencies select ([`builtin_conventions`]), plus every
+/// [`MARKER_CONVENTIONS`] entry whose marker file exists under `repo_root`,
+/// rebased onto the service (`service_root` is its directory). Every caller
+/// that derives a file's route reads this, so the file orchestrator and the
+/// reach census give one answer.
+pub fn conventions_for_service(
+    dependency_names: &[String],
+    repo_root: &Path,
+    service_root: &Path,
+) -> Vec<RoutingConvention> {
+    let mut out = builtin_conventions(dependency_names);
+    let Some(service_dir) = service_dir_in_repo(repo_root, service_root) else {
+        return out;
+    };
+    for make in MARKER_CONVENTIONS {
+        let convention = make();
+        let marked = convention
+            .marker_files
+            .iter()
+            .any(|marker| repo_root.join(marker).is_file());
+        if !marked {
+            continue;
+        }
+        if let Some(convention) = convention.for_service(&service_dir) {
+            out.push(convention);
+        }
+    }
+    out
+}
+
+/// `service_root` relative to `repo_root`, `/`-separated, `""` for the root
+/// itself. Tried as given, then canonicalized, since callers hold either form.
+/// `None` for a service outside the repository.
+fn service_dir_in_repo(repo_root: &Path, service_root: &Path) -> Option<String> {
+    let relative = service_root
+        .strip_prefix(repo_root)
+        .map(Path::to_path_buf)
+        .ok()
+        .or_else(|| {
+            let repo = repo_root.canonicalize().ok()?;
+            let service = service_root.canonicalize().ok()?;
+            service.strip_prefix(repo).map(Path::to_path_buf).ok()
+        })?;
+    Some(normalize_rel(&relative))
 }
 
 #[cfg(test)]
@@ -977,6 +1164,59 @@ mod tests {
         let astro = builtin_conventions(&["astro".to_string()]);
         assert_eq!(astro.len(), 1);
         assert_eq!(astro[0].name, "astro");
+    }
+
+    // --- Functions named by their folder ---
+
+    fn function_route(p: &str) -> Option<DerivedRoute> {
+        derive_route(
+            &PathBuf::from(p),
+            &[RoutingConvention::supabase_functions()],
+        )
+    }
+
+    #[test]
+    fn a_function_folder_is_one_any_method_route() {
+        let r = function_route("supabase/functions/price-quote/index.ts").unwrap();
+        assert_eq!(r.path, "/functions/v1/price-quote");
+        assert_eq!(
+            r.method_source,
+            MethodSource::ModuleCall {
+                method: "ALL".to_string()
+            }
+        );
+        assert!(function_route("supabase/functions/price-quote/index.mjs").is_some());
+    }
+
+    #[test]
+    fn only_a_folder_one_below_the_root_is_a_function() {
+        // The root's own index, a nested folder's index, a sibling module and
+        // a shared folder are not functions.
+        assert!(function_route("supabase/functions/index.ts").is_none());
+        assert!(function_route("supabase/functions/price-quote/lib/index.ts").is_none());
+        assert!(function_route("supabase/functions/price-quote/pricing.ts").is_none());
+        assert!(function_route("supabase/functions/_shared/index.ts").is_none());
+    }
+
+    #[test]
+    fn repo_relative_roots_rebase_onto_the_service() {
+        let at = |dir: &str| {
+            RoutingConvention::supabase_functions()
+                .for_service(dir)
+                .map(|c| c.root_globs)
+        };
+        assert_eq!(at(""), Some(vec!["supabase/functions".to_string()]));
+        assert_eq!(at("."), Some(vec!["supabase/functions".to_string()]));
+        assert_eq!(at("supabase"), Some(vec!["functions".to_string()]));
+        assert_eq!(at("supabase/functions"), Some(vec![String::new()]));
+        assert_eq!(at("apps/web"), None);
+        // A service-relative convention is untouched.
+        assert_eq!(
+            RoutingConvention::astro()
+                .for_service("apps/web")
+                .map(|c| c.root_globs),
+            Some(vec!["src/pages".to_string()])
+        );
     }
 
     // --- Flat routes (dot-separated filename) ---

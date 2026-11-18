@@ -234,7 +234,8 @@ pub fn service_reach(repo: &Path, service: &Config, files: &[PathBuf]) -> Servic
         &service_root,
     ));
     let dependencies: Vec<String> = dependencies.into_iter().collect();
-    let conventions = crate::file_based_router::builtin_conventions(&dependencies);
+    let conventions =
+        crate::file_based_router::conventions_for_service(&dependencies, repo, &service_root);
     if !conventions.is_empty() {
         for (index, file) in files.iter().enumerate() {
             let Ok(relative) = file.strip_prefix(&service_root) else {

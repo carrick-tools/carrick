@@ -362,6 +362,24 @@ pub struct ModuleExports {
     pub reexports_all: bool,
 }
 
+/// A top-level call statement handed exactly one function
+/// ([`SwcScanner::top_level_function_calls`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingCall {
+    /// 1-based line the call opens on.
+    pub line_number: usize,
+    /// Start byte offset of the call expression.
+    pub span_start: u32,
+    /// End byte offset of the call expression.
+    pub span_end: u32,
+    /// The name the function was handed by, or `"anonymous"` for a function
+    /// written inline.
+    pub handler: String,
+    /// 1-based line the handed function's own declaration opens on: the
+    /// call's line for an inline function, the declaration's line for a name.
+    pub handler_line: usize,
+}
+
 /// A route declared as data in a registry array
 /// (`{ method: 'GET', path: '/health', handler: healthCheckHandler }`). The
 /// HTTP method, path, and handler owner are all structural facts — no call site
@@ -1022,6 +1040,88 @@ impl SwcScanner {
         }
     }
 
+    /// Every top-level call STATEMENT of a module that is handed exactly one
+    /// function, in source order: the shape of a module that serves its one
+    /// handler by passing it to a call (`serve(async (req) => ...)`,
+    /// `Deno.serve(handler)`), read for
+    /// [`crate::file_based_router::MethodSource::ModuleCall`].
+    ///
+    /// Structure only, never the callee's name: an argument counts when it is
+    /// a function written inline, or a bare name the module declares at its
+    /// top level as a function (`function handler() {}`, `const handler =
+    /// async () => ...`). Other arguments (an options object) are not counted,
+    /// so `serve({ port }, handler)` is still one function. A call whose
+    /// value is kept (`const server = serve(...)`) or awaited is not a
+    /// statement of this shape and is not read.
+    pub fn top_level_function_calls(&self, file_path: &Path, content: &str) -> Vec<ServingCall> {
+        let Some((sm, module)) = parse_standalone_module(file_path, content) else {
+            return Vec::new();
+        };
+        // Module-scope names bound to a function, with the span of the
+        // function itself (where its declaration opens).
+        let mut functions: HashMap<String, swc_common::Span> = HashMap::new();
+        for item in &module.body {
+            let decl = match item {
+                ModuleItem::Stmt(Stmt::Decl(d)) => d,
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => &e.decl,
+                _ => continue,
+            };
+            match decl {
+                Decl::Fn(f) => {
+                    functions.insert(f.ident.sym.to_string(), f.function.span);
+                }
+                Decl::Var(var) => {
+                    for d in &var.decls {
+                        let (Pat::Ident(ident), Some(init)) = (&d.name, &d.init) else {
+                            continue;
+                        };
+                        if let Some(span) = inline_function_span(init) {
+                            functions.insert(ident.id.sym.to_string(), span);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for item in &module.body {
+            let ModuleItem::Stmt(Stmt::Expr(statement)) = item else {
+                continue;
+            };
+            let Expr::Call(call) = &*statement.expr else {
+                continue;
+            };
+            if !matches!(call.callee, Callee::Expr(_)) {
+                continue;
+            }
+            let handed: Vec<(String, swc_common::Span)> = call
+                .args
+                .iter()
+                .filter(|arg| arg.spread.is_none())
+                .filter_map(|arg| match &*arg.expr {
+                    Expr::Ident(name) => functions
+                        .get(name.sym.as_ref())
+                        .map(|span| (name.sym.to_string(), *span)),
+                    other => {
+                        inline_function_span(other).map(|span| ("anonymous".to_string(), span))
+                    }
+                })
+                .collect();
+            let [(handler, function)] = handed.as_slice() else {
+                continue;
+            };
+            out.push(ServingCall {
+                line_number: sm.lookup_char_pos(call.span.lo).line,
+                span_start: call.span.lo.0,
+                span_end: call.span.hi.0,
+                handler: handler.clone(),
+                handler_line: sm.lookup_char_pos(function.lo).line,
+            });
+        }
+        out
+    }
+
     /// Extract route-descriptor endpoints declared as data in a registry array
     /// (`{ method: 'GET', path: '/health', handler: healthCheckHandler }`).
     ///
@@ -1347,6 +1447,17 @@ fn declared_route_methods(pat: &Pat, init: &Expr) -> Vec<(String, Vec<String>)> 
 /// the scanner's own map. Returns `None` when the file does not parse; every
 /// deterministic pass built on this treats a parse failure as "no facts here",
 /// which is what the scanner's candidate pass does too.
+/// The span of a function written inline as `expr` (an arrow or a function
+/// expression, through parentheses), or `None`.
+fn inline_function_span(expr: &Expr) -> Option<swc_common::Span> {
+    match expr {
+        Expr::Arrow(arrow) => Some(arrow.span),
+        Expr::Fn(f) => Some(f.function.span),
+        Expr::Paren(inner) => inline_function_span(&inner.expr),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_standalone_module(
     file_path: &Path,
     content: &str,
