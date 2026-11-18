@@ -118,6 +118,11 @@ const CASES: Case[] = [
   { key: 'rf-absent-wrong-scalar', root: 'order', sent: '{ id: string }', expected: '{ id: string; total: string }', bucket: 'incompatible' },
   { key: 'rf-converted-read-as-string', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: string }', bucket: 'compatible' },
   { key: 'rf-absent-list-read-as-string', root: 'order', sent: '{ id: string }', expected: '{ id: string; lines: string }', bucket: 'incompatible' },
+  // carrick#4747: an enum is a string on the wire. A reading that can never hold one breaks, in the judge and the held form alike; one that can is untouched (values unmeasured).
+  { key: 'rf-enum-number', root: 'order', sent: '{ id: string }', expected: '{ id: string; state: number }', bucket: 'incompatible' },
+  { key: 'rf-enum-object', root: 'order', sent: '{ id: string }', expected: '{ id: string; state: { name: string } }', bucket: 'incompatible' },
+  { key: 'rf-enum-string', root: 'order', sent: '{ id: string }', expected: '{ id: string; state: string }', bucket: 'compatible' },
+  { key: 'rf-enum-union', root: 'order', sent: '{ id: string }', expected: "{ id: string; state: 'OPEN' | 'DONE' | null }", bucket: 'compatible' },
   // A real leaf mismatch beside an absent field, and a sub-field the schema does not declare, stay breaks.
   { key: 'json-ok', sent: '{ at: Date }', expected: '{ at: string }', bucket: 'compatible' },
   { key: 'json-break', sent: '{ at: number }', expected: '{ at: string }', bucket: 'incompatible' },

@@ -28,6 +28,7 @@ export const SHOP_TYPES: GraphqlTypes = {
       price: nn(scalar('Money')),
       label: scalar('String'),
       lines: nn(list(nn(ref('Line')))),
+      state: nn({ enum: 'OrderState' }),
     },
   },
   Line: { fields: { sku: nn(scalar('String')) } },
