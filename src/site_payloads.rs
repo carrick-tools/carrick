@@ -437,10 +437,13 @@ impl SitePayloads {
             // A value read outside the site's own call (the body a wrapper
             // builds, carrick#4128) names the call: a type parameter of the
             // wrapper is read as that call instantiates it.
+            // So is a result read at the labelled call below the deciding
+            // call (carrick#4371, carrick#4375).
             let through_call = match slot {
                 PayloadAt::Value(_) if outside(at, &site.call) => {
                     through(root, &site.call, &mut sources)
                 }
+                PayloadAt::Result(_) if at != &site.call => through(root, &site.call, &mut sources),
                 _ => None,
             };
             requests.push(InferRequestItem {

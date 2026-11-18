@@ -1,0 +1,13 @@
+{
+  "name": "sibling-arm",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "services/*",
+    "packages/*"
+  ],
+  "dependencies": {
+    "@fixture/http": "^1.0.0",
+    "@fixture/reply": "^1.0.0"
+  }
+}

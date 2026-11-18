@@ -157,6 +157,9 @@ struct Scope {
     /// call()`), with the value they are read from: each is a part of it, not
     /// the value itself.
     parts: HashMap<String, Vec<Expr>>,
+    /// For a name taken from an object pattern's own key (`{ data }`,
+    /// `{ data: body }`), that key; a name bound deeper has none.
+    part_keys: HashMap<String, String>,
 }
 
 impl Visit for Scope {
@@ -167,6 +170,7 @@ impl Visit for Scope {
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
         if let Some(init) = &declarator.init {
             let whole = matches!(declarator.name, Pat::Ident(_));
+            self.part_keys.extend(object_keys(&declarator.name));
             for name in pattern_names(&declarator.name) {
                 if !whole {
                     self.parts
@@ -191,6 +195,36 @@ impl Visit for Scope {
     fn visit_function(&mut self, _: &Function) {}
     fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
     fn visit_class(&mut self, _: &Class) {}
+}
+
+/// The names an object pattern binds straight off one of its own keys, with
+/// that key: `data` for `{ data }`, `body` to `data` for `{ data: body }`.
+fn object_keys(pat: &Pat) -> Vec<(String, String)> {
+    let Pat::Object(object) = pat else {
+        return Vec::new();
+    };
+    object
+        .props
+        .iter()
+        .filter_map(|prop| match prop {
+            swc_ecma_ast::ObjectPatProp::Assign(assign) => {
+                let name = assign.key.id.sym.to_string();
+                Some((name.clone(), name))
+            }
+            swc_ecma_ast::ObjectPatProp::KeyValue(kv) => {
+                let Pat::Ident(ident) = &*kv.value else {
+                    return None;
+                };
+                let key = match &kv.key {
+                    swc_ecma_ast::PropName::Ident(key) => key.sym.to_string(),
+                    swc_ecma_ast::PropName::Str(key) => key.value.to_string_lossy().into_owned(),
+                    _ => return None,
+                };
+                Some((ident.id.sym.to_string(), key))
+            }
+            swc_ecma_ast::ObjectPatProp::Rest(_) => None,
+        })
+        .collect()
 }
 
 fn pattern_names(pat: &Pat) -> Vec<String> {
@@ -348,11 +382,111 @@ pub enum ShapeKind {
 }
 
 /// What a function returns, when that is one call's value read one way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReturnShape {
     pub kind: ShapeKind,
     /// The call whose value is read.
     pub base: Span,
+    /// For [`ShapeKind::Member`], the member read (`data` in `res.data`, or
+    /// the key a destructured name is taken from, `const { data } = …`);
+    /// `None` where the source names none (an array pattern). Read by
+    /// [`hands_back_body`]'s steps (carrick#4371). In memory only.
+    pub member: Option<String>,
+}
+
+impl ReturnShape {
+    /// The read this shape makes off its base call's value, as a
+    /// [`hands_back_body`] step: none for a whole value.
+    pub fn step(&self) -> Option<Step> {
+        match self.kind {
+            ShapeKind::Value => None,
+            // `is_parse` reads `.json()` alone.
+            ShapeKind::Parsed => Some(Step::Parse("json".to_string())),
+            ShapeKind::Member => Some(Step::Member(self.member.clone().unwrap_or_default())),
+        }
+    }
+}
+
+/// One read a function makes off a returned call's value on its way back to
+/// its caller (carrick#4371): the parse by name, or one member by name. An
+/// unnamed member is the empty name, which no label names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Step {
+    Parse(String),
+    Member(String),
+}
+
+/// What is known of the call a chain of returns ends at, for
+/// [`hands_back_body`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndRead {
+    /// The store's verified result label for the call (carrick#2819).
+    Labelled(crate::services::type_sidecar::ResultShape),
+    /// No verified label: what the call resolves to is not stated.
+    Unlabelled,
+    /// The platform's `fetch`, with no label: it resolves to a `Response`,
+    /// whose body is its `.json()`.
+    PlatformFetch,
+}
+
+/// Whether a chain of returns hands its caller the body ([`hands_back_body`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HandBack {
+    /// The caller holds the response body: read it at the caller's call.
+    Body,
+    /// The caller holds something else (an envelope, a field, a flag): the
+    /// response is read where the request is made.
+    Other,
+    /// A member is read off a call no verified label describes: whether
+    /// that member is the body is not known (READY-4371 R10).
+    Undecided,
+}
+
+/// The one test of whether the reads `steps` make off the value of the call
+/// a chain of returns ends at hand back that call's response body
+/// (carrick#4371 R2). The call's result is described by `end`:
+///
+/// | `end` | body when `steps` is |
+/// |---|---|
+/// | labelled `member: [m]` | `[Member(m)]` |
+/// | labelled `parse: p` | `[Parse(p)]` |
+/// | labelled `whole`, or unlabelled | `[]` |
+/// | the platform `fetch`, unlabelled | `[Parse("json")]` |
+///
+/// Anything else is [`HandBack::Other`], except:
+///
+/// - a member read over an unlabelled end is [`HandBack::Undecided`]: the
+///   label decides it (READY-4371 R10);
+/// - the platform `fetch`'s whole value is [`HandBack::Undecided`] too. It
+///   resolves to a `Response`, which the labelled call's own read cannot
+///   type (`machinery_envelope`); whoever holds it reads the body off it
+///   (`.json()`, `.arrayBuffer()`), and the deciding call is where that
+///   read is followed. A member of a `Response` (`ok`, `status`) is never
+///   its body: other.
+///
+/// Its readers: the site pass, which reads a wrapper site's response at the
+/// labelled call unless the wrapper hands the body back
+/// ([`crate::request_summary::site_record`]'s payload slots). The request
+/// summaries' flags and call-through's walk take it next (READY-4371 T2,
+/// T3), so the question has this one answer.
+pub fn hands_back_body(steps: &[Step], end: &EndRead) -> HandBack {
+    use crate::services::type_sidecar::ResultShape;
+    let body = match (end, steps) {
+        (EndRead::Labelled(ResultShape::Member([wanted])), [Step::Member(read)]) => read == wanted,
+        (EndRead::Labelled(ResultShape::Parse(wanted)), [Step::Parse(read)]) => read == wanted,
+        (EndRead::Labelled(ResultShape::Whole(_)) | EndRead::Unlabelled, []) => true,
+        (EndRead::PlatformFetch, [Step::Parse(read)]) => read == "json",
+        _ => false,
+    };
+    if body {
+        return HandBack::Body;
+    }
+    let reads_member = steps.iter().any(|step| matches!(step, Step::Member(_)));
+    match end {
+        EndRead::Unlabelled if reads_member => HandBack::Undecided,
+        EndRead::PlatformFetch if steps.is_empty() => HandBack::Undecided,
+        _ => HandBack::Other,
+    }
 }
 
 /// Every function of `module`, by the span of its node, with what it returns:
@@ -802,11 +936,11 @@ fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {
     // return res.json();` hands back one parse. Two member reads stay two:
     // a shape does not say which member.
     match shapes.split_first() {
-        Some((first, [])) => Some(*first),
+        Some((first, [])) => Some(first.clone()),
         Some((first, rest))
             if first.kind != ShapeKind::Member && rest.iter().all(|shape| shape == first) =>
         {
-            Some(*first)
+            Some(first.clone())
         }
         _ => None,
     }
@@ -824,6 +958,8 @@ struct Resolved<'a> {
     expr: &'a Expr,
     /// Read off a bigger value by taking it apart.
     part: bool,
+    /// For a part taken off an object pattern's own key, that key.
+    key: Option<String>,
 }
 
 /// Names followed at most this far.
@@ -832,6 +968,11 @@ const MAX_NAME_HOPS: usize = 8;
 fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
     let mut expr = expr;
     let mut part = false;
+    let mut key = None;
+    // The key names the call's member only when one part hop leads to the
+    // call: `const { data } = await call(); const { items } = data` holds
+    // `data.items`, which no one key names (carrick#4513).
+    let mut part_hops = 0;
     for _ in 0..MAX_NAME_HOPS {
         expr = match expr {
             Expr::Await(awaited) => &awaited.arg,
@@ -841,11 +982,24 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
             Expr::TsConstAssertion(cast) => &cast.expr,
             Expr::TsNonNull(cast) => &cast.expr,
             Expr::TsSatisfies(cast) => &cast.expr,
+            // `call.catch(() => null)`: the call's value or no body, as a
+            // `return null` in a `catch` block hands back (carrick#4513).
+            Expr::Call(call) => match no_body_catch(call) {
+                Some(caught) => caught,
+                None => break,
+            },
             Expr::Ident(ident) => {
                 let name: &str = &ident.sym;
                 match scope.given.get(name).map(Vec::as_slice) {
                     Some([only]) => {
-                        part |= scope.parts.contains_key(name);
+                        if scope.parts.contains_key(name) {
+                            part = true;
+                            part_hops += 1;
+                            key = match part_hops {
+                                1 => scope.part_keys.get(name).cloned(),
+                                _ => None,
+                            };
+                        }
                         only
                     }
                     _ => break,
@@ -854,10 +1008,21 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
             _ => break,
         };
     }
-    Resolved { expr, part }
+    Resolved { expr, part, key }
 }
 
 fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
+    // `return body || null`, `return body ?? undefined`: the value or no
+    // body, as a second `return null` would hand back (carrick#4513).
+    if let Expr::Bin(bin) = returned
+        && matches!(
+            bin.op,
+            swc_ecma_ast::BinaryOp::LogicalOr | swc_ecma_ast::BinaryOp::NullishCoalescing
+        )
+        && matches!(classify(&bin.right, scope), Some(Returned::NoBody))
+    {
+        return classify(&bin.left, scope);
+    }
     let value = resolve(returned, scope);
     let base_of = |obj: &Expr| -> Option<Span> {
         let obj = resolve(obj, scope);
@@ -867,34 +1032,61 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
             _ => None,
         }
     };
-    let shape = |kind, base| Some(Returned::Shape(ReturnShape { kind, base }));
+    let shape = |kind, base| {
+        Some(Returned::Shape(ReturnShape {
+            kind,
+            base,
+            member: None,
+        }))
+    };
+    let member = |base, name: Option<String>| {
+        Some(Returned::Shape(ReturnShape {
+            kind: ShapeKind::Member,
+            base,
+            member: name,
+        }))
+    };
     match value.expr {
         Expr::Ident(ident) if &*ident.sym == "undefined" => Some(Returned::NoBody),
         Expr::Lit(swc_ecma_ast::Lit::Null(_)) => Some(Returned::NoBody),
         Expr::Unary(unary) if unary.op == swc_ecma_ast::UnaryOp::Void => Some(Returned::NoBody),
         // `const { data } = await call(); return data`
-        Expr::Call(call) if value.part => shape(ShapeKind::Member, call.span),
+        Expr::Call(call) if value.part => member(call.span, value.key.clone()),
         _ if value.part => None,
         Expr::Call(call) => match &call.callee {
             Callee::Expr(callee) if is_parse(call) => {
-                let Expr::Member(member) = &**callee else {
+                let Expr::Member(read) = &**callee else {
                     return None;
                 };
-                shape(ShapeKind::Parsed, base_of(&member.obj)?)
+                shape(ShapeKind::Parsed, base_of(&read.obj)?)
             }
             _ => shape(ShapeKind::Value, call.span),
         },
         Expr::OptChain(chain) => match &*chain.base {
-            OptChainBase::Member(member) if reads_one_member(&member.prop) => {
-                shape(ShapeKind::Member, base_of(&member.obj)?)
+            OptChainBase::Member(read) if reads_one_member(&read.prop) => {
+                member(base_of(&read.obj)?, member_name(&read.prop))
             }
             OptChainBase::Call(_) => shape(ShapeKind::Value, chain.span),
             _ => None,
         },
-        Expr::Member(member) if reads_one_member(&member.prop) => {
-            shape(ShapeKind::Member, base_of(&member.obj)?)
+        Expr::Member(read) if reads_one_member(&read.prop) => {
+            member(base_of(&read.obj)?, member_name(&read.prop))
         }
         _ => None,
+    }
+}
+
+/// The name of a property [`reads_one_member`] accepts.
+fn member_name(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(name) => Some(name.sym.to_string()),
+        MemberProp::Computed(computed) => match &*computed.expr {
+            Expr::Lit(swc_ecma_ast::Lit::Str(text)) => {
+                Some(text.value.to_string_lossy().into_owned())
+            }
+            _ => None,
+        },
+        MemberProp::PrivateName(_) => None,
     }
 }
 
@@ -909,6 +1101,52 @@ fn is_parse(call: &CallExpr) -> bool {
                     if matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "json")
             )
         )
+}
+
+/// The value `.catch` is called on, where the handler hands back no body:
+/// `null`, `undefined`, `void 0`, or nothing (`() => {}`, a bare `return`).
+fn no_body_catch(call: &CallExpr) -> Option<&Expr> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(member) = &**callee else {
+        return None;
+    };
+    if !matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "catch") {
+        return None;
+    }
+    let [handler] = call.args.as_slice() else {
+        return None;
+    };
+    if handler.spread.is_some() {
+        return None;
+    }
+    let no_body = |expr: &Expr| match expr {
+        Expr::Ident(ident) => &*ident.sym == "undefined",
+        Expr::Lit(swc_ecma_ast::Lit::Null(_)) => true,
+        Expr::Unary(unary) => unary.op == swc_ecma_ast::UnaryOp::Void,
+        _ => false,
+    };
+    let block_no_body = |stmts: &[swc_ecma_ast::Stmt]| {
+        stmts.iter().all(|stmt| match stmt {
+            swc_ecma_ast::Stmt::Return(ret) => ret.arg.as_deref().is_none_or(no_body),
+            swc_ecma_ast::Stmt::Empty(_) => true,
+            _ => false,
+        })
+    };
+    let hands_back_none = match &*handler.expr {
+        Expr::Arrow(arrow) => match &*arrow.body {
+            ArrowFunctionBody::Expr(expr) => no_body(expr),
+            ArrowFunctionBody::FunctionBody(block) => block_no_body(&block.stmts),
+        },
+        Expr::Fn(function) => function
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|block| block_no_body(&block.stmts)),
+        _ => false,
+    };
+    hands_back_none.then_some(&*member.obj)
 }
 
 /// A property named in the source: `.data` or `["data"]`.
@@ -1044,7 +1282,9 @@ mod tests {
         .expect("parses");
         let shapes = return_shapes(&module);
         let (_, shape) = shapes.first().expect("a function");
-        shape.map(|shape| (shape.kind, cm.span_to_snippet(shape.base).unwrap()))
+        shape
+            .as_ref()
+            .map(|shape| (shape.kind, cm.span_to_snippet(shape.base).unwrap()))
     }
 
     fn of(kind: ShapeKind, base: &str) -> Option<(ShapeKind, String)> {
@@ -1086,6 +1326,145 @@ mod tests {
             "async function f(o) { const { data: body } = await call(o); return body; }",
         ] {
             assert_eq!(shape(source), of(ShapeKind::Member, "call(o)"), "{source}");
+        }
+    }
+
+    /// The first function's shape of `source`, whole.
+    fn whole_shape(source: &str) -> Option<ReturnShape> {
+        let cm: Lrc<SourceMap> = Default::default();
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("t.ts".into())),
+            source.to_string(),
+        );
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("parses");
+        return_shapes(&module).remove(0).1
+    }
+
+    /// carrick#4371 R4: a member read names its member, and a destructured
+    /// name the key it is taken from; a parse is `json`; a whole value
+    /// reads nothing.
+    #[test]
+    fn a_member_read_names_its_member_and_a_destructured_name_its_key() {
+        for (source, wanted) in [
+            (
+                "async function f(o) { return (await call(o)).data; }",
+                "data",
+            ),
+            (
+                "async function f(o) { const r = await call(o); return r?.ok; }",
+                "ok",
+            ),
+            (
+                "async function f(o) { const r = await call(o); return r[\"items\"]; }",
+                "items",
+            ),
+            (
+                "async function f(o) { const { data } = await call(o); return data; }",
+                "data",
+            ),
+            (
+                "async function f(o) { const { data: body } = await call(o); return body; }",
+                "data",
+            ),
+        ] {
+            let step = whole_shape(source).and_then(|shape| shape.step());
+            assert_eq!(step, Some(Step::Member(wanted.to_string())), "{source}");
+        }
+        let parsed = whole_shape("async function f(u) { return (await fetch(u)).json(); }");
+        assert_eq!(
+            parsed.and_then(|shape| shape.step()),
+            Some(Step::Parse("json".to_string()))
+        );
+        let whole = whole_shape("function f(o) { return call(o); }");
+        assert_eq!(whole.and_then(|shape| shape.step()), None);
+    }
+
+    /// carrick#4513: a name destructured twice holds a member of a member,
+    /// which no one key names; a value or no body reads as the value.
+    #[test]
+    fn a_chained_destructure_names_no_key_and_a_fallback_to_null_is_the_value() {
+        let chained = whole_shape(
+            "async function f(o) { const { data } = await call(o); const { items } = data; return items; }",
+        );
+        assert_eq!(
+            chained.and_then(|shape| shape.step()),
+            Some(Step::Member(String::new()))
+        );
+        for source in [
+            "async function f(o) { const r = await call(o); return r.data || null; }",
+            "async function f(o) { const r = await call(o); return r.data ?? undefined; }",
+        ] {
+            let step = whole_shape(source).and_then(|shape| shape.step());
+            assert_eq!(step, Some(Step::Member("data".to_string())), "{source}");
+        }
+        // A rejection handler that hands back no body is a no-body path.
+        // The chain ends at the request, `call(o)`, as an uncaught return's does.
+        let whole = whole_shape("function f(o) { return call(o); }").expect("a call's value");
+        for source in [
+            "function f(o) { return call(o).catch(() => null); }",
+            "function f(o) { return call(o).catch(() => undefined); }",
+            "function f(o) { return call(o).catch(() => {}); }",
+        ] {
+            assert_eq!(whole_shape(source), Some(whole.clone()), "{source}");
+        }
+        let member = whole_shape("async function f(o) { const r = await call(o); return r.data; }")
+            .expect("a member");
+        let caught_member = whole_shape(
+            "async function f(o) { const r = await call(o).catch(() => null); return r.data; }",
+        );
+        assert_eq!(caught_member, Some(member));
+        // One that hands back a value of its own is that value.
+        let own_value = whole_shape("function f(o) { return call(o).catch(() => []); }")
+            .expect("a call's value");
+        assert_ne!(own_value.base, whole.base);
+        // A fallback to a value of the function's own is not the value.
+        let own = whole_shape(
+            "async function f(o) { const r = await call(o); return r.data || 'none'; }",
+        );
+        assert_eq!(own, None);
+    }
+
+    /// carrick#4371 R2: the one accept test, row by row.
+    #[test]
+    fn hands_back_body_reads_the_steps_against_the_ends_label() {
+        use crate::services::type_sidecar::ResultShape;
+        let member = |name: &str| Step::Member(name.to_string());
+        let parse = |name: &str| Step::Parse(name.to_string());
+        let data = EndRead::Labelled(ResultShape::Member(["data".to_string()]));
+        let text = EndRead::Labelled(ResultShape::Parse("text".to_string()));
+        let whole = EndRead::Labelled(ResultShape::Whole(true));
+        for (steps, end, wanted) in [
+            (vec![member("data")], &data, HandBack::Body),
+            (vec![member("status")], &data, HandBack::Other),
+            (vec![], &data, HandBack::Other),
+            (vec![parse("text")], &text, HandBack::Body),
+            (vec![parse("json")], &text, HandBack::Other),
+            (vec![], &whole, HandBack::Body),
+            (vec![member("ok")], &whole, HandBack::Other),
+            (vec![], &EndRead::Unlabelled, HandBack::Body),
+            (
+                vec![member("data")],
+                &EndRead::Unlabelled,
+                HandBack::Undecided,
+            ),
+            (vec![parse("json")], &EndRead::Unlabelled, HandBack::Other),
+            (vec![parse("json")], &EndRead::PlatformFetch, HandBack::Body),
+            (vec![], &EndRead::PlatformFetch, HandBack::Undecided),
+            (vec![member("ok")], &EndRead::PlatformFetch, HandBack::Other),
+            (vec![member("data"), member("x")], &data, HandBack::Other),
+        ] {
+            assert_eq!(
+                hands_back_body(&steps, end),
+                wanted,
+                "{steps:?} over {end:?}"
+            );
         }
     }
 

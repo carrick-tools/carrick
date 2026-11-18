@@ -3732,7 +3732,91 @@ export class TypeInferrer {
     return atCaller.kind === 'instantiated' ? atCaller.type : call.getType();
   }
 
+  /**
+   * A call's result as the caller reads it. A request made below a wrapper
+   * (`through_call` names the call that reaches the wrapper) is read at the
+   * call it names, where the caller states what it reads, in two cases:
+   *
+   *  - the read below finds only transport (a decided `machinery_envelope`,
+   *    or the response object itself, stated by nothing): the wrapper hands
+   *    the transport on, and the body is read off it by its caller;
+   *  - the caller chooses a raw text body: a text read of the value, or a
+   *    text format passed at the call (carrick#4513). A raw text body has no
+   *    JSON shape, so the mark is read at the deciding call whichever call
+   *    the type came from.
+   *
+   * A read below the wrapper that finds a body keeps it.
+   */
   private inferCallResult(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    extractionConfig?: ExtractionConfig
+  ): InferredType | null {
+    const read = this.inferCallResultBelowWrapper(sourceFile, request, extractionConfig);
+    const through = request.through_call;
+    if (!through) return read;
+    const callerFile = this.getSourceFile(through.file_path);
+    const deciding = callerFile
+      ? this.findCallExpressionAtSpan(callerFile, through.span_start, through.span_end)
+      : undefined;
+    if (!callerFile || !deciding || !callNamedBy(deciding.compilerNode)) return read;
+    if (read && !this.readIsOnlyTransport(sourceFile, request, read)) {
+      return this.markedAtDecidingCall(read, deciding);
+    }
+    const decidingRequest: InferRequestItem = {
+      ...request,
+      file_path: through.file_path,
+      line_number: deciding.getStartLineNumber(),
+      span_start: through.span_start,
+      span_end: through.span_end,
+      expression_text: undefined,
+      expression_line: undefined,
+      through_call: undefined,
+      result: undefined,
+    };
+    const atDeciding = this.inferCallResultBelowWrapper(callerFile, decidingRequest, extractionConfig);
+    if (!atDeciding || this.readIsOnlyTransport(callerFile, decidingRequest, atDeciding)) {
+      return read ?? atDeciding;
+    }
+    this.log(
+      `Call result at ${request.file_path}:${request.line_number} is only transport; ` +
+        `reading it at the call that reaches the wrapper, ${through.file_path}:${decidingRequest.line_number}`
+    );
+    return atDeciding;
+  }
+
+  /** The read states nothing but transport: a decided envelope, or the response object unstated. */
+  private readIsOnlyTransport(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    read: InferredType
+  ): boolean {
+    if ((read.any_provenance ?? []).some((p) => p.path === '' && p.reason === 'machinery_envelope')) {
+      return true;
+    }
+    if (read.is_explicit || (read.any_provenance ?? []).length > 0 || request.result) return false;
+    const call = this.resolveTargetCallExpression(sourceFile, request);
+    if (!call) return false;
+    const value = this.unwrapPromiseType(call.getType());
+    return (
+      this.typeIsOrContainsResponseMachinery(value) &&
+      read.type_string.replace(/\s+/g, ' ').trim() === typeText(value, call).replace(/\s+/g, ' ').trim()
+    );
+  }
+
+  /** The raw-text mark the deciding call states, added to a read that did not carry it. */
+  private markedAtDecidingCall(read: InferredType, deciding: CallExpression): InferredType {
+    if (read.raw_text_read || !isBareStringText(read.type_string)) return read;
+    const func = this.findContainingFunctionForNode(deciding);
+    const terminal = this.resolveCallResultTerminalNode(deciding, func).terminal;
+    markRawTextRead(
+      read,
+      this.textReadAtTerminal(deciding, terminal) || this.callChoosesTextBody(deciding)
+    );
+    return read;
+  }
+
+  private inferCallResultBelowWrapper(
     sourceFile: SourceFile,
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig

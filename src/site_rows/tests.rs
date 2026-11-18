@@ -89,6 +89,8 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
         procedure: None,
         makes_end: false,
         chain_handed_on: false,
+        deciding_callee: None,
+        hands_back: None,
     }
 }
 
@@ -153,6 +155,7 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
         lead: None,
         unread: None,
         receiver: None,
+        hands_back: None,
     }
 }
 

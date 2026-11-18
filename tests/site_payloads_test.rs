@@ -35,6 +35,13 @@ const RETIRED_SWITCHES: [&str; 5] = [
 
 /// The blob one offline scan of `repo` writes, with `env` set.
 fn scan(repo: &Path, env: &[(&str, &str)]) -> serde_json::Value {
+    let mut blobs = scan_blobs(repo, env);
+    assert_eq!(blobs.len(), 1, "one service, one blob");
+    blobs.remove(0)
+}
+
+/// Every blob one offline scan of `repo` writes (one per service).
+fn scan_blobs(repo: &Path, env: &[(&str, &str)]) -> Vec<serde_json::Value> {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
@@ -75,7 +82,7 @@ fn scan(repo: &Path, env: &[(&str, &str)]) -> serde_json::Value {
         "scan exited non-zero:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let mut blobs: Vec<serde_json::Value> = std::fs::read_dir(storage.path())
+    std::fs::read_dir(storage.path())
         .expect("storage dir")
         .flatten()
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
@@ -83,9 +90,7 @@ fn scan(repo: &Path, env: &[(&str, &str)]) -> serde_json::Value {
             serde_json::from_slice(&std::fs::read(entry.path()).expect("read blob"))
                 .expect("parse blob")
         })
-        .collect();
-    assert_eq!(blobs.len(), 1, "one service, one blob");
-    blobs.remove(0)
+        .collect()
 }
 
 /// The consumer `kind` entry at `file:line`.
@@ -534,6 +539,27 @@ fn captured_flat(blob: &serde_json::Value, alias: &str) -> String {
         .to_string()
 }
 
+/// carrick#4513: the consumer entries whose symbol, or whose stored type
+/// text (`bundled_types`), is a wrapper's own type parameter, read inside
+/// the wrapper. Only the wrapper's callers set it, so no entry may name it.
+fn entries_naming_a_type_parameter(blob: &serde_json::Value) -> Vec<String> {
+    let bundled = blob["bundled_types"].as_str().unwrap_or_default();
+    blob["type_manifest"]
+        .as_array()
+        .expect("type_manifest")
+        .iter()
+        .filter(|entry| entry["role"] == "consumer")
+        .filter(|entry| {
+            let stored = format!(
+                "export type {} = T;",
+                entry["type_alias"].as_str().unwrap_or_default()
+            );
+            entry["primary_type_symbol"] == "T" || bundled.lines().any(|line| line.trim() == stored)
+        })
+        .map(|entry| format!("{}:{}", entry["file_path"], entry["line_number"]))
+        .collect()
+}
+
 /// carrick#4319 T1: `tests/fixtures/site-maker-response/`. Where the
 /// deciding call only makes the function that sends (`makeGate({ base })`
 /// returns a closure that calls `http.remove`), the site row's response is
@@ -560,23 +586,18 @@ fn a_maker_decided_site_reads_its_response_at_the_labelled_call() {
     ] {
         assert_eq!(response(file, line), wanted, "response at {file}:{line}");
     }
-    // The maker's own type parameter is open at the labelled call: a decided
-    // abstain, not the closure.
-    let typed = entry_at(&on, "response", "src/typed-maker.ts", 6);
+    // The maker's own type parameter is open at the labelled call; the maker
+    // call binds it (carrick#4375, carrick#4371 T5).
     assert_eq!(
-        captured_flat(&on, typed["type_alias"].as_str().unwrap()),
-        "unknown",
-        "{typed:#?}"
+        response("src/typed-maker.ts", 6),
+        "{ count: number; }",
+        "response at src/typed-maker.ts:6"
     );
-    let reasons: Vec<&str> = typed["any_provenance"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| row["reason"].as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    assert_eq!(reasons, vec!["bound_by_callers"], "{typed:#?}");
+    assert!(
+        entries_naming_a_type_parameter(&on).is_empty(),
+        "{:#?}",
+        entries_naming_a_type_parameter(&on)
+    );
     // The request slot does not move.
     let order = captured_flat(&on, &alias_at(&on, "request", "src/poster.ts", 7));
     assert_eq!(order, "{ sku: string; qty: number; }");
@@ -693,4 +714,104 @@ fn a_model_row_at_a_maker_sites_labelled_call_is_withdrawn() {
         "{ trimmed: number; }",
         "response at src/env-maker.ts:4"
     );
+}
+
+/// carrick#4371 T1 and T5: `tests/fixtures/site-wrapper-response/`. A
+/// wrapper site's response is read at the deciding call only where the
+/// wrapper hands back the labelled call's body down a chain of returns, as
+/// the store's result label reads the body. Anywhere else (a field, a flag,
+/// an envelope, a caught value, nothing) it is read at the labelled call,
+/// and the deciding call binds the wrapper's open type parameter there
+/// (carrick#4375). A member read off a call the store labels no result for
+/// stays at the deciding call. The answer key is the fixture's README.
+#[test]
+fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
+    let repo =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-wrapper-response");
+    let on = scan(&repo, &[]);
+    let mut wrong = Vec::new();
+    for (name, wanted) in [
+        ("own-member", "{ ok: boolean; id: string; }"),
+        ("own-literal", "{ id: string; }"),
+        ("own-nothing", "{ purged: number; }"),
+        ("own-envelope", "{ ref: string; }"),
+        ("own-two-hop", "{ v: number; }"),
+        ("own-based", "{ hits: number; }"),
+        ("own-generic", "{ alive: boolean; }"),
+        ("reply-status", "{ name: string; }"),
+        ("reply-whole", "{ city: string; }"),
+        ("reply-generic-whole", "{ size: number; }"),
+        ("caught", "{ c: number; } | null"),
+        ("own-member-unlabelled", "boolean"),
+        ("keep-whole", "{ total: number; }"),
+        ("keep-awaited", "{ rows: number; }"),
+        ("keep-two-hop", "{ depth: number; }"),
+        ("keep-generic", "{ lines: number; }"),
+        ("reply-data", "{ name: string; }"),
+        ("reply-generic-data", "{ price: number; }"),
+        ("destructured", "{ zip: string; }"),
+        ("keep-retried", "{ n: number; }"),
+        ("then-data", "{ size: number; }"),
+        ("keep-local-run", "{ done: boolean; }"),
+        // carrick#4513 seeds.
+        ("seed-generic", "import(\"./src/seed-generic-lib\").Order[]"),
+        ("seed-exact", "import(\"./src/seed-exact-lib\").Order[]"),
+        ("seed-chained", "{ items: { id: string; }[]; }"),
+        ("seed-widen", "string | null"),
+        ("seed-widen-caught", "string | null"),
+        ("seed-envelope", "unknown"),
+        ("seed-caught-void", "void | { gone: boolean; }"),
+        ("seed-caught-value", "{ rows: string[]; }"),
+    ] {
+        let file = format!("src/{name}.ts");
+        let got = captured_flat(&on, &alias_at(&on, "response", &file, 2));
+        if got != wanted {
+            wrong.push(format!("{file}:2 wanted `{wanted}`, got `{got}`"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(
+        entries_naming_a_type_parameter(&on).is_empty(),
+        "{:#?}",
+        entries_naming_a_type_parameter(&on)
+    );
+}
+
+/// carrick#4755 T0: `tests/fixtures/site-wrapper-response-sibling/`. An own
+/// wrapper over a generic helper that lives in a SIBLING service: the
+/// wrapper's record ends at the call of the helper, a function this pass
+/// does not read, and that call is on the site's own chain above the
+/// labelled call. No answer, so the response is read at the deciding call
+/// (the wrapper's caller binds `T`) and the type is kept, not lost to
+/// `unknown`. The control, the same code in one service, reads the same.
+/// The answer key is the fixture's README.
+#[test]
+fn a_wrapper_over_a_sibling_helper_reads_its_response_at_the_deciding_call() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/site-wrapper-response-sibling");
+    let blobs = scan_blobs(&repo, &[]);
+    let app = blobs
+        .iter()
+        .find(|blob| {
+            blob["type_manifest"].as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry["file_path"] == "services/app/src/load.ts")
+            })
+        })
+        .expect("the app's blob");
+    let mut wrong = Vec::new();
+    for (file, line, wanted) in [
+        ("services/app/src/load.ts", 8, "{ gone: boolean; }"),
+        ("services/app/src/load.ts", 9, "{ wiped: number; }"),
+        ("services/app/src/load-own.ts", 8, "{ gone: boolean; }"),
+        ("services/app/src/load-own.ts", 9, "{ wiped: number; }"),
+        ("services/app/src/orders-own.ts", 2, "{ ok: boolean; }"),
+    ] {
+        let got = captured_flat(app, &alias_at(app, "response", file, line));
+        if got != wanted {
+            wrong.push(format!("{file}:{line} wanted `{wanted}`, got `{got}`"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
