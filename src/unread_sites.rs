@@ -116,6 +116,17 @@ pub struct UnreadSite {
 }
 
 impl UnreadSite {
+    /// Whether this is the site of an HTTP route its file states with no
+    /// handler located ([`unplaced_producer`] with kind `http`, saved by a
+    /// routing convention that states a route from where the file stands).
+    /// It sits on the line of the very row it explains, so the site fold
+    /// keeps it where it drops any other stop on a row line.
+    pub fn is_route_without_handler(&self) -> bool {
+        self.reason == Stop::HandlerNotLocated
+            && self.kind.as_deref() == Some("http")
+            && self.role.as_deref() == Some("producer")
+    }
+
     fn at(&self) -> (&str, u32, u32) {
         (&self.file, self.span_start, self.span_end)
     }

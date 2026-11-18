@@ -623,6 +623,38 @@ pub struct FileRouteDerivation {
     /// not one call handed one function it declares. Saved as an unread
     /// producer site ([`crate::unread_sites::unplaced_producer`]).
     pub handler_not_located: Option<HandlerNotLocated>,
+    /// Whether the claim came from a [`MethodSource::ModuleCall`] convention:
+    /// the file states one route for every method, so the join matches a
+    /// model row's method the way a consumer's method matches a route.
+    pub module_call: bool,
+}
+
+/// What claimed a file's route set, as the join reads it
+/// ([`FileRouteDerivation::claimed`], [`FileRouteDerivation::module_call`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteClaim {
+    /// No convention states this file's whole route set.
+    Unclaimed,
+    /// A convention states it from the module's exports: a model row folds
+    /// onto a derived row only on an equal method.
+    Exports,
+    /// A [`MethodSource::ModuleCall`] convention states it: the derived row
+    /// may be `ALL`, which every method a model row names reaches.
+    ModuleCall,
+}
+
+impl RouteClaim {
+    fn of(derivation_claimed: bool, module_call: bool) -> Self {
+        match (derivation_claimed, module_call) {
+            (false, _) => Self::Unclaimed,
+            (true, false) => Self::Exports,
+            (true, true) => Self::ModuleCall,
+        }
+    }
+
+    fn is_claimed(self) -> bool {
+        self != Self::Unclaimed
+    }
 }
 
 /// The place of a route whose handler was not located
@@ -2585,7 +2617,7 @@ impl FileOrchestrator {
             /// True independently of `route_endpoints` being empty — a claimed
             /// module that exports no handler serves no route, which is a
             /// statement, not a silence.
-            route_module_claimed: bool,
+            route_module_claimed: RouteClaim,
             /// Endpoints derived deterministically from route-descriptor data
             /// (`{ method, path, handler }`), merged in after the LLM pass. The
             /// LLM ignores route-as-data, so these are the authoritative source
@@ -2750,7 +2782,7 @@ impl FileOrchestrator {
             /// exports no handler is exactly the file that reaches here: it
             /// raises no candidate of its own, and a wrapper import is what
             /// rescues it into the model pass (carrick#704).
-            route_module_claimed: bool,
+            route_module_claimed: RouteClaim,
         }
 
         /// Every pass over ONE file's rows that runs after the model's answer
@@ -3204,7 +3236,9 @@ impl FileOrchestrator {
                 claimed: route_module_claimed,
                 endpoints: route_endpoints,
                 handler_not_located,
+                module_call,
             } = derivation;
+            let route_module_claimed = RouteClaim::of(route_module_claimed, module_call);
             if let Some(at) = handler_not_located {
                 let mut site = crate::unread_sites::unplaced_producer(
                     &crate::site_rows::relative(repo_root, &file_path.to_string_lossy()),
@@ -8269,6 +8303,7 @@ impl FileOrchestrator {
         // lower bound; claiming it would discard a model row that correctly
         // described the route the re-export serves.
         let mut claimed = route.method_source == MethodSource::ExportName && !module.reexports_all;
+        let mut module_call = false;
         let mut handler_not_located = None;
         let exports = module.handlers;
         // The module renders a view as well as serving the route when it also
@@ -8366,6 +8401,7 @@ impl FileOrchestrator {
             // handed.
             MethodSource::ModuleCall { method } => {
                 claimed = true;
+                module_call = true;
                 let calls = scanner.top_level_function_calls(file_path, content);
                 let serving: Vec<_> = calls
                     .iter()
@@ -8429,6 +8465,7 @@ impl FileOrchestrator {
             claimed,
             endpoints,
             handler_not_located,
+            module_call,
         }
     }
 
@@ -9889,7 +9926,7 @@ impl FileOrchestrator {
         answered_at_callers: &BTreeSet<u32>,
         withdrawn: &mut Vec<DataCallResult>,
         file_path: &str,
-        route_module_claimed: bool,
+        route_module_claimed: RouteClaim,
         stats: &mut ProcessingStats,
     ) {
         let FileAnalysisResult {
@@ -10304,7 +10341,7 @@ impl FileOrchestrator {
                     };
                     stats.model_rows_joined += 1;
                 }
-                None if route_module_claimed => {
+                None if route_module_claimed.is_claimed() => {
                     // A routing convention claimed this file, so the route set
                     // is its exported handlers and nothing else (carrick#703).
                     // A row the model states here matched none of them, which
@@ -10888,7 +10925,7 @@ impl FileOrchestrator {
     fn route_stated_deterministically(
         deterministic: &[EndpointResult],
         endpoint: &EndpointResult,
-        route_module_claimed: bool,
+        route_module_claimed: RouteClaim,
         offered: impl Fn(usize) -> bool,
     ) -> Option<usize> {
         let canonical = Self::canonicalize_route_path(&endpoint.path);
@@ -10898,12 +10935,12 @@ impl FileOrchestrator {
             .filter(|(index, existing)| {
                 offered(*index)
                     && existing.resolution_source != Some(ResolutionSource::Model)
-                    && (if route_module_claimed {
+                    && (if route_module_claimed == RouteClaim::ModuleCall {
                         carrick_match::method_matches(&existing.method, &endpoint.method)
                     } else {
                         existing.method.eq_ignore_ascii_case(&endpoint.method)
                     })
-                    && (route_module_claimed
+                    && (route_module_claimed.is_claimed()
                         || Self::canonicalize_route_path(&existing.path) == canonical)
             });
         let (index, _) = matches.next()?;
@@ -15801,7 +15838,7 @@ export * from "./aFetch.js";"#,
             &BTreeSet::new(),
             &mut Vec::new(),
             "src/client.ts",
-            false,
+            RouteClaim::Unclaimed,
             &mut stats,
         );
         (result, stats)
@@ -15988,7 +16025,7 @@ export * from "./aFetch.js";"#,
             &BTreeSet::new(),
             &mut Vec::new(),
             "src/client.ts",
-            false,
+            RouteClaim::Unclaimed,
             &mut stats,
         );
 
@@ -20157,12 +20194,67 @@ export function serializeWidget(w) { return w; }
             &candidate_map,
             std::slice::from_ref(&derived),
             "app/routes/settings.builds.tsx",
+            RouteClaim::Exports,
         );
 
         assert_eq!(result.endpoints.len(), 1, "{:?}", result.endpoints);
         assert_eq!(result.endpoints[0].path, "/settings/builds");
         assert_eq!(stats.model_endpoints_discarded_in_claimed_modules, 1);
         assert_eq!(stats.model_only_rows, 0);
+    }
+
+    /// A module an export-name convention claims keeps the exact method
+    /// comparison: its `ALL` row (a wildcard export) is not a candidate for a
+    /// model `GET` row beside a `GET` row, so the `GET` row is the one it
+    /// folds onto and keeps its anchors; with an `ALL` row alone a model
+    /// `GET` row folds onto nothing. Only a module a
+    /// [`MethodSource::ModuleCall`] convention claims matches the method the
+    /// way a consumer's method matches a route.
+    #[test]
+    fn an_export_name_module_folds_a_model_row_only_on_an_equal_method() {
+        let mut derived_all = synthetic_endpoint("ALL", "/settings/builds");
+        derived_all.candidate_id = "file-route:ALL:0".to_string();
+        let derived_get = synthetic_endpoint("GET", "/settings/builds");
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        for (rows, kept) in [
+            (vec![derived_all.clone(), derived_get.clone()], true),
+            (vec![derived_all.clone()], false),
+        ] {
+            let mut guess = endpoint_with_candidate("/api/build-settings", "no-listed-site");
+            guess.response_expression_text = Some("{ builds }".to_string());
+            guess.response_expression_line = Some(16);
+            let (result, stats) = emit_and_join_claimed_route_module(
+                FileAnalysisResult {
+                    endpoints: vec![guess],
+                    ..Default::default()
+                },
+                &candidate_map,
+                &rows,
+                "app/routes/settings.builds.tsx",
+                RouteClaim::Exports,
+            );
+            let methods: Vec<_> = result.endpoints.iter().map(|e| e.method.as_str()).collect();
+            assert_eq!(methods.len(), rows.len(), "{methods:?}");
+            let on_get = result.endpoints.iter().find(|e| e.method == "GET");
+            if kept {
+                assert_eq!(
+                    on_get.and_then(|e| e.response_expression_text.as_deref()),
+                    Some("{ builds }")
+                );
+                assert_eq!(stats.model_rows_reconciled, 1);
+                assert_eq!(stats.model_endpoints_discarded_in_claimed_modules, 0);
+            } else {
+                assert_eq!(stats.model_rows_reconciled, 0);
+                assert!(
+                    result
+                        .endpoints
+                        .iter()
+                        .all(|e| e.response_expression_text.is_none()),
+                    "the ALL row took a GET row's anchors"
+                );
+            }
+        }
     }
 
     /// A module a folder convention claims states one `ALL` row. The model's
@@ -20206,6 +20298,7 @@ export function serializeWidget(w) { return w; }
                 &candidate_map,
                 std::slice::from_ref(&derived),
                 "supabase/functions/price-quote/index.ts",
+                RouteClaim::ModuleCall,
             );
 
             let rows: Vec<_> = result
@@ -20275,6 +20368,7 @@ export function serializeWidget(w) { return w; }
             &candidate_map,
             std::slice::from_ref(&derived),
             "app/routes/admin._index.tsx",
+            RouteClaim::Exports,
         );
 
         assert_eq!(result.endpoints.len(), 1);
@@ -20894,7 +20988,11 @@ export { routes };
             &LiteralBaseMap::new(),
             route_endpoints,
             file_path,
-            route_module_claimed,
+            if route_module_claimed {
+                RouteClaim::Exports
+            } else {
+                RouteClaim::Unclaimed
+            },
         )
     }
 
@@ -20915,7 +21013,7 @@ export { routes };
             literal_bases,
             &[],
             file_path,
-            false,
+            RouteClaim::Unclaimed,
         )
     }
 
@@ -20932,7 +21030,7 @@ export { routes };
         literal_bases: &LiteralBaseMap,
         route_endpoints: &[EndpointResult],
         file_path: &str,
-        route_module_claimed: bool,
+        route_module_claimed: RouteClaim,
     ) -> (FileAnalysisResult, ProcessingStats) {
         let mut stats = ProcessingStats::default();
         let resolved = FileOrchestrator::resolve_candidates(
@@ -21578,17 +21676,19 @@ export { routes };
         candidate_map: &HashMap<String, CandidateTarget>,
         route_endpoints: &[EndpointResult],
         file_path: &str,
+        claim: RouteClaim,
     ) -> (FileAnalysisResult, ProcessingStats) {
-        emit_and_join_with(
+        emit_and_join_core(
             model,
             candidate_map,
             &HashMap::new(),
             &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
+            &LiteralBaseMap::new(),
             route_endpoints,
             file_path,
-            true,
+            claim,
         )
     }
 

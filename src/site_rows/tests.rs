@@ -1554,6 +1554,37 @@ fn a_stop_on_a_row_line_is_saved_unless_a_row_the_code_decided_stands_there() {
     assert_eq!(fold.unread_on_row_line, 4);
 }
 
+/// A producer-role stop on the line of a row the code decided is dropped and
+/// counted, whatever built it: only the site of an HTTP route its file states
+/// with no handler located ([`crate::unread_sites::UnreadSite::is_route_without_handler`]) stays.
+#[test]
+fn a_producer_stop_on_a_row_line_is_dropped_but_a_route_without_a_handler_stays() {
+    use crate::unread_sites::{UnreadSite, unplaced_producer};
+    let mut calls = vec![blob_row(
+        OperationKey::http("POST", "/a"),
+        "src/summary.ts",
+        4,
+        Some(ResolutionSource::RequestSummary),
+    )];
+    // An unplaced operation of another protocol, and a producer-role stop of
+    // another reason, both on the row's line.
+    let graphql = unplaced_producer("src/summary.ts", 4, 10, "graphql");
+    let mut other_reason = unplaced_producer("src/summary.ts", 4, 20, "http");
+    other_reason.reason = Stop::UnresolvedName;
+    let route = unplaced_producer("src/summary.ts", 4, 30, "http");
+    let site = SiteRows {
+        enabled: true,
+        unread: vec![graphql, other_reason, route],
+        ..SiteRows::default()
+    };
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), "", make);
+    assert_eq!(fold.unread_on_row_line, 2);
+    let kept: Vec<&UnreadSite> = fold.unread.iter().collect();
+    assert_eq!(kept.len(), 1, "{kept:#?}");
+    assert!(kept[0].is_route_without_handler());
+    assert_eq!(kept[0].span_start, 30);
+}
+
 /// Off, nothing folds and nothing is written: the rows are byte for byte
 /// what they were.
 #[test]
