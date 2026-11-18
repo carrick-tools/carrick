@@ -772,6 +772,12 @@ fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
         ("own-chain", "{ v: number; }"),
         ("own-mapper", "{ id: string; extra: number; }"),
         ("own-maker-hop", "{ g: number; }"),
+        ("own-env-hop", "{ e: number; }"),
+        // Over an untyped call, the labelled call's body states no type:
+        // `unknown` (`declared`), where main stored the wrapper's own value.
+        ("own-chain-any", "any"),
+        ("own-env-hop-any", "any"),
+        ("own-env-one", "any"),
         ("inline-data", "{ q: number; }"),
         // Mapping shapes: main's read, the wrapper's own value (P3).
         ("map-then", "string[]"),

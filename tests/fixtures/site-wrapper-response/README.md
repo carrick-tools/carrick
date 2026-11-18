@@ -89,13 +89,25 @@ row's symbol, as a model reading the wrapper can.
 | `own-chain` | `isUp(p)`, which returns `r.v > 0` | `{ v: number; }` | `boolean` | `boolean` |
 | `own-mapper` | `toDomain(res.data)`, an own mapper | `{ id: string; extra: number; }` | `{ id: string; }` | `{ id: string; }` |
 | `own-maker-hop` | `makeGate(b)`, a maker, one hop down | `{ g: number; }` | `() => Promise<{ g: number; }>` | same as main |
+| `own-env-hop` | `inner(p)`, which returns `{ status: 200, body }` | `{ e: number; }` | `{ status: number; body: { e: number; }; }` | same as main |
+| `own-chain-any` | `isUp(p)` over `http.post<any>` | `unknown` (`declared`, stored `any`) | `boolean` | `boolean` |
+| `own-env-hop-any` | `inner(p)`, an envelope over `http.post<any>` | `unknown` (`declared`, stored `any`) | the envelope | the envelope |
+| `own-env-one` | `{ status: 200, body }` over `http.post<any>`, one hop | `unknown` (`declared`, stored `any`) | the envelope | `unknown` |
 | `pick-tern` | `c ? a(p) : b(p)`, two requests | `{ a: number; } \| { b: number; }` at both | same | each request's own body |
 | `pick-two` | `if (c) return a(p); return b(p);` | `{ a: number; } \| { b: number; }` at both | same | same |
 | `inline-data` | `(await reply.get(u)).data` | `{ q: number; }` | same | same |
 
 A literal default beside the body is the body: the caller holds the body's
 type or the default's, read at the deciding call. A callee's own value is
-the wrapper's own too. Two requests in one conditional are not followed.
+the wrapper's own too: read at the labelled call, it is that call's body,
+or `unknown` where that call states no type. Main stored the wrapper's own
+value there. Two requests in one conditional are not followed.
+
+Open (a ruling): `.catch(() => [])` over `http.post<any>`, declared
+`Promise<Order[]>`, stores `Order[]` on main and `unknown` here, as on this
+PR's first round. Reading it at the deciding call keeps `Order[]` but moves
+`seed-caught-value` from `{ rows: string[]; }` to `{ rows: string[]; } |
+{ rows: string[]; }`, so it is not in this fixture.
 
 Mapping shapes keep main's read, the wrapper's own value; P3 and the
 landing own them: `map-then` (`.then((r) => r.data.items)`, `string[]`),
