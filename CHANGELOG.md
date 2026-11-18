@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.163](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.162...carrick-v0.3.163) (2026-11-18)
+
+
+### Features
+
+* **held:** the early answer states a socket emit break and the re-check confirms it ([#4777](https://github.com/carrick-tools/carrick/issues/4777)) ([24d9e0d](https://github.com/carrick-tools/carrick/commit/24d9e0daaff25f0327177126b7cc7ff97ca2d600))
+
+
+### Bug Fixes
+
+* **check:** a library mark on a carried service no longer refuses the re-check ([#4811](https://github.com/carrick-tools/carrick/issues/4811)) ([04935be](https://github.com/carrick-tools/carrick/commit/04935becb556bdb96643f22f02808cefd39a0a13))
+* **discovery:** bound one top-level builder read at 50,000 steps ([#3766](https://github.com/carrick-tools/carrick/issues/3766)) ([#4813](https://github.com/carrick-tools/carrick/issues/4813)) ([a0008ef](https://github.com/carrick-tools/carrick/commit/a0008efb69bd89beeba49b53f334a169525894ff))
+* **engine:** a death at the capture keeps a typed stored index too ([#4145](https://github.com/carrick-tools/carrick/issues/4145)) ([#4817](https://github.com/carrick-tools/carrick/issues/4817)) ([2993c0d](https://github.com/carrick-tools/carrick/commit/2993c0dc4aaeac45607d19d77ad26d12222dfcbe))
+* **engine:** the analysis's own library store ask runs on a task of its own ([#4810](https://github.com/carrick-tools/carrick/issues/4810)) ([#4815](https://github.com/carrick-tools/carrick/issues/4815)) ([118b752](https://github.com/carrick-tools/carrick/commit/118b752b16bc77fbd7beb5516fe035136383fbd4))
+* **graphql:** an enum read as a type that cannot hold a string is a break ([#4747](https://github.com/carrick-tools/carrick/issues/4747)) ([#4784](https://github.com/carrick-tools/carrick/issues/4784)) ([2e1f17b](https://github.com/carrick-tools/carrick/commit/2e1f17bf4868f87900f6cb8fe768c99dfbf31ef0))
+* **manifest:** every socket emit site gets its own type entry and verdict ([#4780](https://github.com/carrick-tools/carrick/issues/4780)) ([1250d11](https://github.com/carrick-tools/carrick/commit/1250d11de3390a933967928637b4b8957999e535)), closes [#4779](https://github.com/carrick-tools/carrick/issues/4779)
+* **pr:** a removed HTTP route or procedure served by an unread registration the PR wrote is a candidate break row ([#3225](https://github.com/carrick-tools/carrick/issues/3225)) ([#4801](https://github.com/carrick-tools/carrick/issues/4801)) ([8bc98c9](https://github.com/carrick-tools/carrick/commit/8bc98c93f1a8c2b13773b0c1ad017b47a9a33fca))
+* **recheck:** verdict against a changed, un-reread service says so ([#4773](https://github.com/carrick-tools/carrick/issues/4773)) ([#4818](https://github.com/carrick-tools/carrick/issues/4818)) ([7e43b6d](https://github.com/carrick-tools/carrick/commit/7e43b6d68c7ace9b6c5b7024bf9a4540c151bf6b))
+* **scan:** name the file a slow discovery step is on, at info ([#3766](https://github.com/carrick-tools/carrick/issues/3766)) ([#4812](https://github.com/carrick-tools/carrick/issues/4812)) ([7cc23bc](https://github.com/carrick-tools/carrick/commit/7cc23bc8e361282d3585d8c1b0166c675c9491fc))
+* **sidecar:** a consumer call result that is a bare type parameter or a generic library class states no type ([#4513](https://github.com/carrick-tools/carrick/issues/4513) P1) ([#4791](https://github.com/carrick-tools/carrick/issues/4791)) ([a5eae5e](https://github.com/carrick-tools/carrick/commit/a5eae5eaec741f6cf2282be142de6efca185508c))
+* **sidecar:** a declared handler with no success reply body decides no_success_payload (T2a) ([#4795](https://github.com/carrick-tools/carrick/issues/4795)) ([74d38b4](https://github.com/carrick-tools/carrick/commit/74d38b4a6b24606f89b0715b6b49f53e22ce96f7))
+* **upload:** every presigned S3 PUT names its Content-Length, zero included ([#4809](https://github.com/carrick-tools/carrick/issues/4809)) ([6ea2fc2](https://github.com/carrick-tools/carrick/commit/6ea2fc2faebdd05ee59d3afa147f4eff85ef1a49))
+
 ## [0.3.162](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.161...carrick-v0.3.162) (2026-11-18)
 
 
