@@ -97,7 +97,7 @@ export function parseTscOutput(stdout: string): RawDiagnostic[] {
 }
 
 /** Assignment-class codes: a real structural mismatch on the value assignment. */
-const ASSIGNMENT_CODES = new Set([2322, 2559, 2739, 2740, 2741, 2769, 2345]);
+export const ASSIGNMENT_CODES = new Set([2322, 2559, 2739, 2740, 2741, 2769, 2345]);
 
 function sideForGate(name: GateName, plan: ProbePlan): { side: Side; kind: string } {
   const [which, kind] = name.split(':');

@@ -775,6 +775,44 @@ export interface CheckVerdict {
    * one out. `no_program`: no program could be built to walk it in.
    */
   foreign_kind?: 'hit' | 'budget' | 'no_program';
+  /**
+   * On an `incompatible` verdict only, and on every one: what the relaxed
+   * re-check found (incompatible-rule T1). It changes nothing else about the
+   * verdict; the scanner's relabel reads it.
+   */
+  break_evidence?: BreakEvidence;
+}
+
+/** A kind of difference the relaxed re-check can allow (`NOT_PROVEN_KINDS`). */
+export type NotProvenKind =
+  | 'open_value'
+  | 'null_where_optional'
+  | 'null_where_required'
+  | 'weak_type'
+  | 'listed_value';
+
+/**
+ * Whether an incompatible pair still differs once kinds of difference that
+ * prove no break are allowed, decided by the compiler over the exact types
+ * the judge compared.
+ */
+export interface BreakEvidence {
+  /**
+   * `true` when a difference remains with every kind allowed, AND whenever
+   * the re-check could not decide (`cause` says why). `false` only when the
+   * re-check ran to its end and the pair fits with some set of kinds allowed.
+   */
+  proven: boolean;
+  /** When not proven: the smallest set of kinds that, allowed together, makes the pair fit. Empty when proven. */
+  kinds: NotProvenKind[];
+  /**
+   * When not proven: every minimal set of kinds that makes the pair fit, the
+   * smallest first. A relabel that allows a set of kinds demotes the pair
+   * only when one of these lies inside it. Empty when proven.
+   */
+  passing: NotProvenKind[][];
+  /** When proven: why, in words (a difference remains, or what stopped the re-check). */
+  cause?: string;
 }
 
 /**
@@ -826,6 +864,8 @@ export interface CheckPhaseMs {
   tsc: number;
   probe_program: number;
   classify: number;
+  /** The relaxed re-check over the incompatible pairs (incompatible-rule T1); 0 when no pair was incompatible. */
+  relaxed: number;
 }
 
 /** How the check's compiler process ended. */
@@ -855,6 +895,14 @@ export interface CheckOptions {
    * 7's native tsc (`judgeTscPath`). Tests inject a stand-in to pin the
    * abnormal-termination path. */
   tscPath?: string;
+  /** The tsc CLI for the relaxed re-check only. Defaults to `tscPath`'s
+   * compiler. Tests inject a stand-in to pin that a failed re-check changes
+   * no verdict. */
+  relaxedTscPath?: string;
+  /** Total time cap for the relaxed re-check's compile, in ms (default
+   * `relaxedLimitMs`). Past it no evidence is made: every incompatible pair
+   * reads proven, with the cause. */
+  relaxedTimeoutMs?: number;
   /** Total time cap for the workspace install, in ms (default 1800000, or
    * `CARRICK_CHECK_INSTALL_TIMEOUT_MS`). Past it the install is killed and
    * every pair reads unverifiable with gate `install:timeout` (carrick#3021). */
