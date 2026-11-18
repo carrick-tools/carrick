@@ -495,6 +495,7 @@ mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
             package: "fixture-router".into(),
             export: "Router".into(),
             member: Some("get".into()),
