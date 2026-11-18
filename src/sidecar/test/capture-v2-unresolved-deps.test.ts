@@ -137,6 +137,7 @@ describe('capture v2: declared dependencies that do not resolve', () => {
     });
     const result = captureStub({
       repoRoot,
+      scanRoot: path.join(root, 'ws'),
       serviceName: 'hoisted-svc',
       outDir: path.join(root, 'stub'),
       anchors: [ANCHOR],
