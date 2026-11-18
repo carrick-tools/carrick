@@ -39,7 +39,26 @@ pub fn producer_reads_request_body(method: &str) -> bool {
     )
 }
 
-pub fn build_display_name(key: &OperationKey, type_kind: &str) -> String {
+/// The name a compiler diagnostic quotes for one manifest type. Display only:
+/// the manifest's `type_alias` is the key, and this string is swapped in for
+/// it in user-facing text (carrick#4774).
+///
+/// A socket or pub/sub pair is a sent payload and an expected payload, not a
+/// request and a response, so the two sides carry two different names: the
+/// emitter or publisher (the consumer entry) is `sent payload`, the listener
+/// or subscriber (the producer entry) is `expected payload`. Every other
+/// protocol keeps `Request` / `Response`.
+pub fn build_display_name(key: &OperationKey, role: ManifestRole, type_kind: &str) -> String {
+    if matches!(
+        key,
+        OperationKey::Socket { .. } | OperationKey::Pubsub { .. }
+    ) {
+        let side = match role {
+            ManifestRole::Consumer => "sent payload",
+            ManifestRole::Producer => "expected payload",
+        };
+        return format!("{} → {}", key, side);
+    }
     let kind = if type_kind.is_empty() {
         type_kind.to_string()
     } else {
@@ -556,17 +575,73 @@ mod tests {
     #[test]
     fn test_build_display_name() {
         assert_eq!(
-            build_display_name(&OperationKey::http("GET", "/users/:param"), "response"),
+            build_display_name(
+                &OperationKey::http("GET", "/users/:param"),
+                ManifestRole::Producer,
+                "response"
+            ),
             "GET /users/:param → Response"
         );
         assert_eq!(
-            build_display_name(&OperationKey::http("POST", "/api/orders"), "request"),
+            build_display_name(
+                &OperationKey::http("POST", "/api/orders"),
+                ManifestRole::Consumer,
+                "request"
+            ),
             "POST /api/orders → Request"
         );
         assert_eq!(
-            build_display_name(&OperationKey::http("DELETE", "/items/:id"), "Response"),
+            build_display_name(
+                &OperationKey::http("DELETE", "/items/:id"),
+                ManifestRole::Producer,
+                "Response"
+            ),
             "DELETE /items/:id → Response"
         );
+    }
+
+    /// carrick#4774: a message pair's two sides read differently in a
+    /// diagnostic that quotes both; an HTTP pair keeps Request / Response.
+    #[test]
+    fn a_socket_pair_names_the_sent_and_the_expected_payload() {
+        let key = OperationKey::Socket {
+            event: "orders:subscribe".to_string(),
+            direction: crate::operation::SocketDirection::ClientToServer,
+        };
+        assert_eq!(
+            build_display_name(&key, ManifestRole::Consumer, "response"),
+            "orders:subscribe (client→server) → sent payload"
+        );
+        assert_eq!(
+            build_display_name(&key, ManifestRole::Producer, "response"),
+            "orders:subscribe (client→server) → expected payload"
+        );
+    }
+
+    #[test]
+    fn a_pubsub_pair_names_the_sent_and_the_expected_payload() {
+        let key = OperationKey::Pubsub {
+            topic: "orders.shipped".to_string(),
+        };
+        assert_eq!(
+            build_display_name(&key, ManifestRole::Consumer, "response"),
+            "orders.shipped (pub/sub) → sent payload"
+        );
+        assert_eq!(
+            build_display_name(&key, ManifestRole::Producer, "response"),
+            "orders.shipped (pub/sub) → expected payload"
+        );
+    }
+
+    #[test]
+    fn an_http_pair_keeps_request_and_response_names_on_both_roles() {
+        let key = OperationKey::http("GET", "/api/orders");
+        for role in [ManifestRole::Producer, ManifestRole::Consumer] {
+            assert_eq!(
+                build_display_name(&key, role, "response"),
+                "GET /api/orders → Response"
+            );
+        }
     }
 
     // ---- carrick#780: the placeholder says which it is ---------------------
