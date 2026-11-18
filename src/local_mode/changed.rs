@@ -615,6 +615,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &rejoined.join,
         &wanted,
         &touched_since_index(&index, &trees),
+        &super::recheck::library_marked(&rejoined.index, &rejoined.rescanned),
     );
     super::recheck::took("check/judge", began);
     let began = Instant::now();
@@ -1122,6 +1123,7 @@ pub(super) fn judge(
     join: &super::LocalJoin,
     changed: &BTreeMap<String, &BTreeSet<String>>,
     touched: &Touched,
+    marked: &BTreeSet<String>,
 ) -> Judged {
     // Which repo each service belongs to, and where that repo is, so a row's
     // repo-relative file can be tested against the changed set and printed
@@ -1158,7 +1160,6 @@ pub(super) fn judge(
     };
 
     let strict = states_dispatch(before);
-    let marked = super::recheck::library_marked(rebuilt);
     let mut judged = Judged {
         routes: 0,
         calls: 0,
@@ -1188,7 +1189,7 @@ pub(super) fn judge(
         };
         // A pair with a service whose library rows are missing from the index
         // is not judged, whatever its stored verdict says (carrick#4807).
-        if let Some(service) = missing_library_side(&marked, operation, item) {
+        if let Some(service) = missing_library_side(marked, operation, item) {
             if in_change {
                 judged.not_type_checked.push(NotTypeChecked {
                     file: shown(root, repo_path, &operation.file),
@@ -2470,6 +2471,7 @@ mod tests {
             &join,
             &changed,
             &Touched::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
         judged.problems.into_iter().next().unwrap()
@@ -2555,6 +2557,7 @@ mod tests {
             &join,
             &changed,
             &touched,
+            &BTreeSet::new(),
         )
         .problems
     }
@@ -2687,6 +2690,7 @@ mod tests {
             &join,
             &changed,
             &Touched::new(),
+            &BTreeSet::new(),
         );
 
         assert_eq!(judged.problems.len(), 2, "{:?}", judged.problems);
@@ -2755,6 +2759,7 @@ mod tests {
             &join,
             &changed,
             &Touched::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
         judged.problems[0].clone()
@@ -2818,6 +2823,7 @@ mod tests {
             &join,
             &changed,
             &Touched::new(),
+            &BTreeSet::new(),
         )
         .problems
     }

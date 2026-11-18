@@ -1852,7 +1852,10 @@ fn inside(
         .unwrap_or_default();
     let (moved, inside) = judge_edit(workspace, before, &rejoined, tree, relative, plan);
     state_judged(&mut items, &inside);
-    state_library_missing(&mut items, &library_marked(&rejoined.index));
+    state_library_missing(
+        &mut items,
+        &library_marked(&rejoined.index, &rejoined.rescanned),
+    );
     // No rows where the index held some is an answer, not a failure: the edit
     // took the last route out of this file, and the fresh (empty) list is what
     // says so.
@@ -1991,6 +1994,7 @@ fn judge_edit(
         &rejoined.join,
         &wanted,
         &super::changed::touched_since_index(before, std::slice::from_ref(tree)),
+        &library_marked(&rejoined.index, &rejoined.rescanned),
     );
     let (outside, inside): (Vec<_>, Vec<_>) = judged
         .problems
@@ -2068,12 +2072,14 @@ pub(super) fn library_unavailable<'a>(
     }
 }
 
-/// The services of `rebuilt` whose stored boundary says their library rows
-/// are missing from the index (carrick#4807). A pair with one of them on
-/// either side is not judged: its library rows are not there to pair against.
-/// The sign-in rule is [`library_unavailable`]'s.
+/// The services of `rebuilt` this run carried whose stored boundary says their
+/// library rows are missing from the index (carrick#4807). A pair with one of
+/// them on either side is not judged: its library rows are not there to pair
+/// against. A re-scanned service's own failed ask stops the check instead
+/// ([`library_unavailable`]), and the sign-in rule is that function's.
 pub(super) fn library_marked(
     rebuilt: &super::read_model::LocalIndex,
+    rescanned: &std::collections::BTreeSet<String>,
 ) -> std::collections::BTreeSet<String> {
     use crate::library_store::AskFailure;
     let signed_out = crate::credentials::CloudAuth::detect().is_err();
@@ -2081,6 +2087,7 @@ pub(super) fn library_marked(
         .repos
         .iter()
         .flat_map(|repo| repo.services.iter())
+        .filter(|service| !rescanned.contains(&service.name))
         .filter(|service| {
             match service
                 .boundary
