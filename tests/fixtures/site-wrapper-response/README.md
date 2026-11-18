@@ -64,10 +64,8 @@ and its callers in one file. The helper reads the JSON into its own `T`
 model's row at the helper's own `fetch` (`src/seed-same-file.ts:2`) names no
 call to bind `T`, so it states no type: `unknown`, `bound_by_callers`, never
 `T` in the stored text (`bundled_types`). Before, the stored text was `T`.
-Where a caller is named (`through_call`), the read is typed where the caller
-holds it (`body` of the call's awaited result, with its type argument): the
-sidecar test `infer-call-result-below-wrapper` holds those seeds, because the
-same-file wrapper pass reads these callers at their own call.
+Reading the body where a named caller holds it (`body` of the call's awaited
+result) is P3 of carrick#4513, not yet built.
 
 The `seed-*` rows are carrick#4513's. `seed-chained` holds a member of a
 member, which no one key names, so the response is the labelled call's
@@ -80,6 +78,7 @@ null or void. One that hands back a value of its own stays at the
 labelled call. `seed-generic`'s cassette names `T` as the
 row's symbol, as a model reading the wrapper can.
 
-`keep-retried`, `then-data` and `keep-local-run` move from the deciding call
-to the labelled call; the labelled call holds the wrapper's open `T`, which
-the deciding call binds (carrick#4375), so their types do not change.
+`keep-retried` (`retry(run)`), `then-data` (`.then(fn)`) and
+`keep-local-run` (a local closure's call) end at a call the return pass does
+not follow. That is undecided, so they are read at the deciding call, whole
+(carrick#4513 P2).

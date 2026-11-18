@@ -9374,6 +9374,27 @@ pub(crate) mod tests {
              \x20 return fetch(`${base}/list`).catch(() => []);\n\
              }\n\
              export const listed = () => listOr(\"/l\");\n";
+        // A text read of the `Response`, or no body: the deciding call holds
+        // `string | null`, which the read below loses.
+        const TEXT: &str = "async function readToken(base: string): Promise<string | null> {\n\
+             \x20 const res = await fetch(`${base}/token`);\n\
+             \x20 if (!res.ok) return null;\n\
+             \x20 return res.text();\n\
+             }\n\
+             export const token = () => readToken(\"/t\");\n";
+        const TEXT_NAMED: &str = "async function readNote(base: string): Promise<string | null> {\n\
+             \x20 const res = await fetch(`${base}/note`);\n\
+             \x20 const text = await res.text();\n\
+             \x20 return text;\n\
+             }\n\
+             export const note = () => readNote(\"/n\");\n";
+        // Two requests: the wrapper hands back the second one's value, so the
+        // first one's response is read where it is made.
+        const TWO: &str = "async function both(base: string) {\n\
+             \x20 await fetch(`${base}/first`);\n\
+             \x20 return (await fetch(`${base}/second`)).json();\n\
+             }\n\
+             export const bothSent = () => both(\"/b\");\n";
         let on = super::super::fixture_walk::walked(
             "factory-closure",
             "services/web",
@@ -9387,6 +9408,9 @@ pub(crate) mod tests {
                 ("src/n-cond.ts", COND),
                 ("src/n-cond-named.ts", COND_NAMED),
                 ("src/n-caught-own.ts", CAUGHT_OWN),
+                ("src/n-text.ts", TEXT),
+                ("src/n-text-named.ts", TEXT_NAMED),
+                ("src/n-two.ts", TWO),
             ],
             true,
         )
@@ -9444,10 +9468,27 @@ pub(crate) mod tests {
             ("n-cond.ts", 5, HandBack::Body),
             ("n-cond-named.ts", 6, HandBack::Body),
             ("n-caught-own.ts", 4, HandBack::Other),
+            ("n-text.ts", 6, HandBack::Undecided),
+            ("n-text-named.ts", 6, HandBack::Undecided),
         ] {
             if reads(file, line) != vec![Some(wanted)] {
                 wrong.push(format!("{file}:{line} wanted {wanted:?}"));
             }
+        }
+        // Both requests' sites stand at the caller's line: the first one's
+        // chain ends at the second request, the second one's at its parse.
+        let two: Vec<(u32, Option<HandBack>)> = decided
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with("n-two.ts") && site.line == 5)
+            .map(|site| (site.end.line, site.hands_back))
+            .collect();
+        let mut two = two;
+        two.sort();
+        if two != vec![(2, Some(HandBack::Other)), (3, Some(HandBack::Body))] {
+            wrong.push(format!(
+                "n-two.ts:5 wanted first Other, second Body, got {two:?}"
+            ));
         }
         assert!(wrong.is_empty(), "{wrong:#?}\n{every:#?}");
     }
