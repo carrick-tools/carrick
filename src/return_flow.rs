@@ -406,6 +406,13 @@ pub struct ReturnShape {
     /// or that value, so its chain ends in a value of its own
     /// ([`NoChain::Own`], carrick#4513 P2). In memory only.
     pub caught_own: bool,
+    /// For a `caught_own` base whose handler hands back a literal default
+    /// (`.catch(() => [])`, [`is_literal_default`]): the value `.catch` is
+    /// called on, read as a return. The function hands back that value or
+    /// the default, so its chain follows it (carrick#4513 P2, as
+    /// [`ReturnRead::Defaulted`]). The shape itself stays the `.catch`
+    /// call's value, which [`return_shapes`]' readers read. In memory only.
+    pub caught: Option<Box<ReturnShape>>,
 }
 
 /// Why a function's returns are no chain to one call's value (carrick#4513
@@ -1293,6 +1300,7 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
             base,
             member: None,
             caught_own: false,
+            caught: None,
         }))
     };
     let member = |base, name: Option<String>| {
@@ -1301,6 +1309,7 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
             base,
             member: name,
             caught_own: false,
+            caught: None,
         }))
     };
     match value.expr {
@@ -1319,12 +1328,28 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
             }
             // `call.catch(() => [])`: the call's value or one of the
             // function's own (a no-body handler was resolved through above).
-            _ if catches_own_value(call) => Some(Returned::Shape(ReturnShape {
-                kind: ShapeKind::Value,
-                base: call.span,
-                member: None,
-                caught_own: true,
-            })),
+            // A literal default is the value or the default: the chain
+            // follows the value `.catch` is called on.
+            _ if catches_own_value(call) => {
+                let caught = match catch_handler(call) {
+                    Some((receiver, _)) if catches_literal_default(call) => {
+                        match classify(receiver, scope) {
+                            Some(Returned::Shape(inner) | Returned::Defaulted(inner)) => {
+                                Some(Box::new(inner))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                Some(Returned::Shape(ReturnShape {
+                    kind: ShapeKind::Value,
+                    base: call.span,
+                    member: None,
+                    caught_own: true,
+                    caught,
+                }))
+            }
             _ => shape(ShapeKind::Value, call.span),
         },
         Expr::OptChain(chain) => match &*chain.base {
@@ -1425,12 +1450,27 @@ fn catch_handler(call: &CallExpr) -> Option<(&Expr, &swc_ecma_ast::ExprOrSpread)
 /// its own on every path (`() => []`, `() => ({ rows: [] })`), read with no
 /// name followed: one that rethrows or hands back a call is not.
 fn catches_own_value(call: &CallExpr) -> bool {
+    let scope = Scope::default();
+    catch_hands_back(call, |expr| {
+        classify(expr, &scope).is_none() && unshaped(expr, &scope) == NoChain::Own
+    })
+}
+
+/// Whether `call` is `.catch(handler)` whose handler hands back a literal
+/// default on every path ([`is_literal_default`]: `() => []`, `() => ({
+/// rows: [] })`).
+fn catches_literal_default(call: &CallExpr) -> bool {
+    let scope = Scope::default();
+    catch_hands_back(call, |expr| is_literal_default(expr, &scope))
+}
+
+/// Whether `call` is `.catch(handler)` whose handler's every return passes
+/// `test`, read with no name followed.
+fn catch_hands_back(call: &CallExpr, test: impl Fn(&Expr) -> bool) -> bool {
     let Some((_, handler)) = catch_handler(call) else {
         return false;
     };
-    let scope = Scope::default();
-    let own =
-        |expr: &Expr| classify(expr, &scope).is_none() && unshaped(expr, &scope) == NoChain::Own;
+    let own = |expr: &Expr| test(expr);
     match &*handler.expr {
         Expr::Arrow(arrow) => match &*arrow.body {
             ArrowFunctionBody::Expr(expr) => own(expr),
@@ -1774,6 +1814,16 @@ mod tests {
             );
             assert_eq!(whole_shape(source), None, "{source}");
         }
+        // `.catch(() => [])`: the shape stays the `.catch` call's value, as
+        // main's readers read it; the chain follows the value it is called on.
+        let whole = whole_shape("function f(o) { return call(o); }").expect("a call's value");
+        let caught = whole_shape("function f(o) { return call(o).catch(() => []); }")
+            .expect("the catch's value");
+        assert_ne!(caught.base, whole.base);
+        assert_eq!(caught.caught.as_deref(), Some(&whole));
+        let own = whole_shape("function f(o) { return call(o).catch(() => `no ${o}`); }")
+            .expect("the catch's value");
+        assert!(own.caught_own && own.caught.is_none(), "{own:?}");
         for source in [
             "async function f(o) { await call(o); return true; }",
             "async function f(o) { const r = await call(o); if (!r.data) return () => 1; return r.data; }",

@@ -55,7 +55,7 @@ deciding call.
 | `seed-widen` | `res.data \|\| null` | `string \| null` | `string` |
 | `seed-widen-caught` | `res.data`, or `null` from a `catch` | `string \| null` | same |
 | `seed-caught-void` | `.catch(() => {})`, a no-body path | `void \| { gone: boolean; }` | `{ gone: boolean; }` |
-| `seed-caught-value` | `.catch(() => ({ rows: [] }))`, a value of its own | `{ rows: string[]; }` | same |
+| `seed-caught-value` | `.catch(() => ({ rows: [] }))`, the value or a literal default | `{ rows: string[]; } \| { rows: string[]; }` (main's text, read at the deciding call) | same |
 | `seed-envelope` | `{ body, response }` over an unlabelled `fetch`, body unstated | `unknown` | same |
 
 `seed-same-file` (carrick#4513, the box's shape) declares a generic helper
@@ -103,11 +103,12 @@ the wrapper's own too: read at the labelled call, it is that call's body,
 or `unknown` where that call states no type. Main stored the wrapper's own
 value there. Two requests in one conditional are not followed.
 
-Open (a ruling): `.catch(() => [])` over `http.post<any>`, declared
-`Promise<Order[]>`, stores `Order[]` on main and `unknown` here, as on this
-PR's first round. Reading it at the deciding call keeps `Order[]` but moves
-`seed-caught-value` from `{ rows: string[]; }` to `{ rows: string[]; } |
-{ rows: string[]; }`, so it is not in this fixture.
+A `.catch` whose handler hands back a literal default (`.catch(() => [])`)
+is the value or the default too, read at the deciding call: `fb-catch`
+(`.catch(() => [])` over `http.post<any>`, declared `Promise<Order[]>`)
+keeps main's `Order[]`, and `seed-caught-value` keeps main's text, `{ rows:
+string[]; } | { rows: string[]; }`. The duplicated member is the printer's,
+an existing defect this answer key does not fix.
 
 Mapping shapes keep main's read, the wrapper's own value; P3 and the
 landing own them: `map-then` (`.then((r) => r.data.items)`, `string[]`),

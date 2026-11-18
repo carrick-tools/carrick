@@ -12040,6 +12040,9 @@ impl Composer<'_> {
         // A literal default beside the value is the value's chain: the caller
         // holds the body's type or the default's (carrick#4513 P2).
         let shape = ir.return_read.chain()?;
+        // `call.catch(() => [])` with a literal default: the value `.catch`
+        // is called on, or the default.
+        let shape = shape.caught.as_deref().unwrap_or(shape);
         let call = ir
             .calls
             .iter()

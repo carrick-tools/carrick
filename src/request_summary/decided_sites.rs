@@ -9332,7 +9332,8 @@ pub(crate) mod tests {
     /// object, until P3) is read at the labelled call; one it does not follow
     /// (`new P(executor)`, `new P(promise)`, a library call holding the chain
     /// in its callback) at the deciding call, whole. `c ? body : null` is the
-    /// body or no body, and `.catch(() => [])` a value of its own.
+    /// body or no body. `.catch(() => [])` is the value or a literal default,
+    /// and a handler that builds a template of its own a value of its own.
     #[test]
     fn a_wrapper_with_no_chain_says_whether_it_made_its_value_or_did_not_follow_it() {
         use crate::return_flow::HandBack;
@@ -9373,10 +9374,18 @@ pub(crate) mod tests {
              \x20 return (out);\n\
              }\n\
              export const heldRead = () => held(\"/n\", true);\n";
+        // A handler that makes a value of its own that is no literal (a
+        // template with an expression): that value, read below.
         const CAUGHT_OWN: &str = "function listOr(base: string) {\n\
-             \x20 return fetch(`${base}/list`).catch(() => []);\n\
+             \x20 return fetch(`${base}/list`).catch(() => `failed ${base}`);\n\
              }\n\
              export const listed = () => listOr(\"/l\");\n";
+        // A literal default (round 2): the `fetch`'s value or `[]`, the
+        // `Response` whole, followed at the deciding call.
+        const CAUGHT_DEFAULT: &str = "function listOrEmpty(base: string) {\n\
+             \x20 return fetch(`${base}/empty`).catch(() => []);\n\
+             }\n\
+             export const listedEmpty = () => listOrEmpty(\"/l\");\n";
         // A text read of the `Response`, or no body: the deciding call holds
         // `string | null`, which the read below loses.
         const TEXT: &str = "async function readToken(base: string): Promise<string | null> {\n\
@@ -9411,6 +9420,7 @@ pub(crate) mod tests {
                 ("src/n-cond.ts", COND),
                 ("src/n-cond-named.ts", COND_NAMED),
                 ("src/n-caught-own.ts", CAUGHT_OWN),
+                ("src/n-caught-default.ts", CAUGHT_DEFAULT),
                 ("src/n-text.ts", TEXT),
                 ("src/n-text-named.ts", TEXT_NAMED),
                 ("src/n-two.ts", TWO),
@@ -9471,6 +9481,7 @@ pub(crate) mod tests {
             ("n-cond.ts", 5, HandBack::Body),
             ("n-cond-named.ts", 6, HandBack::Body),
             ("n-caught-own.ts", 4, HandBack::Other),
+            ("n-caught-default.ts", 4, HandBack::Undecided),
             ("n-text.ts", 6, HandBack::Undecided),
             ("n-text-named.ts", 6, HandBack::Undecided),
         ] {

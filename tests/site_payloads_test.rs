@@ -761,13 +761,19 @@ fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
         ("seed-widen-caught", "string | null"),
         ("seed-envelope", "unknown"),
         ("seed-caught-void", "void | { gone: boolean; }"),
-        ("seed-caught-value", "{ rows: string[]; }"),
+        // Main's stored text, read at the deciding call. The duplicated
+        // member is the printer's (a separate defect), not this read's.
+        (
+            "seed-caught-value",
+            "{ rows: string[]; } | { rows: string[]; }",
+        ),
         // The review of carrick#4805 (round 2): a literal default beside
         // the body is the body (main's read, kept).
         ("fb-coalesce", "import(\"./src/fb-coalesce-lib\").Order[]"),
         ("fb-or", "import(\"./src/fb-or-lib\").Order[]"),
         ("fb-if", "import(\"./src/fb-if-lib\").Order[]"),
         ("fb-tern", "import(\"./src/fb-tern-lib\").Order[]"),
+        ("fb-catch", "import(\"./src/fb-catch-lib\").Order[]"),
         // A callee's own value is the wrapper's own.
         ("own-chain", "{ v: number; }"),
         ("own-mapper", "{ id: string; extra: number; }"),
