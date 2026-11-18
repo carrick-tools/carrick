@@ -1583,7 +1583,14 @@ fn a_file_names_who_calls_its_functions() {
             ("src/inventory.ts".to_string(), 17)
         ]
     );
-    let type_line = "- type Widget (line 3) is the response type of GET /api/v1/widgets/:encoded at 2 call(s): src/inventory.ts:9, src/inventory.ts:17. Producers: catalog-web app/routes/api.v1.widgets.$widgetId.ts:11";
+    // The producer is in another repo, so its line names the commit it is true
+    // at (T4).
+    let producer = check_json(root, "catalog-web/app/routes/api.v1.widgets.$widgetId.ts");
+    let producer_commit = producer["index_commit"].as_str().expect("commit");
+    let type_line = format!(
+        "- type Widget (line 3) is the response type of GET /api/v1/widgets/:encoded at 2 call(s): src/inventory.ts:9, src/inventory.ts:17. Producers: catalog-web app/routes/api.v1.widgets.$widgetId.ts:11 (line as of {})",
+        &producer_commit[..7]
+    );
     let line = "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17";
     assert_eq!(client["uses_lines"], serde_json::json!([type_line, line]));
 
@@ -1643,6 +1650,84 @@ fn a_file_names_who_calls_its_functions() {
     assert_eq!(
         check_json(root, "inventory-svc/src/inventory.ts")["items"],
         items_before
+    );
+}
+
+/// A line number about a file the tree holds differently from the index points
+/// at other code, so it is withheld (the local-copy refresh plan, T4): the
+/// queried file's own lines when it changed, each caller's when that caller's
+/// file changed. A file the tree still holds as indexed keeps its line, and a
+/// file in another repo keeps its line with the commit it is true at.
+#[test]
+#[serial]
+fn a_line_about_a_changed_file_is_not_stated() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let client_file = root.join("inventory-svc/src/client.ts");
+    let caller_file = root.join("inventory-svc/src/inventory.ts");
+
+    // Nothing changed: every line is the index's.
+    let before = check_json(root, "inventory-svc/src/client.ts");
+    let lines = before["uses_lines"].to_string();
+    assert!(
+        lines.contains("CatalogClient.readWidget (line 12)"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("src/inventory.ts:9, src/inventory.ts:17"),
+        "{lines}"
+    );
+
+    // A caller's file changed, the queried file did not: the caller is named
+    // by file, the function keeps its line, and the count is unchanged.
+    edit(
+        &caller_file,
+        "export async function countActive(",
+        "// two lines\n// inserted above\nexport async function countActive(",
+    );
+    let caller_moved = check_json(root, "inventory-svc/src/client.ts");
+    let function = &caller_moved["uses"]["functions"][0];
+    assert_eq!(function["line"], serde_json::json!(12), "{caller_moved:#}");
+    assert_eq!(function["callers_total"], serde_json::json!(2));
+    assert_eq!(function["callers"][0]["line"], serde_json::json!(0));
+    assert_eq!(
+        caller_moved["uses_lines"][0],
+        serde_json::json!(
+            "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts (changed since the index), src/inventory.ts (changed since the index)"
+        ),
+        "{caller_moved:#}"
+    );
+
+    // The queried file changed, its caller did not: the function is named with
+    // no line, and the unchanged caller keeps its.
+    git(
+        &workspace.path().join("inventory-svc"),
+        &["checkout", "-q", "--", "."],
+    );
+    edit(
+        &client_file,
+        "export class CatalogClient",
+        "// two lines\n// inserted above\nexport class CatalogClient",
+    );
+    let own_moved = check_json(root, "inventory-svc/src/client.ts");
+    assert_eq!(
+        own_moved["uses_lines"][0],
+        serde_json::json!(
+            "- CatalogClient.readWidget has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17"
+        ),
+        "{own_moved:#}"
+    );
+
+    // The file that calls the changed one names it by file, and its own
+    // function keeps its line.
+    let send = check_json(root, "inventory-svc/src/send.ts");
+    assert_eq!(
+        send["uses_lines"],
+        serde_json::json!([
+            "- send (line 9) has 1 caller(s) outside this file: src/client.ts (changed since the index)"
+        ]),
+        "{send:#}"
     );
 }
 

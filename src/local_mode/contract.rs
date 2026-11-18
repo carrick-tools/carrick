@@ -163,10 +163,38 @@ pub struct Counterpart {
     /// the one the queried file lives in.
     pub file: String,
     pub line: Option<u32>,
+    /// Why `line` is absent or how far to trust it ([`LineNote`]), in the
+    /// words a reader sees after the location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_note: Option<String>,
     /// The absolute path of that repo on this machine, so a reader can open
     /// `repo/file` instead of guessing which directory `file` hangs off
     /// (carrick#709). `None` when the index no longer holds that repo.
     pub repo: Option<String>,
+}
+
+/// What a location's line number is worth (the local-copy refresh plan, T4).
+///
+/// The index records the line a thing had at its commit. A file the working
+/// tree holds differently has moved those lines, so the line is withheld and
+/// the note says why; a file in another repo is not compared with its own
+/// tree, so its line stays and names the commit it is true at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineNote {
+    /// The file differs from the index's commit; no line is stated.
+    Changed,
+    /// The line is true of this commit of another repo.
+    AsOf(String),
+}
+
+impl LineNote {
+    /// The words a reader sees after the location.
+    pub fn text(&self) -> String {
+        match self {
+            LineNote::Changed => "changed since the index".to_string(),
+            LineNote::AsOf(commit) => format!("line as of {}", &commit[..commit.len().min(7)]),
+        }
+    }
 }
 
 /// What the index concluded about one row.
@@ -412,6 +440,8 @@ pub struct Caller {
     pub line: u32,
     /// The calling function, or `<module>` for a call at the top of a file.
     pub function: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_note: Option<String>,
 }
 
 /// A type this file declares, and the operations in other files that read it.
@@ -438,6 +468,8 @@ pub struct TypeOperation {
     pub path: String,
     pub file: String,
     pub line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_note: Option<String>,
     /// The other side of that operation, as [`Item::counterparts`] states it.
     pub counterparts: Vec<Counterpart>,
 }
@@ -476,7 +508,13 @@ impl Uses {
                 let sites: Vec<String> = members
                     .iter()
                     .map(|operation| {
-                        locator(&operation.service, service, &operation.file, operation.line)
+                        locator(
+                            &operation.service,
+                            service,
+                            &operation.file,
+                            operation.line,
+                            operation.line_note.as_deref(),
+                        )
                     })
                     .collect();
                 let mut counterparts: Vec<&Counterpart> = Vec::new();
@@ -544,7 +582,15 @@ impl Uses {
             let callers: Vec<String> = function
                 .callers
                 .iter()
-                .map(|caller| locator(&caller.service, service, &caller.file, caller.line))
+                .map(|caller| {
+                    locator(
+                        &caller.service,
+                        service,
+                        &caller.file,
+                        caller.line,
+                        caller.line_note.as_deref(),
+                    )
+                })
                 .collect();
             lines.push(format!(
                 "- {}{} has {} caller(s) outside this file: {}",
@@ -568,16 +614,20 @@ fn at_line(line: u32) -> String {
 }
 
 /// `file:line`, prefixed with the service when it is not the queried file's.
-fn locator(of: &str, queried: &str, file: &str, line: u32) -> String {
+fn locator(of: &str, queried: &str, file: &str, line: u32, note: Option<&str>) -> String {
     let prefix = if of == queried {
         String::new()
     } else {
         format!("{of} ")
     };
-    if line > 0 {
+    let place = if line > 0 {
         format!("{prefix}{file}:{line}")
     } else {
         format!("{prefix}{file}")
+    };
+    match note {
+        Some(note) => format!("{place} ({note})"),
+        None => place,
     }
 }
 
@@ -588,7 +638,10 @@ fn counterpart_locator(counterpart: &Counterpart) -> String {
         _ if !counterpart.file.is_empty() => counterpart.file.clone(),
         _ => "an unnamed file".to_string(),
     };
-    format!("{} {place}", counterpart.service)
+    match &counterpart.line_note {
+        Some(note) => format!("{} {place} ({note})", counterpart.service),
+        None => format!("{} {place}", counterpart.service),
+    }
 }
 
 /// The first [`MAX_USE_LOCATORS`] of `shown`, then `, and N more` against
@@ -1332,6 +1385,7 @@ mod tests {
                     service: "admin-ui".to_string(),
                     file: "src/api.ts".to_string(),
                     line: Some(44),
+                    line_note: None,
                     repo: Some("/repos/admin-ui".to_string()),
                 }],
                 verdict: None,
@@ -1361,6 +1415,7 @@ mod tests {
             file: file.into(),
             line,
             function: "f".into(),
+            line_note: None,
         }
     }
 
@@ -1380,6 +1435,7 @@ mod tests {
             service: service.into(),
             file: file.into(),
             line: Some(line),
+            line_note: None,
             repo: None,
         }
     }
@@ -1399,6 +1455,7 @@ mod tests {
             path: path.into(),
             file: site.0.into(),
             line: site.1,
+            line_note: None,
             counterparts,
         }
     }
