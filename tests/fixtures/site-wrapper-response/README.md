@@ -78,6 +78,31 @@ null or void. One that hands back a value of its own stays at the
 labelled call. `seed-generic`'s cassette names `T` as the
 row's symbol, as a model reading the wrapper can.
 
+## The review of carrick#4805 (round 2)
+
+| Row | Wrapper hands back | Wanted response | Main | carrick#4805 before round 2 |
+|---|---|---|---|---|
+| `fb-coalesce` | `res.data ?? []` over `reply.get<any>`, declared `Promise<Order[]>` | `Order[]` | same | `any` (`declared`) |
+| `fb-or` | `res.data \|\| []` | `Order[]` | same | `any` |
+| `fb-if` | `if (!res.data) return []; return res.data;` | `Order[]` | same | `any` |
+| `fb-tern` | `res.data ? res.data : []` | `Order[]` | same | `any` |
+| `own-chain` | `isUp(p)`, which returns `r.v > 0` | `{ v: number; }` | `boolean` | `boolean` |
+| `own-mapper` | `toDomain(res.data)`, an own mapper | `{ id: string; extra: number; }` | `{ id: string; }` | `{ id: string; }` |
+| `own-maker-hop` | `makeGate(b)`, a maker, one hop down | `{ g: number; }` | `() => Promise<{ g: number; }>` | same as main |
+| `pick-tern` | `c ? a(p) : b(p)`, two requests | `{ a: number; } \| { b: number; }` at both | same | each request's own body |
+| `pick-two` | `if (c) return a(p); return b(p);` | `{ a: number; } \| { b: number; }` at both | same | same |
+| `inline-data` | `(await reply.get(u)).data` | `{ q: number; }` | same | same |
+
+A literal default beside the body is the body: the caller holds the body's
+type or the default's, read at the deciding call. A callee's own value is
+the wrapper's own too. Two requests in one conditional are not followed.
+
+Mapping shapes keep main's read, the wrapper's own value; P3 and the
+landing own them: `map-then` (`.then((r) => r.data.items)`, `string[]`),
+`map-array` (`.data.map(fromDto)`, `number[]`), `map-new` (`new
+User(data)`, `User`), `map-index` (`.data[0]`, `{ id: string; }`) and
+`map-db` (a request, then a database read, `{ row: number; }`).
+
 `keep-retried` (`retry(run)`), `then-data` (`.then(fn)`) and
 `keep-local-run` (a local closure's call) end at a call the return pass does
 not follow. That is undecided, so they are read at the deciding call, whole

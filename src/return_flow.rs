@@ -427,6 +427,14 @@ pub enum NoChain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnRead {
     Shape(ReturnShape),
+    /// The shape's value or a literal default of the function's own: `res.data
+    /// ?? []`, `res.data || 'none'`, `res.data ? res.data : []`, or `if
+    /// (!res.data) return []; return res.data`. The caller holds the body's
+    /// type or the default's, so the chain is the shape's (carrick#4513 P2).
+    /// [`Self::shape`] is `None` for it, as before this read: the request
+    /// summaries' flags and call-through read [`return_shapes`], and they
+    /// take this answer with the rest of Q1 (READY-4513-finish T2, T3).
+    Defaulted(ReturnShape),
     NoShape(NoChain),
 }
 
@@ -441,7 +449,17 @@ impl ReturnRead {
     pub fn shape(&self) -> Option<&ReturnShape> {
         match self {
             Self::Shape(shape) => Some(shape),
-            Self::NoShape(_) => None,
+            Self::Defaulted(_) | Self::NoShape(_) => None,
+        }
+    }
+
+    /// The shape whose value the function hands back, with or without a
+    /// literal default ([`Self::Defaulted`]): what its chain of returns
+    /// follows.
+    pub fn chain(&self) -> Result<&ReturnShape, NoChain> {
+        match self {
+            Self::Shape(shape) | Self::Defaulted(shape) => Ok(shape),
+            Self::NoShape(why) => Err(*why),
         }
     }
 }
@@ -989,15 +1007,25 @@ impl HeldWalk {
 /// One function's [`ReturnRead`]. A return that is no shape is a value of
 /// the function's own or one not followed ([`unshaped`]); any return not
 /// followed makes the whole unfollowed, and so do shapes that are not one
-/// (several calls, two members). Otherwise a value of its own on any path
-/// makes the whole its own (READY-4513-finish D2).
+/// (several calls, two members). A literal default on a path beside one
+/// shape is [`ReturnRead::Defaulted`]. Otherwise a value of its own on any
+/// path makes the whole its own (READY-4513-finish D2).
 fn read_of(returned: &[&Expr], scope: &Scope) -> ReturnRead {
     let mut shapes = Vec::new();
     let mut own = false;
+    // A return of a literal default beside the call's value (`if (!res.data)
+    // return []; return res.data;`): the value or the default (carrick#4513
+    // P2), as `res.data ?? []` is.
+    let mut defaulted = false;
     for expr in returned {
         match classify(expr, scope) {
             Some(Returned::NoBody) => {}
             Some(Returned::Shape(shape)) => shapes.push(shape),
+            Some(Returned::Defaulted(shape)) => {
+                shapes.push(shape);
+                defaulted = true;
+            }
+            None if is_literal_default(expr, scope) => defaulted = true,
             None => match unshaped(expr, scope) {
                 NoChain::Own => own = true,
                 NoChain::Unfollowed => return ReturnRead::NoShape(NoChain::Unfollowed),
@@ -1007,18 +1035,22 @@ fn read_of(returned: &[&Expr], scope: &Scope) -> ReturnRead {
     if own {
         return ReturnRead::NoShape(NoChain::Own);
     }
+    let shaped = |shape: &ReturnShape| match defaulted {
+        true => ReturnRead::Defaulted(shape.clone()),
+        false => ReturnRead::Shape(shape.clone()),
+    };
     // Several returns that hand back the same call's value, or its parse,
     // are one shape (carrick#3823): `if (ok) return (await res.json()) as T;
     // return res.json();` hands back one parse. Two member reads stay two:
     // a shape does not say which member.
     match shapes.split_first() {
-        Some((first, [])) => ReturnRead::Shape(first.clone()),
+        Some((first, [])) => shaped(first),
         Some((first, rest))
             if first.kind != ShapeKind::Member && rest.iter().all(|shape| shape == first) =>
         {
-            ReturnRead::Shape(first.clone())
+            shaped(first)
         }
-        // Nothing handed back but no body: nothing of the call's.
+        // Nothing handed back but no body or a literal: nothing of the call's.
         None => ReturnRead::NoShape(NoChain::Own),
         _ => ReturnRead::NoShape(NoChain::Unfollowed),
     }
@@ -1030,16 +1062,23 @@ fn unshaped(returned: &Expr, scope: &Scope) -> NoChain {
     use swc_ecma_ast::Lit;
     let value = resolve(returned, scope);
     // A value that is one of two (`c ? a : b`, `a || b`, `a ?? b`) is its
-    // own where neither side is unfollowed: a call's value on one path and a
-    // value of its own on another is not that call's value alone, as two
-    // returns of the same are not ([`read_of`]).
+    // own where neither side is unfollowed and at most one is a call's
+    // value: a call's value on one path and a value of its own on another
+    // is not that call's value alone, as two returns of the same are not
+    // ([`read_of`]). Two calls' values (`c ? a() : b()`) are not followed,
+    // as two returns of different calls are not: which one is the body is
+    // not said (carrick#4513 P2). A literal default beside a call's value
+    // ([`classify`]) never reaches here.
     let either = |left: &Expr, right: &Expr| {
+        // `Some(true)` for a call's value, `Some(false)` for one of the
+        // function's own, `None` for one not followed.
         let side = |expr: &Expr| match classify(expr, scope) {
-            Some(_) => NoChain::Own,
-            None => unshaped(expr, scope),
+            Some(Returned::Shape(_) | Returned::Defaulted(_)) => Some(true),
+            Some(Returned::NoBody) => Some(false),
+            None => (unshaped(expr, scope) == NoChain::Own).then_some(false),
         };
         match (side(left), side(right)) {
-            (NoChain::Own, NoChain::Own) => NoChain::Own,
+            (Some(false), Some(_)) | (Some(true), Some(false)) => NoChain::Own,
             _ => NoChain::Unfollowed,
         }
     };
@@ -1105,6 +1144,41 @@ enum Returned {
     /// `undefined`, `null`, `void 0`: no body is handed back.
     NoBody,
     Shape(ReturnShape),
+    /// The shape's value or a literal default ([`ReturnRead::Defaulted`]).
+    Defaulted(ReturnShape),
+}
+
+/// A literal the function hands back as its own default: a string, number,
+/// boolean or big integer, a template with no expression, or an array or
+/// object literal of only those (`[]`, `{}`, `{ items: [] }`). Read through
+/// the wrappers that do not change a value and a name given it once. A
+/// function, a name it declares, or anything read off a value is not one.
+fn is_literal_default(expr: &Expr, scope: &Scope) -> bool {
+    use swc_ecma_ast::{Lit, Prop, PropOrSpread};
+    fn literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Paren(paren) => literal(&paren.expr),
+            Expr::TsAs(cast) => literal(&cast.expr),
+            Expr::TsConstAssertion(cast) => literal(&cast.expr),
+            Expr::TsSatisfies(cast) => literal(&cast.expr),
+            Expr::Lit(Lit::Str(_) | Lit::Bool(_) | Lit::Num(_) | Lit::BigInt(_)) => true,
+            Expr::Unary(unary) if unary.op == swc_ecma_ast::UnaryOp::Minus => literal(&unary.arg),
+            Expr::Tpl(tpl) => tpl.exprs.is_empty(),
+            Expr::Array(array) => array.elems.iter().all(|elem| {
+                elem.as_ref()
+                    .is_some_and(|elem| elem.spread.is_none() && literal(&elem.expr))
+            }),
+            Expr::Object(object) => object.props.iter().all(|prop| match prop {
+                PropOrSpread::Prop(prop) => {
+                    matches!(&**prop, Prop::KeyValue(pair) if literal(&pair.value))
+                }
+                PropOrSpread::Spread(_) => false,
+            }),
+            _ => false,
+        }
+    }
+    let value = resolve(expr, scope);
+    !value.part && literal(value.expr)
 }
 
 /// A value with the wrappers that do not change it taken off and the names
@@ -1169,21 +1243,39 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
 fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
     let value = resolve(returned, scope);
     let no_body = |expr: &Expr| matches!(classify(expr, scope), Some(Returned::NoBody));
+    let default = |expr: &Expr| is_literal_default(expr, scope);
+    // The value with a literal default (carrick#4513 P2): what the value is,
+    // marked defaulted.
+    let defaulted = |value: &Expr| match classify(value, scope) {
+        Some(Returned::Shape(shape) | Returned::Defaulted(shape)) => {
+            Some(Returned::Defaulted(shape))
+        }
+        other => other,
+    };
     // `return body || null`, `return body ?? undefined`, `return c ? body :
     // null`: the value or no body, as a second `return null` would hand back
-    // (carrick#4513), awaited, in parentheses or through a name alike.
+    // (carrick#4513), awaited, in parentheses or through a name alike. The
+    // same with a literal default (`body ?? []`, `c ? body : []`) is the
+    // value or the default.
     if !value.part {
         match value.expr {
             Expr::Bin(bin)
                 if matches!(
                     bin.op,
                     swc_ecma_ast::BinaryOp::LogicalOr | swc_ecma_ast::BinaryOp::NullishCoalescing
-                ) && no_body(&bin.right) =>
+                ) =>
             {
-                return classify(&bin.left, scope);
+                if no_body(&bin.right) {
+                    return classify(&bin.left, scope);
+                }
+                if default(&bin.right) {
+                    return defaulted(&bin.left);
+                }
             }
             Expr::Cond(cond) if no_body(&cond.alt) => return classify(&cond.cons, scope),
             Expr::Cond(cond) if no_body(&cond.cons) => return classify(&cond.alt, scope),
+            Expr::Cond(cond) if default(&cond.alt) => return defaulted(&cond.cons),
+            Expr::Cond(cond) if default(&cond.cons) => return defaulted(&cond.alt),
             _ => {}
         }
     }
@@ -1636,6 +1728,113 @@ mod tests {
             "async function f(o) { const r = await call(o); return r.data || 'none'; }",
         );
         assert_eq!(own, None);
+    }
+
+    /// The first function's [`ReturnRead`] of `source`.
+    fn read(source: &str) -> ReturnRead {
+        let cm: Lrc<SourceMap> = Default::default();
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("t.ts".into())),
+            source.to_string(),
+        );
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("parses");
+        return_reads(&module).remove(0).1
+    }
+
+    /// carrick#4513 P2 (review finding 2): a call's value with a literal
+    /// default of the function's own is that value's chain, marked
+    /// defaulted, through `??`, `||`, a conditional or a second `return`.
+    /// `return_shapes` still has no shape for it, so the summaries' and
+    /// call-through's inputs do not move. A default that is a function or
+    /// a value read off another is not a literal: the whole stays its own.
+    #[test]
+    fn a_value_with_a_literal_default_is_the_values_chain_marked_defaulted() {
+        let data = whole_shape("async function f(o) { const r = await call(o); return r.data; }")
+            .expect("a member");
+        for source in [
+            "async function f(o) { const r = await call(o); return r.data ?? []; }",
+            "async function f(o) { const r = await call(o); return r.data || []; }",
+            "async function f(o) { const r = await call(o); return r.data || 'none'; }",
+            "async function f(o) { const r = await call(o); return r.data ? r.data : []; }",
+            "async function f(o) { const r = await call(o); return !r.data ? { items: [] } : r.data; }",
+            "async function f(o) { const r = await call(o); if (!r.data) return []; return r.data; }",
+            "async function f(o) { const r = await call(o); if (!r.data) return -1; return r.data; }",
+        ] {
+            assert_eq!(
+                read(source),
+                ReturnRead::Defaulted(data.clone()),
+                "{source}"
+            );
+            assert_eq!(whole_shape(source), None, "{source}");
+        }
+        for source in [
+            "async function f(o) { await call(o); return true; }",
+            "async function f(o) { const r = await call(o); if (!r.data) return () => 1; return r.data; }",
+            "async function f(o) { const r = await call(o); return r.data ?? [r.status]; }",
+            "async function f(o) { const r = await call(o); return r.data ?? `${o}`; }",
+        ] {
+            assert_eq!(read(source), ReturnRead::NoShape(NoChain::Own), "{source}");
+        }
+    }
+
+    /// carrick#4513 P2 (review, smaller point): two calls' values in one
+    /// conditional are not followed, as two returns of different calls are
+    /// not; two values of the function's own stay its own.
+    #[test]
+    fn a_conditional_of_two_calls_is_not_followed() {
+        for source in [
+            "function f(o, c) { return c ? a(o) : b(o); }",
+            "function f(o, c) { if (c) { return a(o); } return b(o); }",
+            "function f(o, c) { return a(o) || b(o); }",
+        ] {
+            assert_eq!(
+                read(source),
+                ReturnRead::NoShape(NoChain::Unfollowed),
+                "{source}"
+            );
+        }
+        for source in [
+            "function f(o, c) { return c ? 1 : 2; }",
+            "async function f(o, c) { const r = await a(o); return c ? r.data.x : 2; }",
+        ] {
+            assert_eq!(read(source), ReturnRead::NoShape(NoChain::Own), "{source}");
+        }
+    }
+
+    /// carrick#4513 P2 (D2): why a function has no shape, sub-arm by
+    /// sub-arm. A value it makes itself is its own; a name given two values
+    /// or two calls' values are not followed.
+    #[test]
+    fn a_function_with_no_shape_says_whether_its_value_is_its_own() {
+        for source in [
+            "async function f(o) { return (await sdk(o)).data.items; }",
+            "function f(o) { return `${sdk(o)}`; }",
+            "async function f(o) { const r = await sdk(o); return r.v > 0; }",
+            "function f(o) { class Made {} return Made; }",
+            "function f(o) { function run() { return sdk(o); } return run; }",
+            "function f(o) { return { data: sdk(o) }; }",
+            "async function f(o) { await sdk(o); }",
+        ] {
+            assert_eq!(read(source), ReturnRead::NoShape(NoChain::Own), "{source}");
+        }
+        for source in [
+            "async function f(o) { let r = sdk(1); r = sdk(2); return r.data; }",
+            "async function f(o) { if (o) return sdk(1); return sdk(2); }",
+            "function f(o) { return new Wrapped(sdk(o)); }",
+        ] {
+            assert_eq!(
+                read(source),
+                ReturnRead::NoShape(NoChain::Unfollowed),
+                "{source}"
+            );
+        }
     }
 
     /// carrick#4371 R2: the one accept test, row by row.

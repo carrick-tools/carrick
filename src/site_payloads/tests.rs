@@ -70,7 +70,6 @@ fn record(role: &str, handler: bool, payloads: PayloadSlots) -> SiteRecord {
         lead: None,
         unread: None,
         receiver: None,
-        hands_back: None,
     }
 }
 

@@ -11924,15 +11924,15 @@ impl ReturnChains {
     /// own wrapper (carrick#4513 P2, READY-4513-finish §2 Q1): the one
     /// answer the site pass reads. `deciding` is the function the deciding
     /// call runs (its file as walked and its key), `labelled` the call the
-    /// request is made at, `above_labelled` the `file:line` of each call on
-    /// the site's own chain above the labelled call.
+    /// request is made at, `above_labelled` each call on the site's own chain
+    /// above the labelled call (its repo-relative file and SWC span).
     ///
     /// | The wrapper hands back | Answer |
     /// |---|---|
-    /// | the labelled call's body, as its label reads it, down a chain of returns ([`crate::return_flow::hands_back_body`]) | [`HandBack::Body`]: read at the deciding call, whole |
-    /// | a value of its own (a literal, an operator, an object, a function, nothing, `.catch` with its own value), or a member the label does not name | [`HandBack::Other`]: read at the labelled call |
-    /// | a member of an unlabelled call's value, the platform `fetch` whole, or a value it does not follow: a `new` expression, several calls, a call of a function this pass does not read (`schema.parse(body)`, `retry(run)`, `.then(fn)`, a library call holding the chain in its callback), a callee whose returns are no chain | [`HandBack::Undecided`]: read at the deciding call, whole |
-    /// | a chain that leaves the functions this pass reads, at a call above the labelled one (carrick#4755 T0), or a function this pass did not read | `None`: read at the deciding call, whole |
+    /// | the labelled call's body, as its label reads it, down a chain of returns ([`crate::return_flow::hands_back_body`]), with or without a literal default (`body ?? []`, `c ? body : []`, a second `return []`) | [`HandBack::Body`]: read at the deciding call, whole |
+    /// | a value of its own (a literal, an operator, an object, a function, nothing, `.catch` with its own value, a callee's own value: `return isUp(p)`, `return toDomain(res.data)`), a member the label does not name, or another request's value | [`HandBack::Other`]: read at the labelled call |
+    /// | a member of an unlabelled call's value, the platform `fetch` whole, or a value it does not follow: a `new` expression, several calls (`c ? a() : b()` too), a call of a function this pass does not read (`schema.parse(body)`, `retry(run)`, `.then(fn)`, a library call holding the chain in its callback), a callee whose returns are not followed | [`HandBack::Undecided`]: read at the deciding call, whole |
+    /// | a chain that leaves the functions this pass reads, at a call above the labelled one (carrick#4755 T0, told by span), or a function this pass did not read | `None`: read at the deciding call, whole |
     ///
     /// [`HandBack::Body`]: crate::return_flow::HandBack::Body
     /// [`HandBack::Other`]: crate::return_flow::HandBack::Other
@@ -11942,7 +11942,7 @@ impl ReturnChains {
         root: &Path,
         deciding: (&Path, &str),
         labelled: &LabelledCall<'_>,
-        above_labelled: &[&str],
+        above_labelled: &[decided_sites::Via],
         results: &crate::result_shapes::ResultIndex,
     ) -> Option<crate::return_flow::HandBack> {
         use crate::return_flow::{EndRead, HandBack, NoChain, hands_back_body};
@@ -11975,9 +11975,16 @@ impl ReturnChains {
         // The record ends at a call on the site's own chain, above the
         // labelled call: the function that call runs is one this pass did not
         // read (another service's), so the record stops where the walk went
-        // on. No answer (carrick#4755 T0).
-        let end_at = format!("{}:{}", relative(&record.end.file), record.end.line);
-        if above_labelled.contains(&end_at.as_str()) {
+        // on. No answer (carrick#4755 T0). Told by span, as the labelled
+        // call is: another call on the same line is not that call.
+        let end_file = relative(&record.end.file);
+        if above_labelled.iter().any(|via| {
+            let file = via
+                .at
+                .rsplit_once(':')
+                .map_or(via.at.as_str(), |(file, _)| file);
+            file == end_file && via.span == end_span
+        }) {
             return None;
         }
         // The record ends at another request: what the wrapper hands back is
@@ -12029,11 +12036,10 @@ impl Composer<'_> {
     }
 
     fn returned_of(&mut self, file: &Path, ir: &FnIr) -> Chained {
-        use crate::return_flow::{NoChain, ReturnRead};
-        let shape = match &ir.return_read {
-            ReturnRead::Shape(shape) => shape,
-            ReturnRead::NoShape(why) => return Err(*why),
-        };
+        use crate::return_flow::NoChain;
+        // A literal default beside the value is the value's chain: the caller
+        // holds the body's type or the default's (carrick#4513 P2).
+        let shape = ir.return_read.chain()?;
         let call = ir
             .calls
             .iter()
@@ -12052,10 +12058,15 @@ impl Composer<'_> {
                     .get(&callee_file)
                     .is_some_and(|read| read.functions.contains_key(&key)) =>
             {
-                // A callee whose own returns are no chain: not followed
-                // (READY-4513-finish D2).
+                // A callee that hands back a value of its own (`return
+                // isUp(p)` where `isUp` returns `r.v > 0`, a mapper, a
+                // maker) makes this function's value its own too, as calling
+                // the callee directly does (carrick#4513 P2). A callee whose
+                // returns are not followed is not followed (READY-4513-finish
+                // D2).
                 match self.returned(&callee_file, &key) {
                     Some(Ok(record)) => record,
+                    Some(Err(NoChain::Own)) => return Err(NoChain::Own),
                     _ => return Err(NoChain::Unfollowed),
                 }
             }

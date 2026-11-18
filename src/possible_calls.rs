@@ -639,7 +639,6 @@ mod tests {
             lead: Some("name_unstated"),
             unread,
             receiver: None,
-            hands_back: None,
         }
     }
 

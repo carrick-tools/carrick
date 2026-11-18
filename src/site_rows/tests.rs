@@ -155,7 +155,6 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
         lead: None,
         unread: None,
         receiver: None,
-        hands_back: None,
     }
 }
 
@@ -3481,6 +3480,7 @@ fn the_name_census_counts_each_reader_s_outcome() {
     let literal = || vec![Piece::Lit("orders".to_string())];
     let relayed = vec![Via {
         at: "src/send.ts:3".to_string(),
+        span: (0, 0),
         callee: "relay".to_string(),
     }];
     let sites = vec![

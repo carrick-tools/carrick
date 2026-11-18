@@ -405,13 +405,6 @@ pub struct SiteRecord {
     /// no site's sha moves.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<super::discovery::ReceiverAt>,
-    /// Whether the deciding call hands back the labelled call's body
-    /// ([`DecidedSite::hands_back`], carrick#4371): `Other` puts the
-    /// response slot at the labelled call. Kept here so the summaries' rows
-    /// and the model-row gate read the one answer (READY-4371 T2, R9).
-    /// Off the wire.
-    #[serde(skip)]
-    pub hands_back: Option<crate::return_flow::HandBack>,
 }
 
 impl SiteRecord {
@@ -2767,7 +2760,6 @@ fn record(
         lead: (bucket == Bucket::Lead).then_some("name_unstated"),
         unread: (bucket == Bucket::Lead).then(|| name_hole.get()).flatten(),
         receiver: site.receiver.clone(),
-        hands_back: site.hands_back,
     })
 }
 

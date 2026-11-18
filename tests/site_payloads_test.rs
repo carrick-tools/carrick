@@ -762,11 +762,55 @@ fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
         ("seed-envelope", "unknown"),
         ("seed-caught-void", "void | { gone: boolean; }"),
         ("seed-caught-value", "{ rows: string[]; }"),
+        // The review of carrick#4805 (round 2): a literal default beside
+        // the body is the body (main's read, kept).
+        ("fb-coalesce", "import(\"./src/fb-coalesce-lib\").Order[]"),
+        ("fb-or", "import(\"./src/fb-or-lib\").Order[]"),
+        ("fb-if", "import(\"./src/fb-if-lib\").Order[]"),
+        ("fb-tern", "import(\"./src/fb-tern-lib\").Order[]"),
+        // A callee's own value is the wrapper's own.
+        ("own-chain", "{ v: number; }"),
+        ("own-mapper", "{ id: string; extra: number; }"),
+        ("own-maker-hop", "{ g: number; }"),
+        ("inline-data", "{ q: number; }"),
+        // Mapping shapes: main's read, the wrapper's own value (P3).
+        ("map-then", "string[]"),
+        ("map-array", "number[]"),
+        ("map-index", "{ id: string; }"),
+        ("map-db", "{ row: number; }"),
     ] {
         let file = format!("src/{name}.ts");
         let got = captured_flat(&on, &alias_at(&on, "response", &file, 2));
         if got != wanted {
             wrong.push(format!("{file}:2 wanted `{wanted}`, got `{got}`"));
+        }
+    }
+    // Two requests in one conditional, or in two returns: which one is the
+    // body is not said, so each is read at the deciding call (main's read).
+    for (name, path_a, path_b) in [
+        ("pick-tern", "/x/a", "/x/b"),
+        ("pick-two", "/y/ta", "/y/tb"),
+    ] {
+        let file = format!("src/{name}.ts");
+        for path in [path_a, path_b] {
+            let entries: Vec<&serde_json::Value> = on["type_manifest"]
+                .as_array()
+                .expect("type_manifest")
+                .iter()
+                .filter(|entry| {
+                    entry["role"] == "consumer"
+                        && entry["type_kind"] == "response"
+                        && entry["file_path"] == file.as_str()
+                        && entry["path"] == path
+                })
+                .collect();
+            let got: Vec<String> = entries
+                .iter()
+                .map(|entry| captured_flat(&on, entry["type_alias"].as_str().unwrap()))
+                .collect();
+            if got != vec!["{ a: number; } | { b: number; }".to_string()] {
+                wrong.push(format!("{file} {path}: got {got:?}"));
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -835,4 +879,33 @@ fn a_wrapper_handing_back_a_promise_class_reads_its_response_at_the_deciding_cal
         "{ format: \"json\"; results: unknown[]; } | { format: \"csv\"; results: string; }",
         "{entry:#?}"
     );
+    // Review of carrick#4805, finding 1: the callers of wrappers over the
+    // platform `fetch` that hand back another request's value, a field, a
+    // flag or an envelope are stated by the summaries, and no such row is
+    // asked for a response type, on main as here. Pinned as measured; P3
+    // types them (the fixture's README).
+    let mut stated = Vec::new();
+    for name in [
+        "fetch-two",
+        "fetch-rev",
+        "fetch-ping",
+        "fetch-flag",
+        "fetch-env",
+    ] {
+        let file = format!("src/{name}.ts");
+        let at_caller: Vec<&serde_json::Value> = on["type_manifest"]
+            .as_array()
+            .expect("type_manifest")
+            .iter()
+            .filter(|entry| {
+                entry["role"] == "consumer"
+                    && entry["type_kind"] == "response"
+                    && entry["file_path"] == file.as_str()
+            })
+            .collect();
+        if !at_caller.is_empty() {
+            stated.push(format!("{file}: {at_caller:#?}"));
+        }
+    }
+    assert!(stated.is_empty(), "{stated:#?}");
 }
