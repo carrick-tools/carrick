@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.3.162](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.161...carrick-v0.3.162) (2026-11-18)
+
+
+### Features
+
+* **held:** an early break's sentence is true for the edited side ([#4767](https://github.com/carrick-tools/carrick/issues/4767)) ([a5c9d40](https://github.com/carrick-tools/carrick/commit/a5c9d4040359e527d36eab5a9b636523744201cf))
+* **held:** the early check reads a socket emit against the listener's type ([#4766](https://github.com/carrick-tools/carrick/issues/4766)) ([e880455](https://github.com/carrick-tools/carrick/commit/e88045546f0ff70c0597e69063675701f5b0d628))
+* **held:** the store query and join a socket early check will read (unwired) ([#4758](https://github.com/carrick-tools/carrick/issues/4758)) ([2fcff1e](https://github.com/carrick-tools/carrick/commit/2fcff1ece66b53ba13c62d838f6d57068d6e0423))
+* **hook:** the re-check confirms an early call item by its place ([#4769](https://github.com/carrick-tools/carrick/issues/4769)) ([d3af5f0](https://github.com/carrick-tools/carrick/commit/d3af5f021a5b3a964f013e32cb965eb8fc5d7719))
+* **pr-result:** count edited-file rows a no-model carry did not carry (carrick[#4768](https://github.com/carrick-tools/carrick/issues/4768)) ([#4787](https://github.com/carrick-tools/carrick/issues/4787)) ([a41d0d6](https://github.com/carrick-tools/carrick/commit/a41d0d6ed433fc15966a8e52f616e44e26b5c8a9))
+* **scan:** count rows an edited file did not carry, per reason ([#4749](https://github.com/carrick-tools/carrick/issues/4749)) ([#4765](https://github.com/carrick-tools/carrick/issues/4765)) ([2364e48](https://github.com/carrick-tools/carrick/commit/2364e48610a991da3e5fbb5ddf3c19d3ae1ef51b))
+
+
+### Bug Fixes
+
+* **decided-sites:** a socket receive whose label states no handler reads it from the call ([#4740](https://github.com/carrick-tools/carrick/issues/4740)) ([4dec240](https://github.com/carrick-tools/carrick/commit/4dec2409fb0aee3a95a3a941c274820b4f926fbc))
+* **event-bus:** a pub/sub site the bus pass and the model both report is a stated row ([#4754](https://github.com/carrick-tools/carrick/issues/4754)) ([0b576df](https://github.com/carrick-tools/carrick/commit/0b576df3a739e2274b8cd7578cec0199b8cbce33))
+* **graphql:** a clean tree states unresolved_import and drops operations no call runs (R1, P1) ([#4738](https://github.com/carrick-tools/carrick/issues/4738)) ([fba6022](https://github.com/carrick-tools/carrick/commit/fba6022b1ff19e3c116575fe7da14f434e7413b0))
+* **graphql:** anchor a placed root field's type at its schema-keyed place ([#4733](https://github.com/carrick-tools/carrick/issues/4733)) ([0933f93](https://github.com/carrick-tools/carrick/commit/0933f93fb762948a1368d68056ccfda65adbc6e8))
+* **hooks:** agent hooks find Carrick after a Node switch ([#4762](https://github.com/carrick-tools/carrick/issues/4762)) ([76581ff](https://github.com/carrick-tools/carrick/commit/76581ffd1b89c1389e18777968d3875464a3ac8a))
+* **manifest:** a queue send with no stated scope types its payload at its request slot (T6b) ([#4625](https://github.com/carrick-tools/carrick/issues/4625)) ([f8becbc](https://github.com/carrick-tools/carrick/commit/f8becbca0a2ec76caf7a6be3f200121f265c3868))
+* **pr:** a removed socket or pub/sub row served by an unread registration the PR wrote is a candidate ([#4756](https://github.com/carrick-tools/carrick/issues/4756)) ([aa8af6b](https://github.com/carrick-tools/carrick/commit/aa8af6bdb50e23a22e3b8505fcd16c78ed2eb827))
+* **read-place:** a listener or subscriber entry stores the position of its message parameter ([#4751](https://github.com/carrick-tools/carrick/issues/4751)) ([d228d14](https://github.com/carrick-tools/carrick/commit/d228d1418c28e9bb9eb6c750d11291b03a99148d)), closes [#4677](https://github.com/carrick-tools/carrick/issues/4677)
+* **recheck:** a socket or pub/sub mismatch states the sender's type as sent and the listener's as expected ([#4772](https://github.com/carrick-tools/carrick/issues/4772)) ([5e92394](https://github.com/carrick-tools/carrick/commit/5e923942397b30c7e13fc1ba1eb53a26d50f1b95))
+* **sidecar:** a text or line anchor outside the row's own handler gives unknown (T2) ([#4727](https://github.com/carrick-tools/carrick/issues/4727)) ([6ebcd44](https://github.com/carrick-tools/carrick/commit/6ebcd448a9c0084d4e48d535cabc875a8444b6a8))
+* **sidecar:** compare GraphQL fields the root record lacks or converts in the type the served schema declares ([#4732](https://github.com/carrick-tools/carrick/issues/4732)) ([229e25e](https://github.com/carrick-tools/carrick/commit/229e25e455d088e2aa8350223052edfacbc85bbb))
+* **sidecar:** stop() kills a sidecar that ignores SIGTERM ([#4781](https://github.com/carrick-tools/carrick/issues/4781)) ([#4785](https://github.com/carrick-tools/carrick/issues/4785)) ([f5e4222](https://github.com/carrick-tools/carrick/commit/f5e422204002c707c8c68d73e808a467c965bd23))
+* **trpc:** judge a procedure pair from the consumer's own code ([#937](https://github.com/carrick-tools/carrick/issues/937) T-B) ([#4591](https://github.com/carrick-tools/carrick/issues/4591)) ([5016ae6](https://github.com/carrick-tools/carrick/commit/5016ae6e50c94a8a743ea5717da0628a39e6b1d6))
+
+
+### Refactoring
+
+* **check-probe:** the judge's message rules are exported for the early check (no behaviour change) ([#4760](https://github.com/carrick-tools/carrick/issues/4760)) ([5e74ae2](https://github.com/carrick-tools/carrick/commit/5e74ae27312a789fa5aaa79bf5a40bee5d2567d3))
+* **sidecar:** one raw-TypeScript reader of a reply's HTTP status (T1) ([#4790](https://github.com/carrick-tools/carrick/issues/4790)) ([8f88238](https://github.com/carrick-tools/carrick/commit/8f88238b1979718c23262082ca7409faf115a637))
+
+
+### Documentation
+
+* **update-check:** hook entries call the launcher, not a bare carrick ([#4763](https://github.com/carrick-tools/carrick/issues/4763)) ([c821e03](https://github.com/carrick-tools/carrick/commit/c821e0351c439280409576aa2ddf6fa97aac4118))
+
+
+### CI/CD
+
+* **plugin:** install the packed package on Node 26, the newest current line ([#4761](https://github.com/carrick-tools/carrick/issues/4761)) ([2e736e8](https://github.com/carrick-tools/carrick/commit/2e736e8d5dccd82767b549739989b4e9a4d02fc5))
+* **sidecar:** the shard runner kills and names a hung test file ([#4752](https://github.com/carrick-tools/carrick/issues/4752)) ([#4757](https://github.com/carrick-tools/carrick/issues/4757)) ([da23e6a](https://github.com/carrick-tools/carrick/commit/da23e6a580cdf583f3500193630f70cd4b63c9c6))
+
 ## [0.3.161](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.160...carrick-v0.3.161) (2026-11-17)
 
 
