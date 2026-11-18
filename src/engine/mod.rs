@@ -10092,7 +10092,8 @@ struct LibrarySiteIndex {
         crate::operation::SocketDirection,
         bool,
     )>,
-    /// The pub/sub rows whose name is global with no namespace, sorted by
+    /// The pub/sub rows whose name is global (stated, or crossing services
+    /// because nothing scopes it) with no namespace, sorted by
     /// file, line and name: the rows a type-manifest entry anchors
     /// (carrick#3089). The type check pairs non-HTTP entries by key alone
     /// (`type_compat_v2::build_check_pairs`), so a service-scoped or
@@ -10126,10 +10127,11 @@ impl LibrarySiteIndex {
                 .insert((file.clone(), row.line, row.name.clone()));
             match row.kind {
                 LibraryRowKind::Pubsub(role) => {
-                    // Only a stated `global` scope: a row that states none
-                    // is kept out, as it was while a silent claim read
-                    // `service` (carrick#3531).
-                    if row.name_scope.as_ref().is_some_and(|scope| {
+                    // A stated `global` scope, or none: a broker's name that
+                    // nothing scopes crosses services (carrick#3531), so its
+                    // entry is judged in the pairs the matcher makes. A
+                    // `service` scope or a namespace stays out.
+                    if row.name_scope.as_ref().is_none_or(|scope| {
                         scope.scope == crate::services::type_sidecar::NameScopeKind::Global
                             && scope.namespace.is_none()
                     }) {
@@ -36864,9 +36866,11 @@ io.on("bare:in", (event) => {});
         entries
     }
 
-    /// carrick#3089: a global library row with no model op at its site gets
-    /// one entry, a publisher's site-id'd as `build_site_id` spells it and a
-    /// subscriber's plain; a service-scoped or namespaced row gets none.
+    /// carrick#3089: a global library row, or one whose claim states no scope
+    /// (the name crosses services, carrick#3531), with no model op at its
+    /// site gets one entry, a publisher's site-id'd as `build_site_id` spells
+    /// it and a subscriber's plain; a service-scoped or namespaced row gets
+    /// none.
     #[test]
     fn a_global_library_pubsub_row_gets_one_manifest_entry() {
         use crate::operation::PubsubRole;
@@ -36900,6 +36904,15 @@ io.on("bare:in", (event) => {});
                     "jobs.local",
                     crate::library_claims::LibraryRowKind::Pubsub(PubsubRole::Publisher),
                 ),
+                crate::library_claims::LibraryRow {
+                    name_scope: None,
+                    ..library_row(
+                        "/repo/src/jobs.ts",
+                        16,
+                        "jobs.silent",
+                        crate::library_claims::LibraryRowKind::Pubsub(PubsubRole::Publisher),
+                    )
+                },
             ],
             &HashMap::new(),
         );
@@ -36930,6 +36943,13 @@ io.on("bare:in", (event) => {});
                     ManifestRole::Producer,
                     "src/jobs.ts",
                     10,
+                    None
+                ),
+                (
+                    "pubsub|jobs.silent".to_string(),
+                    ManifestRole::Consumer,
+                    "src/jobs.ts",
+                    16,
                     None
                 ),
             ]

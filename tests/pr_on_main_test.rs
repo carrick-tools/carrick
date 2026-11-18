@@ -5834,3 +5834,37 @@ async fn a_field_retyped_in_one_of_two_served_schemas_is_no_finding() {
         findings_of(&payload)
     );
 }
+
+/// A broker send whose claim states no scope (the name crosses services)
+/// types its payload at its request slot: main's blob for the sender holds
+/// the consumer entry, so the judge has a side to compare with the worker's.
+#[tokio::test]
+async fn jobs_sender_main_types_the_send_payload_at_its_request_slot() {
+    let _serial = SERIAL.lock().await;
+    let main = main_snapshot().await;
+    let sender = main
+        .jobs_rows
+        .iter()
+        .find(|row| {
+            row.calls
+                .iter()
+                .any(|call| call.file_path.to_string_lossy().ends_with("src/mail.ts:10"))
+        })
+        .unwrap_or_else(|| panic!("no stored row for the sender"));
+    let manifest = serde_json::to_value(&sender.type_manifest).unwrap();
+    let entry = manifest
+        .as_array()
+        .unwrap_or_else(|| panic!("the sender's blob has no type manifest: {manifest:#}"))
+        .iter()
+        .find(|entry| entry["topic"] == "welcome-mail" && entry["role"] == "consumer")
+        .unwrap_or_else(|| panic!("no consumer entry for the send: {manifest:#}"));
+    assert_eq!(entry["file_path"], "src/mail.ts", "{entry:#}");
+    assert_eq!(entry["line_number"], 10, "{entry:#}");
+    assert_ne!(entry["type_state"], "unknown", "{entry:#}");
+    assert!(
+        entry["expanded_definition"]
+            .as_str()
+            .is_some_and(|text| text.contains("userId") && text.contains("locale")),
+        "{entry:#}"
+    );
+}
