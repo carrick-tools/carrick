@@ -157,9 +157,21 @@ struct Scope {
     /// call()`), with the value they are read from: each is a part of it, not
     /// the value itself.
     parts: HashMap<String, Vec<Expr>>,
+    /// For a name taken from an object pattern's own key (`{ data }`,
+    /// `{ data: body }`), that key; a name bound deeper has none.
+    part_keys: HashMap<String, String>,
+    /// The functions and classes the body declares by name: a value of its
+    /// own when handed back ([`NoChain::Own`]).
+    declared: HashSet<String>,
 }
 
 impl Visit for Scope {
+    fn visit_fn_decl(&mut self, decl: &swc_ecma_ast::FnDecl) {
+        self.declared.insert(decl.ident.sym.to_string());
+    }
+    fn visit_class_decl(&mut self, decl: &swc_ecma_ast::ClassDecl) {
+        self.declared.insert(decl.ident.sym.to_string());
+    }
     fn visit_call_expr(&mut self, call: &CallExpr) {
         self.calls.push(call.span);
         call.visit_children_with(self);
@@ -167,6 +179,7 @@ impl Visit for Scope {
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
         if let Some(init) = &declarator.init {
             let whole = matches!(declarator.name, Pat::Ident(_));
+            self.part_keys.extend(object_keys(&declarator.name));
             for name in pattern_names(&declarator.name) {
                 if !whole {
                     self.parts
@@ -191,6 +204,36 @@ impl Visit for Scope {
     fn visit_function(&mut self, _: &Function) {}
     fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
     fn visit_class(&mut self, _: &Class) {}
+}
+
+/// The names an object pattern binds straight off one of its own keys, with
+/// that key: `data` for `{ data }`, `body` to `data` for `{ data: body }`.
+fn object_keys(pat: &Pat) -> Vec<(String, String)> {
+    let Pat::Object(object) = pat else {
+        return Vec::new();
+    };
+    object
+        .props
+        .iter()
+        .filter_map(|prop| match prop {
+            swc_ecma_ast::ObjectPatProp::Assign(assign) => {
+                let name = assign.key.id.sym.to_string();
+                Some((name.clone(), name))
+            }
+            swc_ecma_ast::ObjectPatProp::KeyValue(kv) => {
+                let Pat::Ident(ident) = &*kv.value else {
+                    return None;
+                };
+                let key = match &kv.key {
+                    swc_ecma_ast::PropName::Ident(key) => key.sym.to_string(),
+                    swc_ecma_ast::PropName::Str(key) => key.value.to_string_lossy().into_owned(),
+                    _ => return None,
+                };
+                Some((ident.id.sym.to_string(), key))
+            }
+            swc_ecma_ast::ObjectPatProp::Rest(_) => None,
+        })
+        .collect()
 }
 
 fn pattern_names(pat: &Pat) -> Vec<String> {
@@ -348,11 +391,179 @@ pub enum ShapeKind {
 }
 
 /// What a function returns, when that is one call's value read one way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReturnShape {
     pub kind: ShapeKind,
     /// The call whose value is read.
     pub base: Span,
+    /// For [`ShapeKind::Member`], the member read (`data` in `res.data`, or
+    /// the key a destructured name is taken from, `const { data } = …`);
+    /// `None` where the source names none (an array pattern). Read by
+    /// [`hands_back_body`]'s steps (carrick#4371). In memory only.
+    pub member: Option<String>,
+    /// The base is `call.catch(handler)` whose handler hands back a value of
+    /// its own (`.catch(() => [])`): the function hands back the call's value
+    /// or that value, so its chain ends in a value of its own
+    /// ([`NoChain::Own`], carrick#4513 P2). In memory only.
+    pub caught_own: bool,
+    /// For a `caught_own` base whose handler hands back a literal default
+    /// (`.catch(() => [])`, [`is_literal_default`]): the value `.catch` is
+    /// called on, read as a return. The function hands back that value or
+    /// the default, so its chain follows it (carrick#4513 P2, as
+    /// [`ReturnRead::Defaulted`]). The shape itself stays the `.catch`
+    /// call's value, which [`return_shapes`]' readers read. In memory only.
+    pub caught: Option<Box<ReturnShape>>,
+}
+
+/// Why a function's returns are no chain to one call's value (carrick#4513
+/// P2, READY-4513-finish D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NoChain {
+    /// The function provably hands back a value it makes itself: a literal,
+    /// a template, an operator, an object or array literal, a member of a
+    /// member, a function, or nothing.
+    Own,
+    /// What it hands back is not followed: a `new` expression, several
+    /// calls, a name given more than one value or none this pass reads, or a
+    /// callee whose own returns are no chain.
+    Unfollowed,
+}
+
+/// What a function returns, as [`return_reads`] reads it: one call's value
+/// read one way, or why it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnRead {
+    Shape(ReturnShape),
+    /// The shape's value or a literal default of the function's own: `res.data
+    /// ?? []`, `res.data || 'none'`, `res.data ? res.data : []`, or `if
+    /// (!res.data) return []; return res.data`. The caller holds the body's
+    /// type or the default's, so the chain is the shape's (carrick#4513 P2).
+    /// [`Self::shape`] is `None` for it, as before this read: the request
+    /// summaries' flags and call-through read [`return_shapes`], and they
+    /// take this answer with the rest of Q1 (READY-4513-finish T2, T3).
+    Defaulted(ReturnShape),
+    NoShape(NoChain),
+}
+
+impl Default for ReturnRead {
+    /// A function this pass did not read: not followed.
+    fn default() -> Self {
+        Self::NoShape(NoChain::Unfollowed)
+    }
+}
+
+impl ReturnRead {
+    pub fn shape(&self) -> Option<&ReturnShape> {
+        match self {
+            Self::Shape(shape) => Some(shape),
+            Self::Defaulted(_) | Self::NoShape(_) => None,
+        }
+    }
+
+    /// The shape whose value the function hands back, with or without a
+    /// literal default ([`Self::Defaulted`]): what its chain of returns
+    /// follows.
+    pub fn chain(&self) -> Result<&ReturnShape, NoChain> {
+        match self {
+            Self::Shape(shape) | Self::Defaulted(shape) => Ok(shape),
+            Self::NoShape(why) => Err(*why),
+        }
+    }
+}
+
+impl ReturnShape {
+    /// The read this shape makes off its base call's value, as a
+    /// [`hands_back_body`] step: none for a whole value.
+    pub fn step(&self) -> Option<Step> {
+        match self.kind {
+            ShapeKind::Value => None,
+            // `is_parse` reads `.json()` alone.
+            ShapeKind::Parsed => Some(Step::Parse("json".to_string())),
+            ShapeKind::Member => Some(Step::Member(self.member.clone().unwrap_or_default())),
+        }
+    }
+}
+
+/// One read a function makes off a returned call's value on its way back to
+/// its caller (carrick#4371): the parse by name, or one member by name. An
+/// unnamed member is the empty name, which no label names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Step {
+    Parse(String),
+    Member(String),
+}
+
+/// What is known of the call a chain of returns ends at, for
+/// [`hands_back_body`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndRead {
+    /// The store's verified result label for the call (carrick#2819).
+    Labelled(crate::services::type_sidecar::ResultShape),
+    /// No verified label: what the call resolves to is not stated.
+    Unlabelled,
+    /// The platform's `fetch`, with no label: it resolves to a `Response`,
+    /// whose body is its `.json()`.
+    PlatformFetch,
+}
+
+/// Whether a chain of returns hands its caller the body ([`hands_back_body`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HandBack {
+    /// The caller holds the response body: read it at the caller's call.
+    Body,
+    /// The caller holds something else (an envelope, a field, a flag): the
+    /// response is read where the request is made.
+    Other,
+    /// A member is read off a call no verified label describes: whether
+    /// that member is the body is not known (READY-4371 R10).
+    Undecided,
+}
+
+/// The one test of whether the reads `steps` make off the value of the call
+/// a chain of returns ends at hand back that call's response body
+/// (carrick#4371 R2). The call's result is described by `end`:
+///
+/// | `end` | body when `steps` is |
+/// |---|---|
+/// | labelled `member: [m]` | `[Member(m)]` |
+/// | labelled `parse: p` | `[Parse(p)]` |
+/// | labelled `whole`, or unlabelled | `[]` |
+/// | the platform `fetch`, unlabelled | `[Parse("json")]` |
+///
+/// Anything else is [`HandBack::Other`], except:
+///
+/// - a member read over an unlabelled end is [`HandBack::Undecided`]: the
+///   label decides it (READY-4371 R10);
+/// - the platform `fetch`'s whole value is [`HandBack::Undecided`] too. It
+///   resolves to a `Response`, which the labelled call's own read cannot
+///   type (`machinery_envelope`); whoever holds it reads the body off it
+///   (`.json()`, `.arrayBuffer()`), and the deciding call is where that
+///   read is followed. A member of a `Response` (`ok`, `status`) is never
+///   its body: other.
+///
+/// Its readers: the site pass, which reads a wrapper site's response at the
+/// labelled call unless the wrapper hands the body back
+/// ([`crate::request_summary::site_record`]'s payload slots). The request
+/// summaries' flags and call-through's walk take it next (READY-4371 T2,
+/// T3), so the question has this one answer.
+pub fn hands_back_body(steps: &[Step], end: &EndRead) -> HandBack {
+    use crate::services::type_sidecar::ResultShape;
+    let body = match (end, steps) {
+        (EndRead::Labelled(ResultShape::Member([wanted])), [Step::Member(read)]) => read == wanted,
+        (EndRead::Labelled(ResultShape::Parse(wanted)), [Step::Parse(read)]) => read == wanted,
+        (EndRead::Labelled(ResultShape::Whole(_)) | EndRead::Unlabelled, []) => true,
+        (EndRead::PlatformFetch, [Step::Parse(read)]) => read == "json",
+        _ => false,
+    };
+    if body {
+        return HandBack::Body;
+    }
+    let reads_member = steps.iter().any(|step| matches!(step, Step::Member(_)));
+    match end {
+        EndRead::Unlabelled if reads_member => HandBack::Undecided,
+        EndRead::PlatformFetch if steps.is_empty() => HandBack::Undecided,
+        _ => HandBack::Other,
+    }
 }
 
 /// Every function of `module`, by the span of its node, with what it returns:
@@ -372,6 +583,17 @@ pub struct ReturnShape {
 /// has one answer (carrick#3823): [`crate::call_through`] for model rows,
 /// and the request summaries' `passes_body` for summary rows.
 pub fn return_shapes(module: &swc_ecma_ast::Module) -> Vec<(Span, Option<ReturnShape>)> {
+    return_reads(module)
+        .into_iter()
+        .map(|(span, read)| (span, read.shape().cloned()))
+        .collect()
+}
+
+/// [`return_shapes`], with why a function has no shape where it has none
+/// ([`NoChain`], carrick#4513 P2): the request summaries' return chains read
+/// it, so a value the function makes itself is told from one this pass does
+/// not follow.
+pub fn return_reads(module: &swc_ecma_ast::Module) -> Vec<(Span, ReturnRead)> {
     let mut reader = ShapeReader::default();
     module.visit_with(&mut reader);
     reader.shapes.sort_by_key(|(span, _)| (span.lo, span.hi));
@@ -380,14 +602,14 @@ pub fn return_shapes(module: &swc_ecma_ast::Module) -> Vec<(Span, Option<ReturnS
 
 #[derive(Default)]
 struct ShapeReader {
-    shapes: Vec<(Span, Option<ReturnShape>)>,
+    shapes: Vec<(Span, ReturnRead)>,
 }
 
 impl ShapeReader {
     fn read(&mut self, node: Span, returned: Vec<&Expr>, body: &dyn VisitWithScope) {
         let mut scope = Scope::default();
         body.collect(&mut scope);
-        self.shapes.push((node, shape_of(&returned, &scope)));
+        self.shapes.push((node, read_of(&returned, &scope)));
     }
 }
 
@@ -789,26 +1011,139 @@ impl HeldWalk {
     }
 }
 
-fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {
+/// One function's [`ReturnRead`]. A return that is no shape is a value of
+/// the function's own or one not followed ([`unshaped`]); any return not
+/// followed makes the whole unfollowed, and so do shapes that are not one
+/// (several calls, two members). A literal default on a path beside one
+/// shape is [`ReturnRead::Defaulted`]. Otherwise a value of its own on any
+/// path makes the whole its own (READY-4513-finish D2).
+fn read_of(returned: &[&Expr], scope: &Scope) -> ReturnRead {
     let mut shapes = Vec::new();
+    let mut own = false;
+    // A return of a literal default beside the call's value (`if (!res.data)
+    // return []; return res.data;`): the value or the default (carrick#4513
+    // P2), as `res.data ?? []` is.
+    let mut defaulted = false;
     for expr in returned {
-        match classify(expr, scope)? {
-            Returned::NoBody => {}
-            Returned::Shape(shape) => shapes.push(shape),
+        match classify(expr, scope) {
+            Some(Returned::NoBody) => {}
+            Some(Returned::Shape(shape)) => shapes.push(shape),
+            Some(Returned::Defaulted(shape)) => {
+                shapes.push(shape);
+                defaulted = true;
+            }
+            None if is_literal_default(expr, scope) => defaulted = true,
+            None => match unshaped(expr, scope) {
+                NoChain::Own => own = true,
+                NoChain::Unfollowed => return ReturnRead::NoShape(NoChain::Unfollowed),
+            },
         }
     }
+    if own {
+        return ReturnRead::NoShape(NoChain::Own);
+    }
+    let shaped = |shape: &ReturnShape| match defaulted {
+        true => ReturnRead::Defaulted(shape.clone()),
+        false => ReturnRead::Shape(shape.clone()),
+    };
     // Several returns that hand back the same call's value, or its parse,
     // are one shape (carrick#3823): `if (ok) return (await res.json()) as T;
     // return res.json();` hands back one parse. Two member reads stay two:
     // a shape does not say which member.
     match shapes.split_first() {
-        Some((first, [])) => Some(*first),
+        Some((first, [])) => shaped(first),
         Some((first, rest))
             if first.kind != ShapeKind::Member && rest.iter().all(|shape| shape == first) =>
         {
-            Some(*first)
+            shaped(first)
         }
-        _ => None,
+        // Nothing handed back but no body or a literal: nothing of the call's.
+        None => ReturnRead::NoShape(NoChain::Own),
+        _ => ReturnRead::NoShape(NoChain::Unfollowed),
+    }
+}
+
+/// Why one returned value [`classify`] gives no shape is no chain: a value
+/// the function makes itself, or one this pass does not follow.
+fn unshaped(returned: &Expr, scope: &Scope) -> NoChain {
+    use swc_ecma_ast::Lit;
+    let value = resolve(returned, scope);
+    // A value that is one of two (`c ? a : b`, `a || b`, `a ?? b`) is its
+    // own where neither side is unfollowed and at most one is a call's
+    // value: a call's value on one path and a value of its own on another
+    // is not that call's value alone, as two returns of the same are not
+    // ([`read_of`]). Two calls' values (`c ? a() : b()`) are not followed,
+    // as two returns of different calls are not: which one is the body is
+    // not said (carrick#4513 P2). A literal default beside a call's value
+    // ([`classify`]) never reaches here.
+    let either = |left: &Expr, right: &Expr| {
+        // `Some(true)` for a call's value, `Some(false)` for one of the
+        // function's own, `None` for one not followed.
+        let side = |expr: &Expr| match classify(expr, scope) {
+            Some(Returned::Shape(_) | Returned::Defaulted(_)) => Some(true),
+            Some(Returned::NoBody) => Some(false),
+            None => (unshaped(expr, scope) == NoChain::Own).then_some(false),
+        };
+        match (side(left), side(right)) {
+            (Some(false), Some(_)) | (Some(true), Some(false)) => NoChain::Own,
+            _ => NoChain::Unfollowed,
+        }
+    };
+    match value.expr {
+        Expr::Bin(bin)
+            if matches!(
+                bin.op,
+                swc_ecma_ast::BinaryOp::LogicalOr
+                    | swc_ecma_ast::BinaryOp::LogicalAnd
+                    | swc_ecma_ast::BinaryOp::NullishCoalescing
+            ) =>
+        {
+            either(&bin.left, &bin.right)
+        }
+        Expr::Cond(cond) => either(&cond.cons, &cond.alt),
+        Expr::Lit(Lit::Str(_) | Lit::Bool(_) | Lit::Num(_) | Lit::BigInt(_) | Lit::Regex(_))
+        | Expr::Tpl(_)
+        | Expr::Bin(_)
+        | Expr::Unary(_)
+        | Expr::Update(_)
+        | Expr::Object(_)
+        | Expr::Array(_)
+        | Expr::Fn(_)
+        | Expr::Arrow(_)
+        | Expr::Class(_) => NoChain::Own,
+        // A function or class the body declares (`return run;`).
+        Expr::Ident(ident)
+            if scope.declared.contains(&*ident.sym) && !scope.given.contains_key(&*ident.sym) =>
+        {
+            NoChain::Own
+        }
+        // A member of a member, or of a value already read once
+        // (`res.data.items`, `(await res.json()).data`): no one read names it.
+        Expr::Member(read)
+            if reads_one_member(&read.prop) && reads_off_a_value(&read.obj, scope) =>
+        {
+            NoChain::Own
+        }
+        Expr::OptChain(chain) => match &*chain.base {
+            OptChainBase::Member(read)
+                if reads_one_member(&read.prop) && reads_off_a_value(&read.obj, scope) =>
+            {
+                NoChain::Own
+            }
+            _ => NoChain::Unfollowed,
+        },
+        _ => NoChain::Unfollowed,
+    }
+}
+
+/// Whether `obj` resolves to a call's value, or to a part or a member of
+/// one: what is read off it is a value the function made by reading.
+fn reads_off_a_value(obj: &Expr, scope: &Scope) -> bool {
+    let obj = resolve(obj, scope);
+    match obj.expr {
+        Expr::Call(_) | Expr::OptChain(_) => true,
+        Expr::Member(read) => reads_off_a_value(&read.obj, scope),
+        _ => obj.part,
     }
 }
 
@@ -816,6 +1151,41 @@ enum Returned {
     /// `undefined`, `null`, `void 0`: no body is handed back.
     NoBody,
     Shape(ReturnShape),
+    /// The shape's value or a literal default ([`ReturnRead::Defaulted`]).
+    Defaulted(ReturnShape),
+}
+
+/// A literal the function hands back as its own default: a string, number,
+/// boolean or big integer, a template with no expression, or an array or
+/// object literal of only those (`[]`, `{}`, `{ items: [] }`). Read through
+/// the wrappers that do not change a value and a name given it once. A
+/// function, a name it declares, or anything read off a value is not one.
+fn is_literal_default(expr: &Expr, scope: &Scope) -> bool {
+    use swc_ecma_ast::{Lit, Prop, PropOrSpread};
+    fn literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Paren(paren) => literal(&paren.expr),
+            Expr::TsAs(cast) => literal(&cast.expr),
+            Expr::TsConstAssertion(cast) => literal(&cast.expr),
+            Expr::TsSatisfies(cast) => literal(&cast.expr),
+            Expr::Lit(Lit::Str(_) | Lit::Bool(_) | Lit::Num(_) | Lit::BigInt(_)) => true,
+            Expr::Unary(unary) if unary.op == swc_ecma_ast::UnaryOp::Minus => literal(&unary.arg),
+            Expr::Tpl(tpl) => tpl.exprs.is_empty(),
+            Expr::Array(array) => array.elems.iter().all(|elem| {
+                elem.as_ref()
+                    .is_some_and(|elem| elem.spread.is_none() && literal(&elem.expr))
+            }),
+            Expr::Object(object) => object.props.iter().all(|prop| match prop {
+                PropOrSpread::Prop(prop) => {
+                    matches!(&**prop, Prop::KeyValue(pair) if literal(&pair.value))
+                }
+                PropOrSpread::Spread(_) => false,
+            }),
+            _ => false,
+        }
+    }
+    let value = resolve(expr, scope);
+    !value.part && literal(value.expr)
 }
 
 /// A value with the wrappers that do not change it taken off and the names
@@ -824,6 +1194,8 @@ struct Resolved<'a> {
     expr: &'a Expr,
     /// Read off a bigger value by taking it apart.
     part: bool,
+    /// For a part taken off an object pattern's own key, that key.
+    key: Option<String>,
 }
 
 /// Names followed at most this far.
@@ -832,6 +1204,11 @@ const MAX_NAME_HOPS: usize = 8;
 fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
     let mut expr = expr;
     let mut part = false;
+    let mut key = None;
+    // The key names the call's member only when one part hop leads to the
+    // call: `const { data } = await call(); const { items } = data` holds
+    // `data.items`, which no one key names (carrick#4513).
+    let mut part_hops = 0;
     for _ in 0..MAX_NAME_HOPS {
         expr = match expr {
             Expr::Await(awaited) => &awaited.arg,
@@ -841,11 +1218,24 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
             Expr::TsConstAssertion(cast) => &cast.expr,
             Expr::TsNonNull(cast) => &cast.expr,
             Expr::TsSatisfies(cast) => &cast.expr,
+            // `call.catch(() => null)`: the call's value or no body, as a
+            // `return null` in a `catch` block hands back (carrick#4513).
+            Expr::Call(call) => match no_body_catch(call) {
+                Some(caught) => caught,
+                None => break,
+            },
             Expr::Ident(ident) => {
                 let name: &str = &ident.sym;
                 match scope.given.get(name).map(Vec::as_slice) {
                     Some([only]) => {
-                        part |= scope.parts.contains_key(name);
+                        if scope.parts.contains_key(name) {
+                            part = true;
+                            part_hops += 1;
+                            key = match part_hops {
+                                1 => scope.part_keys.get(name).cloned(),
+                                _ => None,
+                            };
+                        }
                         only
                     }
                     _ => break,
@@ -854,11 +1244,48 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
             _ => break,
         };
     }
-    Resolved { expr, part }
+    Resolved { expr, part, key }
 }
 
 fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
     let value = resolve(returned, scope);
+    let no_body = |expr: &Expr| matches!(classify(expr, scope), Some(Returned::NoBody));
+    let default = |expr: &Expr| is_literal_default(expr, scope);
+    // The value with a literal default (carrick#4513 P2): what the value is,
+    // marked defaulted.
+    let defaulted = |value: &Expr| match classify(value, scope) {
+        Some(Returned::Shape(shape) | Returned::Defaulted(shape)) => {
+            Some(Returned::Defaulted(shape))
+        }
+        other => other,
+    };
+    // `return body || null`, `return body ?? undefined`, `return c ? body :
+    // null`: the value or no body, as a second `return null` would hand back
+    // (carrick#4513), awaited, in parentheses or through a name alike. The
+    // same with a literal default (`body ?? []`, `c ? body : []`) is the
+    // value or the default.
+    if !value.part {
+        match value.expr {
+            Expr::Bin(bin)
+                if matches!(
+                    bin.op,
+                    swc_ecma_ast::BinaryOp::LogicalOr | swc_ecma_ast::BinaryOp::NullishCoalescing
+                ) =>
+            {
+                if no_body(&bin.right) {
+                    return classify(&bin.left, scope);
+                }
+                if default(&bin.right) {
+                    return defaulted(&bin.left);
+                }
+            }
+            Expr::Cond(cond) if no_body(&cond.alt) => return classify(&cond.cons, scope),
+            Expr::Cond(cond) if no_body(&cond.cons) => return classify(&cond.alt, scope),
+            Expr::Cond(cond) if default(&cond.alt) => return defaulted(&cond.cons),
+            Expr::Cond(cond) if default(&cond.cons) => return defaulted(&cond.alt),
+            _ => {}
+        }
+    }
     let base_of = |obj: &Expr| -> Option<Span> {
         let obj = resolve(obj, scope);
         match obj.expr {
@@ -867,34 +1294,89 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
             _ => None,
         }
     };
-    let shape = |kind, base| Some(Returned::Shape(ReturnShape { kind, base }));
+    let shape = |kind, base| {
+        Some(Returned::Shape(ReturnShape {
+            kind,
+            base,
+            member: None,
+            caught_own: false,
+            caught: None,
+        }))
+    };
+    let member = |base, name: Option<String>| {
+        Some(Returned::Shape(ReturnShape {
+            kind: ShapeKind::Member,
+            base,
+            member: name,
+            caught_own: false,
+            caught: None,
+        }))
+    };
     match value.expr {
         Expr::Ident(ident) if &*ident.sym == "undefined" => Some(Returned::NoBody),
         Expr::Lit(swc_ecma_ast::Lit::Null(_)) => Some(Returned::NoBody),
         Expr::Unary(unary) if unary.op == swc_ecma_ast::UnaryOp::Void => Some(Returned::NoBody),
         // `const { data } = await call(); return data`
-        Expr::Call(call) if value.part => shape(ShapeKind::Member, call.span),
+        Expr::Call(call) if value.part => member(call.span, value.key.clone()),
         _ if value.part => None,
         Expr::Call(call) => match &call.callee {
             Callee::Expr(callee) if is_parse(call) => {
-                let Expr::Member(member) = &**callee else {
+                let Expr::Member(read) = &**callee else {
                     return None;
                 };
-                shape(ShapeKind::Parsed, base_of(&member.obj)?)
+                shape(ShapeKind::Parsed, base_of(&read.obj)?)
+            }
+            // `call.catch(() => [])`: the call's value or one of the
+            // function's own (a no-body handler was resolved through above).
+            // A literal default is the value or the default: the chain
+            // follows the value `.catch` is called on.
+            _ if catches_own_value(call) => {
+                let caught = match catch_handler(call) {
+                    Some((receiver, _)) if catches_literal_default(call) => {
+                        match classify(receiver, scope) {
+                            Some(Returned::Shape(inner) | Returned::Defaulted(inner)) => {
+                                Some(Box::new(inner))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                Some(Returned::Shape(ReturnShape {
+                    kind: ShapeKind::Value,
+                    base: call.span,
+                    member: None,
+                    caught_own: true,
+                    caught,
+                }))
             }
             _ => shape(ShapeKind::Value, call.span),
         },
         Expr::OptChain(chain) => match &*chain.base {
-            OptChainBase::Member(member) if reads_one_member(&member.prop) => {
-                shape(ShapeKind::Member, base_of(&member.obj)?)
+            OptChainBase::Member(read) if reads_one_member(&read.prop) => {
+                member(base_of(&read.obj)?, member_name(&read.prop))
             }
             OptChainBase::Call(_) => shape(ShapeKind::Value, chain.span),
             _ => None,
         },
-        Expr::Member(member) if reads_one_member(&member.prop) => {
-            shape(ShapeKind::Member, base_of(&member.obj)?)
+        Expr::Member(read) if reads_one_member(&read.prop) => {
+            member(base_of(&read.obj)?, member_name(&read.prop))
         }
         _ => None,
+    }
+}
+
+/// The name of a property [`reads_one_member`] accepts.
+fn member_name(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(name) => Some(name.sym.to_string()),
+        MemberProp::Computed(computed) => match &*computed.expr {
+            Expr::Lit(swc_ecma_ast::Lit::Str(text)) => {
+                Some(text.value.to_string_lossy().into_owned())
+            }
+            _ => None,
+        },
+        MemberProp::PrivateName(_) => None,
     }
 }
 
@@ -909,6 +1391,101 @@ fn is_parse(call: &CallExpr) -> bool {
                     if matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "json")
             )
         )
+}
+
+/// The value `.catch` is called on, where the handler hands back no body:
+/// `null`, `undefined`, `void 0`, or nothing (`() => {}`, a bare `return`).
+fn no_body_catch(call: &CallExpr) -> Option<&Expr> {
+    let (receiver, handler) = catch_handler(call)?;
+    let no_body = |expr: &Expr| match expr {
+        Expr::Ident(ident) => &*ident.sym == "undefined",
+        Expr::Lit(swc_ecma_ast::Lit::Null(_)) => true,
+        Expr::Unary(unary) => unary.op == swc_ecma_ast::UnaryOp::Void,
+        _ => false,
+    };
+    let block_no_body = |stmts: &[swc_ecma_ast::Stmt]| {
+        stmts.iter().all(|stmt| match stmt {
+            swc_ecma_ast::Stmt::Return(ret) => ret.arg.as_deref().is_none_or(no_body),
+            swc_ecma_ast::Stmt::Empty(_) => true,
+            _ => false,
+        })
+    };
+    let hands_back_none = match &*handler.expr {
+        Expr::Arrow(arrow) => match &*arrow.body {
+            ArrowFunctionBody::Expr(expr) => no_body(expr),
+            ArrowFunctionBody::FunctionBody(block) => block_no_body(&block.stmts),
+        },
+        Expr::Fn(function) => function
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|block| block_no_body(&block.stmts)),
+        _ => false,
+    };
+    hands_back_none.then_some(receiver)
+}
+
+/// `receiver.catch(handler)`: the value `.catch` is called on and its one
+/// handler.
+fn catch_handler(call: &CallExpr) -> Option<(&Expr, &swc_ecma_ast::ExprOrSpread)> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(member) = &**callee else {
+        return None;
+    };
+    if !matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "catch") {
+        return None;
+    }
+    let [handler] = call.args.as_slice() else {
+        return None;
+    };
+    if handler.spread.is_some() {
+        return None;
+    }
+    Some((&*member.obj, handler))
+}
+
+/// Whether `call` is `.catch(handler)` whose handler hands back a value of
+/// its own on every path (`() => []`, `() => ({ rows: [] })`), read with no
+/// name followed: one that rethrows or hands back a call is not.
+fn catches_own_value(call: &CallExpr) -> bool {
+    let scope = Scope::default();
+    catch_hands_back(call, |expr| {
+        classify(expr, &scope).is_none() && unshaped(expr, &scope) == NoChain::Own
+    })
+}
+
+/// Whether `call` is `.catch(handler)` whose handler hands back a literal
+/// default on every path ([`is_literal_default`]: `() => []`, `() => ({
+/// rows: [] })`).
+fn catches_literal_default(call: &CallExpr) -> bool {
+    let scope = Scope::default();
+    catch_hands_back(call, |expr| is_literal_default(expr, &scope))
+}
+
+/// Whether `call` is `.catch(handler)` whose handler's every return passes
+/// `test`, read with no name followed.
+fn catch_hands_back(call: &CallExpr, test: impl Fn(&Expr) -> bool) -> bool {
+    let Some((_, handler)) = catch_handler(call) else {
+        return false;
+    };
+    let own = |expr: &Expr| test(expr);
+    match &*handler.expr {
+        Expr::Arrow(arrow) => match &*arrow.body {
+            ArrowFunctionBody::Expr(expr) => own(expr),
+            ArrowFunctionBody::FunctionBody(block) => {
+                let mut returns = Returns::default();
+                block.visit_with(&mut returns);
+                let all_return = block
+                    .stmts
+                    .last()
+                    .is_some_and(|stmt| matches!(stmt, swc_ecma_ast::Stmt::Return(_)));
+                all_return && returns.exprs.iter().all(own)
+            }
+        },
+        _ => false,
+    }
 }
 
 /// A property named in the source: `.data` or `["data"]`.
@@ -1044,7 +1621,9 @@ mod tests {
         .expect("parses");
         let shapes = return_shapes(&module);
         let (_, shape) = shapes.first().expect("a function");
-        shape.map(|shape| (shape.kind, cm.span_to_snippet(shape.base).unwrap()))
+        shape
+            .as_ref()
+            .map(|shape| (shape.kind, cm.span_to_snippet(shape.base).unwrap()))
     }
 
     fn of(kind: ShapeKind, base: &str) -> Option<(ShapeKind, String)> {
@@ -1086,6 +1665,262 @@ mod tests {
             "async function f(o) { const { data: body } = await call(o); return body; }",
         ] {
             assert_eq!(shape(source), of(ShapeKind::Member, "call(o)"), "{source}");
+        }
+    }
+
+    /// The first function's shape of `source`, whole.
+    fn whole_shape(source: &str) -> Option<ReturnShape> {
+        let cm: Lrc<SourceMap> = Default::default();
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("t.ts".into())),
+            source.to_string(),
+        );
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("parses");
+        return_shapes(&module).remove(0).1
+    }
+
+    /// carrick#4371 R4: a member read names its member, and a destructured
+    /// name the key it is taken from; a parse is `json`; a whole value
+    /// reads nothing.
+    #[test]
+    fn a_member_read_names_its_member_and_a_destructured_name_its_key() {
+        for (source, wanted) in [
+            (
+                "async function f(o) { return (await call(o)).data; }",
+                "data",
+            ),
+            (
+                "async function f(o) { const r = await call(o); return r?.ok; }",
+                "ok",
+            ),
+            (
+                "async function f(o) { const r = await call(o); return r[\"items\"]; }",
+                "items",
+            ),
+            (
+                "async function f(o) { const { data } = await call(o); return data; }",
+                "data",
+            ),
+            (
+                "async function f(o) { const { data: body } = await call(o); return body; }",
+                "data",
+            ),
+        ] {
+            let step = whole_shape(source).and_then(|shape| shape.step());
+            assert_eq!(step, Some(Step::Member(wanted.to_string())), "{source}");
+        }
+        let parsed = whole_shape("async function f(u) { return (await fetch(u)).json(); }");
+        assert_eq!(
+            parsed.and_then(|shape| shape.step()),
+            Some(Step::Parse("json".to_string()))
+        );
+        let whole = whole_shape("function f(o) { return call(o); }");
+        assert_eq!(whole.and_then(|shape| shape.step()), None);
+    }
+
+    /// carrick#4513: a name destructured twice holds a member of a member,
+    /// which no one key names; a value or no body reads as the value.
+    #[test]
+    fn a_chained_destructure_names_no_key_and_a_fallback_to_null_is_the_value() {
+        let chained = whole_shape(
+            "async function f(o) { const { data } = await call(o); const { items } = data; return items; }",
+        );
+        assert_eq!(
+            chained.and_then(|shape| shape.step()),
+            Some(Step::Member(String::new()))
+        );
+        for source in [
+            "async function f(o) { const r = await call(o); return r.data || null; }",
+            "async function f(o) { const r = await call(o); return r.data ?? undefined; }",
+        ] {
+            let step = whole_shape(source).and_then(|shape| shape.step());
+            assert_eq!(step, Some(Step::Member("data".to_string())), "{source}");
+        }
+        // A rejection handler that hands back no body is a no-body path.
+        // The chain ends at the request, `call(o)`, as an uncaught return's does.
+        let whole = whole_shape("function f(o) { return call(o); }").expect("a call's value");
+        for source in [
+            "function f(o) { return call(o).catch(() => null); }",
+            "function f(o) { return call(o).catch(() => undefined); }",
+            "function f(o) { return call(o).catch(() => {}); }",
+        ] {
+            assert_eq!(whole_shape(source), Some(whole.clone()), "{source}");
+        }
+        let member = whole_shape("async function f(o) { const r = await call(o); return r.data; }")
+            .expect("a member");
+        let caught_member = whole_shape(
+            "async function f(o) { const r = await call(o).catch(() => null); return r.data; }",
+        );
+        assert_eq!(caught_member, Some(member));
+        // One that hands back a value of its own is that value.
+        let own_value = whole_shape("function f(o) { return call(o).catch(() => []); }")
+            .expect("a call's value");
+        assert_ne!(own_value.base, whole.base);
+        // A fallback to a value of the function's own is not the value.
+        let own = whole_shape(
+            "async function f(o) { const r = await call(o); return r.data || 'none'; }",
+        );
+        assert_eq!(own, None);
+    }
+
+    /// The first function's [`ReturnRead`] of `source`.
+    fn read(source: &str) -> ReturnRead {
+        let cm: Lrc<SourceMap> = Default::default();
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("t.ts".into())),
+            source.to_string(),
+        );
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("parses");
+        return_reads(&module).remove(0).1
+    }
+
+    /// carrick#4513 P2 (review finding 2): a call's value with a literal
+    /// default of the function's own is that value's chain, marked
+    /// defaulted, through `??`, `||`, a conditional or a second `return`.
+    /// `return_shapes` still has no shape for it, so the summaries' and
+    /// call-through's inputs do not move. A default that is a function or
+    /// a value read off another is not a literal: the whole stays its own.
+    #[test]
+    fn a_value_with_a_literal_default_is_the_values_chain_marked_defaulted() {
+        let data = whole_shape("async function f(o) { const r = await call(o); return r.data; }")
+            .expect("a member");
+        for source in [
+            "async function f(o) { const r = await call(o); return r.data ?? []; }",
+            "async function f(o) { const r = await call(o); return r.data || []; }",
+            "async function f(o) { const r = await call(o); return r.data || 'none'; }",
+            "async function f(o) { const r = await call(o); return r.data ? r.data : []; }",
+            "async function f(o) { const r = await call(o); return !r.data ? { items: [] } : r.data; }",
+            "async function f(o) { const r = await call(o); if (!r.data) return []; return r.data; }",
+            "async function f(o) { const r = await call(o); if (!r.data) return -1; return r.data; }",
+        ] {
+            assert_eq!(
+                read(source),
+                ReturnRead::Defaulted(data.clone()),
+                "{source}"
+            );
+            assert_eq!(whole_shape(source), None, "{source}");
+        }
+        // `.catch(() => [])`: the shape stays the `.catch` call's value, as
+        // main's readers read it; the chain follows the value it is called on.
+        let whole = whole_shape("function f(o) { return call(o); }").expect("a call's value");
+        let caught = whole_shape("function f(o) { return call(o).catch(() => []); }")
+            .expect("the catch's value");
+        assert_ne!(caught.base, whole.base);
+        assert_eq!(caught.caught.as_deref(), Some(&whole));
+        let own = whole_shape("function f(o) { return call(o).catch(() => `no ${o}`); }")
+            .expect("the catch's value");
+        assert!(own.caught_own && own.caught.is_none(), "{own:?}");
+        for source in [
+            "async function f(o) { await call(o); return true; }",
+            "async function f(o) { const r = await call(o); if (!r.data) return () => 1; return r.data; }",
+            "async function f(o) { const r = await call(o); return r.data ?? [r.status]; }",
+            "async function f(o) { const r = await call(o); return r.data ?? `${o}`; }",
+        ] {
+            assert_eq!(read(source), ReturnRead::NoShape(NoChain::Own), "{source}");
+        }
+    }
+
+    /// carrick#4513 P2 (review, smaller point): two calls' values in one
+    /// conditional are not followed, as two returns of different calls are
+    /// not; two values of the function's own stay its own.
+    #[test]
+    fn a_conditional_of_two_calls_is_not_followed() {
+        for source in [
+            "function f(o, c) { return c ? a(o) : b(o); }",
+            "function f(o, c) { if (c) { return a(o); } return b(o); }",
+            "function f(o, c) { return a(o) || b(o); }",
+        ] {
+            assert_eq!(
+                read(source),
+                ReturnRead::NoShape(NoChain::Unfollowed),
+                "{source}"
+            );
+        }
+        for source in [
+            "function f(o, c) { return c ? 1 : 2; }",
+            "async function f(o, c) { const r = await a(o); return c ? r.data.x : 2; }",
+        ] {
+            assert_eq!(read(source), ReturnRead::NoShape(NoChain::Own), "{source}");
+        }
+    }
+
+    /// carrick#4513 P2 (D2): why a function has no shape, sub-arm by
+    /// sub-arm. A value it makes itself is its own; a name given two values
+    /// or two calls' values are not followed.
+    #[test]
+    fn a_function_with_no_shape_says_whether_its_value_is_its_own() {
+        for source in [
+            "async function f(o) { return (await sdk(o)).data.items; }",
+            "function f(o) { return `${sdk(o)}`; }",
+            "async function f(o) { const r = await sdk(o); return r.v > 0; }",
+            "function f(o) { class Made {} return Made; }",
+            "function f(o) { function run() { return sdk(o); } return run; }",
+            "function f(o) { return { data: sdk(o) }; }",
+            "async function f(o) { await sdk(o); }",
+        ] {
+            assert_eq!(read(source), ReturnRead::NoShape(NoChain::Own), "{source}");
+        }
+        for source in [
+            "async function f(o) { let r = sdk(1); r = sdk(2); return r.data; }",
+            "async function f(o) { if (o) return sdk(1); return sdk(2); }",
+            "function f(o) { return new Wrapped(sdk(o)); }",
+        ] {
+            assert_eq!(
+                read(source),
+                ReturnRead::NoShape(NoChain::Unfollowed),
+                "{source}"
+            );
+        }
+    }
+
+    /// carrick#4371 R2: the one accept test, row by row.
+    #[test]
+    fn hands_back_body_reads_the_steps_against_the_ends_label() {
+        use crate::services::type_sidecar::ResultShape;
+        let member = |name: &str| Step::Member(name.to_string());
+        let parse = |name: &str| Step::Parse(name.to_string());
+        let data = EndRead::Labelled(ResultShape::Member(["data".to_string()]));
+        let text = EndRead::Labelled(ResultShape::Parse("text".to_string()));
+        let whole = EndRead::Labelled(ResultShape::Whole(true));
+        for (steps, end, wanted) in [
+            (vec![member("data")], &data, HandBack::Body),
+            (vec![member("status")], &data, HandBack::Other),
+            (vec![], &data, HandBack::Other),
+            (vec![parse("text")], &text, HandBack::Body),
+            (vec![parse("json")], &text, HandBack::Other),
+            (vec![], &whole, HandBack::Body),
+            (vec![member("ok")], &whole, HandBack::Other),
+            (vec![], &EndRead::Unlabelled, HandBack::Body),
+            (
+                vec![member("data")],
+                &EndRead::Unlabelled,
+                HandBack::Undecided,
+            ),
+            (vec![parse("json")], &EndRead::Unlabelled, HandBack::Other),
+            (vec![parse("json")], &EndRead::PlatformFetch, HandBack::Body),
+            (vec![], &EndRead::PlatformFetch, HandBack::Undecided),
+            (vec![member("ok")], &EndRead::PlatformFetch, HandBack::Other),
+            (vec![member("data"), member("x")], &data, HandBack::Other),
+        ] {
+            assert_eq!(
+                hands_back_body(&steps, end),
+                wanted,
+                "{steps:?} over {end:?}"
+            );
         }
     }
 

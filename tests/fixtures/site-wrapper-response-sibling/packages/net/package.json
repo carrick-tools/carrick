@@ -1,0 +1,13 @@
+{
+  "name": "@fixture/net",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/http": "^1.0.0",
+    "@fixture/reply": "^1.0.0"
+  },
+  "exports": {
+    "./gate": "./src/gate.ts",
+    "./clear": "./src/clear.ts"
+  }
+}

@@ -315,9 +315,12 @@ impl PayloadAt {
 /// `result` is the one statement of where a site's response is read, and
 /// both askers read it: the payload slots ([`crate::site_payloads`]) and the
 /// fold's own rows ([`crate::site_rows::SiteRow::response_at`]). It is the
-/// deciding call, except where that call only makes the function that sends
-/// ([`DecidedSite::makes_end`], carrick#4319): its result is then that
-/// function, and what the send answers is read at the labelled call.
+/// deciding call where that call hands back the labelled call's body, or is
+/// the labelled call, and the labelled call where the deciding call hands
+/// back anything else: a field, a flag, an envelope, the function a maker
+/// makes ([`DecidedSite::hands_back`], carrick#4371, carrick#4319). A
+/// wrapper's own value is never its response. Why and how it is decided:
+/// READY-4371's R-table, in carrick#4371.
 fn payload_slots(
     result: &AnchorAt,
     payload_at: Option<&AnchorAt>,
@@ -2727,9 +2730,11 @@ fn record(
     } else {
         None
     };
-    // A maker's call returns the function that sends (carrick#4319): what
-    // the send answers is read at the labelled call.
-    let result = if site.makes_end {
+    // A deciding call whose callee hands back something other than the
+    // labelled call's body (a field, a flag, an envelope, the function a
+    // maker makes; carrick#4371, carrick#4319): what the send answers is
+    // read at the labelled call.
+    let result = if site.hands_back == Some(crate::return_flow::HandBack::Other) {
         AnchorAt {
             file: site.end.file.clone(),
             line: site.end.line,

@@ -89,6 +89,8 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
         procedure: None,
         makes_end: false,
         chain_handed_on: false,
+        deciding_callee: None,
+        hands_back: None,
     }
 }
 
@@ -3478,6 +3480,7 @@ fn the_name_census_counts_each_reader_s_outcome() {
     let literal = || vec![Piece::Lit("orders".to_string())];
     let relayed = vec![Via {
         at: "src/send.ts:3".to_string(),
+        span: (0, 0),
         callee: "relay".to_string(),
     }];
     let sites = vec![
