@@ -1747,6 +1747,10 @@ struct ReceiverOp<'a> {
     member: &'a str,
 }
 
+/// One call made through a listed client into a package never asked: (listed
+/// package, declaring package, file, span start, span end).
+type ThroughListed = (String, String, String, u32, u32);
+
 struct Walker<'a> {
     inputs: &'a RequestSummaryInputs,
     /// The run's other services, in declared order (carrick#2618): the walk
@@ -1780,7 +1784,7 @@ struct Walker<'a> {
     declarations_unanswered: std::cell::RefCell<BTreeSet<(String, u32, u32)>>,
     /// The calls made through a listed client into a package never asked, as
     /// (listed package, declaring package, file, span), counted once each.
-    through_listed: std::cell::RefCell<BTreeSet<(String, String, String, u32, u32)>>,
+    through_listed: std::cell::RefCell<BTreeSet<ThroughListed>>,
     /// What each call of the service's own files entered, by file and span
     /// ([`Discovery::entered`]).
     entered: BTreeMap<(PathBuf, u32, u32), EnteredAt>,
