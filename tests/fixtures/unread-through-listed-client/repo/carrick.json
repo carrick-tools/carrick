@@ -1,0 +1,3 @@
+{
+  "services": [{ "name": "unread-through-listed-client", "directory": ".", "tsconfig": "tsconfig.json" }]
+}

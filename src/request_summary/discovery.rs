@@ -331,6 +331,9 @@ pub struct Labels<'a> {
     /// The packages the scan ended without an answer for ([`crate::library_store::Settled::unanswered`]),
     /// for the settled pass; `None` leaves [`Self::answered`] to decide.
     unready: Option<HashSet<&'a str>>,
+    /// Every package the scan asked the store about, for the settled pass;
+    /// `None` tells no package apart as never asked ([`Labels::asking`]).
+    asked: Option<HashSet<&'a str>>,
     /// The packages with an export of a network role.
     networked: HashSet<&'a str>,
     /// The exports the store labelled with no network role.
@@ -354,6 +357,7 @@ impl<'a> Labels<'a> {
             implementations: None,
             answered: None,
             unready: None,
+            asked: None,
             networked: exports
                 .iter()
                 .filter(|export| export.role != LibraryRole::None)
@@ -414,6 +418,27 @@ impl<'a> Labels<'a> {
             .as_ref()
             .is_some_and(unanswered)
             .then_some(Stop::UnansweredPackage)
+    }
+
+    /// Whether the settled pass never asked the store about the package `key`
+    /// keys: not the default library, not a runtime module (asked by import,
+    /// its globals need no import), and outside every asked package.
+    fn never_asked(&self, key: &str) -> bool {
+        !is_language_key(key)
+            && !key.starts_with("node:")
+            && self
+                .asked
+                .as_ref()
+                .is_some_and(|asked| !asked.contains(key))
+    }
+
+    /// These labels with every package the scan asked the store about, for the
+    /// settled pass ([`Labels::never_asked`]).
+    pub fn asking(self, asked: &'a BTreeSet<String>) -> Self {
+        Labels {
+            asked: Some(asked.iter().map(String::as_str).collect()),
+            ..self
+        }
     }
 
     /// These labels for the settled pass, with the packages the scan ended
@@ -1753,6 +1778,9 @@ struct Walker<'a> {
     ambiguous: std::cell::Cell<usize>,
     /// The calls [`Discovery::declarations_unanswered`] lists.
     declarations_unanswered: std::cell::RefCell<BTreeSet<(String, u32, u32)>>,
+    /// The calls made through a listed client into a package never asked, as
+    /// (listed package, declaring package, file, span), counted once each.
+    through_listed: std::cell::RefCell<BTreeSet<(String, String, String, u32, u32)>>,
     /// What each call of the service's own files entered, by file and span
     /// ([`Discovery::entered`]).
     entered: BTreeMap<(PathBuf, u32, u32), EnteredAt>,
@@ -2644,10 +2672,19 @@ impl<'a> Walker<'a> {
                 {
                     return None;
                 }
-                let reasons: Vec<Option<Stop>> = keys
+                let mut reasons: Vec<Option<Stop>> = keys
                     .iter()
                     .map(|key| self.labels.package_reason(key))
                     .collect();
+                if reasons.iter().all(Option::is_none) {
+                    // Every declaring package was never asked, and the call is
+                    // made on an instance a listed, networked package built:
+                    // it arrives through that package, which names why it was
+                    // not followed (C2-narrow).
+                    if let Some(through) = self.listed_client_of(file, call, &keys) {
+                        reasons = vec![self.labels.package_reason(&through)];
+                    }
+                }
                 if reasons.iter().any(Option::is_none) {
                     return None;
                 }
@@ -2667,6 +2704,33 @@ impl<'a> Walker<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The listed, networked package whose instance `call` is made on, when
+    /// every package in `keys` that declares it was never asked: the library
+    /// site reader's own reading of what the call arrives through
+    /// ([`Walker::instances`]). Tallies the pair once per call site.
+    fn listed_client_of(&self, file: &Path, call: &CallIr, keys: &[String]) -> Option<String> {
+        if keys.is_empty() || !keys.iter().all(|key| self.labels.never_asked(key)) {
+            return None;
+        }
+        let site = self
+            .instances
+            .get(&(file, call.site.span_start, call.site.span_end))?;
+        let through = specifier_keys(&site.specifier)
+            .into_iter()
+            .find(|key| !is_language_key(key) && self.labels.networked.contains(key.as_str()))?;
+        let mut tally = self.through_listed.borrow_mut();
+        for key in keys {
+            tally.insert((
+                through.clone(),
+                key.clone(),
+                self.rel(file),
+                call.site.span_start,
+                call.site.span_end,
+            ));
+        }
+        Some(through)
     }
 
     /// Whether the store labelled the export `call` is made on with no
@@ -4086,6 +4150,7 @@ pub fn discover_with(
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
         declarations_unanswered: std::cell::RefCell::new(BTreeSet::new()),
+        through_listed: std::cell::RefCell::new(BTreeSet::new()),
         entered: BTreeMap::new(),
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
@@ -4131,6 +4196,12 @@ pub fn discover_with(
         })
         .collect();
     discovery.declarations_unanswered = walker.declarations_unanswered.take();
+    for (through, declaring, ..) in walker.through_listed.take() {
+        *discovery
+            .counts
+            .entry(format!("through_listed/{through}<-{declaring}"))
+            .or_default() += 1;
+    }
     let ambiguous = walker.ambiguous.get();
     if ambiguous > 0 {
         discovery
@@ -6227,6 +6298,100 @@ mod tests {
                 .finished
                 .contains(&span("answered.ts", "render(body)")),
             "an answered package with nothing to label stays silent"
+        );
+    }
+
+    /// A call declared in a package the scan never asked, made on an instance
+    /// a listed, networked package built, is saved in the settled pass as that
+    /// listed package's `package_unmatched`. Controls: a call declared in the
+    /// listed package, one through a listed package answered `none`, one
+    /// made direct on an unlisted package, one declared in a listed package
+    /// the store answered with no exports (asked), and one into a package that
+    /// is not installed all keep the reading they had. The answer key is
+    /// `tests/fixtures/unread-through-listed-client/expected.json`.
+    #[test]
+    fn a_call_through_a_listed_client_into_an_unlisted_package_is_the_listed_package_unmatched() {
+        let Some(on) = walked("unread-through-listed-client", ".", "web", &[], true) else {
+            return;
+        };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/unread-through-listed-client");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        let unready = BTreeSet::new();
+        let asked: BTreeSet<String> = [
+            "@acme/sdk".to_string(),
+            "@acme/store".to_string(),
+            "@acme/extras".to_string(),
+        ]
+        .into();
+        let before = discover(
+            &on.inputs,
+            &Labels::of(&answer.exports).ended_without(&unready),
+            &on.repo,
+        );
+        let after = discover(
+            &on.inputs,
+            &Labels::of(&answer.exports)
+                .ended_without(&unready)
+                .asking(&asked),
+            &on.repo,
+        );
+        let span = |file: &str, needle: &str| -> (String, u32, u32) {
+            let text = std::fs::read_to_string(fixture.join("repo/src").join(file)).unwrap();
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (format!("src/{file}"), lo, lo + needle.len() as u32)
+        };
+        let stop_at = |discovery: &Discovery, at: &(String, u32, u32)| {
+            discovery
+                .unfollowed
+                .iter()
+                .find(|site| (site.file.clone(), site.span_start, site.span_end) == *at)
+                .and_then(|site| site.stop)
+        };
+        let invoke = span(
+            "invoke.ts",
+            "client.functions.invoke(\"send-welcome\", { body: { user } })",
+        );
+        let context = format!("{:?}\n{:?}", after.unfollowed, after.counts);
+        assert_eq!(stop_at(&before, &invoke), None, "no reason before");
+        assert_eq!(
+            stop_at(&after, &invoke),
+            Some(Stop::PackageUnmatched),
+            "{context}"
+        );
+        assert_eq!(
+            after
+                .counts
+                .get("through_listed/@acme/sdk<-@acme/functions-js"),
+            Some(&1),
+            "{context}"
+        );
+        for (file, needle) in [
+            ("invoke.ts", "client.ping()"),
+            ("store.ts", "store.cache.get(key)"),
+            ("direct.ts", "helper()"),
+            ("extras.ts", "client.extras.run(\"nightly\")"),
+            ("gone.ts", "vanish(who)"),
+        ] {
+            let at = span(file, needle);
+            assert_eq!(
+                stop_at(&after, &at),
+                stop_at(&before, &at),
+                "{file} {needle}: {context}"
+            );
+        }
+        assert_eq!(
+            stop_at(&after, &span("extras.ts", "client.extras.run(\"nightly\")")),
+            None,
+            "the declaring package was asked: {context}"
+        );
+        assert!(
+            after
+                .missed_inside
+                .contains(&span("caller.ts", "welcome(user)")),
+            "the caller that enters the saved call is marked: {context}"
         );
     }
 

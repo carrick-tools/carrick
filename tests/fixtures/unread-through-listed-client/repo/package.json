@@ -1,0 +1,10 @@
+{
+  "name": "unread-through-listed-client",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@acme/sdk": "^1.0.0",
+    "@acme/store": "^1.0.0",
+    "@acme/extras": "^1.0.0"
+  }
+}

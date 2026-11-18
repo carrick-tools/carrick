@@ -1,0 +1,25 @@
+{
+  "reasons": {
+    "src/invoke.ts:6": "package_unmatched",
+    "src/invoke.ts:10": "package_unmatched",
+    "src/caller.ts:4": "missed_inside",
+    "src/direct.ts:4": "unanswered_package",
+    "src/gone.ts:4": "value_callee"
+  },
+  "silent": {
+    "src/store.ts": [
+      6
+    ],
+    "src/extras.ts": [
+      4
+    ]
+  },
+  "by_reason": {
+    "package_unmatched": 2,
+    "missed_inside": 1,
+    "no_op_claim": 1,
+    "unanswered_package": 1,
+    "value_callee": 1
+  },
+  "arrived_through": "@acme/sdk<-@acme/functions-js=1"
+}
