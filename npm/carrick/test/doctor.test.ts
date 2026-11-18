@@ -395,7 +395,7 @@ test("missing skills, skills an older version wrote, and skills edited here", ()
     // Missing and outdated are faults; an edited file is a note, because a
     // team that changed a skill meant to and doctor exits non-zero on faults.
     assert.equal(findingCount(lines), 2, all);
-    assert.match(all, /1 of the 8 task skill file\(s\) are missing here/);
+    assert.match(all, /1 of the 10 task skill file\(s\) are missing here/);
     assert.match(all, /1 task skill file\(s\) here were written by an older version of carrick/);
     // One file is named as one, not as the first of several (carrick#1574).
     assert.match(all, /carrick-census\/SKILL\.md\), so your agent/);
@@ -675,7 +675,7 @@ test("the whole command, on a workspace with exactly three findings", () => {
     `■ ${path.basename(root)}: service "api" includes "packages/shared", which is not a directory in this repo.`,
     `${path.basename(root)}: Carrick now scans this repo in its own cloud runners on every push, so .github/workflows/carrick.yml is no longer needed and only uses CI minutes. You can delete it.`,
     `◇ Agent hooks are installed here and run \`carrick\` on PATH (${path.join(bin, "carrick")}).`,
-    "▲ 8 of the 8 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
+    "▲ 10 of the 10 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
     // Found with no ~/.claude at all: the command is the detection.
     "◇ MCP server connected for Claude Code.",
     "▲ api: api is connected and has no hosted index yet. Carrick builds it in the cloud, and `carrick refresh` downloads it once it is ready. (hosted state: no_index_yet)",

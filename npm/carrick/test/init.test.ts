@@ -2860,13 +2860,13 @@ for (const harness of [".claude", ".agents"]) {
   });
 }
 
-test("a task skill root that is an ordinary folder, or a link that stays inside its harness folder, still gets all four", () => {
+test("a task skill root that is an ordinary folder, or a link that stays inside its harness folder, still gets all five", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-skill-link-"));
   try {
     fs.mkdirSync(path.join(dir, ".agents", "real"), { recursive: true });
     fs.symlinkSync("real", path.join(dir, ".agents", "skills"));
     const outcomes = writeTaskSkills(dir, { slug: null });
-    assert.equal(outcomes.length, 8);
+    assert.equal(outcomes.length, 10);
     assert.ok(outcomes.every((row) => row.state === "absent" && row.wrote), JSON.stringify(outcomes));
     assert.deepEqual(taskSkillWarnings(outcomes), []);
     assert.ok(fs.existsSync(path.join(dir, ".agents", "real", "carrick-impact", "SKILL.md")));

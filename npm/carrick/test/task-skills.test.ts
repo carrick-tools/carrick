@@ -1,4 +1,4 @@
-// The four task skills `carrick init` installs, and the stamp that decides
+// The five task skills `carrick init` installs, and the stamp that decides
 // which copies are ours.
 //
 // The two that can destroy something are tested hardest: a body somebody has
@@ -34,14 +34,14 @@ test("every skill lands under both harnesses, with its frontmatter and its stamp
   const dir = workspace();
   const outcomes = writeTaskSkills(dir, { slug: "acme-index" });
 
-  assert.equal(outcomes.length, 8);
+  assert.equal(outcomes.length, 10);
   assert.deepEqual(
     outcomes.map((row) => row.path).sort(),
     taskSkillPaths().sort(),
   );
   assert.ok(
     outcomes.every((row) => row.wrote && row.state === "absent"),
-    "a first run writes all eight",
+    "a first run writes all ten",
   );
 
   for (const root of SKILL_ROOTS) {
@@ -174,27 +174,16 @@ test("the bodies read what an answer carries rather than a response shape writte
   // One call where the server answers both wordings, two where it does not.
   const census = renderTaskSkill("carrick-census", { slug: "acme-index" }).replace(/\s+/g, " ");
   assert.match(census, /also_phrased_as: \["<how it does it>"\]/);
-  assert.match(census, /Where the answer carries no `phrasings`, or the field comes back refused/);
-  assert.match(census, /`hidden_by_threshold` where the answer carries it/);
-
-  // The other hidden count, and its lever is a different one: these rows are
-  // held back by word weight, so a lower similarity_threshold never reaches
-  // them and a receipt naming only the first count reads as if it would.
-  assert.match(census, /`hidden_by_lexical_floor` where the answer carries it/);
-  assert.match(census, /A lower `similarity_threshold` does not reach these rows\./);
-
-  // A function with no intent is still ranked, on its own tokens, so the
-  // receipt cannot report it as a function no search looked at.
-  assert.doesNotMatch(census, /which no search looked at/);
-  assert.match(census, /ranked on their name, signature and body tokens alone/);
+  assert.match(census, /Where the answer carries no `phrasings`, run the second wording as its own search/);
+  assert.match(census, /Do not change `similarity_threshold` while paging/);
 });
 
-test("census follows helpers to callers, impact greps on zero, drift reads per-call-site verdicts (#3443)", () => {
+test("census follows helpers to callers through the endpoint, impact greps on zero, drift reads per-call-site verdicts (#3443)", () => {
   const census = renderTaskSkill("carrick-census", { slug: "acme-index" }).replace(/\s+/g, " ");
-  assert.match(census, /## 5\. Follow helpers to callers/);
-  assert.match(census, /get_callers\(project: "acme-index", function_name: "<helper>"/);
-  assert.match(census, /Report the callers as the places that do X/);
-  assert.match(census, /grep the source for that identifier as well and merge the two/);
+  assert.match(census, /depth: 3/);
+  assert.match(census, /Take the path from that endpoint, never from the handler's name/);
+  assert.match(census, /chains that stop/);
+  assert.match(census, /Skip `unread_sites`/);
 
   const impact = renderTaskSkill("carrick-impact", { slug: "acme-index" }).replace(/\s+/g, " ");
   assert.match(impact, /When `get_callers` returns 0 rows, grep the function's name/);
@@ -205,6 +194,16 @@ test("census follows helpers to callers, impact greps on zero, drift reads per-c
   assert.match(drift, /the top-level `verdicts` can be `\[\]` while the call sites hold them/);
   assert.match(drift, /from the `verdict\.state` on each call site/);
   assert.match(drift, /`verdicts` is empty and no call site carries a `verdict`/);
+});
+
+test("the audit skill renders for both scopes and names its two finding kinds and its cost", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    assert.doesNotMatch(audit, /\{\{/);
+    assert.match(audit, /kind: "type_mismatch"/);
+    assert.match(audit, /kind: "similar_functions"/);
+    assert.match(audit, /Cost: this skill opens source for every item it reads\./);
+  }
 });
 
 test("a second run writes nothing and reports nothing to fix", () => {
@@ -258,7 +257,7 @@ test("a checkout that rewrote the line endings still reads as ours", () => {
   fs.writeFileSync(target, crlf);
 
   assert.equal(skillState(crlf), "ours");
-  assert.equal(removeTaskSkills(dir).deleted.length, 8);
+  assert.equal(removeTaskSkills(dir).deleted.length, 10);
 });
 
 test("a skill of the same name that Carrick never wrote is left alone and named", () => {
@@ -287,7 +286,7 @@ test("remove deletes the stamped copies and nothing else", () => {
   fs.writeFileSync(neighbour, "mine\n");
 
   const result = removeTaskSkills(dir);
-  assert.equal(result.deleted.length, 6);
+  assert.equal(result.deleted.length, 8);
   assert.ok(fs.existsSync(edited), "an edited body was deleted");
   assert.ok(fs.existsSync(theirs), "somebody else's skill was deleted");
   assert.ok(fs.existsSync(neighbour), "an unrelated skill was deleted");
@@ -308,7 +307,7 @@ test("remove deletes the stamped copies and nothing else", () => {
 // (carrick#1333). It takes the first `project: "…"` there, which is the scope
 // only while the templates carry `{{SCOPE}}` and no literal of that shape. A
 // template that grew a prose example would make every file render differently
-// from what is on disk: eight findings in `carrick doctor` and a daily line
+// from what is on disk: ten findings in `carrick doctor` and a daily line
 // that never stops, both of them wrong and neither of them loud.
 test("no skill template holds a project scope of its own", () => {
   for (const name of TASK_SKILLS) {
@@ -337,7 +336,7 @@ test("removing the last skill takes the host folder init created with it", () =>
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
 
-  assert.equal(removeTaskSkills(dir).deleted.length, 8);
+  assert.equal(removeTaskSkills(dir).deleted.length, 10);
   assert.equal(fs.existsSync(path.join(dir, ".agents")), false, ".agents was left behind");
   assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true);
   assert.equal(fs.existsSync(path.join(dir, ".claude")), true, "somebody's own folder went with it");
