@@ -4317,6 +4317,233 @@ fn rechecked_monorepo() -> tempfile::TempDir {
     workspace
 }
 
+/// carrick#4807: three services of one monorepo. `catalog-web` serves two
+/// routes: widgets, read by `inventory-svc`, and gadgets, read by
+/// `ledger-svc`. Indexed, then `inventory-svc`'s stored blob is marked as its
+/// hosted scan's library ask failed. `inventory-svc` is never re-scanned by an
+/// edit of a `catalog-web` file, so its mark is one the run only carries.
+fn monorepo_with_a_marked_carried_service() -> tempfile::TempDir {
+    let workspace = monorepo_workspace();
+    let root = workspace.path();
+    let mono = root.join("mono");
+    let source = repo_root().join("tests/fixtures/local-mode-workspace");
+    copy_tree(&source.join("inventory-svc"), &mono.join("ledger-svc"));
+    let ledger = mono.join("ledger-svc/src");
+    std::fs::remove_file(ledger.join("inventory.ts")).expect("drop the widget reader");
+    std::fs::write(
+        ledger.join("client.ts"),
+        r#"import { send } from "./send.js";
+
+export type Gadget = {
+  id: string;
+  label: string;
+  stock: number;
+};
+
+export class GadgetClient {
+  constructor(private readonly baseUrl: string) {}
+
+  readGadget(gadgetId: string): Promise<Gadget> {
+    const encoded = encodeURIComponent(gadgetId);
+    return send<Gadget>(`${this.baseUrl}/api/v1/gadgets/${encoded}`, {
+      method: "GET",
+    });
+  }
+}
+"#,
+    )
+    .expect("the gadget client");
+    std::fs::write(
+        ledger.join("stock.ts"),
+        r#"import type { GadgetClient } from "./client.js";
+
+export async function stockOf(
+  gadgetId: string,
+  client: GadgetClient
+): Promise<number> {
+  const gadget = await client.readGadget(gadgetId);
+  return gadget.stock;
+}
+"#,
+    )
+    .expect("the stock reader");
+    std::fs::write(
+        mono.join("catalog-web/app/routes/api.v1.gadgets.$gadgetId.ts"),
+        r#"// GET /api/v1/gadgets/:gadgetId, read by `ledger-svc`.
+
+export type Gadget = {
+  id: string;
+  label: string;
+  stock: number;
+};
+
+export async function loader({
+  params,
+}: {
+  params: { gadgetId: string };
+}): Promise<Gadget> {
+  return { id: String(params.gadgetId), label: "bolt", stock: 4 };
+}
+"#,
+    )
+    .expect("the gadget route");
+    std::fs::write(
+        mono.join("carrick.json"),
+        r#"{ "services": [
+  { "name": "catalog-web", "directory": "catalog-web" },
+  { "name": "inventory-svc", "directory": "inventory-svc" },
+  { "name": "ledger-svc", "directory": "ledger-svc" }
+] }
+"#,
+    )
+    .expect("write carrick.json");
+    commit_all(&mono, "three services");
+    index(root);
+    mark_stored_service(root, "inventory-svc");
+    sign_in(root, "one");
+    workspace
+}
+
+/// Write `library_ask_failed: unreachable` on the stored blob of `service`,
+/// as the hosted scan writes it when its own ask failed.
+fn mark_stored_service(root: &Path, service: &str) {
+    let mut marked = 0;
+    for entry in std::fs::read_dir(root.join(".carrick/repos"))
+        .expect("the index's blobs")
+        .flatten()
+    {
+        let path = entry.path();
+        let mut blob: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read a blob"))
+                .expect("a blob is JSON");
+        if blob["service_name"] != service {
+            continue;
+        }
+        let boundary = blob
+            .get_mut("boundary")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap_or_else(|| panic!("{service}'s blob holds a boundary"));
+        boundary.insert("library_ask_failed".into(), "unreachable".into());
+        std::fs::write(&path, serde_json::to_vec(&blob).expect("serialise")).expect("write back");
+        marked += 1;
+    }
+    assert_eq!(marked, 1, "one blob of {service} was marked");
+}
+
+const GADGET_ROUTE: &str = "mono/catalog-web/app/routes/api.v1.gadgets.$gadgetId.ts";
+const LIBRARY_ROWS_MISSING: &str =
+    "not checked: the library rows of inventory-svc are missing from the index.";
+
+/// carrick#4807: a mark stored on a service the run only carried does not
+/// refuse the re-check. The re-check of the gadgets route (its own ask was
+/// answered) runs and states the planted mismatch with `ledger-svc`.
+#[test]
+#[serial]
+fn a_recheck_runs_when_only_a_carried_service_holds_a_library_mark() {
+    let workspace = monorepo_with_a_marked_carried_service();
+    let root = workspace.path();
+    edit(&root.join(GADGET_ROUTE), "  stock: number;\n", "");
+    edit(&root.join(GADGET_ROUTE), ", stock: 4", "");
+
+    let answer = recheck_json(root, GADGET_ROUTE, &AMPLE);
+    assert_ne!(
+        answer["recheck"]["ran"], "none",
+        "the carried service's mark must not refuse the re-check:\n{answer:#}"
+    );
+    let stated = answer["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|item| {
+            item["stated"] == true
+                && item["verdict"]["result"] == "type_mismatch"
+                && item["counterparts"]
+                    .as_array()
+                    .is_some_and(|c| c.iter().any(|c| c["service"] == "ledger-svc"))
+        });
+    assert!(
+        stated,
+        "the planted mismatch with ledger-svc is stated:\n{answer:#}"
+    );
+}
+
+/// carrick#4807: the pair with the marked service is not judged and says
+/// why: not "no route", not "compatible", and not a mismatch.
+#[test]
+#[serial]
+fn a_pair_with_a_marked_carried_service_is_not_judged() {
+    let workspace = monorepo_with_a_marked_carried_service();
+    let root = workspace.path();
+    drop_active_count(root);
+
+    let answer = recheck_json(root, MONO_ROUTE, &AMPLE);
+    assert_ne!(answer["recheck"]["ran"], "none", "{answer:#}");
+    let paired: Vec<&serde_json::Value> = answer["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item["counterparts"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c["service"] == "inventory-svc"))
+        })
+        .collect();
+    assert!(!paired.is_empty(), "the widgets route pairs:\n{answer:#}");
+    for item in paired {
+        assert_eq!(item["verdict"]["state"], "not_checked", "{item:#}");
+        assert_eq!(
+            item["verdict"]["result"],
+            serde_json::Value::Null,
+            "{item:#}"
+        );
+        assert_eq!(item["verdict"]["detail"], LIBRARY_ROWS_MISSING, "{item:#}");
+        assert_ne!(item["stated"], true, "{item:#}");
+    }
+}
+
+/// carrick#4807: `check --changed` follows the same rule: a carried service's
+/// mark does not refuse it, the pair with the marked service is named as not
+/// judged and never fails, and the pair with another service is judged.
+#[test]
+#[serial]
+fn check_changed_runs_when_only_a_carried_service_holds_a_library_mark() {
+    let workspace = monorepo_with_a_marked_carried_service();
+    let root = workspace.path();
+    drop_active_count(root);
+    edit(&root.join(GADGET_ROUTE), "  stock: number;\n", "");
+    edit(&root.join(GADGET_ROUTE), ", stock: 4", "");
+
+    let (_, json, _) = changed_scanned(root, &[]);
+    assert_eq!(json["not_checked"], serde_json::Value::Null, "{json:#}");
+    let names = |p: &serde_json::Value, service: &str| {
+        p["other"].as_array().is_some_and(|other| {
+            other
+                .iter()
+                .any(|o| o.as_str().is_some_and(|o| o.starts_with(service)))
+        })
+    };
+    let problems = json["problems"].as_array().expect("problems");
+    assert!(
+        problems
+            .iter()
+            .any(|p| p["kind"] == "incompatible" && names(p, "ledger-svc")),
+        "ledger-svc's pair is judged:\n{json:#}"
+    );
+    assert!(
+        !problems.iter().any(|p| names(p, "inventory-svc")),
+        "inventory-svc's pair is not:\n{json:#}"
+    );
+    let unjudged = json["not_type_checked"]
+        .as_array()
+        .expect("not_type_checked");
+    assert!(
+        unjudged
+            .iter()
+            .any(|row| row["reason"] == LIBRARY_ROWS_MISSING),
+        "the marked pair is named with its reason:\n{json:#}"
+    );
+}
+
 /// `check --changed --json`: the exit code, the answer without how it was
 /// reached, and whether a scan child started (its `scan` timing line).
 fn changed_scanned(root: &Path, env: &[(&str, &str)]) -> (Option<i32>, serde_json::Value, bool) {

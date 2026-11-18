@@ -588,7 +588,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     if !lost.is_empty() {
         output.not_checked = Some(lost.join(" "));
     } else if let Some(sentence) =
-        super::recheck::library_unavailable(&rejoined.index, changed.keys())
+        super::recheck::library_unavailable(&rejoined.index, changed.keys(), &rejoined.rescanned)
     {
         // The re-scan asked the library store and got no answer: a route
         // registered through a server package is missing, so "checked 0
@@ -1158,6 +1158,7 @@ pub(super) fn judge(
     };
 
     let strict = states_dispatch(before);
+    let marked = super::recheck::library_marked(rebuilt);
     let mut judged = Judged {
         routes: 0,
         calls: 0,
@@ -1185,6 +1186,22 @@ pub(super) fn judge(
         let Some(item) = item_of(repo, operation) else {
             continue;
         };
+        // A pair with a service whose library rows are missing from the index
+        // is not judged, whatever its stored verdict says (carrick#4807).
+        if let Some(service) = missing_library_side(&marked, operation, item) {
+            if in_change {
+                judged.not_type_checked.push(NotTypeChecked {
+                    file: shown(root, repo_path, &operation.file),
+                    line: operation.line,
+                    role: item.kind.as_str().to_string(),
+                    method: operation.method.clone(),
+                    path: operation.path.clone(),
+                    reason: super::recheck::library_missing_reason(service),
+                    descriptor: false,
+                });
+            }
+            continue;
+        }
         let mismatch = item.verdict.as_ref().is_some_and(|verdict| {
             matches!(
                 verdict.result.as_deref(),
@@ -1554,6 +1571,22 @@ pub(super) fn judge(
     judged.not_type_checked.sort();
     judged.not_type_checked.dedup();
     judged
+}
+
+/// The service among `marked` that one side of this paired row sits in: the
+/// row's own or a counterpart's. `None` for a row with no counterpart, which
+/// pairs with nothing.
+pub(super) fn missing_library_side<'a>(
+    marked: &'a BTreeSet<String>,
+    operation: &JoinedOperation,
+    item: &'a IndexedItem,
+) -> Option<&'a str> {
+    if item.counterparts.is_empty() {
+        return None;
+    }
+    std::iter::once(operation.service.as_str())
+        .chain(item.counterparts.iter().map(|c| c.service.as_str()))
+        .find_map(|service| marked.get(service).map(String::as_str))
 }
 
 /// Whether any row of the index states a dispatch case. An index written
