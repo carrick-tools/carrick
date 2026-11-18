@@ -1,0 +1,46 @@
+{
+  "library_claims": [
+    {
+      "package": "@acme/sdk",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@acme/sdk",
+          "export": "createClient",
+          "role": "http_client",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@acme/store",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@acme/store",
+          "export": "createStore",
+          "role": "none",
+          "makes": [],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@acme/extras",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": []
+    }
+  ]
+}
