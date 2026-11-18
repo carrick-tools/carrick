@@ -9999,6 +9999,7 @@ fn append_deterministic_protocol_operations(
     append_pubsub_operations(
         cloud_data,
         file_results,
+        &extractions.event_bus,
         &extractions.socket_sites,
         in_process,
         &library,
@@ -10437,7 +10438,12 @@ fn classify_in_process_pubsub(
 /// two the model's is the richer: it carries the payload anchor that gives the
 /// op a resolved type, which this pass does not yet extract (#688). The value
 /// added here is the sites the model reported nothing for, which is the whole
-/// of the gap #676 was filed for.
+/// of the gap #676 was filed for. The model's row at the same file, line, topic
+/// and role is then stated by this pass: `append_pubsub_operations` gives it
+/// `resolution_source: event_bus` ([`bus_states_site`]), so two readers that
+/// agree make a fact and the row keeps its payload anchor. Same topic and role
+/// on another line of the file is not the same site: the model's row stays a
+/// candidate.
 ///
 /// The tradeoff that accepts: where the model reported a role and the AST
 /// disagrees, the model's role stands. It applies only where both saw the same
@@ -10537,6 +10543,30 @@ fn llm_pubsub_sites(
     sites
 }
 
+/// Whether the structural bus pass read this very site: same file, line, topic
+/// and role. A site a library row states is that row's, so it never counts.
+/// Fails closed: a bus op on another line of the file is another site.
+fn bus_states_site(
+    event_bus: &crate::event_emitter::BusExtraction,
+    library: &LibrarySiteIndex,
+    file: &Path,
+    line: u32,
+    topic: &str,
+    role: crate::operation::PubsubRole,
+) -> bool {
+    let ops = match role {
+        crate::operation::PubsubRole::Subscriber => &event_bus.subscribers,
+        crate::operation::PubsubRole::Publisher => &event_bus.publishers,
+    };
+    let file = library.relative(file);
+    ops.iter().any(|op| {
+        op.line == line
+            && op.event == topic
+            && library.relative(&op.file_path) == file
+            && !library.states_name(&op.file_path, op.line, &op.event)
+    })
+}
+
 /// Component-wise path normalization used by the protocol folds: strip a leading
 /// `./` (a `CurDir` component) so a walk-derived path (`./realtime/server.ts`)
 /// and a repo-relative file_results key (`realtime/server.ts`) collapse to the
@@ -10581,9 +10611,11 @@ fn protocol_relative(root: &Path, file: &Path) -> PathBuf {
 /// candidate everywhere a source is read (carrick#1626). An op the scanner's
 /// pass backfilled into the same list (`PubsubOperation::backfilled`) states
 /// no source.
+#[allow(clippy::too_many_arguments)]
 fn append_pubsub_operations(
     cloud_data: &mut CloudRepoData,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    event_bus: &crate::event_emitter::BusExtraction,
     sockets: &socket_sites::SocketSites,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
     library: &LibrarySiteIndex,
@@ -10637,9 +10669,20 @@ fn append_pubsub_operations(
             // The model's row says so (carrick#1626). A row the scanner's own
             // pass backfilled into the model's list is not the model's, and no
             // pass here is a labelled source yet, so it states none.
+            // Where the bus pass read the same file, line, topic and role,
+            // two independent readers agree: the row (the model's, which
+            // carries the payload anchor) is stated by the bus pass.
+            let source = if op.backfilled {
+                None
+            } else if op.role.is_some_and(|role| {
+                bus_states_site(event_bus, library, &file_path, line, &op.topic, role)
+            }) {
+                Some(crate::agents::file_analyzer_agent::ResolutionSource::EventBus)
+            } else {
+                Some(crate::agents::file_analyzer_agent::ResolutionSource::Model)
+            };
             let stated = |row: ApiEndpointDetails| ApiEndpointDetails {
-                resolution_source: (!op.backfilled)
-                    .then_some(crate::agents::file_analyzer_agent::ResolutionSource::Model),
+                resolution_source: source,
                 ..row
             };
             match op.role {
@@ -32660,6 +32703,194 @@ unfollowed_member_calls_total: 0,
         );
     }
 
+    use crate::library_claims::LibraryRows;
+
+    /// The bus pass and the model both report `order:failed` in one file;
+    /// `model_line` is where the model puts the subscriber and the publisher,
+    /// the bus pass reads both at line 14.
+    fn bus_and_model_rows(
+        model_line: i32,
+        model: bool,
+        library: LibraryRows,
+    ) -> (
+        CloudRepoData,
+        HashMap<String, FileAnalysisResult>,
+        LibrarySiteIndex,
+    ) {
+        use crate::operation::PubsubRole;
+
+        let bus_op = || crate::event_emitter::BusOp {
+            key: OperationKey::pubsub("order:failed"),
+            event: "order:failed".to_string(),
+            file_path: PathBuf::from("svc/src/orderBus.ts"),
+            line: 14,
+            member_start: 0,
+        };
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        if model {
+            let op = |role| {
+                let mut op = pubsub_op("order:failed", role, Some("OrderFailed"), Some("./types"));
+                op.line_number = model_line;
+                op
+            };
+            file_results.insert(
+                "svc/src/orderBus.ts".to_string(),
+                FileAnalysisResult {
+                    pubsub_operations: vec![op(PubsubRole::Subscriber), op(PubsubRole::Publisher)],
+                    ..Default::default()
+                },
+            );
+        }
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction {
+                subscribers: vec![bus_op()],
+                publishers: vec![bus_op()],
+            },
+            library,
+            ..ProtocolExtractions::default()
+        };
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
+        );
+        let index = LibrarySiteIndex::of(
+            &stated_library_rows(&extractions.library, ".", &Config::default()),
+            ".",
+        );
+        (cloud_data, file_results, index)
+    }
+
+    fn order_failed_rows(
+        cloud_data: &CloudRepoData,
+    ) -> Vec<(
+        String,
+        Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    )> {
+        cloud_data
+            .endpoints
+            .iter()
+            .chain(cloud_data.calls.iter())
+            .filter(|row| row.key.canonical() == "pubsub|order:failed")
+            .map(|row| (row.file_path.display().to_string(), row.resolution_source))
+            .collect()
+    }
+
+    #[test]
+    fn a_bus_site_the_model_also_reports_is_one_row_stated_by_the_bus_pass() {
+        use crate::agents::file_analyzer_agent::ResolutionSource as Source;
+        let (cloud_data, _, _) = bus_and_model_rows(14, true, LibraryRows::default());
+        assert_eq!(
+            order_failed_rows(&cloud_data),
+            vec![
+                ("svc/src/orderBus.ts:14".to_string(), Some(Source::EventBus)),
+                ("svc/src/orderBus.ts:14".to_string(), Some(Source::EventBus)),
+            ],
+            "one subscriber row and one publisher row, both stated"
+        );
+    }
+
+    #[test]
+    fn the_corroborated_row_keeps_its_manifest_entry() {
+        let (_, file_results, index) = bus_and_model_rows(14, true, LibraryRows::default());
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &socket_sites::SocketSites::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            &index,
+            ".",
+        );
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.primary_type_symbol.as_deref() == Some("OrderFailed"))
+        );
+    }
+
+    #[test]
+    fn a_model_only_pubsub_site_stays_a_candidate() {
+        use crate::agents::file_analyzer_agent::ResolutionSource as Source;
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/orderBus.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "order:failed",
+                    crate::operation::PubsubRole::Subscriber,
+                    None,
+                    None,
+                )],
+                ..Default::default()
+            },
+        );
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &ProtocolExtractions::default(),
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
+        );
+        assert_eq!(
+            order_failed_rows(&cloud_data),
+            vec![("svc/src/orderBus.ts:14".to_string(), Some(Source::Model))]
+        );
+    }
+
+    #[test]
+    fn a_model_row_on_another_line_of_the_same_file_stays_a_candidate() {
+        use crate::agents::file_analyzer_agent::ResolutionSource as Source;
+        let (cloud_data, _, _) = bus_and_model_rows(20, true, LibraryRows::default());
+        assert_eq!(
+            order_failed_rows(&cloud_data),
+            vec![
+                ("svc/src/orderBus.ts:20".to_string(), Some(Source::Model)),
+                ("svc/src/orderBus.ts:20".to_string(), Some(Source::Model)),
+            ],
+            "the model's rows stand as candidates and the bus rows are dropped"
+        );
+    }
+
+    #[test]
+    fn a_library_stated_site_is_untouched() {
+        use crate::agents::file_analyzer_agent::ResolutionSource as Source;
+        use crate::library_claims::LibraryRowKind;
+        use crate::operation::PubsubRole;
+        let library = LibraryRows {
+            rows: vec![
+                library_row(
+                    "svc/src/orderBus.ts",
+                    14,
+                    "order:failed",
+                    LibraryRowKind::Pubsub(PubsubRole::Subscriber),
+                ),
+                library_row(
+                    "svc/src/orderBus.ts",
+                    14,
+                    "order:failed",
+                    LibraryRowKind::Pubsub(PubsubRole::Publisher),
+                ),
+            ],
+            ..LibraryRows::default()
+        };
+        let (cloud_data, _, _) = bus_and_model_rows(14, true, library);
+        let rows = order_failed_rows(&cloud_data);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|(_, source)| *source == Some(Source::LibraryClaim)),
+            "{rows:?}"
+        );
+    }
+
     /// carrick#1662: a model route at exactly a verified definition's span is
     /// withdrawn. It fails closed: a model route at another span, a route a
     /// pass stated, and a row that is no definition keep their routes.
@@ -37362,6 +37593,7 @@ io.on("bare:in", (event) => {});
         append_pubsub_operations(
             &mut cloud_data,
             &file_results,
+            &crate::event_emitter::BusExtraction::default(),
             &socket_sites::SocketSites::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &LibrarySiteIndex::default(),
