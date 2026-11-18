@@ -812,7 +812,11 @@ async function relaxedEvidence(input: {
     for (const r of relaxed) {
       input.ws.guard.writeFile(path.join(input.ws.probesDir, RELAXED_DIR, r.fileName), r.source);
     }
-    const config = JSON.parse(CHECKER_TSCONFIG) as { include: string[] };
+    // The judge's options, its own files left out. The stubs' declaration
+    // files are not checked again: the judge already did, and the evidence
+    // reads the relaxed files' diagnostics only.
+    const config = JSON.parse(CHECKER_TSCONFIG) as { compilerOptions: Record<string, unknown>; include: string[] };
+    config.compilerOptions.skipLibCheck = true;
     config.include = [`${RELAXED_DIR}/**/*.ts`];
     input.ws.guard.writeFile(path.join(input.ws.probesDir, RELAXED_TSCONFIG), JSON.stringify(config, null, 2) + '\n');
     const run = await runProcess(

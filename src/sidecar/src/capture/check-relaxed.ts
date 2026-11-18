@@ -83,6 +83,12 @@ export function relaxedDeclarations(): string[] {
     `type ${P}ListedS = { readonly [${P}listedS]: 'listed string' };`,
     `declare const ${P}listedN: unique symbol;`,
     `type ${P}ListedN = { readonly [${P}listedN]: 'listed number' };`,
+    // An array is rebuilt as an object of its elements, marked as a list, on
+    // both sides: rebuilt arrays are all one type to the compiler, and three
+    // of them nested on each side end its comparison unchecked (measured: a
+    // field missing under three levels of arrays passed). A tuple is kept as
+    // declared on both sides, unrelaxed.
+    `declare const ${P}list: unique symbol;`,
     `declare const ${P}listedB: unique symbol;`,
     `type ${P}ListedB = { readonly [${P}listedB]: 'listed boolean' };`,
     // The generic JSON value in its two spellings: object values required (a
@@ -92,17 +98,50 @@ export function relaxedDeclarations(): string[] {
     `type ${P}JsonOpt = string | number | boolean | null | ${P}JsonOpt[] | { [k: string]: ${P}JsonOpt | undefined };`,
     `type ${P}Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;`,
     `type ${P}IsJson<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : ${P}Same<T, ${P}Json> extends true ? true : ${P}Same<T, ${P}JsonOpt>;`,
-    // The sending side. A JSON value is tested before the union distributes,
-    // with `undefined` set aside so an optional JSON field keeps its `?`.
-    `type ${P}Firm<T, F> = 'open_value' extends F ? (${P}IsJson<Exclude<T, undefined>> extends true ? ${P}OpenJ | Extract<T, undefined> : ${P}FirmEach<T, F>) : ${P}FirmEach<T, F>;`,
-    `type ${P}FirmEach<T, F> = 0 extends 1 & T ? T : T extends string ? ([string] extends [T] ? ('open_value' extends F ? ${P}OpenS : T) : ('listed_value' extends F ? ${P}ListedS : T)) : T extends number ? ([number] extends [T] ? ('open_value' extends F ? ${P}OpenN : T) : ('listed_value' extends F ? ${P}ListedN : T)) : T extends boolean ? ('listed_value' extends F ? ${P}ListedB : T) : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: ${P}Firm<T[K], F> } : T;`,
-    // The receiving side. `O` says whether the position allows absence (an
-    // optional key, or a type holding `undefined`), which picks the null kind.
-    `type ${P}Null<F, O> = O extends true ? ('null_where_optional' extends F ? null : never) : ('null_where_required' extends F ? null : never);`,
-    `type ${P}Relax<T, F, O = false> = ${P}RelaxEach<T, F> | ${P}Null<F, O>;`,
-    `type ${P}Weak<T, F> = 'weak_type' extends F ? ({} extends T ? { [k: string]: unknown } : unknown) : unknown;`,
-    `type ${P}RelaxEach<T, F> = 0 extends 1 & T ? T : T extends string ? T | ('open_value' extends F ? ${P}OpenS : never) | ('listed_value' extends F ? ${P}ListedS : never) : T extends number ? T | ('open_value' extends F ? ${P}OpenN : never) | ('listed_value' extends F ? ${P}ListedN : never) : T extends boolean ? T | ('listed_value' extends F ? ${P}ListedB : never) : T extends (...args: any[]) => any ? T : T extends readonly unknown[] ? { [K in keyof T]: ${P}Relax<T[K], F, undefined extends T[K] ? true : false> } | ('open_value' extends F ? ${P}OpenJ : never) : T extends object ? ({ [K in keyof T]: ${P}Relax<T[K], F, undefined extends T[K] ? true : false> } & ${P}Weak<T, F>) | ('open_value' extends F ? ${P}OpenJ : never) : T;`,
+    ...levels(),
   ];
+}
+
+/**
+ * How many levels of nesting (an object's fields, an array's elements) the
+ * relaxations reach. Below it both sides are compared as declared, which can
+ * only keep a difference.
+ */
+export const RELAXED_DEPTH = 10;
+
+/**
+ * The two helpers, one copy per level of nesting. A recursive helper that
+ * rebuilds BOTH sides makes the compiler see the same helper three times on
+ * each side of its comparison, and past that it assumes the two related
+ * without looking (measured: a field missing under three levels of arrays
+ * passed). A copy per level is never on the stack twice, so every level is
+ * compared for real.
+ */
+function levels(): string[] {
+  const out: string[] = [
+    `type ${P}Firm<T, F> = ${P}Firm0<T, F>;`,
+    `type ${P}Relax<T, F> = ${P}Relax0<T, F, false>;`,
+    // The receiving side's null: `O` says whether the position allows
+    // absence (an optional key, or a type holding `undefined`).
+    `type ${P}Null<F, O> = O extends true ? ('null_where_optional' extends F ? null : never) : ('null_where_required' extends F ? null : never);`,
+    `type ${P}Weak<T, F> = 'weak_type' extends F ? ({} extends T ? { [k: string]: unknown } : unknown) : unknown;`,
+    `type ${P}Firm${RELAXED_DEPTH}<T, F> = T;`,
+    `type ${P}Relax${RELAXED_DEPTH}<T, F, O> = T;`,
+  ];
+  for (let d = 0; d < RELAXED_DEPTH; d++) {
+    const firm = `${P}Firm${d + 1}`;
+    const relax = `${P}Relax${d + 1}`;
+    out.push(
+      // The sending side. A JSON value is tested before the union
+      // distributes, with `undefined` set aside so an optional JSON field
+      // keeps its `?`.
+      `type ${P}Firm${d}<T, F> = 'open_value' extends F ? (${P}IsJson<Exclude<T, undefined>> extends true ? ${P}OpenJ | Extract<T, undefined> : ${P}FirmEach${d}<T, F>) : ${P}FirmEach${d}<T, F>;`,
+      `type ${P}FirmEach${d}<T, F> = 0 extends 1 & T ? T : T extends string ? ([string] extends [T] ? ('open_value' extends F ? ${P}OpenS : T) : ('listed_value' extends F ? ${P}ListedS : T)) : T extends number ? ([number] extends [T] ? ('open_value' extends F ? ${P}OpenN : T) : ('listed_value' extends F ? ${P}ListedN : T)) : T extends boolean ? ('listed_value' extends F ? ${P}ListedB : T) : T extends (...args: any[]) => any ? T : T extends readonly unknown[] ? (number extends T['length'] ? { readonly [${P}list]: true; readonly [i: number]: ${firm}<T[number], F> } : T) : T extends object ? { [K in keyof T]: ${firm}<T[K], F> } : T;`,
+      `type ${P}Relax${d}<T, F, O> = ${P}RelaxEach${d}<T, F> | ${P}Null<F, O>;`,
+      `type ${P}RelaxEach${d}<T, F> = 0 extends 1 & T ? T : T extends string ? T | ('open_value' extends F ? ${P}OpenS : never) | ('listed_value' extends F ? ${P}ListedS : never) : T extends number ? T | ('open_value' extends F ? ${P}OpenN : never) | ('listed_value' extends F ? ${P}ListedN : never) : T extends boolean ? T | ('listed_value' extends F ? ${P}ListedB : never) : T extends (...args: any[]) => any ? T : T extends readonly unknown[] ? (number extends T['length'] ? { readonly [${P}list]: true; readonly [i: number]: ${relax}<T[number], F, undefined extends T[number] ? true : false> } : T) | ('open_value' extends F ? ${P}OpenJ : never) : T extends object ? ({ [K in keyof T]: ${relax}<T[K], F, undefined extends T[K] ? true : false> } & ${P}Weak<T, F>) | ('open_value' extends F ? ${P}OpenJ : never) : T;`
+    );
+  }
+  return out;
 }
 
 /** The kinds a subset mask names, in `NOT_PROVEN_KINDS` order. */

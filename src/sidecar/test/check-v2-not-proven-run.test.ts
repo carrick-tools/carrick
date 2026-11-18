@@ -42,6 +42,13 @@ const SEEDS: Array<{ key: string; protocol: CheckPairSpec['protocol']; type_kind
   { key: 'missingfield', protocol: 'http', type_kind: 'response', producer: `{ id: string }`, consumer: `{ id: string; openedAt: string }` },
   { key: 'socketnull', protocol: 'socket', type_kind: 'both', producer: `{ room?: string }`, consumer: `{ room: string | null }` },
   { key: 'graphqlleaf', protocol: 'graphql', type_kind: 'response', producer: `{ status: string }`, consumer: `{ status: 'ACTIVE' | 'PAUSED' }` },
+  // The compiler stops comparing two rebuilt types nested three deep on each
+  // side and assumes them related, so the helpers rebuild an array as an
+  // object of its elements: under three levels of arrays an open value is
+  // still allowed, and a missing field or another kind still proven.
+  { key: 'openunderdeeparrays', protocol: 'http', type_kind: 'response', producer: `{ x: { a: { b: { c: { kind: string }[] }[] }[] } }`, consumer: `{ x: { a: { b: { c: { kind: 'card' | 'wire' }[] }[] }[] } }` },
+  { key: 'missingunderdeeparrays', protocol: 'http', type_kind: 'response', producer: `{ kind: string; x: { a: { b: { c: { id: string }[] }[] }[] } }`, consumer: `{ kind: 'card' | 'wire'; x: { a: { b: { c: { id: string; openedAt: string }[] }[] }[] } }` },
+  { key: 'dateunderdeeparrays', protocol: 'http', type_kind: 'response', producer: `{ a: { b: { c: { at: string }[] }[] }[] }`, consumer: `{ a: { b: { c: { at: Date }[] }[] }[] }` },
 ];
 
 const PAIRS: CheckPairSpec[] = SEEDS.map((s) => ({
@@ -52,7 +59,7 @@ const PAIRS: CheckPairSpec[] = SEEDS.map((s) => ({
   consumer: { service_name: 'web', alias: `${s.key}_C` },
 }));
 
-const INCOMPATIBLE = ['openkind', 'nullrequired', 'weakcast', 'missingfield', 'socketnull', 'graphqlleaf'];
+const INCOMPATIBLE = ['openkind', 'nullrequired', 'weakcast', 'missingfield', 'socketnull', 'graphqlleaf', 'openunderdeeparrays', 'missingunderdeeparrays', 'dateunderdeeparrays'];
 
 function byKey(result: CheckResult): Map<string, CheckVerdict> {
   return new Map(result.verdicts.map((v) => [v.pair_key, v]));
@@ -101,12 +108,15 @@ describe('check_v2: the relaxed re-check is evidence only (incompatible-rule T1)
     assert.deepStrictEqual(kinds('weakcast'), { proven: false, kinds: ['weak_type'], passing: [['weak_type']] });
     assert.deepStrictEqual(kinds('socketnull'), { proven: false, kinds: ['null_where_optional'], passing: [['null_where_optional']] });
     assert.deepStrictEqual(kinds('graphqlleaf'), { proven: false, kinds: ['open_value'], passing: [['open_value']] });
-    assert.deepStrictEqual(kinds('missingfield'), {
-      proven: true,
-      kinds: [],
-      passing: [],
-      cause: 'a difference remains with every relaxation allowed',
-    });
+    assert.deepStrictEqual(kinds('openunderdeeparrays'), { proven: false, kinds: ['open_value'], passing: [['open_value']] });
+    for (const key of ['missingfield', 'missingunderdeeparrays', 'dateunderdeeparrays']) {
+      assert.deepStrictEqual(kinds(key), {
+        proven: true,
+        kinds: [],
+        passing: [],
+        cause: 'a difference remains with every relaxation allowed',
+      }, key);
+    }
   });
 
   it('relaxed probes are written for the incompatible pairs only, outside the judge\'s probes', () => {
