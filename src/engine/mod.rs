@@ -6341,6 +6341,7 @@ async fn analyze_current_repo_incremental(
                 &settled_answered(library_ask.as_deref(), unready.as_ref()),
                 sidecar,
                 &semantics_root,
+                Path::new(repo_path),
             );
             let results = result_index_of(
                 &request_inputs,
@@ -7938,6 +7939,7 @@ async fn fact_files_of(
             &answer.answered,
             sidecar,
             from_dir,
+            root,
         ),
     };
     let exports = answer.exports.clone();
@@ -8479,11 +8481,17 @@ fn member_declarations(
     answered: &BTreeSet<String>,
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
+    repo_root: &Path,
 ) -> Option<AskedDeclarations> {
     use crate::request_summary::discovery::{MemberDeclarations, declaration_ask_answered};
     inputs.positions.as_ref()?;
     let started = Instant::now();
-    let ask = declaration_ask_answered(inputs, siblings, claims, answered);
+    // What each labelled package depends on, from its installed manifest
+    // (carrick#4878): a call landing outside the answered packages is asked
+    // on a package that can re-export from there.
+    let packages: BTreeSet<String> = claims.iter().map(|claim| claim.package.clone()).collect();
+    let depends = crate::library_store::installed_dependencies(&packages, from_dir, repo_root);
+    let ask = declaration_ask_answered(inputs, siblings, claims, answered, &depends);
     let mut failed = false;
     let declarations = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
@@ -8552,6 +8560,7 @@ enum FirstTrace<'a> {
 /// The member declarations the settled pass reads (carrick#4077 R5): the first
 /// answer's when the settled `claims` are its exports and its ask was whole,
 /// otherwise one ask over `claims`.
+#[allow(clippy::too_many_arguments)]
 fn settled_declarations(
     first: Option<FirstDeclarations>,
     inputs: &crate::request_summary::RequestSummaryInputs,
@@ -8560,14 +8569,17 @@ fn settled_declarations(
     answered: &BTreeSet<String>,
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
+    repo_root: &Path,
 ) -> Option<crate::request_summary::discovery::MemberDeclarations> {
     match first {
         Some(FirstDeclarations {
             exports,
             asked: Some(asked),
         }) if asked.whole && exports == claims => Some(asked.declarations),
-        _ => member_declarations(inputs, siblings, claims, answered, sidecar, from_dir)
-            .map(|asked| asked.declarations),
+        _ => member_declarations(
+            inputs, siblings, claims, answered, sidecar, from_dir, repo_root,
+        )
+        .map(|asked| asked.declarations),
     }
 }
 
@@ -16148,6 +16160,7 @@ async fn analyze_current_repo(
         &settled_answered(library_ask.as_deref(), unready.as_ref()),
         sidecar,
         &service_root,
+        Path::new(repo_path),
     );
     let results = result_index_of(
         &request_inputs,
@@ -31253,6 +31266,7 @@ unfollowed_member_calls_total: 0,
             &receiver_trace_answer().answered_packages,
             Some(&sidecar),
             &on.repo,
+            &on.repo,
         )
         .expect("the service has rows");
         assert!(!settled.is_empty(), "the verifier names declarations");
@@ -31267,6 +31281,7 @@ unfollowed_member_calls_total: 0,
             &exports[..more],
             &receiver_trace_answer().answered_packages,
             Some(&sidecar),
+            &on.repo,
             &on.repo,
         )
         .expect("the service has rows");

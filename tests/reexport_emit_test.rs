@@ -197,6 +197,52 @@ fn a_re_exported_class_listed_by_the_store_ends_at_the_labelled_export() {
     assert_lead("library-claims-kit-listed.json", "asked", "Hub");
 }
 
+/// The labelled package names no dependency, so it cannot re-export the class
+/// the call landed in: the call is not asked on it and ends nowhere labelled.
+#[test]
+fn a_package_that_does_not_depend_on_the_landing_package_is_not_asked() {
+    for cassette in [
+        "library-claims-kit.json",
+        "library-claims-kit-instance.json",
+    ] {
+        let blobs = scan(cassette);
+        let (leads, _) = ends_at_call(&blobs, "nodep");
+        assert!(leads.is_empty(), "nodep lead in {cassette}: {leads:?}");
+        let (leads, _) = ends_at_call(&blobs, "asked");
+        assert_eq!(leads, vec!["\"hub-kit\"/\"Hub\"/\"fire\""]);
+    }
+}
+
+/// A const with a call signature the labelled package re-exports from its
+/// dependency: the call on what it returns lands in the dependency, so its
+/// `handler` op and the export's `call` maker are asked, and the call with
+/// its literal topic is a row read through both labels. It holds with no
+/// dependency read too: a guard for the producer rows that read this shape.
+#[test]
+fn a_member_called_on_a_re_exported_callable_const_is_a_labelled_row() {
+    let blobs = scan("library-claims-kit-callable.json");
+    let blob = blobs
+        .iter()
+        .map(|(_, blob)| blob)
+        .find(|blob| blob["service_name"] == "callable")
+        .expect("callable blob");
+    let rows: Vec<&serde_json::Value> = blob["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["file_path"] == "services/callable/src/orders.ts:7")
+        .collect();
+    assert_eq!(rows.len(), 1, "one row at the call: {rows:?}");
+    assert_eq!(rows[0]["key"]["topic"], "orders.shipped");
+    assert_eq!(
+        rows[0]["library_semantics"],
+        serde_json::json!([
+            "hub-kit@1:defineFn:make:call:()",
+            "hub-kit@1:defineFn:op:send:handler:of:instance:()"
+        ])
+    );
+}
+
 /// The dependency is the labelled package: a service that declares it ends
 /// there.
 #[test]

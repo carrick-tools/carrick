@@ -789,22 +789,43 @@ pub struct DeclarationAsk {
     pub ops: Vec<Option<DeclaredOp>>,
     pub scopes: Vec<Option<AskedScope>>,
     /// The packages the answer held as answered, which the ask read a call
-    /// landing outside of ([`lands_outside`]).
+    /// landing outside of ([`outside_keys`]).
     answered: BTreeSet<String>,
+    /// What the ask read as each package's dependencies ([`Dependencies`]).
+    depends: Dependencies,
 }
 
-/// Whether a call's declaration is in a package the answer did not hold as
-/// answered (carrick#4878): a class a labelled package re-exports from its
-/// dependency is declared there, so the call's store keys name the
-/// dependency, never the labelled package. The default library and the
-/// runtime's modules are asked by their own keys and never re-exported
-/// through a package. A row naming no declaration lands nowhere.
-fn lands_outside(row: &Row, exports: &[ExportClaims], answered: &BTreeSet<String>) -> bool {
+/// The packages each labelled package depends on, by the package's name:
+/// what its installed manifest lists as `dependencies`, `peerDependencies`
+/// or `optionalDependencies` (carrick#4878). A package absent here has no manifest to read, and no
+/// call landing outside the answered packages is asked on it.
+pub type Dependencies = BTreeMap<String, BTreeSet<String>>;
+
+/// The store keys a call's declaration is in when that is a package the
+/// answer did not hold as answered (carrick#4878); none otherwise. A class a
+/// labelled package re-exports from its dependency is declared there, so the
+/// call's store keys name the dependency, never the labelled package. The
+/// default library and the runtime's modules are asked by their own keys and
+/// never re-exported through a package. A row naming no declaration lands
+/// nowhere.
+fn outside_keys(row: &Row, exports: &[ExportClaims], answered: &BTreeSet<String>) -> Vec<String> {
     let keys = store_keys(row, exports);
-    !keys.is_empty()
-        && keys.iter().all(|key| {
-            !is_language_key(key) && !key.starts_with("node:") && !answered.contains(key)
-        })
+    if keys
+        .iter()
+        .all(|key| !is_language_key(key) && !key.starts_with("node:") && !answered.contains(key))
+    {
+        keys
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether `package` can re-export a declaration found in `outside`: its
+/// installed manifest names one of them as a dependency.
+fn reaches(depends: &Dependencies, package: &str, outside: &[String]) -> bool {
+    depends
+        .get(package)
+        .is_some_and(|names| outside.iter().any(|key| names.contains(key)))
 }
 
 /// What a service's rows call outside the repo ([`declaration_ask_answered`]).
@@ -812,8 +833,9 @@ fn lands_outside(row: &Row, exports: &[ExportClaims], answered: &BTreeSet<String
 struct Called {
     /// Each `(store key, member)` a row's declaration and symbol name.
     pairs: HashSet<(String, String)>,
-    /// The members called through a declaration in no answered package.
-    outside: HashSet<String>,
+    /// Each `(store key, member)` called through a declaration in no answered
+    /// package, by the key it is declared in.
+    outside: HashSet<(String, String)>,
 }
 
 /// One scope claim the trace asks, by its claim id, on one receiver id
@@ -898,13 +920,14 @@ pub fn declaration_ask(
         .iter()
         .map(|export| export.package.clone())
         .collect();
-    declaration_ask_answered(inputs, siblings, exports, &answered)
+    declaration_ask_answered(inputs, siblings, exports, &answered, &Dependencies::new())
 }
 
 /// [`declaration_ask`] with the packages the store answered, with or without
 /// an export (carrick#4878). A labelled op or scope claim on member `m` is
 /// also asked when a call or member row outside the repo has symbol `m` and
-/// its declaration is in no answered package ([`lands_outside`]): the
+/// its declaration is in a package `C` no answered package is, and the
+/// export's package depends on `C` (`depends`, [`reaches`]): the
 /// verifier decides whether the export's member resolves to that
 /// declaration, as it does for a class the package re-exports from its
 /// dependency. Every other claim is asked on the `(package, member)` match.
@@ -913,9 +936,11 @@ pub fn declaration_ask_answered(
     siblings: &[&RequestSummaryInputs],
     exports: &[ExportClaims],
     answered: &BTreeSet<String>,
+    depends: &Dependencies,
 ) -> DeclarationAsk {
     let mut ask = DeclarationAsk {
         answered: answered.clone(),
+        depends: depends.clone(),
         ..DeclarationAsk::default()
     };
     let Some(positions) = inputs.positions.as_ref() else {
@@ -933,9 +958,11 @@ pub fn declaration_ask_answered(
             let Some(symbol) = row.symbol() else {
                 continue;
             };
-            if lands_outside(row, exports, answered) {
-                called.outside.insert(symbol.to_string());
-            }
+            called.outside.extend(
+                outside_keys(row, exports, answered)
+                    .into_iter()
+                    .map(|key| (key, symbol.to_string())),
+            );
             called.pairs.extend(
                 store_keys(row, exports)
                     .into_iter()
@@ -961,7 +988,7 @@ pub fn declaration_ask_answered(
             called
                 .outside
                 .into_iter()
-                .filter(|member| !own.outside.contains(member)),
+                .filter(|pair| !own.outside.contains(pair)),
         );
     }
     // The scope checks, asked once every export's op checks are in.
@@ -990,7 +1017,14 @@ pub fn declaration_ask_answered(
                         called
                             .pairs
                             .contains(&(export.package.clone(), member.clone()))
-                            || called.outside.contains(member)
+                            || called.outside.iter().any(|(outside, called)| {
+                                called == member
+                                    && reaches(
+                                        depends,
+                                        &export.package,
+                                        std::slice::from_ref(outside),
+                                    )
+                            })
                     }
                     _ => false,
                 })
@@ -1087,6 +1121,8 @@ pub struct MemberDeclarations {
     unanswered: HashSet<(String, String)>,
     /// The packages the answer held as answered ([`DeclarationAsk`]'s).
     answered: BTreeSet<String>,
+    /// The dependencies the ask read ([`DeclarationAsk`]'s).
+    depends: Dependencies,
 }
 
 impl MemberDeclarations {
@@ -1145,13 +1181,18 @@ impl MemberDeclarations {
                 .into_iter()
                 .any(|key| self.unanswered.contains(&(key, symbol.to_string())))
                 // A call landing outside every answered package had every
-                // labelled op of its member asked (carrick#4878): one of
-                // them left open leaves the call open. Only a call with a
-                // reason of its own reads this ([`Discovery::declarations_unanswered`]
+                // labelled op of its member asked on a package that depends
+                // on the one it landed in (carrick#4878): one of them left
+                // open leaves the call open. Only a call with a reason of
+                // its own reads this ([`Discovery::declarations_unanswered`]
                 // marks saved sites, `unfollowed` re-reads a package
                 // mismatch), so it saves no call of its own.
-                || (lands_outside(row, exports, &self.answered)
-                    && self.unanswered.iter().any(|(_, member)| member == symbol)))
+                || {
+                    let outside = outside_keys(row, exports, &self.answered);
+                    self.unanswered.iter().any(|(package, member)| {
+                        member == symbol && reaches(&self.depends, package, &outside)
+                    })
+                })
     }
 
     /// The declarations the verdicts for `ask` name. A verdict counts only
@@ -1160,6 +1201,7 @@ impl MemberDeclarations {
         let mut out = MemberDeclarations {
             checks: ask.checks.len(),
             answered: ask.answered.clone(),
+            depends: ask.depends.clone(),
             not_reached: crate::services::type_sidecar::not_reached_in_time(verdicts),
             ..MemberDeclarations::default()
         };
