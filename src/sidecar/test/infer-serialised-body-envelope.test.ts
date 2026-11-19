@@ -45,9 +45,16 @@ export interface PlatformResult {
 export function respond(code: number, payload: unknown): PackagedEnvelope {
   return { statusCode: code, body: JSON.stringify(payload) };
 }
+/** A scope guard an installed package ships: its error branch states a 403. */
+export async function guardScope(
+  id: string
+): Promise<{ scope: string } | { error: PackagedEnvelope }> {
+  if (!id) return { error: { statusCode: 403, body: JSON.stringify({ error: "denied" }) } };
+  return { scope: id };
+}
 `;
 
-const NOTES_TS = `import { respond, type PlatformResult } from "responder-runtime";
+const NOTES_TS = `import { guardScope, respond, type PlatformResult } from "responder-runtime";
 
 export interface Note {
   id: string;
@@ -301,6 +308,216 @@ export async function objectBody() { // OBJECT_BODY
 export async function creditNow(): Promise<CreditResult> { // NOT_ENVELOPE
   return credit();
 }
+
+// carrick#2205: a returned envelope built earlier, one def-use hop away.
+
+export async function constBuilder(id: string) { // CONST_BUILDER
+  if (!id) return reply(400, { error: "id required" });
+  const out = reply(201, { id });
+  return out;
+}
+
+export async function letBuilder(id: string) { // LET_BUILDER
+  if (!id) return reply(200, { id: "none" });
+  let out = reply(201, { id });
+  return out;
+}
+
+export async function chainedConsts(id: string) { // CHAINED
+  if (!id) return reply(200, { id: "none" });
+  const first = reply(201, { id });
+  const second = first;
+  return second;
+}
+
+export async function rewritten(id: string) { // REWRITTEN
+  if (!id) return reply(200, { id: "none" });
+  const out = reply(201, { id });
+  out.body = JSON.stringify({ replaced: true });
+  return out;
+}
+
+export async function deleted(id: string) { // DELETED
+  if (!id) return reply(200, { id: "none" });
+  const out = reply(201, { id });
+  delete out.headers;
+  return out;
+}
+
+declare function save(input: Envelope): Envelope;
+
+export async function savedInput(doc: { tags: string[] }) { // SAVED_INPUT
+  if (flag) return reply(200, { saved: false });
+  const out = save({ statusCode: 200, body: JSON.stringify(doc) });
+  return out;
+}
+
+export async function callbackConst(ids: string[]) { // CALLBACK_CONST
+  if (flag) return reply(200, { count: 0 });
+  return ids.map((id) => {
+    const out = reply(200, { id });
+    return out;
+  })[0];
+}
+
+const deny = () => ({ error: notFound({ error: "missing" }) });
+
+async function resolveScope(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  if (!id) return { error: reply(403, { error: "denied" }) };
+  if (id === "gone") return deny();
+  if (id === "late") return { error: log(null, 503, "late", reply(503, { error: "later" })) };
+  return { scope: id };
+}
+
+export async function scoped(id: string) { // MEMBER_ERROR
+  const resolved = await resolveScope(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+async function scopeWithCode(id: string, code: number): Promise<{ scope: string } | { error: Envelope }> {
+  if (!id) return { error: reply(code, { error: "denied" }) };
+  return { scope: id };
+}
+
+export async function scopedCode(id: string) { // MEMBER_VARIABLE
+  const resolved = await scopeWithCode(id, 403);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+async function scopeWithSuccess(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  if (!id) return { error: reply(200, { scope: "default" }) };
+  return { scope: id };
+}
+
+export async function scopedSuccess(id: string) { // MEMBER_SUCCESS
+  const resolved = await scopeWithSuccess(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+async function scopeForwarded(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  const inner = await resolveScope(id);
+  if ("error" in inner) return { error: inner.error };
+  return { scope: inner.scope };
+}
+
+export async function scopedForwarded(id: string) { // MEMBER_SECOND_HOP
+  const resolved = await scopeForwarded(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+const failure = { error: reply(403, { error: "denied" }) };
+
+async function scopeSpread(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  if (!id) return { error: reply(403, { error: "denied" }) };
+  if (flag) return { ...failure };
+  return { scope: id };
+}
+
+export async function scopedSpread(id: string) { // MEMBER_SPREAD
+  const resolved = await scopeSpread(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+async function scopeShorthand(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  const error = reply(200, { scope: "default" });
+  if (!id) return { error: reply(403, { error: "denied" }) };
+  if (flag) return { error };
+  return { scope: id };
+}
+
+export async function scopedShorthand(id: string) { // MEMBER_SHORTHAND
+  const resolved = await scopeShorthand(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+declare const cachedFailure: { error: Envelope };
+
+async function scopeOpaque(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  if (!id) return { error: reply(403, { error: "denied" }) };
+  if (flag) return cachedFailure;
+  return { scope: id };
+}
+
+export async function scopedOpaque(id: string) { // MEMBER_OPAQUE
+  const resolved = await scopeOpaque(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+function scopeLoop(id: string): { scope: string } | { error: Envelope } {
+  if (!id) return { error: reply(403, { error: "denied" }) };
+  if (flag) return scopeLoop(id.slice(1));
+  return { scope: id };
+}
+
+export async function scopedLoop(id: string) { // MEMBER_RECURSIVE
+  const resolved = scopeLoop(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+async function scopeWritten(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  if (!id) return { error: reply(403, { error: "denied" }) };
+  return { scope: id };
+}
+
+export async function scopedWritten(id: string) { // MEMBER_WRITTEN
+  const resolved = await scopeWritten(id);
+  if ("error" in resolved) {
+    resolved.error.statusCode = 200;
+    return resolved.error;
+  }
+  return reply(200, { scope: resolved.scope });
+}
+
+async function scopeNeverFails(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  return { scope: id };
+}
+
+export async function scopedAbsent(id: string) { // MEMBER_ABSENT
+  const resolved = await scopeNeverFails(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+export async function scopedInstalled(id: string) { // MEMBER_INSTALLED
+  const resolved = await guardScope(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+async function scopeSaved(id: string): Promise<{ scope: string } | { error: Envelope }> {
+  if (!id) return { error: save({ statusCode: 403, body: JSON.stringify({ error: "denied" }) }) };
+  return { scope: id };
+}
+
+export async function scopedSaved(id: string) { // MEMBER_CALL_INPUT
+  const resolved = await scopeSaved(id);
+  if ("error" in resolved) return resolved.error;
+  return reply(200, { scope: resolved.scope });
+}
+
+export async function articleViaConst() { // ARTICLE_CONST
+  const found = article;
+  return found;
+}
+
+export async function articleBuiltViaConst(doc: { tags: string[] }) { // ARTICLE_BUILT_CONST
+  const built = { id: "a1", title: "t", body: JSON.stringify(doc), status: 200 };
+  return built;
+}
+
+export async function articleBesideReply() { // ARTICLE_BESIDE_REPLY
+  if (flag) return reply(200, { ok: true });
+  const found = article;
+  return found;
+}
 `;
 
 /** A rule that names the envelope and reads its `body` member as the payload. */
@@ -412,7 +629,7 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
   }
 
   function assertUnread(inferred: Inferred, detail: RegExp): void {
-    assert.strictEqual(collapse(inferred.type_string), 'unknown');
+    assert.strictEqual(collapse(inferred.type_string), 'unknown', inferred.alias);
     assert.strictEqual(inferred.is_explicit, false);
     const provenance = inferred.any_provenance ?? [];
     assert.strictEqual(provenance.length, 1, JSON.stringify(provenance));
@@ -516,8 +733,72 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
     assert.strictEqual(inferred.is_explicit, false);
   });
 
-  it('answers unknown when one branch returns an identifier', async () => {
-    assertUnread(await inferReturn('ARCHIVE'), /built somewhere else/);
+  it('reads a returned const initialised by an envelope literal', async () => {
+    const inferred = await inferReturn('ARCHIVE');
+    assertNoEnvelope(inferred);
+    assert.strictEqual(collapse(inferred.type_string), '{ archived: boolean; }');
+    assert.strictEqual(inferred.any_provenance, undefined);
+  });
+
+  it('reads a returned const initialised by a builder call', async () => {
+    const inferred = await inferReturn('CONST_BUILDER');
+    assertNoEnvelope(inferred);
+    assert.strictEqual(collapse(inferred.type_string), '{ id: string; }');
+    assert.strictEqual(inferred.any_provenance, undefined);
+  });
+
+  it('answers unknown for a returned let, a second hop, or a const in another function', async () => {
+    for (const marker of ['LET_BUILDER', 'CHAINED', 'CALLBACK_CONST']) {
+      assertUnread(await inferReturn(marker), /built somewhere else/);
+    }
+  });
+
+  it('answers unknown for a returned const written after it was built', async () => {
+    for (const marker of ['REWRITTEN', 'DELETED']) {
+      assertUnread(await inferReturn(marker), /built somewhere else/);
+    }
+  });
+
+  it('never reads an envelope literal handed to a call as the const it initialised', async () => {
+    assertUnread(await inferReturn('SAVED_INPUT'), /response helper that could not be followed/);
+  });
+
+  it('drops a member a helper fills only with error envelopes, and reads the rest', async () => {
+    const inferred = await inferReturn('MEMBER_ERROR');
+    assertNoEnvelope(inferred);
+    assert.strictEqual(collapse(inferred.type_string), '{ scope: string; }');
+    assert.strictEqual(inferred.any_provenance, undefined);
+  });
+
+  it('answers unknown when the helper does not state an error status under the member', async () => {
+    for (const marker of [
+      'MEMBER_VARIABLE',
+      'MEMBER_SUCCESS',
+      'MEMBER_SECOND_HOP',
+      'MEMBER_SPREAD',
+      'MEMBER_SHORTHAND',
+      'MEMBER_OPAQUE',
+      'MEMBER_RECURSIVE',
+      'MEMBER_WRITTEN',
+      'MEMBER_ABSENT',
+      'MEMBER_INSTALLED',
+      'MEMBER_CALL_INPUT',
+    ]) {
+      assertUnread(await inferReturn(marker), /built somewhere else/);
+    }
+  });
+
+  it('answers unknown for a domain value returned through a const beside an envelope', async () => {
+    assertUnread(await inferReturn('ARTICLE_BESIDE_REPLY'), /built somewhere else/);
+  });
+
+  it('keeps today\'s answer for a domain value returned through a const', async () => {
+    const found = await inferReturn('ARTICLE_CONST');
+    assert.strictEqual(found.type_string, PINNED_ARTICLE_CONST);
+    assert.strictEqual(found.any_provenance, undefined);
+    const built = await inferReturn('ARTICLE_BUILT_CONST');
+    assert.strictEqual(built.type_string, PINNED_ARTICLE_BUILT_CONST);
+    assert.strictEqual(built.any_provenance, undefined);
   });
 
   it('answers unknown when the body is not produced by JSON.stringify', async () => {
@@ -642,5 +923,8 @@ const PINNED_GREETING = '{ status: number; body: string; }';
 const PINNED_CSV_ONLY =
   '{ statusCode: number; headers?: { [x: string]: string; }; body: string; }';
 const PINNED_STORE_JSON = '{ id: string; title: string; body: string; status: number; }';
+/** Pinned from origin/main before carrick#2205, byte for byte. */
+const PINNED_ARTICLE_CONST = '{ id: string; title: string; body: string; status: number; }';
+const PINNED_ARTICLE_BUILT_CONST = '{ id: string; title: string; body: string; status: number; }';
 const PINNED_PARTIAL =
   '{ id?: string | undefined; title?: string | undefined; body?: string | undefined; status?: number | undefined; }';
