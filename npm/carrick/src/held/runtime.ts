@@ -25,7 +25,7 @@ import { commitsOf, indexedCommit } from "../facts/peers.ts";
 import { factsPath, openFacts, type ContractRow, type GraphqlTypeTable } from "../facts/store.ts";
 import { createLogger } from "../log.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit, ServiceRuntime, StartResult } from "./daemon.ts";
-import { Ts7Lsp, type Diag as LspDiag, type Engine } from "./engine.ts";
+import { StalePull, Ts7Lsp, type Diag as LspDiag, type Engine } from "./engine.ts";
 import { placedPath, shadowDir } from "./paths.ts";
 import {
   arm,
@@ -390,6 +390,11 @@ class HeldService implements ServiceEngine {
           const e = entries[u.n]!;
           no(e.pos, e.groups[u.group]!, u.reason);
         }
+      } catch (error) {
+        // No report for the text sent: these positions arm nothing and keep no reason; they are gated again after the next answer.
+        if (!(error instanceof StalePull)) throw error;
+        log("gate pull stale", rel, String(error));
+        this.queue(rel, positions.map((p) => p.id));
       } finally {
         this.engine.set(shadow, text);
       }

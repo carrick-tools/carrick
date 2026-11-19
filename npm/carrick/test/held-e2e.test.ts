@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { HeldDaemon, type HeldAnswer, type ServiceInit } from "../src/held/daemon.ts";
 import { heldDetail } from "../src/held/early.ts";
-import { Ts7Lsp, type Engine } from "../src/held/engine.ts";
+import { StalePull, Ts7Lsp, type Engine } from "../src/held/engine.ts";
 import { createRuntime } from "../src/held/runtime.ts";
 import { logPath, placedPath } from "../src/held/paths.ts";
 import type { ContractRow } from "../src/facts/store.ts";
@@ -80,6 +80,8 @@ async function rig(
   before: (root: string) => void = () => undefined,
   /** Sees every call to the held compiler (a test's spy). */
   wrap: (engine: Engine) => Engine = (engine) => engine,
+  /** Starts the held compiler (a test puts a relay in front of it). */
+  lsp: (command: string, cwd: string) => Ts7Lsp = (command, cwd) => new Ts7Lsp(command, cwd),
 ): Promise<Rig> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-e2e-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -106,7 +108,7 @@ async function rig(
     rows: async () => rows,
     commits: async () => ({ shop: commit }),
     stamp: () => "fixed",
-    makeEngine: (command, cwd) => wrap(new Ts7Lsp(command, cwd)),
+    makeEngine: (command, cwd) => wrap(lsp(command, cwd)),
   });
   const daemon = new HeldDaemon({ root, home, env, programs: async () => [init], runtime });
   t.after(() => daemon.close());
@@ -345,4 +347,40 @@ test("the twin pass runs after a request that changed text, never after one that
   await settle();
   assert.deepEqual(pulls, [], "a read after the edit changes nothing, so no twin pass");
   await r.edit(EXPRESS, r.text(EXPRESS).replace("res.json({ orders })", "res.json({ orders, total })"));
+});
+
+test("a stale report of the twin text, served once after an idle spell, states no break on a comment-only edit", { timeout: 300_000 }, async (t) => {
+  const trigger = path.join(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-relay-"))), "stale");
+  t.after(() => fs.rmSync(path.dirname(trigger), { recursive: true, force: true }));
+  const relay = path.join(testDir, "stale-relay.mjs");
+  const r = await rig(t, rows, undefined, undefined, (command, cwd) => new Ts7Lsp(process.execPath, cwd, [relay, trigger, command, "--lsp", "--stdio"]));
+  const settle = (): Promise<HeldAnswer> => r.ask(ORDERS, "read");
+  // A text-moving edit: the twin pass after it is the last report the language server gave for every armed file.
+  assert.deepEqual((await r.edit(ORDERS, `${r.text(ORDERS)}// one\n`)).lines, []);
+  await settle();
+  await settle();
+  fs.writeFileSync(trigger, "");
+  const answer = await r.edit(ORDERS, `${r.text(ORDERS)}// two\n`);
+  assert.equal(fs.existsSync(trigger), false, "the relay served the stale reports");
+  assert.equal(answer.state, "ready");
+  assert.deepEqual(answer.lines, [], "a comment moves no check");
+  await settle();
+  assert.deepEqual(r.placed().armed.length, 9, "every check stays armed");
+});
+
+test("a gate pull with no answer for its text arms nothing and records no reason; the file is gated again after the next answer", { timeout: 300_000 }, async (t) => {
+  let failures = 1;
+  const r = await rig(t, rows, undefined, (engine) => ({
+    set: (file, text) => engine.set(file, text),
+    pull: (files) => (failures-- > 0 ? Promise.reject(new StalePull("no answer for the text just sent")) : engine.pull(files)),
+    rss: () => engine.rss(),
+    close: () => engine.close(),
+  }));
+  // The start gated one file without an answer: the engine still starts, and that file's checks are neither armed nor unarmed.
+  const first = r.placed();
+  assert.ok(first.armed.length < 9, JSON.stringify(first.armed));
+  assert.ok(!first.unarmed.some((u) => !["value_outside_service", "no_values"].includes(u.reason)), JSON.stringify(first.unarmed));
+  await r.ask(ORDERS, "read");
+  await r.ask(ORDERS, "read");
+  assert.equal(r.placed().armed.length, 9, "gated again after the next answer");
 });
