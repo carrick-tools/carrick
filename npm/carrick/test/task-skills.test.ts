@@ -203,6 +203,18 @@ test("the audit skill renders for both scopes and names its two finding kinds an
     assert.match(audit, /kind: "type_mismatch"/);
     assert.match(audit, /kind: "similar_functions"/);
     assert.match(audit, /Cost: this skill opens source for every item it reads\./);
+    assert.match(audit, /index at/);
+    assert.match(audit, /No findings list has been built/);
+    assert.match(audit, /caps each section at 10/);
+    assert.match(audit, /refused:/);
+    assert.match(audit, /Your first words to the user are the two counts/);
+    assert.match(audit, /one command per shell call/);
+    assert.match(audit, /including any you then worked around/);
+    for (const word of ["GraphQL", "socket", "pub/sub", "queue", "RPC"]) {
+      assert.ok(audit.includes(word), `the audit skill does not name ${word}`);
+    }
+    assert.match(audit, /1,600 TypeScript files/);
+    assert.doesNotMatch(audit, /2,200 files/);
   }
 });
 
