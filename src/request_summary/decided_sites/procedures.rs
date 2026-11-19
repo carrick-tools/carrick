@@ -72,6 +72,9 @@ pub struct ProcedureLabels {
     /// The ops named by the variable that holds their call's value
     /// (`bound: binding`, contract amendment 13): package, export, member.
     bound: Vec<(String, String, String)>,
+    /// Of those, the key of argument 0 each states its call's body under
+    /// (the op's `payload`, carrick#4909): package, export, member, key.
+    payloads: Vec<(String, String, String, String)>,
     /// The verified router members.
     collects: Vec<CollectsLabel>,
     /// The verified members that merge the routers they are given.
@@ -218,6 +221,7 @@ impl ProcedureLabels {
                     LibraryClaim::Op {
                         member: Some(member),
                         name: Some(name),
+                        payload,
                         ..
                     } if matches!(
                         **name,
@@ -232,12 +236,28 @@ impl ProcedureLabels {
                             export.export.clone(),
                             member.clone(),
                         );
-                        let list = match **name {
+                        let binding = matches!(
+                            **name,
                             OpName::Bound {
                                 bound: BoundName::Binding,
                                 ..
-                            } => &mut labels.bound,
-                            _ => &mut labels.keyed,
+                            }
+                        );
+                        if let Some(key) = payload
+                            .as_ref()
+                            .filter(|slot| binding && slot.arg == 0)
+                            .and_then(|slot| slot.key.clone())
+                        {
+                            let (package, export, member) = op.clone();
+                            let stated = (package, export, member, key);
+                            if !labels.payloads.contains(&stated) {
+                                labels.payloads.push(stated);
+                            }
+                        }
+                        let list = if binding {
+                            &mut labels.bound
+                        } else {
+                            &mut labels.keyed
                         };
                         if !list.contains(&op) {
                             list.push(op);
@@ -287,6 +307,19 @@ impl ProcedureLabels {
         Self::is_of(&self.bound, end)
     }
 
+    /// The key of argument 0 a binding-named op `end` states its body
+    /// under, where its label states one.
+    fn bound_payload(&self, end: &LabelledEnd) -> Option<String> {
+        self.payloads
+            .iter()
+            .find(|(package, export, member, _)| {
+                *package == end.package
+                    && *export == end.export
+                    && end.member.as_deref() == Some(member.as_str())
+            })
+            .map(|(.., key)| key.clone())
+    }
+
     fn is_of(ops: &[(String, String, String)], end: &LabelledEnd) -> bool {
         ops.iter().any(|(package, export, member)| {
             *package == end.package
@@ -334,6 +367,10 @@ pub struct Procedure {
     /// full path is `""`, a path the library chooses and the code never
     /// writes, and neither is its own path.
     pub binding: bool,
+    /// For a binding-named procedure: the key of argument 0 its call
+    /// carries what a caller sends under (the op's `payload`, carrick#4909),
+    /// where its label states one.
+    pub payload_key: Option<String>,
 }
 
 /// Why an adapter's mount is unread: the key its count is kept under
@@ -607,6 +644,7 @@ impl Pass<'_, '_> {
             };
             let mut procedure = Procedure {
                 binding: true,
+                payload_key: self.labels.bound_payload(&site.end),
                 ..Procedure::default()
             };
             match key {

@@ -303,6 +303,15 @@ impl SitePayloads {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut requests = Vec::new();
         for entry in entries {
+            // A procedure named by its binding is typed from the variable's
+            // own call signature (carrick#4909): what a caller sends, not
+            // what its handler is handed after the validator ran.
+            if matches!(
+                entry.evidence.infer_kind,
+                InferKind::ProcedureInput | InferKind::ProcedureOutput
+            ) {
+                continue;
+            }
             let file = crate::site_rows::relative(root, &entry.file_path);
             let http = matches!(entry.key, OperationKey::Http { .. });
             let side = match entry.role {

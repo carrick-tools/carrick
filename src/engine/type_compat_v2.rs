@@ -797,6 +797,10 @@ pub(crate) fn derive_capture_anchors(
             InferKind::RequestBody => no_text_no_param && (no_span || request.at_registration),
             InferKind::FunctionReturn => no_span && no_text_no_param,
             InferKind::ResponseBody => no_text_no_param,
+            // A procedure named by its binding is read off its declaration
+            // by the inferrer (carrick#4909); unanswered there, its line's
+            // first expression is the variable's name, never a payload.
+            InferKind::ProcedureInput | InferKind::ProcedureOutput => true,
             _ => false,
         };
         if names_no_payload {

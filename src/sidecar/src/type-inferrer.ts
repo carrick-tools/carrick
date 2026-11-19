@@ -1520,6 +1520,9 @@ export class TypeInferrer {
         return this.inferReceiverType(sourceFile, request);
       case 'request_config':
         return this.inferRequestConfig(sourceFile, request);
+      case 'procedure_input':
+      case 'procedure_output':
+        return this.inferProcedureBinding(sourceFile, request);
       default:
         this.logError(`Unknown infer kind: ${request.infer_kind}`);
         return null;
@@ -4634,6 +4637,72 @@ export class TypeInferrer {
       this.logError(`Stated root relation failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }
+  }
+
+  /**
+   * carrick#4909: a procedure named by the variable that holds it (contract
+   * amendment 13, `bound: "binding"`) is typed from that variable's own call
+   * signature, read off the declaration whose initializer starts on the
+   * row's line (the line its maker call starts on). `procedure_input` is what
+   * a caller sends: the `member` (the label's `payload` key) of parameter 0,
+   * the validator's input rather than its output. `procedure_output` is the
+   * signature's awaited return.
+   *
+   * No answer, never a guess, where the line holds no such declaration or
+   * more than one, the value has no single non-generic call signature, or
+   * parameter 0 has no `member`.
+   */
+  private inferProcedureBinding(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): InferredType | null {
+    const declarations = sourceFile
+      .getDescendantsOfKind(SyntaxKind.VariableDeclaration)
+      .filter((declaration) => {
+        const initializer = declaration.getInitializer();
+        return (
+          Node.isIdentifier(declaration.getNameNode()) &&
+          initializer !== undefined &&
+          initializer.getStartLineNumber() === request.line_number
+        );
+      });
+    if (declarations.length !== 1) {
+      this.log(
+        `procedure binding: ${declarations.length} declaration(s) start a value on ` +
+          `${request.file_path}:${request.line_number}; not read`
+      );
+      return null;
+    }
+    const declaration = declarations[0];
+    const signatures = declaration.getType().getCallSignatures();
+    if (signatures.length !== 1 || signatures[0].getTypeParameters().length > 0) {
+      this.log(
+        `procedure binding: '${declaration.getName()}' has no single non-generic call signature; not read`
+      );
+      return null;
+    }
+    const signature = signatures[0];
+    let type: Type;
+    if (request.infer_kind === 'procedure_input') {
+      const parameter = signature.getParameters()[0];
+      if (!parameter || !request.member) return null;
+      const member = parameter.getTypeAtLocation(declaration).getProperty(request.member);
+      if (!member) return null;
+      type = member.getTypeAtLocation(declaration);
+    } else {
+      type = this.unwrapPromiseType(signature.getReturnType());
+    }
+    return this.createInferredType(
+      request,
+      typeText(type, declaration),
+      false,
+      this.getNodeLocation(declaration),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      type
+    );
   }
 
   private inferVariable(
@@ -12985,6 +13054,10 @@ export class TypeInferrer {
         return 'Param';
       case 'request_config':
         return 'RequestConfig';
+      case 'procedure_input':
+        return 'ProcedureInput';
+      case 'procedure_output':
+        return 'ProcedureOutput';
       default:
         return 'Type';
     }

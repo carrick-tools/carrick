@@ -9346,7 +9346,18 @@ fn apply_traced_routes(
     Vec<crate::services::type_sidecar::InferRequestItem>,
 ) {
     let mut write = write_traced_routes(mount_graph, traced, repo_path);
-    let asks = traced_route_requests(&mount_graph.endpoints[write.added.clone()], repo_path);
+    let mut asks = traced_route_requests(&mount_graph.endpoints[write.added.clone()], repo_path);
+    let replaced = write
+        .corrected
+        .iter()
+        .map(|(index, _)| &mount_graph.endpoints[*index]);
+    asks.extend(procedure_binding_requests(
+        mount_graph.endpoints[write.added.clone()]
+            .iter()
+            .chain(replaced),
+        traced,
+        repo_path,
+    ));
     if write.applied.added > 0 || write.applied.corrected > 0 || write.applied.replaced > 0 {
         write.applied.folded = FileOrchestrator::fold_documented_operations(mount_graph);
     }
@@ -9377,7 +9388,12 @@ fn traced_route_requests(
     rows.iter()
         .filter_map(|row| {
             let method = normalize_manifest_method(&row.method);
-            if !is_producer_method(&method) || !row.full_path.starts_with('/') {
+            // A procedure named by its binding is asked its own types
+            // ([`procedure_binding_requests`]): its line names no response.
+            if !is_producer_method(&method)
+                || !is_served_row_path(&row.full_path, row.procedure.as_ref())
+                || is_binding_row(row)
+            {
                 return None;
             }
             let (file, line) = parse_file_location(&row.file_location);
@@ -9389,6 +9405,86 @@ fn traced_route_requests(
             ))
         })
         .collect()
+}
+
+/// Whether a producer row is a procedure named by the variable that holds
+/// it (contract amendment 13): keyed by its procedure, served at no path the
+/// code writes.
+fn is_binding_row(row: &crate::mount_graph::ResolvedEndpoint) -> bool {
+    row.procedure.is_some() && row.full_path.is_empty()
+}
+
+/// The type requests of each procedure row named by its binding (contract
+/// amendment 13, carrick#4909), written or replaced by the trace, keyed and
+/// sited as [`build_type_manifest_entries`] keys the row. Its request is
+/// what a caller sends: the key the op's `payload` names on argument 0 of
+/// the variable's own call signature, the validator's input (asked only
+/// where the label states that key). Its response is that signature's
+/// awaited return. Both are read off the declaration whose value starts on
+/// the row's line, which is all the locator these asks carry.
+fn procedure_binding_requests<'a>(
+    rows: impl Iterator<Item = &'a crate::mount_graph::ResolvedEndpoint>,
+    traced: &[crate::site_rows::TracedRoute],
+    repo_path: &str,
+) -> Vec<crate::services::type_sidecar::InferRequestItem> {
+    let root = Path::new(repo_path);
+    let repo_root = normalize_protocol_file(root);
+    let mut asks = Vec::new();
+    for row in rows.filter(|row| is_binding_row(row)) {
+        let method = normalize_manifest_method(&row.method);
+        if !is_producer_method(&method) {
+            continue;
+        }
+        let Some(procedure) = row.procedure.as_ref() else {
+            continue;
+        };
+        let (file, line) = parse_file_location(&row.file_location);
+        let key = OperationKey::http(&method, String::new());
+        let site_id = build_site_id(&file, line, &key, repo_path);
+        let file_abs = root.join(&file).to_string_lossy().into_owned();
+        let payload_key =
+            row_place(&row.file_location, &repo_root).and_then(|(_, relative, at)| {
+                traced
+                    .iter()
+                    .find(|route| {
+                        route.file == relative
+                            && route.line == at
+                            && route
+                                .procedures
+                                .iter()
+                                .any(|named| named.key_path == procedure.path)
+                    })
+                    .and_then(|route| route.payload_key.clone())
+            });
+        let ask = |kind: ManifestTypeKind, infer_kind: InferKind, member: Option<String>| {
+            crate::services::type_sidecar::InferRequestItem {
+                infer_kind,
+                member,
+                alias: Some(build_manifest_type_alias_with_site_id(
+                    &key,
+                    ManifestRole::Producer,
+                    kind,
+                    Some(&site_id),
+                )),
+                ..crate::agents::file_orchestrator::route_response_request(
+                    &file_abs, line, &key, &site_id,
+                )
+            }
+        };
+        if let Some(member) = payload_key {
+            asks.push(ask(
+                ManifestTypeKind::Request,
+                InferKind::ProcedureInput,
+                Some(member),
+            ));
+        }
+        asks.push(ask(
+            ManifestTypeKind::Response,
+            InferKind::ProcedureOutput,
+            None,
+        ));
+    }
+    asks
 }
 
 /// What [`write_traced_routes`] did, by the graph rows it touched: their
@@ -14919,7 +15015,7 @@ fn build_type_manifest_entries(
             continue;
         }
         let path = endpoint.full_path.clone();
-        if !path.starts_with('/') {
+        if !is_served_row_path(&path, endpoint.procedure.as_ref()) {
             continue;
         }
         let (file_path, line_number) = parse_file_location(&endpoint.file_location);
@@ -14927,6 +15023,10 @@ fn build_type_manifest_entries(
         let key = OperationKey::http(&method, path);
         let site_id = build_site_id(&file_path, line_number, &key, repo_root);
 
+        if is_binding_row(endpoint) {
+            add_procedure_binding_pair(&mut entries, key, &file_path, line_number, &site_id);
+            continue;
+        }
         add_manifest_pair(
             &mut entries,
             key,
@@ -15579,13 +15679,55 @@ fn add_manifest_pair(
             key.as_http().map(|(method, _)| method),
             Some("GET" | "HEAD" | "OPTIONS")
         );
+    let kinds: &[ManifestTypeKind] = if skip_request {
+        &[ManifestTypeKind::Response]
+    } else {
+        &[ManifestTypeKind::Request, ManifestTypeKind::Response]
+    };
+    let kinds = kinds
+        .iter()
+        .map(|&type_kind| (type_kind, infer_kind_for_manifest(role, type_kind)));
+    add_manifest_entries(entries, &key, role, file_path, line_number, site_id, kinds);
+}
 
-    for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
-        if skip_request && type_kind == ManifestTypeKind::Request {
-            continue;
-        }
-        let type_alias = build_manifest_type_alias_with_site_id(&key, role, type_kind, site_id);
-        let infer_kind = infer_kind_for_manifest(role, type_kind);
+/// The request and response entries of a procedure named by its binding
+/// (contract amendment 13, carrick#4909), whatever its method: its request
+/// is its call's argument, which a `GET` procedure takes as any other does,
+/// not an HTTP body. Asked by [`procedure_binding_requests`].
+fn add_procedure_binding_pair(
+    entries: &mut Vec<TypeManifestEntry>,
+    key: OperationKey,
+    file_path: &str,
+    line_number: u32,
+    site_id: &str,
+) {
+    let kinds = [
+        (ManifestTypeKind::Request, InferKind::ProcedureInput),
+        (ManifestTypeKind::Response, InferKind::ProcedureOutput),
+    ];
+    add_manifest_entries(
+        entries,
+        &key,
+        ManifestRole::Producer,
+        file_path,
+        line_number,
+        Some(site_id),
+        kinds.into_iter(),
+    );
+}
+
+/// One manifest entry per `(type kind, infer kind)`, unanswered, at one site.
+fn add_manifest_entries(
+    entries: &mut Vec<TypeManifestEntry>,
+    key: &OperationKey,
+    role: ManifestRole,
+    file_path: &str,
+    line_number: u32,
+    site_id: Option<&str>,
+    kinds: impl Iterator<Item = (ManifestTypeKind, InferKind)>,
+) {
+    for (type_kind, infer_kind) in kinds {
+        let type_alias = build_manifest_type_alias_with_site_id(key, role, type_kind, site_id);
         let evidence = crate::cloud_storage::TypeEvidence {
             file_path: file_path.to_string(),
             span_start: None,
@@ -33721,6 +33863,7 @@ unfollowed_member_calls_total: 0,
     ) -> crate::site_rows::TracedRoute {
         crate::site_rows::TracedRoute {
             procedures: Vec::new(),
+            payload_key: None,
             file: file.to_string(),
             line,
             method: method.to_string(),

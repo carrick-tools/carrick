@@ -24,7 +24,9 @@ export type InferKind =
   | 'signature_return'  // Function return for the signature hint — NO Promise/wrapper unwrapping
   | 'function_param'    // Type of a single named parameter (explicit or contextually inferred)
   | 'receiver_type'     // Type of the RECEIVER of a member call (carrick#695)
-  | 'request_config';   // A request call's options literal: does it write the `member` that carries the body? (carrick#2674)
+  | 'request_config'    // A request call's options literal: does it write the `member` that carries the body? (carrick#2674)
+  | 'procedure_input'   // A procedure named by its binding: the `member` of parameter 0 of the variable's call signature (carrick#4909)
+  | 'procedure_output'; // A procedure named by its binding: the awaited return of the variable's call signature (carrick#4909)
 
 // ============================================================================
 // Extraction Config Types (Agent-Informed Payload Unwrapping)
@@ -1168,7 +1170,11 @@ export interface InferRequestItem {
   alias?: string;
   /** Target parameter name for `function_param` inference. */
   param_name?: string;
-  /** The member of a request options literal that carries the body (`request_config`). */
+  /**
+   * The member of a request options literal that carries the body
+   * (`request_config`), or the key of a procedure's parameter 0 that carries
+   * what a caller sends (`procedure_input`, the label's `payload` key).
+   */
   member?: string;
   /**
    * carrick#2818: the library store's label for the call's result, naming the
