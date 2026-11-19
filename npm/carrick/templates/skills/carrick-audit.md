@@ -92,6 +92,15 @@ Class each member against the first:
 - **VARIANT**: same contract, and a difference you can name in a clause.
 - **FALSE POSITIVE**: different contracts.
 
+Class what the function does: its body and the constants and helpers it reads.
+Other code in the same file that it does not read does not count.
+
+A different call signature (parameters a caller passes) is a different
+contract: FALSE POSITIVE.
+
+A VARIANT quotes the line that differs. If you cannot quote one, the class is
+DUPLICATE.
+
 Where the members sit in separate apps, check their package.json files for a
 package they already share. Where one exists, the fix is to move the function
 there and import it; where none does, say so: the fix is a new shared package.
