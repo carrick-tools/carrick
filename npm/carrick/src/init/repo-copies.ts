@@ -39,7 +39,14 @@ import { spawnSync } from "node:child_process";
 
 import { sameText, writeIfChanged } from "./files.ts";
 import { LAUNCHER_FILE, launcherSource } from "./launcher.ts";
-import { installedCarrickHooks, mergeCarrickHooks, mergeHookSet, removeCarrickHooks, SHARED_SETTINGS } from "./settings.ts";
+import {
+  holdsCarrickAllow,
+  installedCarrickHooks,
+  mergeCarrickHooks,
+  mergeHookSet,
+  removeCarrickHooks,
+  SHARED_SETTINGS,
+} from "./settings.ts";
 import { CODEX_HOOKS_FILE, codexHooks, isEmptyHooksDocument } from "./codex.ts";
 import {
   recordWrittenSkills,
@@ -258,8 +265,10 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
     const sharedBody = readOrNull(sharedFile);
     teamHooksLeft = committedHooksAreOurs(repo, SHARED_SETTINGS);
     if (!teamHooksLeft && sharedBody !== null && holdsOurs(sharedBody)) {
-      const cleaned = removeCarrickHooks(sharedBody).body;
       const head = tracked.has(SHARED_SETTINGS) ? committedText(repo, SHARED_SETTINGS) : null;
+      // The removal takes out our allow entry too. One a team committed stays where
+      // it is: only the hooks come out, so the file can match HEAD byte for byte.
+      const cleaned = holdsCarrickAllow(head) ? mergeHookSet(sharedBody, null, false).body : removeCarrickHooks(sharedBody).body;
       if (head !== null && sameDocument(cleaned, head)) shared = { body: head };
       else if (!tracked.has(SHARED_SETTINGS) && isEmptyHooksDocument(cleaned)) shared = { remove: true };
       else shared = { body: cleaned };

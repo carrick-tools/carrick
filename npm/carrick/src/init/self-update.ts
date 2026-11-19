@@ -55,7 +55,14 @@ import {
   recordCliVersion,
   recordedCliVersion,
 } from "./outdated.ts";
-import { expectedCarrickHooks, installedCarrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
+import {
+  expectedCarrickHooks,
+  holdsCarrickAllow,
+  installedCarrickHooks,
+  mergeCarrickHooks,
+  SETTINGS_FILES,
+  withCarrickAllow,
+} from "./settings.ts";
 import { launcherDiffers, writeLauncher } from "./launcher.ts";
 import { addToExcludeBlock, committedHooksAreOurs, recordedRepoCopy, trackedPaths } from "./repo-copies.ts";
 import {
@@ -109,9 +116,11 @@ export function updateHooks(
   merge: typeof mergeCarrickHooks = mergeCarrickHooks,
   tracked: Set<string> = new Set(),
   held: string[] = [],
+  allowed: string[] = [],
 ): string[] {
   const stamp = readStamp(workspace);
   const changed: string[] = [];
+  let wrote = false;
   for (const relative of SETTINGS_FILES) {
     const target = path.join(projectDir, relative);
     // Keyed by the file's path under the workspace, so a repo's copy is its own entry.
@@ -120,9 +129,28 @@ export function updateHooks(
     try {
       const body = fs.readFileSync(target, "utf8");
       const folder = path.dirname(target);
-      const launcherStale = installedCarrickHooks(body).length > 0 && launcherDiffers(folder);
-      if (!entriesAreStale(body, expectedCarrickHooks) && !launcherStale) continue;
-      const merged = merge(body);
+      const ours = installedCarrickHooks(body).length > 0;
+      const launcherStale = ours && launcherDiffers(folder);
+      const stale = entriesAreStale(body, expectedCarrickHooks) || launcherStale;
+      // The allow entry is no staleness. It is given once per file: added where the
+      // file is ours alone to write, and never again once a file has held it, so a
+      // developer who takes it out keeps it out. A tracked file is left without a
+      // word (carrick#4881).
+      const allowKey = `allow:${key}`;
+      const holdsAllow = holdsCarrickAllow(body);
+      if (ours && holdsAllow && stamp[allowKey] === undefined) {
+        stamp[allowKey] = running;
+        wrote = true;
+      }
+      const allowGiven = stamp[allowKey] !== undefined;
+      const lacksAllow = ours && !holdsAllow;
+      const addAllow = lacksAllow && !allowGiven && !tracked.has(relative);
+      if (!stale && !addAllow) continue;
+      let merged = merge(body);
+      if (lacksAllow && allowGiven) {
+        const kept = withCarrickAllow(merged.body, false);
+        merged = { body: kept, changed: kept !== body };
+      }
       if (!merged.changed && !launcherStale) continue;
       if (tracked.has(relative)) {
         held.push(relative);
@@ -131,12 +159,17 @@ export function updateHooks(
       writeAtomic(target, merged.body);
       writeLauncher(folder);
       stamp[key] = running;
-      changed.push(relative);
+      wrote = true;
+      if (!holdsAllow && holdsCarrickAllow(merged.body)) {
+        stamp[allowKey] = running;
+        allowed.push(relative);
+      }
+      if (stale) changed.push(relative);
     } catch {
       // Unreadable or not JSON: a file to report (`carrick doctor` does), never to overwrite.
     }
   }
-  if (changed.length > 0) {
+  if (wrote) {
     try {
       writeAtomic(updatedStampFile(workspace), `${JSON.stringify(stamp, null, 2)}\n`);
     } catch {
@@ -314,6 +347,7 @@ export function bringUpToDate(
   // once per directory; a folder that is no repository, or a git that cannot
   // answer, tracks nothing, which is what this did before it asked.
   const settingsHeld: string[] = [];
+  const allowed: string[] = [];
   const hooks =
     projectDir === null
       ? []
@@ -324,9 +358,14 @@ export function bringUpToDate(
           mergeCarrickHooks,
           trackedPaths(projectDir, SETTINGS_FILES) ?? new Set(),
           settingsHeld,
+          allowed,
         );
   if (hooks.length > 0) {
     lines.push(`Carrick brought its hook entries in ${hooks.join(", ")} up to date for ${running}.`);
+  }
+  if (allowed.length > 0) {
+    const named = listed(allowed.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))));
+    lines.push(`Carrick allowed its read-only MCP tools in ${named}, so headless runs (\`claude -p\`) can call them.`);
   }
   const rootTracked = trackedPaths(workspace, [...SKILL_ROOTS, AGENTS_FILE, CLAUDE_FILE]) ?? new Set();
   const rootHeld: string[] = [];
