@@ -178,10 +178,10 @@ function updateSkills(workspace: string, tracked: Set<string>, held: string[]): 
  * siblings. A root counts only where it is no link and already holds a skill of
  * ours; the new one takes that sibling's scope. Where the siblings are in the
  * repo's exclude block the new path joins the block first; where git tracks
- * them it is named in `held` and not written. A skill the record names was
+ * them it is named in `notAdded` and not written. A skill the record names was
  * removed on purpose and stays removed.
  */
-function addNewSkills(workspace: string, tracked: Set<string>, held: string[]): string[] {
+function addNewSkills(workspace: string, tracked: Set<string>, notAdded: string[]): string[] {
   const added: string[] = [];
   const given = writtenSkills(workspace);
   const installed = inspectTaskSkills(workspace);
@@ -195,7 +195,7 @@ function addNewSkills(workspace: string, tracked: Set<string>, held: string[]): 
     });
     if (missing.length === 0) continue;
     if (siblings.some((skill) => tracked.has(skill.path))) {
-      held.push(...missing.map((name) => skillFile(root, name)));
+      notAdded.push(...missing.map((name) => skillFile(root, name)));
       continue;
     }
     try {
@@ -335,12 +335,25 @@ export function bringUpToDate(
     const roots = [...new Set(skills.map((file) => path.dirname(path.dirname(file))))];
     lines.push(`Carrick brought its task skills in ${roots.join(", ")} up to date for ${running}.`);
   }
-  const fresh = addNewSkills(workspace, rootTracked, rootHeld);
+  const notAdded: string[] = [];
+  const fresh = addNewSkills(workspace, rootTracked, notAdded);
+  const skillPhrase = (files: string[]): { names: string[]; roots: string[]; noun: string } => {
+    const names = [...new Set(files.map((file) => path.basename(path.dirname(file))))];
+    return {
+      names,
+      roots: [...new Set(files.map((file) => path.dirname(path.dirname(file))))],
+      noun: names.length === 1 ? "skill" : "skills",
+    };
+  };
   if (fresh.length > 0) {
-    const roots = [...new Set(fresh.map((file) => path.dirname(path.dirname(file))))];
-    const names = [...new Set(fresh.map((file) => path.basename(path.dirname(file))))];
+    const { names, roots, noun } = skillPhrase(fresh);
+    lines.push(`Carrick added its new task ${noun} ${listed(names)} to ${roots.join(", ")} for ${running}.`);
+  }
+  if (notAdded.length > 0) {
+    const { names, roots, noun } = skillPhrase(notAdded);
+    held.push(...notAdded);
     lines.push(
-      `Carrick added its new task ${names.length === 1 ? "skill" : "skills"} ${listed(names)} in ${roots.join(", ")} for ${running}.`,
+      `Carrick did not add its new task ${noun} ${listed(names)} to ${roots.join(", ")} because git tracks its other skills there. Run \`carrick init\`, then commit the change in its own pull request.`,
     );
   }
   const written = [

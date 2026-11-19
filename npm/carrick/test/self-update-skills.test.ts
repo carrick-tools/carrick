@@ -65,7 +65,7 @@ test("an untracked install without the new skill gets it under both roots, said 
   for (const relative of NEW_PATHS) assert.ok(exists(workspace.root, relative), `${relative} written`);
   // Written with its siblings' scope.
   assert.match(fs.readFileSync(path.join(workspace.root, NEW_PATHS[0]!), "utf8"), /project: "demo"/);
-  assert.deepEqual(lines, [`Carrick added its new task skill ${NEW_SKILL} in ${SKILL_ROOTS.join(", ")} for ${running}.`]);
+  assert.deepEqual(lines, [`Carrick added its new task skill ${NEW_SKILL} to ${SKILL_ROOTS.join(", ")} for ${running}.`]);
   const record = JSON.parse(fs.readFileSync(path.join(workspace.root, RECORD), "utf8")) as Record<string, string[]>;
   for (const root of SKILL_ROOTS) assert.ok(record[root.split(path.sep).join("/")]?.includes(NEW_SKILL));
 
@@ -98,17 +98,21 @@ test("a hidden install gets the new paths in its exclude block, and git shows no
   assert.equal(porcelain(workspace.root), before);
 });
 
-test("tracked siblings: nothing is written and the held line names the missing skill", (t) => {
+test("tracked siblings: nothing is written, and one line says so without claiming git tracks the missing skill", (t) => {
   const workspace = installBeforeTheSkill();
   t.after(() => workspace.cleanup());
   git(workspace.root, "add", "-f", ".claude", ".agents");
   git(workspace.root, "commit", "-q", "-m", "team");
+  const held: string[] = [];
 
-  const lines = bringUpToDate(workspace.root, null, running);
+  const lines = bringUpToDate(workspace.root, null, running, () => {}, held);
 
   for (const relative of NEW_PATHS) assert.equal(exists(workspace.root, relative), false);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /^Carrick did not update .*carrick-audit.* because git tracks them here\./);
+  assert.deepEqual(lines, [
+    `Carrick did not add its new task skill ${NEW_SKILL} to ${SKILL_ROOTS.join(", ")} because git tracks its other skills there. Run \`carrick init\`, then commit the change in its own pull request.`,
+  ]);
+  assert.ok(lines.every((line) => !/did not update/.test(line)));
+  assert.deepEqual(held, NEW_PATHS);
 });
 
 test("a skill the record names that is gone from disk stays gone", (t) => {
