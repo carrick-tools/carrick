@@ -156,6 +156,17 @@ describe('verify_library_claims: a procedure named by its binding (amendment 13)
     );
   });
 
+  it('is claim_invalid when a binding op\'s method_key lacks `maker: true`', () => {
+    assert.strictEqual(
+      judged('defineFn', binding('defineFn', { method_key: { arg: 0, key: 'method' } })),
+      'unchecked claim_invalid'
+    );
+    assert.strictEqual(
+      judged('defineFn', binding('defineFn', { method_key: { arg: 0, key: 'method', maker: false } })),
+      'unchecked claim_invalid'
+    );
+  });
+
   it('verifies a make whose name slot is a function (`ref`)', () => {
     const useMake = check('useFn', 'http_client', 'export', {
       kind: 'make',

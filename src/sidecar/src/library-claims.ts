@@ -1690,7 +1690,8 @@ function orFileMisplaced(claim: LibraryClaim): boolean {
 
 /**
  * `maker: true` (amendment 13) flags the `method_key` slot of a binding op and
- * no other slot; anywhere else the claim is `claim_invalid`. `maker: false` is
+ * no other slot; anywhere else the claim is `claim_invalid`. A binding op's
+ * `method_key` must carry it. `maker: false` is
  * no flag.
  */
 function makerFlagMisplaced(claim: LibraryClaim): boolean {
@@ -1700,6 +1701,8 @@ function makerFlagMisplaced(claim: LibraryClaim): boolean {
   if (claim.kind === 'op') {
     slots.push(claim.payload, claim.handler, claim.ack, claim.options, claim.base);
     if (!isBinding(claim)) slots.push(claim.method_key);
+    // On a binding op the labelled call is the handler step, which carries no method: the slot is the maker's.
+    else if (claim.method_key !== undefined && claim.method_key.maker !== true) return true;
   }
   return slots.some(slot => slot?.maker === true);
 }
