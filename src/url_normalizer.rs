@@ -87,6 +87,26 @@ impl UrlNormalizer {
         }
     }
 
+    /// This normaliser with `names` read as internal too, as a declared
+    /// `internalEnvVars` entry is: the variables a scan learned are this
+    /// repository's own address (`crate::engine`'s served bases).
+    pub fn with_internal_env_vars<'n>(
+        mut self,
+        names: impl IntoIterator<Item = &'n String>,
+    ) -> Self {
+        self.internal_env_vars.extend(names.into_iter().cloned());
+        self
+    }
+
+    /// The environment variable a consumer key's leading interpolation reads,
+    /// in either env spelling (`${process.env.X}/p`, `${import.meta.env.X}/p`);
+    /// `None` for any other key.
+    pub fn leading_env_name(path: &str) -> Option<&str> {
+        let inner = path.strip_prefix("${")?;
+        let end = inner.find('}')?;
+        crate::call_base::env_prefixed_name(&inner[..end])
+    }
+
     /// Drop each env-var alias whose own name the config declares internal
     /// while the variable it reads is not (carrick#2519). A base is internal
     /// when either the name the code reads it by or the variable behind it is

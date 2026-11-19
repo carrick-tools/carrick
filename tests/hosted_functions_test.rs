@@ -45,16 +45,74 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 /// Every blob the scan of the fixture writes, with `carrick.json` kept or
-/// removed.
+/// removed, and no store answer (P1's case).
 fn scan_blobs(with_config: bool) -> Vec<serde_json::Value> {
+    scans(Tree {
+        config: with_config,
+        claims: false,
+        marker: true,
+        extra: &[],
+    })
+    .remove(0)
+    .blobs
+}
+
+/// The fixture as one scan reads it.
+#[derive(Clone, Copy)]
+struct Tree<'a> {
+    /// `carrick.json` kept (two services) or removed (one at the root).
+    config: bool,
+    /// The fixture's `library-claims.json` replayed as the store's answer.
+    claims: bool,
+    /// `supabase/config.toml` kept.
+    marker: bool,
+    /// Files written into the copy before the commit.
+    extra: &'a [(&'a str, &'a str)],
+}
+
+/// What one scan wrote: its blobs and its run log.
+struct Scanned {
+    blobs: Vec<serde_json::Value>,
+    log: String,
+}
+
+/// One scan of `tree`.
+fn scan(tree: Tree<'_>) -> Scanned {
+    scans_of(tree, 1).remove(0)
+}
+
+/// [`scan`], returned as a one-element list.
+fn scans(tree: Tree<'_>) -> Vec<Scanned> {
+    scans_of(tree, 1)
+}
+
+/// `runs` scans of one committed copy of `tree`, sharing one store and
+/// cache: every scan after the first takes the incremental path.
+fn scans_of(tree: Tree<'_>, runs: usize) -> Vec<Scanned> {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("workspace");
     copy_dir(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hosted-functions"),
         &repo,
     );
-    if !with_config {
+    if !tree.config {
         std::fs::remove_file(repo.join("carrick.json")).unwrap();
+    }
+    if !tree.marker {
+        std::fs::remove_file(repo.join("supabase/config.toml")).unwrap();
+    }
+    if tree.claims {
+        std::fs::create_dir_all(repo.join("__llm__/library-claims")).unwrap();
+        std::fs::copy(
+            repo.join("library-claims.json"),
+            repo.join("__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+    }
+    for (file, text) in tree.extra {
+        let path = repo.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
     }
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A", "-f"]);
@@ -103,21 +161,48 @@ fn scan_blobs(with_config: bool) -> Vec<serde_json::Value> {
     ] {
         cmd.env_remove(var);
     }
-    let output = cmd.output().expect("spawn carrick");
-    assert!(
-        output.status.success(),
-        "the scan failed:\n{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    std::fs::read_dir(&storage)
-        .expect("storage dir")
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .map(|path| {
-            serde_json::from_slice(&std::fs::read(path).expect("read blob")).expect("parse blob")
-        })
-        .collect()
+    let logs = home.join(".carrick/logs/runs");
+    let mut out = Vec::with_capacity(runs);
+    for run in 0..runs {
+        // The first scan finds no earlier blob; a later one reads the store
+        // back and takes the incremental path.
+        if run == 0 {
+            cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
+        } else {
+            cmd.env_remove("CARRICK_LOCAL_STORAGE_ISOLATE");
+        }
+        let before: BTreeSet<PathBuf> = run_logs(&logs);
+        let output = cmd.output().expect("spawn carrick");
+        assert!(
+            output.status.success(),
+            "the scan failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = run_logs(&logs)
+            .difference(&before)
+            .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let blobs = std::fs::read_dir(&storage)
+            .expect("storage dir")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .map(|path| {
+                serde_json::from_slice(&std::fs::read(path).expect("read blob"))
+                    .expect("parse blob")
+            })
+            .collect();
+        out.push(Scanned { blobs, log });
+    }
+    out
+}
+
+/// The run logs under `dir`.
+fn run_logs(dir: &Path) -> BTreeSet<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+        .unwrap_or_default()
 }
 
 /// (`file:line`, method, path, resolution source) of every endpoint row in `blobs` under
@@ -207,4 +292,222 @@ fn each_folder_function_is_one_fact_row_at_its_real_address() {
             "carrick.json kept: {with_config}"
         );
     }
+}
+
+// The consumer half (README "Answer key (consumer rows)"): the client the web
+// app makes with `@supabase/supabase-js` on `VITE_SUPABASE_URL` says that
+// variable is the repository's own address, so a fetch on it keys the path
+// the folder function serves.
+
+/// The fixture with its store answer: the `fetch` claim and the client's
+/// make claim, base on argument 0.
+const SERVED: Tree<'static> = Tree {
+    config: true,
+    claims: true,
+    marker: true,
+    extra: &[],
+};
+
+/// (method, path, resolution source) of every call row in `blobs` at `at`
+/// (`file:line`, repo-relative).
+fn calls_at(blobs: &[serde_json::Value], at: &str) -> Vec<(String, String, String)> {
+    blobs
+        .iter()
+        .flat_map(|blob| blob["calls"].as_array().into_iter().flatten())
+        .filter(|row| row["file_path"].as_str() == Some(at))
+        .map(|row| {
+            (
+                row["key"]["method"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                row["key"]["path"].as_str().unwrap_or_default().to_string(),
+                row["resolution_source"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The one call row at `at`.
+fn one_call_at(blobs: &[serde_json::Value], at: &str) -> (String, String, String) {
+    let rows = calls_at(blobs, at);
+    assert_eq!(rows.len(), 1, "one call row at {at}: {rows:?}");
+    rows.into_iter().next().unwrap()
+}
+
+/// Whether `path` still starts with an env read of `name`, in either
+/// spelling.
+fn keeps_env_base(path: &str, name: &str) -> bool {
+    [
+        format!("${{process.env.{name}}}"),
+        format!("${{import.meta.env.{name}}}"),
+    ]
+    .iter()
+    .any(|base| path.starts_with(base.as_str()))
+}
+
+const QUOTE: &str = "src/quote.ts:2";
+const OTHER: &str = "src/other.ts:2";
+const LEARNED_LINE: &str = "VITE_SUPABASE_URL is this repository's own address: the @supabase/supabase-js client made at src/client.ts:5 is made with it";
+
+#[test]
+fn a_client_made_on_an_env_base_this_repo_serves_makes_that_base_internal() {
+    let scanned = scan(SERVED);
+    let (method, path, _) = one_call_at(&scanned.blobs, QUOTE);
+    assert_eq!(
+        (method.as_str(), path.as_str()),
+        ("POST", "/functions/v1/price-quote")
+    );
+    // A variable no client is made on is not learned.
+    let (_, other, _) = one_call_at(&scanned.blobs, OTHER);
+    assert!(keeps_env_base(&other, "VITE_OTHER_URL"), "{other}");
+    assert!(other.ends_with("/x"), "{other}");
+    assert!(
+        scanned.log.contains(LEARNED_LINE),
+        "the scan says what it learned"
+    );
+}
+
+#[test]
+fn the_fetch_pairs_with_the_folder_function() {
+    for config in [true, false] {
+        let blobs = scan(Tree { config, ..SERVED }).blobs;
+        let (method, path, _) = one_call_at(&blobs, QUOTE);
+        let served: BTreeSet<(String, String)> = function_rows(&blobs)
+            .into_iter()
+            .map(|(_, method, path, _)| (method, path))
+            .collect();
+        assert!(
+            served.contains(&("ALL".to_string(), path.clone())),
+            "carrick.json kept: {config}: {path} is served: {served:?}"
+        );
+        assert!(carrick_match::method_matches("ALL", &method));
+    }
+}
+
+#[test]
+fn one_row_at_the_fetch_line() {
+    let (_, path, _) = one_call_at(&scan(SERVED).blobs, QUOTE);
+    assert!(!path.contains("${"), "host-free: {path}");
+}
+
+#[test]
+fn the_early_row_and_the_fact_row_key_alike_for_a_learned_base() {
+    // The fact row takes the site: the early base-path row read the same
+    // learned key and gave way to it.
+    let (_, path, source) = one_call_at(&scan(SERVED).blobs, QUOTE);
+    assert_eq!(path, "/functions/v1/price-quote");
+    assert_ne!(source, "env_base_path");
+}
+
+#[test]
+fn a_second_scan_keys_the_same() {
+    let runs = scans_of(SERVED, 2);
+    assert!(
+        runs[1].log.contains("Incremental analysis complete"),
+        "the second scan took the incremental path"
+    );
+    for (run, scanned) in runs.iter().enumerate() {
+        let (_, path, _) = one_call_at(&scanned.blobs, QUOTE);
+        assert_eq!(path, "/functions/v1/price-quote", "scan {run}");
+    }
+}
+
+#[test]
+fn no_marker_learns_nothing() {
+    let scanned = scan(Tree {
+        marker: false,
+        ..SERVED
+    });
+    let (_, path, _) = one_call_at(&scanned.blobs, QUOTE);
+    assert!(keeps_env_base(&path, "VITE_SUPABASE_URL"), "{path}");
+    assert!(!scanned.log.contains("is this repository's own address"));
+}
+
+/// A call only the model reads (its receiver is a parameter of no package,
+/// so no claim decides it), on the learned base.
+const MODEL_ONLY: &[(&str, &str)] = &[
+    (
+        "src/digest.ts",
+        "const DIGEST_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/team-digest`;\nexport async function sendDigest(api: { post(url: string): Promise<unknown> }): Promise<unknown> {\n  return api.post(DIGEST_URL);\n}\n",
+    ),
+    (
+        "__llm__/analyze-file/digest.json",
+        r#"{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:3",
+      "line_number": 3,
+      "target": "${import.meta.env.VITE_SUPABASE_URL}/functions/v1/team-digest",
+      "method": "POST",
+      "pattern_matched": ".post(",
+      "call_expression_text": "api.post(DIGEST_URL)",
+      "call_expression_line": 3,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
+"#,
+    ),
+];
+
+#[test]
+fn a_model_only_row_on_a_learned_base_is_host_free() {
+    let blobs = scan(Tree {
+        extra: MODEL_ONLY,
+        ..SERVED
+    })
+    .blobs;
+    let (method, path, source) = one_call_at(&blobs, "src/digest.ts:3");
+    assert_eq!(
+        (method.as_str(), path.as_str(), source.as_str()),
+        ("POST", "/functions/v1/team-digest", "model")
+    );
+}
+
+/// The request type aliases (`…_Request_…`) of the web blob's bundled types.
+fn request_types(blobs: &[serde_json::Value]) -> BTreeSet<String> {
+    blobs
+        .iter()
+        .filter(|blob| blob["service_name"] == "web")
+        .filter_map(|blob| blob["bundled_types"].as_str())
+        .flat_map(str::lines)
+        .filter(|line| line.contains("_Request_"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn the_request_type_joins_the_re_keyed_row() {
+    // The control: the same variable declared internal, with no marker to
+    // learn it from. Both keys read `/functions/v1/price-quote`, so the
+    // request type is the same alias of the same key.
+    let declared_config = r#"{
+  "services": [
+    { "serviceName": "web", "directory": ".", "exclude": ["supabase/functions/"], "internalEnvVars": ["VITE_SUPABASE_URL"] },
+    { "serviceName": "edge-functions", "directory": "supabase/functions" }
+  ]
+}
+"#;
+    let declared = request_types(
+        &scan(Tree {
+            marker: false,
+            extra: &[("carrick.json", declared_config)],
+            ..SERVED
+        })
+        .blobs,
+    );
+    assert!(
+        declared.iter().any(|line| line.contains("items")),
+        "the control types the request: {declared:?}"
+    );
+    assert_eq!(request_types(&scan(SERVED).blobs), declared);
 }

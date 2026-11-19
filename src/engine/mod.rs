@@ -6379,6 +6379,11 @@ async fn analyze_current_repo_incremental(
             )
             .await;
             protocol_extractions.site = site_rows;
+            let keys = crate::site_rows::key_learned_bases(
+                &mut protocol_extractions.site,
+                &mut mount_graph,
+                service,
+            );
             add_unread_route_sites(
                 &mut protocol_extractions.site,
                 &analysis.unread_route_sites,
@@ -6535,11 +6540,7 @@ async fn analyze_current_repo_incremental(
 
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
-            let site_payloads = site_payloads.joined_to_rows(
-                &merged_results,
-                repo_path,
-                &UrlNormalizer::new(config),
-            );
+            let site_payloads = site_payloads.joined_to_rows(&merged_results, repo_path, &keys);
             drop_call_through_entries(&mut manifest_entries, &merged_results, &site_payloads);
             stamp_stated_values(&mut manifest_entries, &merged_results);
             stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results);
@@ -8126,6 +8127,29 @@ async fn site_rows_of(
     .await;
     let mut rows = crate::site_rows::of(&decided, &records, &site_labels, &answers);
     rows.held_open = held_open_at_decided_sites(context.held_at_module, &decided);
+    // The base this service's own client of a platform the repository serves
+    // is made with is the repository's own address: learned here, from the
+    // settled claims, and read by `site_rows::key_learned_bases`.
+    let served = crate::file_based_router::served_packages(root);
+    if !served.is_empty()
+        && let Some(library) = context.library
+    {
+        rows.served_bases = crate::request_summary::decided_sites::served_base_vars(
+            root,
+            library,
+            claims,
+            inputs,
+            context.siblings,
+            &served,
+        );
+        for (name, makers) in &rows.served_bases {
+            for (package, at) in makers {
+                info!(
+                    "{name} is this repository's own address: the {package} client made at {at} is made with it, and this repository serves that platform's functions"
+                );
+            }
+        }
+    }
     // The labelled calls whose every deciding call only makes the function
     // that sends (carrick#4319 T2). With no placements to read, whether the
     // summaries own a request is unknown, and none is named. A line both
@@ -16139,6 +16163,11 @@ async fn analyze_current_repo(
     )
     .await;
     protocol_extractions.site = site_rows;
+    let keys = crate::site_rows::key_learned_bases(
+        &mut protocol_extractions.site,
+        &mut analysis_result.mount_graph,
+        service,
+    );
     add_unread_route_sites(
         &mut protocol_extractions.site,
         &analysis_result.unread_route_sites,
@@ -16254,11 +16283,8 @@ async fn analyze_current_repo(
     // repo's config to resolve (carrick#1416).
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
-    let site_payloads = site_payloads.joined_to_rows(
-        &analysis_result.file_results,
-        repo_path,
-        &UrlNormalizer::new(config),
-    );
+    let site_payloads =
+        site_payloads.joined_to_rows(&analysis_result.file_results, repo_path, &keys);
     drop_call_through_entries(
         &mut manifest_entries,
         &analysis_result.file_results,

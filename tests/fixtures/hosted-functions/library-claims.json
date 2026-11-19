@@ -1,0 +1,72 @@
+{
+  "library_claims": [
+    {
+      "package": "lib:lib.dom.d.ts",
+      "version": "6.0.2",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "lib:lib.dom.d.ts",
+          "export": "fetch",
+          "role": "http_client",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": null,
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1,
+                "key": "body"
+              },
+              "method_key": {
+                "arg": 1,
+                "key": "method"
+              },
+              "method_default": "GET",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@supabase/supabase-js",
+      "version": "2.45.0",
+      "status": "answered",
+      "surface_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "exports": [
+        {
+          "specifier": "@supabase/supabase-js",
+          "export": "createClient",
+          "role": "http_client",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "base": {
+                "arg": 0
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

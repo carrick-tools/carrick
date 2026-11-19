@@ -220,6 +220,12 @@ pub struct SiteRows {
     /// nothing is written.
     pub enabled: bool,
     pub rows: Vec<SiteRow>,
+    /// The environment variables the service's own clients of a package the
+    /// repository serves are made with as their base, each to its maker
+    /// calls' package and `file:line` (`decided_sites::served_base_vars`):
+    /// read as internal for every consumer key of the service
+    /// ([`key_learned_bases`]).
+    pub served_bases: std::collections::BTreeMap<String, Vec<(String, String)>>,
     /// The sites that are possible calls whatever the fold does: leads,
     /// unanswered sites, and sites whose answer states no row.
     pub leads: Vec<PossibleCall>,
@@ -1092,6 +1098,61 @@ pub fn key_requests_canonically(
             *path = normalizer.consumer_call_path(path, row.base.as_ref());
         }
     }
+    drop_repeated_rows(rows);
+}
+
+/// The service's consumer keys read again with the variables it learned
+/// ([`SiteRows::served_bases`]) as internal: every call row whose key's
+/// leading interpolation reads a learned variable, in either env spelling,
+/// the site rows and the rows keyed before the settled claims (the graph's
+/// base-path, model and summary rows) alike, so the fold compares one key
+/// and a learned variable is internal as a declared one is. No other key is
+/// touched. Returns the normaliser every later join on a call's key reads
+/// (the payload join); with nothing learned it is the service's own.
+pub fn key_learned_bases(
+    rows: &mut SiteRows,
+    graph: &mut crate::mount_graph::MountGraph,
+    service: &crate::config::Config,
+) -> crate::url_normalizer::UrlNormalizer {
+    use crate::url_normalizer::UrlNormalizer;
+    let normalizer = UrlNormalizer::new(service).with_internal_env_vars(rows.served_bases.keys());
+    let learned = |path: &str| {
+        UrlNormalizer::leading_env_name(path)
+            .is_some_and(|name| rows.served_bases.contains_key(name))
+    };
+    let mut site_keyed = 0usize;
+    let mut graph_keyed = 0usize;
+    for row in &mut rows.rows {
+        if row.side == RowSide::Call
+            && let OperationKey::Http { path, .. } = &mut row.key
+            && learned(path)
+        {
+            *path = normalizer.consumer_call_path(path, row.base.as_ref());
+            site_keyed += 1;
+        }
+    }
+    for call in graph.data_calls.iter_mut() {
+        if learned(&call.canonical_path) {
+            call.canonical_path =
+                normalizer.consumer_call_path(&call.target_url, call.base.as_ref());
+            graph_keyed += 1;
+        }
+    }
+    if site_keyed > 0 {
+        drop_repeated_rows(rows);
+    }
+    tracing::debug!(
+        learned = rows.served_bases.len(),
+        site_keyed,
+        graph_keyed,
+        "served bases: consumer keys read again with the learned variables"
+    );
+    normalizer
+}
+
+/// Drop every site row that repeats an earlier one's anchors, side, key,
+/// procedure and name scope.
+fn drop_repeated_rows(rows: &mut SiteRows) {
     let mut kept: Vec<SiteRow> = Vec::with_capacity(rows.rows.len());
     for row in std::mem::take(&mut rows.rows) {
         let repeat = kept.iter().any(|earlier| {
@@ -1208,6 +1269,7 @@ pub fn of(
     let mut out = SiteRows {
         enabled: true,
         rows: Vec::new(),
+        served_bases: Default::default(),
         leads: crate::possible_calls::from_sites(decided, records),
         routes: Vec::new(),
         unread: Vec::new(),
