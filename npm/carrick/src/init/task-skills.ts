@@ -250,6 +250,57 @@ export function inspectTaskSkills(workspace: string): InstalledSkill[] {
   return installed;
 }
 
+/**
+ * The record of which skills this install has been given, `.carrick/task-skills-written.json`:
+ * per root, the skill names `carrick init` or a session start put there. A skill
+ * that is absent and not in it is new to this install; one that is in it and
+ * absent was removed on purpose and is not written again by self-update. An
+ * install made before the record existed has none, so its absent skills all read
+ * as new, once.
+ */
+export function writtenRecordFile(workspace: string): string {
+  return path.join(workspace, ".carrick", "task-skills-written.json");
+}
+
+function readRecord(workspace: string): Record<string, string[]> {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(writtenRecordFile(workspace), "utf8"));
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, string[]>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The skill paths (relative to the workspace) the record names. */
+export function writtenSkills(workspace: string): Set<string> {
+  const record = readRecord(workspace);
+  const named = new Set<string>();
+  for (const root of SKILL_ROOTS) {
+    const names = record[root.split(path.sep).join("/")];
+    if (!Array.isArray(names)) continue;
+    for (const name of TASK_SKILLS) if (names.includes(name)) named.add(skillFile(root, name));
+  }
+  return named;
+}
+
+/** Add these skill paths to the record. A record that cannot be written costs nothing but a repeat. */
+export function recordWrittenSkills(workspace: string, relatives: string[]): void {
+  if (relatives.length === 0) return;
+  try {
+    const record = readRecord(workspace);
+    for (const root of SKILL_ROOTS) {
+      const key = root.split(path.sep).join("/");
+      const held = Array.isArray(record[key]) ? record[key]! : [];
+      const names = TASK_SKILLS.filter((name) => held.includes(name) || relatives.includes(skillFile(root, name)));
+      if (names.length > 0) record[key] = [...names];
+    }
+    fs.mkdirSync(path.dirname(writtenRecordFile(workspace)), { recursive: true });
+    fs.writeFileSync(writtenRecordFile(workspace), `${JSON.stringify(record, null, 2)}\n`);
+  } catch {
+    // The skills are written; the record only guards a later deliberate removal.
+  }
+}
+
 /** What one path did on this run. */
 export type SkillOutcome = {
   /** Relative to the workspace. */
@@ -269,6 +320,7 @@ export type SkillOutcome = {
  */
 export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutcome[] {
   const outcomes: SkillOutcome[] = [];
+  const given: string[] = [];
   for (const root of SKILL_ROOTS) {
     const link = skillRootLink(workspace, root);
     for (const name of TASK_SKILLS) {
@@ -286,8 +338,10 @@ export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutc
       }
       const result = writeIfChanged(target, renderTaskSkill(name, scope));
       outcomes.push({ path: relative, state, wrote: result === "written" });
+      given.push(relative);
     }
   }
+  recordWrittenSkills(workspace, given);
   return outcomes;
 }
 

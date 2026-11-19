@@ -57,8 +57,19 @@ import {
 } from "./outdated.ts";
 import { expectedCarrickHooks, installedCarrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
 import { launcherDiffers, writeLauncher } from "./launcher.ts";
-import { committedHooksAreOurs, trackedPaths } from "./repo-copies.ts";
-import { inspectTaskSkills, renderTaskSkill, scopeOf, SKILL_ROOTS, TASK_SKILLS, type TaskSkill } from "./task-skills.ts";
+import { addToExcludeBlock, committedHooksAreOurs, recordedRepoCopy, trackedPaths } from "./repo-copies.ts";
+import {
+  inspectTaskSkills,
+  recordWrittenSkills,
+  renderTaskSkill,
+  scopeOf,
+  skillFile,
+  SKILL_ROOTS,
+  skillRootLink,
+  TASK_SKILLS,
+  writtenSkills,
+  type TaskSkill,
+} from "./task-skills.ts";
 
 /** Which settings files were rewritten for which version, so one removed on purpose stays removed. */
 export function updatedStampFile(workspace: string): string {
@@ -160,6 +171,50 @@ function updateSkills(workspace: string, tracked: Set<string>, held: string[]): 
     }
   }
   return changed;
+}
+
+/**
+ * Task skills that are absent and new to this install, written beside their
+ * siblings. A root counts only where it is no link and already holds a skill of
+ * ours; the new one takes that sibling's scope. Where the siblings are in the
+ * repo's exclude block the new path joins the block first; where git tracks
+ * them it is named in `held` and not written. A skill the record names was
+ * removed on purpose and stays removed.
+ */
+function addNewSkills(workspace: string, tracked: Set<string>, held: string[]): string[] {
+  const added: string[] = [];
+  const given = writtenSkills(workspace);
+  const installed = inspectTaskSkills(workspace);
+  for (const root of SKILL_ROOTS) {
+    if (skillRootLink(workspace, root) !== null) continue;
+    const siblings = installed.filter((skill) => skill.path.startsWith(`${root}${path.sep}`) && skill.state === "ours");
+    if (siblings.length === 0) continue;
+    const missing = TASK_SKILLS.filter((name) => {
+      const relative = skillFile(root, name);
+      return installed.find((skill) => skill.path === relative)?.state === "absent" && !given.has(relative);
+    });
+    if (missing.length === 0) continue;
+    if (siblings.some((skill) => tracked.has(skill.path))) {
+      held.push(...missing.map((name) => skillFile(root, name)));
+      continue;
+    }
+    try {
+      const scope = scopeOf(fs.readFileSync(path.join(workspace, siblings[0]!.path), "utf8"));
+      const hidden = new Set(recordedRepoCopy(workspace)?.recorded ?? []);
+      const paths = missing.map((name) => skillFile(root, name));
+      if (siblings.some((skill) => hidden.has(skill.path)) && !addToExcludeBlock(workspace, paths)) continue;
+      for (const name of missing) {
+        const relative = skillFile(root, name);
+        fs.mkdirSync(path.dirname(path.join(workspace, relative)), { recursive: true });
+        writeAtomic(path.join(workspace, relative), renderTaskSkill(name, scope));
+        recordWrittenSkills(workspace, [relative]);
+        added.push(relative);
+      }
+    } catch {
+      // Left as it was; the next session tries again.
+    }
+  }
+  return added;
 }
 
 /** Repos and services the snapshot's resolution holds; null where it cannot be read. */
@@ -279,6 +334,14 @@ export function bringUpToDate(
   if (skills.length > 0) {
     const roots = [...new Set(skills.map((file) => path.dirname(path.dirname(file))))];
     lines.push(`Carrick brought its task skills in ${roots.join(", ")} up to date for ${running}.`);
+  }
+  const fresh = addNewSkills(workspace, rootTracked, rootHeld);
+  if (fresh.length > 0) {
+    const roots = [...new Set(fresh.map((file) => path.dirname(path.dirname(file))))];
+    const names = [...new Set(fresh.map((file) => path.basename(path.dirname(file))))];
+    lines.push(
+      `Carrick added its new task ${names.length === 1 ? "skill" : "skills"} ${listed(names)} in ${roots.join(", ")} for ${running}.`,
+    );
   }
   const written = [
     updateAgentsSection(workspace, log, rootTracked, rootHeld),
