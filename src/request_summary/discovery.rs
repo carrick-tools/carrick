@@ -836,6 +836,8 @@ struct Called {
     /// Each `(store key, member)` called through a declaration in no answered
     /// package, by the key it is declared in.
     outside: HashSet<(String, String)>,
+    /// Every symbol a row calls outside the repo, whatever package declares it.
+    symbols: HashSet<String>,
 }
 
 /// One scope claim the trace asks, by its claim id, on one receiver id
@@ -958,6 +960,7 @@ pub fn declaration_ask_answered(
             let Some(symbol) = row.symbol() else {
                 continue;
             };
+            called.symbols.insert(symbol.to_string());
             called.outside.extend(
                 outside_keys(row, exports, answered)
                     .into_iter()
@@ -973,6 +976,15 @@ pub fn declaration_ask_answered(
     };
     let own = called_by(positions);
     let mut sibling_only = Called::default();
+    // The symbols called in this service or a sibling: an op on a called
+    // scope's result is asked only for a member some row calls.
+    let mut all_symbols = own.symbols.clone();
+    for sibling in siblings
+        .iter()
+        .filter_map(|sibling| sibling.positions.as_ref())
+    {
+        all_symbols.extend(called_by(sibling).symbols);
+    }
     for called in siblings
         .iter()
         .filter_map(|sibling| sibling.positions.as_ref())
@@ -1041,7 +1053,8 @@ pub fn declaration_ask_answered(
                         ..
                     } => {
                         member_called(member)
-                            || of.as_ref().is_some_and(|of| scope_results.contains(of))
+                            || (all_symbols.contains(member)
+                                && of.as_ref().is_some_and(|of| scope_results.contains(of)))
                     }
                     LibraryClaim::Scope { member, .. } => member_called(member),
                     _ => false,
@@ -12090,17 +12103,31 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
                 .map(|check| check.claim_id.clone())
                 .collect()
         };
-        // `from` is called, and so are a builder op and a filter.
+        // `from` is called, with `select`, `insert` and a filter: only the
+        // ops of the called members are asked, both `select` ops among them.
         let called = inputs_calling(&[
             ("from", "@fixture/hosted"),
             ("select", "@fixture/hosted-rest"),
+            ("insert", "@fixture/hosted-rest"),
             ("eq", "@fixture/hosted-rest"),
         ]);
         let ask = declaration_ask(&called, &[], &exports);
         let got = builder_ops(&ask);
-        assert_eq!(got.len(), 6, "{got:#?}");
+        assert_eq!(got.len(), 3, "{got:#?}");
+        assert_eq!(got.iter().filter(|id| id.contains(":select")).count(), 2);
+        assert_eq!(got.iter().filter(|id| id.contains(":insert")).count(), 1);
         assert!(got.iter().all(|id| !id.contains(":eq")), "{got:#?}");
-        assert_eq!(ask.ops.iter().filter(|op| op.is_some()).count(), 6);
+        assert_eq!(ask.ops.iter().filter(|op| op.is_some()).count(), 3);
+        // All five members called: the 6 builder ops.
+        let all = inputs_calling(&[
+            ("from", "@fixture/hosted"),
+            ("select", "@fixture/hosted-rest"),
+            ("insert", "@fixture/hosted-rest"),
+            ("upsert", "@fixture/hosted-rest"),
+            ("update", "@fixture/hosted-rest"),
+            ("delete", "@fixture/hosted-rest"),
+        ]);
+        assert_eq!(builder_ops(&declaration_ask(&all, &[], &exports)).len(), 6);
         // The filter has no op claim: the answer to the ask never names it,
         // so it is never a call left open.
         let rows = called.positions.as_ref().unwrap();
