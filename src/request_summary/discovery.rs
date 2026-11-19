@@ -852,6 +852,40 @@ pub(crate) fn claim_receivers(
     all
 }
 
+/// The (store key, member) pairs the rows of `positions` call: the members
+/// a declaration ask names ([`declaration_ask`]) and a sibling's unread rows
+/// are counted by ([`MemberDeclarations::unread_rows`]).
+fn called_pairs(
+    positions: &crate::position_rows::PositionIndex,
+    exports: &[ExportClaims],
+) -> HashSet<(String, String)> {
+    positions
+        .call_rows()
+        .chain(positions.member_rows())
+        .filter(|row| !in_repo(row))
+        .flat_map(|row| {
+            let symbol = row.symbol().map(str::to_string);
+            store_keys(row, exports)
+                .into_iter()
+                .filter_map(move |key| Some((key, symbol.clone()?)))
+        })
+        .collect()
+}
+
+/// The member a claim the trace asks is written on: an op or scope claim's
+/// member. The one place that says which claims name a member, so the ask
+/// and the trigger of a sibling's own ask read it the same way (carrick#4472).
+fn claimed_member(claim: &LibraryClaim) -> Option<&str> {
+    match claim {
+        LibraryClaim::Op {
+            member: Some(member),
+            ..
+        }
+        | LibraryClaim::Scope { member, .. } => Some(member),
+        _ => None,
+    }
+}
+
 /// The ask for the service `inputs` reads, under the store's answer
 /// `exports`. Nothing without rows, or with no member any op names.
 ///
@@ -872,19 +906,8 @@ pub fn declaration_ask(
     let Some(positions) = inputs.positions.as_ref() else {
         return ask;
     };
-    let called_by = |positions: &crate::position_rows::PositionIndex| -> HashSet<(String, String)> {
-        positions
-            .call_rows()
-            .chain(positions.member_rows())
-            .filter(|row| !in_repo(row))
-            .flat_map(|row| {
-                let symbol = row.symbol().map(str::to_string);
-                store_keys(row, exports)
-                    .into_iter()
-                    .filter_map(move |key| Some((key, symbol.clone()?)))
-            })
-            .collect()
-    };
+    let called_by =
+        |positions: &crate::position_rows::PositionIndex| called_pairs(positions, exports);
     let own = called_by(positions);
     let sibling_only: HashSet<(String, String)> = siblings
         .iter()
@@ -909,15 +932,10 @@ pub fn declaration_ask(
             let claims = export.claims_with_scopes_by_id();
             let wanted: Vec<&(String, &LibraryClaim)> = claims
                 .iter()
-                .filter(|(_, claim)| match claim {
-                    LibraryClaim::Op {
-                        member: Some(member),
-                        ..
-                    }
-                    | LibraryClaim::Scope { member, .. } => {
-                        called.contains(&(export.package.clone(), member.clone()))
-                    }
-                    _ => false,
+                .filter(|(_, claim)| {
+                    claimed_member(claim).is_some_and(|member| {
+                        called.contains(&(export.package.clone(), member.to_string()))
+                    })
                 })
                 .collect();
             if wanted.is_empty() {
@@ -1140,6 +1158,120 @@ impl MemberDeclarations {
                 .filter(|pair| !verified.contains(pair)),
         );
         out
+    }
+
+    /// Whether the declaration at `decl_file:decl_line` is one a verified
+    /// scope claim names ([`ScopeAnswer::Verified`]).
+    fn scope_verified_at(&self, decl_file: &str, decl_line: u32) -> bool {
+        self.scope_answers.values().any(|answer| {
+            answer.verified().is_some_and(|declarations| {
+                declarations
+                    .iter()
+                    .any(|(file, line)| file == decl_file && *line == decl_line)
+            })
+        })
+    }
+
+    /// How many declarations the rows of `sibling` call as a claimed member
+    /// (an op or scope claim of `exports`, the members its own
+    /// [`declaration_ask`] names) that no answer so far has verified: not in
+    /// [`Self::at`], and in no verified scope answer. Each declaration is
+    /// counted once. A sibling with none needs no ask from its own root
+    /// (carrick#4472 R4).
+    pub fn unread_rows(&self, sibling: &RequestSummaryInputs, exports: &[ExportClaims]) -> usize {
+        self.unread_declarations(sibling, exports).len()
+    }
+
+    /// The declarations [`Self::unread_rows`] counts, as `(file, line)`.
+    fn unread_declarations(
+        &self,
+        sibling: &RequestSummaryInputs,
+        exports: &[ExportClaims],
+    ) -> BTreeSet<(String, u32)> {
+        let Some(positions) = sibling.positions.as_ref() else {
+            return BTreeSet::new();
+        };
+        let claimed: HashSet<(String, String)> = called_pairs(positions, exports)
+            .into_iter()
+            .filter(|(key, member)| {
+                exports
+                    .iter()
+                    .filter(|export| export.role != LibraryRole::None && export.package == *key)
+                    .any(|export| {
+                        export
+                            .claims_with_scopes_by_id()
+                            .iter()
+                            .any(|(_, claim)| claimed_member(claim) == Some(member.as_str()))
+                    })
+            })
+            .collect();
+        let mut unread: BTreeSet<(String, u32)> = BTreeSet::new();
+        for row in positions
+            .call_rows()
+            .chain(positions.member_rows())
+            .filter(|row| !in_repo(row))
+        {
+            let (Some(file), Some(line), Some(symbol)) =
+                (row.decl_file(), row.decl_line(), row.symbol())
+            else {
+                continue;
+            };
+            let named = store_keys(row, exports)
+                .into_iter()
+                .any(|key| claimed.contains(&(key, symbol.to_string())));
+            if named && self.at(file, line).is_empty() && !self.scope_verified_at(file, line) {
+                unread.insert((file.to_string(), line));
+            }
+        }
+        unread
+    }
+
+    /// Whether some row of `sibling` is unread ([`Self::unread_rows`]).
+    pub fn leaves_unread(&self, sibling: &RequestSummaryInputs, exports: &[ExportClaims]) -> bool {
+        self.unread_rows(sibling, exports) > 0
+    }
+
+    /// The answers of two asks read as one (carrick#4472 R8): the checks and
+    /// the checks not reached add up, the declarations of both are indexed
+    /// (ops deduped, as [`Self::of`] does), a verified scope answer beats an
+    /// unanswered one and two verified ones name both their declarations.
+    /// A pair stays in `unanswered` only when some ask left it open and no
+    /// ask verified an op for it.
+    pub fn merge(mut self, other: MemberDeclarations) -> Self {
+        self.checks += other.checks;
+        self.not_reached += other.not_reached;
+        for (declaration, ops) in other.by_declaration {
+            let held = self.by_declaration.entry(declaration).or_default();
+            for op in ops {
+                if !held.contains(&op) {
+                    held.push(op);
+                }
+            }
+        }
+        for (scope, answer) in other.scope_answers {
+            match (self.scope_answers.get_mut(&scope), answer) {
+                (None, answer) => {
+                    self.scope_answers.insert(scope, answer);
+                }
+                (Some(held @ ScopeAnswer::Unanswered), answer) => *held = answer,
+                (Some(ScopeAnswer::Verified(held)), ScopeAnswer::Verified(more)) => {
+                    held.extend(more);
+                    held.sort();
+                    held.dedup();
+                }
+                (Some(ScopeAnswer::Verified(_)), ScopeAnswer::Unanswered) => {}
+            }
+        }
+        self.unanswered.extend(other.unanswered);
+        let verified: HashSet<(&str, &str)> = self
+            .by_declaration
+            .values()
+            .flatten()
+            .map(|op| (op.package.as_str(), op.member.as_str()))
+            .collect();
+        self.unanswered
+            .retain(|(package, member)| !verified.contains(&(package.as_str(), member.as_str())));
+        self
     }
 
     /// The ops the declaration at `decl_file:decl_line` stands for.
@@ -2552,15 +2684,18 @@ impl<'a> Walker<'a> {
     /// no declared op.
     fn declared_op(&self, row: &Row, invoke: Invoke<'_>) -> Option<SiteEnd> {
         let declarations = self.labels.declarations.filter(|_| !invoke.construction)?;
-        if declarations.left_open(row, self.labels.exports) {
-            self.declarations_unanswered.borrow_mut().insert((
-                self.rel(invoke.file),
-                invoke.call.site.span_start,
-                invoke.call.site.span_end,
-            ));
-        }
         let ops = declarations.at(row.decl_file()?, row.decl_line()?);
         if ops.is_empty() {
+            // Marked only once the look-up finds no op: with a sibling asked
+            // from its own root too (carrick#4472), a failed ask must not
+            // mark a call another ask verified. With one ask it is the same.
+            if declarations.left_open(row, self.labels.exports) {
+                self.declarations_unanswered.borrow_mut().insert((
+                    self.rel(invoke.file),
+                    invoke.call.site.span_start,
+                    invoke.call.site.span_end,
+                ));
+            }
             return None;
         }
         let Some(one) = self.one_op(ops) else {
@@ -4714,6 +4849,229 @@ mod tests {
             unread,
             "a short answer saves the same sites"
         );
+    }
+
+    /// A verified verdict for each check of `ask`, each op check naming the
+    /// declaration `decl_file:line` (the same for every check of an ask).
+    fn verified_at(ask: &DeclarationAsk, decl_file: &str, line: u32) -> Vec<SemanticsResult> {
+        ask.checks
+            .iter()
+            .map(|check| SemanticsResult {
+                claim_id: check.claim_id.clone(),
+                receiver: check.receiver.clone(),
+                verdict: SemanticsVerdict::Verified,
+                reason: None,
+                declarations: vec![crate::services::type_sidecar::SemanticsDeclaration {
+                    decl_file: decl_file.to_string(),
+                    decl_line: line,
+                }],
+            })
+            .collect()
+    }
+
+    /// carrick#4472 R8: two answers that name one op at two declarations
+    /// index both; the checks and the checks not reached add up.
+    #[test]
+    fn merged_answers_index_both_declarations_and_sum_the_counts() {
+        let (_, _, _, ask) = traced_with_ask();
+        let first = MemberDeclarations::of(&ask, &verified_at(&ask, "a/index.d.ts", 37));
+        let second = MemberDeclarations::of(&ask, &verified_at(&ask, "b/index.d.ts", 39));
+        let (one, other) = (first.len(), second.len());
+        assert!(one > 0 && other > 0);
+        let merged = first.merge(second);
+        let op = ask.ops.iter().flatten().next().expect("an op check");
+        assert!(merged.at("a/index.d.ts", 37).contains(op));
+        assert!(merged.at("b/index.d.ts", 39).contains(op));
+        assert_eq!(merged.len(), one + other, "no declaration is dropped");
+        assert_eq!(merged.checks, ask.checks.len() * 2);
+        // Merged again with itself, the ops are not repeated.
+        let twice = merged.clone().merge(merged.clone());
+        assert_eq!(
+            twice.at("a/index.d.ts", 37).len(),
+            merged.at("a/index.d.ts", 37).len()
+        );
+    }
+
+    /// carrick#4472 R8: a verified scope answer beats an unanswered one,
+    /// two verified ones name both declarations, and a pair a dead ask left
+    /// open stays open only when no ask verified an op for it.
+    #[test]
+    fn merging_keeps_a_verified_scope_and_a_pair_only_a_dead_ask_held() {
+        let (_, _, _, ask) = traced_with_ask();
+        let scope = AskedScope {
+            package: "p".into(),
+            export: "e".into(),
+            claim_id: "c".into(),
+            receiver: "export".into(),
+        };
+        let held = |answer: ScopeAnswer| {
+            let mut declarations = MemberDeclarations::default();
+            declarations.scope_answers.insert(scope.clone(), answer);
+            declarations
+        };
+        let merged = held(ScopeAnswer::Unanswered)
+            .merge(held(ScopeAnswer::Verified(vec![("x.d.ts".into(), 3)])))
+            .merge(held(ScopeAnswer::Unanswered))
+            .merge(held(ScopeAnswer::Verified(vec![("y.d.ts".into(), 5)])));
+        assert_eq!(
+            merged.scope_answers[&scope],
+            ScopeAnswer::Verified(vec![("x.d.ts".into(), 3), ("y.d.ts".into(), 5)])
+        );
+        // The dead ask's pairs are all open; the verified ask closes its own.
+        let dead = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let pairs: HashSet<(String, String)> = ask
+            .ops
+            .iter()
+            .flatten()
+            .map(|op| (op.package.clone(), op.member.clone()))
+            .collect();
+        assert!(!pairs.is_empty());
+        let alone = dead.clone().merge(MemberDeclarations::default());
+        assert_eq!(alone.unanswered, pairs, "a dead ask alone leaves them open");
+        let verified = MemberDeclarations::of(&ask, &verified_at(&ask, "a/index.d.ts", 37));
+        assert!(dead.merge(verified).unanswered.is_empty());
+    }
+
+    /// carrick#4472 R8: a call whose declaration an ask verified is read
+    /// even where a pair of its op is marked open by another ask (the
+    /// look-up comes before the mark), so it is not saved `unanswered`.
+    #[test]
+    fn a_call_a_verified_declaration_reads_is_not_marked_unanswered() {
+        let (on, exports, answered, _) = traced_with_ask();
+        let discovered = |declarations: &MemberDeclarations| {
+            discover(
+                &on.inputs,
+                &Labels::of(&exports).tracing(declarations),
+                &on.repo,
+            )
+        };
+        let read = discovered(&answered);
+        assert!(read.declarations_unanswered.is_empty());
+        let mut also_open = answered.clone();
+        also_open.unanswered = answered
+            .by_declaration
+            .values()
+            .flatten()
+            .map(|op| (op.package.clone(), op.member.clone()))
+            .collect();
+        assert!(!also_open.unanswered.is_empty());
+        let moved = discovered(&also_open);
+        let read_sites: Vec<(&str, u32, u32)> = read
+            .sites
+            .iter()
+            .filter(|site| site.end.is_some())
+            .map(|site| (site.file.as_str(), site.span_start, site.span_end))
+            .collect();
+        assert!(!read_sites.is_empty(), "the answer reads some calls");
+        let marked: Vec<&(String, u32, u32)> = moved
+            .declarations_unanswered
+            .iter()
+            .filter(|(file, start, end)| read_sites.contains(&(file.as_str(), *start, *end)))
+            .collect();
+        assert!(
+            marked.is_empty(),
+            "read calls marked unanswered: {marked:?}"
+        );
+    }
+
+    /// The services of `fixture` walked, each asked from its own root
+    /// (carrick#4472): the declarations that root's verifier names for the
+    /// service's own ask over `siblings`' members, in declared order.
+    fn asked_from_each_root(
+        fixture: &str,
+        asked: &[(&str, &[&str])],
+    ) -> Option<(
+        super::super::fixture_walk::WalkedServices,
+        Vec<ExportClaims>,
+        Vec<MemberDeclarations>,
+    )> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let configs = crate::config::Config::load_services(vec![
+            root.join(fixture).join("repo/carrick.json"),
+        ])
+        .unwrap();
+        let named: Vec<(&str, &str)> = configs
+            .iter()
+            .map(|config| {
+                (
+                    config.directory.as_deref().unwrap_or("."),
+                    config.service_name.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let on = super::super::fixture_walk::walked_services(fixture, &named, true)?;
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(root.join(fixture).join("library-claims.json")).unwrap(),
+        );
+        let exports = answer.exports;
+        let script = super::super::fixture_walk::sidecar()?;
+        let at = |name: &str| {
+            configs
+                .iter()
+                .position(|config| config.service_name.as_deref() == Some(name))
+                .expect("the fixture names the service")
+        };
+        let answers = asked
+            .iter()
+            .map(|(service, siblings)| {
+                let siblings: Vec<&RequestSummaryInputs> =
+                    siblings.iter().map(|name| &on.inputs[at(name)]).collect();
+                super::super::fixture_walk::census_declarations(
+                    &script,
+                    &on.repo,
+                    &configs[at(service)],
+                    &on.inputs[at(service)],
+                    &siblings,
+                    &exports,
+                )
+            })
+            .collect();
+        Some((on, exports, answers))
+    }
+
+    /// carrick#4472 R4: after the app's own ask, the kit's rows leave
+    /// declarations unread, the installed copies of the queue library and
+    /// the HTTP client among them (the app's root does not resolve them);
+    /// after the kit's own ask from its own root is merged, no installed
+    /// package's declaration is. The two DOM declarations the kit's controls
+    /// call (`addEventListener` on other types than the claimed ones) stay
+    /// unread: no ask verifies them, so the trigger is a row count, not a
+    /// promise of an answer.
+    #[test]
+    fn a_sibling_s_rows_leave_a_declaration_unread_until_its_own_root_answers() {
+        let (on, exports, answers) =
+            asked_from_each_root("sibling-own-install", &[("app", &["kit"]), ("kit", &[])])
+                .expect("the sibling-own-install fixture walks: a skipped test proves nothing");
+        let kit = &on.inputs[1];
+        let [app, from_kit] = <[MemberDeclarations; 2]>::try_from(answers).unwrap();
+        assert!(
+            app.leaves_unread(kit, &exports),
+            "the app's root leaves the kit's copy unread"
+        );
+        let before = app.unread_declarations(kit, &exports);
+        let installed = |set: &BTreeSet<(String, u32)>| {
+            set.iter()
+                .filter(|(file, _)| file.contains("node_modules"))
+                .count()
+        };
+        assert!(installed(&before) >= 2, "queue and HTTP copies: {before:?}");
+        let merged = app.merge(from_kit);
+        let after = merged.unread_declarations(kit, &exports);
+        assert_eq!(installed(&after), 0, "the kit's root reads them: {after:?}");
+        assert!(after.len() < before.len(), "{before:?} then {after:?}");
+        assert!(after.iter().all(|(file, _)| file.starts_with("lib:")));
+    }
+
+    /// carrick#4472 R4: a hoisted install with the same libraries leaves
+    /// nothing unread, so no sibling is asked (every op check of the
+    /// sender's own ask is verified).
+    #[test]
+    fn a_sibling_whose_members_the_own_answer_verified_is_not_asked() {
+        let (on, exports, answers) =
+            asked_from_each_root("queue-enum-base-class", &[("sender", &["queue-kit"])])
+                .expect("the queue-enum-base-class fixture walks: a skipped test proves nothing");
+        let kit = &on.inputs[3];
+        assert!(!answers[0].leaves_unread(kit, &exports));
     }
 
     /// carrick#3991 on the held-member reader (`value_end`): a labelled
