@@ -40,10 +40,10 @@ the repository's own address, read as a declared `internalEnvVars` entry is.
 | `src/other.ts:2` | `POST`, still keyed on its `VITE_OTHER_URL` env base and `/x`: no client is made on that variable |
 | `src/client.ts:5` | no row (the client is made, nothing is sent) |
 
-- The scan's run log says what it learned: `VITE_SUPABASE_URL is this
-  repository's own address: the @supabase/supabase-js client made at
-  src/client.ts:5 is made with it, and this repository serves that
-  platform's functions`.
+- The scan's run log says what it learned: `Treating env var
+  VITE_SUPABASE_URL as internal because the @supabase/supabase-js client
+  created at src/client.ts:5 uses it as its base address and this
+  repository serves that platform's functions`.
 - Without `supabase/config.toml` nothing is learned and `src/quote.ts:2`
   keeps its env base.
 - A second scan sharing the store and cache keys the same.

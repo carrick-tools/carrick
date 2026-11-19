@@ -8145,7 +8145,7 @@ async fn site_rows_of(
         for (name, makers) in &rows.served_bases {
             for (package, at) in makers {
                 info!(
-                    "{name} is this repository's own address: the {package} client made at {at} is made with it, and this repository serves that platform's functions"
+                    "Treating env var {name} as internal because the {package} client created at {at} uses it as its base address and this repository serves that platform's functions"
                 );
             }
         }

@@ -351,7 +351,7 @@ fn keeps_env_base(path: &str, name: &str) -> bool {
 
 const QUOTE: &str = "src/quote.ts:2";
 const OTHER: &str = "src/other.ts:2";
-const LEARNED_LINE: &str = "VITE_SUPABASE_URL is this repository's own address: the @supabase/supabase-js client made at src/client.ts:5 is made with it";
+const LEARNED_LINE: &str = "Treating env var VITE_SUPABASE_URL as internal because the @supabase/supabase-js client created at src/client.ts:5 uses it as its base address";
 
 #[test]
 fn a_client_made_on_an_env_base_this_repo_serves_makes_that_base_internal() {
@@ -424,7 +424,7 @@ fn no_marker_learns_nothing() {
     });
     let (_, path, _) = one_call_at(&scanned.blobs, QUOTE);
     assert!(keeps_env_base(&path, "VITE_SUPABASE_URL"), "{path}");
-    assert!(!scanned.log.contains("is this repository's own address"));
+    assert!(!scanned.log.contains("Treating env var"));
 }
 
 /// A call only the model reads (its receiver is a parameter of no package,
