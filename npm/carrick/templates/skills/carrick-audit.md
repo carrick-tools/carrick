@@ -9,9 +9,9 @@ description: Use when the ask is what is wrong in this codebase, what to clean u
 
 Cost: this skill opens source for every item it reads. On a monorepo of six
 services and about 1,600 TypeScript files, ten type mismatches and ten groups of
-similar functions took one headless Sonnet run 85 to 100 seconds and 39 to 44
-turns: about 100,000 new input tokens, 1.1 to 1.3 million cached input tokens
-and about 12,000 output tokens (2 runs, 19 Nov 2026).
+similar functions took one headless Sonnet run 2 to 3 minutes and 72 to 81
+turns: about 130,000 new input tokens, 1.7 to 2.6 million cached input tokens
+and 16,000 to 19,000 output tokens (3 runs, 19 Nov 2026).
 
 The index states the leads. Your work is to prove or drop each one in source.
 Class nothing from the index's own words alone.
@@ -24,7 +24,8 @@ get_project_map({{SCOPE}})
 
 Note the counts under FOUND ON MAIN: type mismatches and similar functions.
 
-Before you open any source, write the two counts and the cap you will use. Where
+Your first words to the user are the two counts and the cap you will use,
+written before you open any source. Where
 you can ask, offer to narrow to one service or cap the count. Where you cannot
 wait for a reply, such as a non-interactive run, the run caps each section at
 10, says so, and carries on.
