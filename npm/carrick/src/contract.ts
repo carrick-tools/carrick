@@ -134,6 +134,14 @@ export type CheckItem = {
    * wrote. Absent when false, and on every answer that judged nothing.
    */
   stated?: boolean;
+  /**
+   * Early answers only (the held compiler, `held/early.ts`): the break stood
+   * before this edit, as the compiler said it at the previous edit, so it is
+   * not this edit's. Absent when false.
+   */
+  standing?: boolean;
+  /** Early answers only: the run of the compiler's check this break belongs to (`HeldLine.run`). */
+  run?: string;
 };
 
 /** `UnreadItem` from src/local_mode/contract.rs: one call the scan did not read. */
@@ -320,6 +328,10 @@ export type MovedRow = {
   other_build?: boolean;
   /** Stated as this edit's problem, by the rule `CheckItem.stated` follows. Absent when false. */
   stated?: boolean;
+  /** Early answers only, as `CheckItem.standing`. */
+  standing?: boolean;
+  /** Early answers only, as `CheckItem.run`. */
+  run?: string;
 };
 
 /** The `scope` of a `recheck` block (`docs/local-mode-output.md`, "recheck"). */

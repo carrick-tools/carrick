@@ -84,6 +84,13 @@ export type HeldLine = {
   protocol?: string;
   /** A consumer line's call line on the current text, for joining part 2's call row. */
   call_line?: number | null;
+  /**
+   * The run this break belongs to: the edit answer at which its check began to
+   * speak this message. A break that stopped and spoke again is a new run.
+   */
+  run?: string;
+  /** Its check spoke the same message at the engine's previous edit answer: not this edit's break (T1 P1.1). */
+  standing?: true;
 };
 
 export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "error";
@@ -97,7 +104,7 @@ export type HeldAnswer = {
 };
 
 /** What serving a request found, and where its time went. */
-type Served = { state: HeldState; lines: HeldLine[]; steps: Steps; note?: NotChecked };
+type Served = { state: HeldState; lines: HeldLine[]; steps: Steps; note?: NotChecked; service?: string; engine?: string; commits?: Array<() => void> };
 
 /** A started engine for one service. */
 export interface ServiceEngine {
@@ -106,8 +113,12 @@ export interface ServiceEngine {
    * been sent, still inside the engine's queue: no request reaches the engine
    * until it ends (the twin pass edits the engine's texts). `steps` is where
    * the answer's time went, in ms by step; `after` answers the same for its own.
+   * `commit` is called once the answer is filed as an early answer: what its
+   * lines spoke becomes what the next answer's are marked `standing` against
+   * (T1 P1.1). An answer that was not filed is never committed. `engine` is
+   * the engine's id, one per start: a break's run names it (`runOf`).
    */
-  answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps?: Steps; after?: () => Promise<Steps | void> }>;
+  answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps?: Steps; after?: () => Promise<Steps | void>; commit?: () => void; engine?: string }>;
   /** Resident memory in MB, or null. */
   rss(): number | null;
   /** False for a service that started with no compiler: it holds no memory, so it holds no registry slot. */
@@ -214,15 +225,18 @@ export class HeldDaemon {
     let lines: HeldLine[] = [];
     let steps: Steps = {};
     let notes: NotChecked[] = [];
+    let service: string | undefined;
+    let engine: string | undefined;
+    let commits: Array<() => void> = [];
     try {
-      ({ state, lines, steps, notes } = await this.route(request));
+      ({ state, lines, steps, notes, service, engine, commits = [] } = await this.route(request));
     } catch (error) {
       log("request failed", String(error));
       state = "error";
     }
     const ms = Math.round(performance.now() - started);
     this.record(request, state, lines.length, ms, steps);
-    this.file(request, state, lines, ms);
+    if (this.file(request, state, lines, ms, { service, engine })) for (const commit of commits) commit();
     return { state, lines, ms, ...(notes.length > 0 ? { not_checked: notes } : {}) };
   }
 
@@ -233,20 +247,27 @@ export class HeldDaemon {
     const lines: HeldLine[] = [];
     const states: HeldState[] = [];
     const notes: NotChecked[] = [];
+    const ready: string[] = [];
+    const engines: string[] = [];
+    const commits: Array<() => void> = [];
     const steps: Steps = { programs: tenth(performance.now() - started) };
     for (const { init, dir } of programs) {
       const mine = files.filter((f) => within(f, dir));
       if (mine.length === 0) continue;
       const answer = await this.serveService(init, mine, request);
       states.push(answer.state);
+      if (answer.state === "ready") ready.push(`${init.repo}/${init.service}`);
       lines.push(...answer.lines);
       if (answer.note !== undefined) notes.push(answer.note);
+      commits.push(...(answer.commits ?? []));
+      if (answer.engine !== undefined) engines.push(answer.engine);
       addSteps(steps, answer.steps);
     }
     // One state for the whole request: the most useful one any service gave.
     const order: HeldState[] = ["ready", "cold", "capped", "no_compiler", "error"];
     const state = order.find((s) => states.includes(s)) ?? "none";
-    return { state, lines, steps, notes };
+    // The services whose engines answered, and those engines: what an early answer's rows are the whole list of (T1 P1.4).
+    return { state, lines, steps, notes, commits, ...(ready.length > 0 ? { service: ready.join(", ") } : {}), ...(engines.length > 0 ? { engine: engines.join(", ") } : {}) };
   }
 
   private async serveService(init: ServiceInit, files: string[], request: HeldRequest): Promise<Served> {
@@ -295,7 +316,7 @@ export class HeldDaemon {
   }
 
   /** Asked through the slot's queue; `null` when the engine could not answer. */
-  private ask(slot: Slot, engine: ServiceEngine, files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps } | null> {
+  private ask(slot: Slot, engine: ServiceEngine, files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps; engine?: string; commits?: Array<() => void> } | null> {
     const queued = performance.now();
     return new Promise((resolve) => {
       slot.queue = slot.queue.then(async () => {
@@ -314,6 +335,8 @@ export class HeldDaemon {
           resolve({
             lines: answered.lines,
             steps: { queue_wait: tenth(begun - queued), engine: tenth(engineMs), ...answered.steps },
+            ...(answered.commit ? { commits: [answered.commit] } : {}),
+            ...(answered.engine === undefined ? {} : { engine: answered.engine }),
           });
         } catch (error) {
           log("engine could not answer", String(error));
@@ -334,17 +357,19 @@ export class HeldDaemon {
     return request.seq !== undefined && supersededEntry(request.session, request.seq, this.deps.home);
   }
 
-  /** File the early answer for an ask that named its entry, unless a newer edit superseded it. Never throws. */
-  private file(request: HeldRequest, state: HeldState, lines: HeldLine[], ms: number): void {
-    if (request.seq === undefined || request.kind !== "edit") return;
+  /** File the early answer for an ask that named its entry, unless a newer edit superseded it: true when filed. Never throws. */
+  private file(request: HeldRequest, state: HeldState, lines: HeldLine[], ms: number, by: { service?: string | undefined; engine?: string | undefined }): boolean {
+    if (request.seq === undefined || request.kind !== "edit") return false;
     try {
       if (this.superseded(request)) {
         log("held ask superseded by a newer edit; nothing filed");
-        return;
+        return false;
       }
-      answerEarly(request.session, request.seq, { state, lines, ms }, this.now(), this.deps.home);
+      const named = { ...(by.service === undefined ? {} : { service: by.service }), ...(by.engine === undefined ? {} : { engine: by.engine }) };
+      return answerEarly(request.session, request.seq, { state, lines, ms, ...named }, this.now(), this.deps.home);
     } catch (error) {
       log("could not file the held answer", String(error));
+      return false;
     }
   }
 

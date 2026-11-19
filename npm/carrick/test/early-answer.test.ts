@@ -670,6 +670,40 @@ test("a newer entry of the same file supersedes an older ask: only the newest re
   forgetQueue(ws);
 });
 
+test("T1: what an answer spoke is committed only when its early answer is filed; a filed one names its service", async (t) => {
+  const ws = await workspace(t);
+  const svc = ws.at("api");
+  const committed: string[] = [];
+  let gate: (() => void) | null = null;
+  const engine: ServiceEngine = {
+    async answer(_files, request) {
+      if (request.kind === "edit" && gate === null) await new Promise<void>((r) => (gate = r));
+      return { lines: [broken(ws)], commit: () => committed.push(request.seq ?? "") };
+    },
+    rss: () => 100,
+    close: async () => undefined,
+  };
+  const init: ServiceInit = { repo: "api", service: "api", repo_path: svc, sidecar_root: svc, tsconfig: null, scan_root: svc };
+  const daemon = new HeldDaemon({ root: ws.root, home: ws.home, env: { ...ON }, programs: async () => [init], runtime: { start: async () => ({ engine }) } });
+  t.after(() => daemon.close());
+  const { enqueue, readEarly } = await import("../src/hook/rechecks.ts");
+  const file = ws.at("api/src/tasks.ts");
+  await daemon.handle({ session: "s1", files: [file], kind: "read" });
+  await new Promise((r) => setTimeout(r, 30));
+  const [first] = enqueue(ws.root, "s1", [file], Date.now(), { home: ws.home });
+  // The first ask computes; a newer edit of the file supersedes it before it is filed.
+  const pending = daemon.handle({ session: "s1", files: [file], kind: "edit", seq: first!.seq });
+  while (gate === null) await new Promise((r) => setTimeout(r, 5));
+  const [second] = enqueue(ws.root, "s1", [file], Date.now() + 10, { home: ws.home });
+  (gate as () => void)();
+  await pending;
+  assert.deepEqual(committed, [], "a superseded answer is never committed");
+  await daemon.handle({ session: "s1", files: [file], kind: "edit", seq: second!.seq });
+  assert.deepEqual(committed, [second!.seq], "the filed answer is committed once");
+  assert.equal(readEarly("s1", second!.seq, ws.home)?.service, "api/api");
+  forgetQueue(ws);
+});
+
 test("two carriers at once print an early answer once (the claim is shared)", async (t) => {
   const ws = await workspace(t);
   const { enqueue, answerEarly } = await import("../src/hook/rechecks.ts");
@@ -768,4 +802,188 @@ test("GraphQL through the hook: the early QUERY break prints once through the on
   const next = await carrier(ws, "eg1");
   assert.equal(next.split("\n").filter((line) => line.includes("found QUERY task compatible")).length, 1, next);
   assert.equal(record(ws)?.held, "differ");
+});
+
+// --- a break is said once, as the edit's that caused it (T1, carrick#4728) ---
+
+const OTHER = "api/src/other.ts";
+const C_FILE = "api/src/c.ts";
+
+/** File one ready early answer for a fresh entry of `rel`, as the daemon does for service `api/api` from engine `engine`. */
+async function filed(ws: Ws, session: string, rel: string, lines: HeldLine[], engine = "e1"): Promise<string> {
+  const { enqueue, answerEarly } = await import("../src/hook/rechecks.ts");
+  const file = ws.at(rel);
+  if (!fs.existsSync(file)) fs.writeFileSync(file, "export {};\n");
+  const [entry] = enqueue(ws.root, session, [file], Date.now(), { home: ws.home });
+  assert.ok(answerEarly(session, entry!.seq, { state: "ready", lines, ms: 3, service: "api/api", engine }, Date.now(), ws.home), `filed ${rel}`);
+  return entry!.seq;
+}
+
+/** Part 2's answer for entry `seq` of `rel`, as the runner writes it. */
+function answered(ws: Ws, session: string, seq: string, rel: string, result: CheckResult): void {
+  const at = new Date().toISOString();
+  const body = { seq, session, file: ws.at(rel), relative: rel, root: ws.root, state: "answered", enqueued_at: at, started_at: at, finished_at: at, result };
+  fs.writeFileSync(path.join(sessionsDir(ws.home), `${session}.recheck.${seq}.answer.json`), `${JSON.stringify(body)}\n`);
+}
+
+/** A part-2 answer for `rel` whose only stated row is GET /tasks moved in api/src/tasks.ts. */
+function movedTasks(rel: string): CheckResult {
+  const moved: MovedRow = { file: "api/src/tasks.ts", line: 2, role: "route", method: "GET", path: "/tasks", before: "compatible", after: "type_mismatch", counterparts: ["ext src/view4.ts:4"], reason: "the reply lost id", not_judged_before: false, stated: true };
+  return { schema: "carrick.check/0", file: rel.slice("api/".length), service: "api", stale: false, items: [], recheck: { ran: "extraction+types", elapsed_ms: 5, moved: [moved] } };
+}
+
+const run1 = (ws: Ws, over: Partial<HeldLine> = {}): HeldLine => broken(ws, { run: "e1.1", ...over });
+
+test("T1: a break told at its edit is kept, standing, in a later edit's early answer and not printed again", async (t) => {
+  const ws = await workspace(t);
+  const { deliverLate } = await import("../src/hook/late.ts");
+  await filed(ws, "t1a", "api/src/tasks.ts", [run1(ws)]);
+  const first = deliverLate("t1a", Date.now(), new Set(), ws.home);
+  assert.equal(statesBreak(first), 1, first.join("\n"));
+  const later = await filed(ws, "t1a", OTHER, [run1(ws, { standing: true })]);
+  const next = deliverLate("t1a", Date.now(), new Set(), ws.home);
+  assert.equal(statesBreak(next), 0, next.join("\n"));
+  const kept = JSON.parse(fs.readFileSync(path.join(sessionsDir(ws.home), `t1a.recheck.${later}.early.json`), "utf8")) as { service?: string; result: CheckResult };
+  assert.deepEqual(kept.result.recheck?.moved?.map((m) => [m.path, m.standing, m.stated]), [["/tasks", true, true]], "the later answer still lists it");
+  assert.equal(kept.service, "api/api");
+  forgetQueue(ws);
+});
+
+test("T1: an earlier edit's unprinted break is said as that edit's, before the answer in hand that lists it standing", async (t) => {
+  const ws = await workspace(t);
+  await filed(ws, "t1g", OTHER, [run1(ws)]);
+  await liveDaemon(t, ws, () => [run1(ws, { standing: true })]);
+  const out = context((await edit(ws, "t1g", part2(ws, []))).stdout);
+  assert.equal(statesBreak([out]), 1, out);
+  const said = out.split("\n\n").find((block) => block.includes("route GET /tasks ")) ?? "";
+  assert.ok(said.includes("api/src/other.ts"), `said as the earlier edit's:\n${out}`);
+  assert.equal(statesBreak([await carrier(ws, "t1g")]), 0);
+  forgetQueue(ws);
+});
+
+test("T1: a standing break the session was never told prints once (an edit of the same file before any carrier)", async (t) => {
+  const ws = await workspace(t);
+  const { deliverLate } = await import("../src/hook/late.ts");
+  await filed(ws, "t1b", "api/src/tasks.ts", [run1(ws)]);
+  await filed(ws, "t1b", "api/src/tasks.ts", [run1(ws, { standing: true })]);
+  const texts = [...deliverLate("t1b", Date.now(), new Set(), ws.home), ...deliverLate("t1b", Date.now(), new Set(), ws.home)];
+  assert.equal(statesBreak(texts), 1, texts.join("\n"));
+  forgetQueue(ws);
+});
+
+test("T1: a part-2 moved row already told is not printed at a later entry", async (t) => {
+  const ws = await workspace(t);
+  const { deliverLate } = await import("../src/hook/late.ts");
+  // The early answer of an edit of tasks.ts states the break in hand.
+  await filed(ws, "t1c", "api/src/tasks.ts", [run1(ws)]);
+  assert.equal(statesBreak(deliverLate("t1c", Date.now(), new Set(), ws.home)), 1);
+  // A later edit of another file got no early answer (cold, say); part 2 states the same break as moved.
+  const { enqueue } = await import("../src/hook/rechecks.ts");
+  fs.writeFileSync(ws.at(OTHER), "export {};\n");
+  const [entry] = enqueue(ws.root, "t1c", [ws.at(OTHER)], Date.now(), { home: ws.home });
+  answered(ws, "t1c", entry!.seq, OTHER, movedTasks(OTHER));
+  const next = deliverLate("t1c", Date.now(), new Set(), ws.home);
+  assert.equal(statesBreak(next), 0, next.join("\n"));
+  forgetQueue(ws);
+});
+
+test("T1: with no early answer (the switch off), part 2's moved row prints at each entry, as before", async (t) => {
+  const ws = await workspace(t);
+  const { deliverLate } = await import("../src/hook/late.ts");
+  const { enqueue } = await import("../src/hook/rechecks.ts");
+  fs.writeFileSync(ws.at(OTHER), "export {};\n");
+  fs.writeFileSync(ws.at(C_FILE), "export {};\n");
+  const texts: string[] = [];
+  for (const rel of [OTHER, C_FILE]) {
+    const [entry] = enqueue(ws.root, "t1d", [ws.at(rel)], Date.now(), { home: ws.home });
+    answered(ws, "t1d", entry!.seq, rel, movedTasks(rel));
+    texts.push(...deliverLate("t1d", Date.now(), new Set(), ws.home));
+  }
+  assert.equal(statesBreak(texts), 2, texts.join("\n"));
+  forgetQueue(ws);
+});
+
+test("T1: a break told, fixed in another file, broken again and edited again before a carrier prints again", async (t) => {
+  const ws = await workspace(t);
+  const { deliverLate } = await import("../src/hook/late.ts");
+  await filed(ws, "t1e", "api/src/tasks.ts", [run1(ws)]);
+  assert.equal(statesBreak(deliverLate("t1e", Date.now(), new Set(), ws.home)), 1);
+  await filed(ws, "t1e", C_FILE, []);
+  await filed(ws, "t1e", "api/src/tasks.ts", [broken(ws, { run: "e1.2" })]);
+  await filed(ws, "t1e", "api/src/tasks.ts", [broken(ws, { run: "e1.2", standing: true })]);
+  const again = deliverLate("t1e", Date.now(), new Set(), ws.home);
+  assert.equal(statesBreak(again), 1, again.join("\n"));
+  forgetQueue(ws);
+});
+
+test("T1: an early break fixed in another file before any carrier is not printed", async (t) => {
+  const ws = await workspace(t);
+  const { deliverLate } = await import("../src/hook/late.ts");
+  await filed(ws, "t1f", "api/src/tasks.ts", [run1(ws)]);
+  await filed(ws, "t1f", C_FILE, []);
+  const texts = deliverLate("t1f", Date.now(), new Set(), ws.home);
+  assert.equal(statesBreak(texts), 0, texts.join("\n"));
+  forgetQueue(ws);
+});
+
+/** An emit of `task:update` at `line` of api/src/tasks.ts whose payload breaks the listener's type. */
+const emitAt = (ws: Ws, line: number, over: Partial<HeldLine> = {}): HeldLine => ({
+  row_key: `contract::api::src/tasks.ts::consumer::CLIENT->SERVER task:update::0::line::${line}`,
+  group: 0,
+  label: "CLIENT->SERVER task:update",
+  consumer: "listener",
+  file: "src/tasks.ts",
+  line,
+  message: "Type 'string' is not assignable to type 'O0_0'.",
+  row_file: "src/tasks.ts",
+  row_line: line,
+  row_path: ws.at("api/src/tasks.ts"),
+  places: [{ service: "listener", file: "src/listen.ts", line: 3 }],
+  expected: "{ id: number }",
+  side: "consumer",
+  protocol: "socket",
+  call_line: line,
+  ...over,
+});
+const emitBreaks = (texts: string[]): number => texts.join("\n").split("\n").filter((line) => line.includes("task:update") && line.includes("type_mismatch")).length;
+
+test("T1: two emits of one event in one file: the second, broken at a later edit, prints and counts beside the first", async (t) => {
+  const ws = await workspace(t);
+  const { deliverLate } = await import("../src/hook/late.ts");
+  const { withEarlyBreaks } = await import("../src/hook/confirm.ts");
+  const { readEarly } = await import("../src/hook/rechecks.ts");
+  await filed(ws, "t1h", "api/src/tasks.ts", [emitAt(ws, 2, { run: "e1.1" })]);
+  assert.equal(emitBreaks(deliverLate("t1h", Date.now(), new Set(), ws.home)), 1);
+  const later = await filed(ws, "t1h", OTHER, [emitAt(ws, 2, { run: "e1.1", standing: true }), emitAt(ws, 3, { run: "e1.2" })]);
+  const next = deliverLate("t1h", Date.now(), new Set(), ws.home);
+  assert.equal(emitBreaks(next), 1, next.join("\n"));
+  const early = readEarly("t1h", later, ws.home)!;
+  const clean: CheckResult = { schema: "carrick.check/0", file: "src/other.ts", items: [], recheck: { ran: "extraction+types", elapsed_ms: 5 } };
+  assert.equal((withEarlyBreaks(clean, early.result, early).items ?? []).length, 2, "Stop counts both");
+  forgetQueue(ws);
+});
+
+test("T1: a restarted engine's answer is no evidence a break was fixed: it still prints and Stop still counts it", async (t) => {
+  const ws = await workspace(t);
+  const { deliverLate } = await import("../src/hook/late.ts");
+  const { withEarlyBreaks } = await import("../src/hook/confirm.ts");
+  const { readEarly } = await import("../src/hook/rechecks.ts");
+  const seq = await filed(ws, "t1i", "api/src/tasks.ts", [run1(ws)]);
+  // The engine restarted: it re-gated and armed no check that speaks, so its answer lists nothing.
+  await filed(ws, "t1i", C_FILE, [], "e2");
+  assert.equal(statesBreak(deliverLate("t1i", Date.now(), new Set(), ws.home)), 1);
+  const { newestEarlies } = await import("../src/hook/rechecks.ts");
+  const newest = newestEarlies("t1i", ws.home).get("api/api");
+  const clean: CheckResult = { schema: "carrick.check/0", file: "src/tasks.ts", items: [], recheck: { ran: "extraction+types", elapsed_ms: 5 } };
+  assert.equal((withEarlyBreaks(clean, readEarly("t1i", seq, ws.home)!.result, newest).items ?? []).length, 1);
+  forgetQueue(ws);
+});
+
+test("T1: the differ record counts an entry's own breaks, not the standing ones", async () => {
+  const { compareEarly, heldRecord } = await import("../src/hook/confirm.ts");
+  const { earlyResult } = await import("../src/held/early.ts");
+  const root = fs.realpathSync(os.tmpdir());
+  const ws = { root, home: root, at: (rel: string) => path.join(root, rel) } as Ws;
+  const early = earlyResult({ file: ws.at("api/src/other.ts"), root }, [run1(ws, { standing: true })]);
+  assert.deepEqual(heldRecord(compareEarly(early, undefined)), { held: "none", held_rows: { differ: 0, part3_only: 0, part2_only: 0, same: 0 } });
 });

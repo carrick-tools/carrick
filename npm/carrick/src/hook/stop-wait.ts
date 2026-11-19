@@ -47,6 +47,7 @@ import {
   owedFor,
   sessionListing,
   isChanged,
+  newestEarlies,
   newestPerFile,
   pendingFor,
   readEarly,
@@ -148,7 +149,9 @@ function collect(session: string, home: string | undefined, now: number): { own:
  */
 function stated(answer: Answer, home?: string): CheckResult {
   const early = readEarly(answer.session, answer.seq, home);
-  return early === null ? answer.result! : withEarlyBreaks(answer.result!, early.result);
+  if (early === null) return answer.result!;
+  const newest = early.service === undefined ? undefined : newestEarlies(answer.session, home).get(early.service);
+  return withEarlyBreaks(answer.result!, early.result, newest);
 }
 
 export type Coverage = {

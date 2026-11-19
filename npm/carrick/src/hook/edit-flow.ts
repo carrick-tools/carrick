@@ -18,7 +18,7 @@ import type { SimilarLines } from "./similar.ts";
 import { deliverEarly, deliverLateFirst, emitPostToolUse } from "./late.ts";
 import { needsBackground, probeEdits, probeTimeoutMs } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
-import { answerInHand, enqueue, ensureRunner, readEarly } from "./rechecks.ts";
+import { answerInHand, earlyOwedFor, enqueue, ensureRunner, readEarly } from "./rechecks.ts";
 import type { QueueEntry } from "./rechecks.ts";
 import { engineReadyOf } from "./timings.ts";
 import type { Timing } from "./timings.ts";
@@ -271,7 +271,17 @@ export async function editFlow(
   const unchecked = session ? notCheckedLines(session, choice.root, answered.flatMap((a) => a.answer.not_checked ?? [])) : { lines: [], keys: [] };
   told.push(...unchecked.keys);
   const seen = new Set<string>();
-  const earlyNow: string[] = [];
+  // Early answers owed from earlier edits are said first, oldest first, so a break
+  // one of them states as new is said as that edit's; this edit's answer then lists
+  // it standing, already told (T1, carrick#4728).
+  const inHand = new Set(answered.filter((a) => a.answer.state === "ready").map((a) => a.entry.seq));
+  const earlier =
+    channel.channel === "hook" && session
+      ? earlyOwedFor(session)
+          .filter(({ owner, early }) => !(owner === session && inHand.has(early.seq)))
+          .flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { reader: session }))
+      : [];
+  const earlyNow: string[] = [...earlier];
   for (const { entry, answer } of answered) {
     if (answer.state !== "ready") continue;
     const early = readEarly(entry.session, entry.seq);

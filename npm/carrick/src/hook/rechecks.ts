@@ -338,6 +338,17 @@ export type EarlyAnswer = {
   /** How long the daemon took to answer. */
   held_ms: number;
   cwd?: string;
+  /**
+   * The service whose engine answered (`repo/service`): its early answer lists
+   * every break its checks speak, so the newest one says which still stand
+   * (T1 P1.4). Absent when the daemon named none.
+   */
+  service?: string;
+  /**
+   * The engine that answered (one id per engine start): its answer says which
+   * of that engine's runs still stand, and nothing of an earlier engine's.
+   */
+  engine?: string;
   /** No items and no moved rows: the daemon answered and found no break. */
   result: CheckResult;
 };
@@ -364,7 +375,7 @@ export function supersededEntry(session: string, seq: string, home?: string): bo
 export function answerEarly(
   session: string,
   seq: string,
-  answer: { state: string; lines: readonly HeldLine[]; ms: number },
+  answer: { state: string; lines: readonly HeldLine[]; ms: number; service?: string; engine?: string },
   now: number,
   home?: string,
 ): boolean {
@@ -382,6 +393,8 @@ export function answerEarly(
     landed_at: new Date(now).toISOString(),
     held_ms: answer.ms,
     ...(entry.cwd ? { cwd: entry.cwd } : {}),
+    ...(answer.service === undefined ? {} : { service: answer.service }),
+    ...(answer.engine === undefined ? {} : { engine: answer.engine }),
     result: earlyResult(entry, answer.lines),
   };
   const file = sessionPart(session, seq, "early.json", home);
@@ -413,6 +426,24 @@ export function readAnswer(session: string, seq: string, home?: string): Answer 
 /** The early answer filed for entry `seq`, or null. */
 export function readEarly(session: string, seq: string, home?: string): EarlyAnswer | null {
   return readJson<EarlyAnswer>(sessionPart(session, seq, "early.json", home) ?? "");
+}
+
+/**
+ * The newest early answer of each service `session` filed, by entry order, keyed
+ * by `EarlyAnswer.service`: the whole list of breaks that service's checks speak
+ * now (T1 P1.4, D4). Only `ready` answers are filed, so each is a computed
+ * answer. An answer that names no service is no evidence and is left out.
+ */
+export function newestEarlies(session: string, home?: string, listing?: readonly string[]): Map<string, EarlyAnswer> {
+  const newest = new Map<string, EarlyAnswer>();
+  const names = sessionNames(session, home, listing)
+    .filter((n) => n.endsWith(".early.json"))
+    .sort((a, b) => seqOf(session, a).localeCompare(seqOf(session, b)));
+  for (const name of names) {
+    const early = readJson<EarlyAnswer>(path.join(sessionsDir(home), name));
+    if (early?.service !== undefined) newest.set(early.service, early);
+  }
+  return newest;
 }
 
 /** Claim the right to print entry `seq`'s early answer, naming the rows printed: true for exactly one caller. */

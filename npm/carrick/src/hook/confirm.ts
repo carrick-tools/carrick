@@ -26,6 +26,7 @@
 
 import type { CheckItem, CheckResult, MovedRow } from "../contract.ts";
 import { problemItems, statedMoved } from "../contract.ts";
+import { engineOfRun } from "../held/early.ts";
 
 /** The label a check item has as a contract row: `METHOD path{ dispatch}`. */
 export function itemLabel(item: CheckItem): string | null {
@@ -45,6 +46,12 @@ type RowKind = "route" | "call";
 export type EarlyRow = {
   /** Workspace-relative row file and label: the same break under two entries has one key. */
   key: string;
+  /** The break as a told key lists it (`breakListed`): row file, label, side and result. */
+  listed: string;
+  /** The run of the compiler's check it belongs to; empty on a row with none. */
+  run: string;
+  /** Said at the engine's previous edit answer: not this edit's break. */
+  standing: boolean;
   label: string;
   item?: CheckItem;
   moved?: MovedRow;
@@ -59,6 +66,20 @@ function placeOf(text: string): Place | null {
   return match ? { file: match[1]!, line: Number(match[2]) } : null;
 }
 
+/**
+ * A break as the session's told store lists it (T1, D3): the row's
+ * workspace-relative file, its label, the side and the result. Never the line
+ * or the detail, which move with unrelated edits and differ between the
+ * compiler's words and part 2's. A moved row carries no side: it is the
+ * response side, as every early row is.
+ */
+export function breakListed(file: string, label: string, direction: string | null | undefined, result: string | null | undefined): string {
+  return `break::${file}::${label}::${direction ?? "response"}::${result ?? ""}`;
+}
+
+/** The told key of a break: its listing and the run it belongs to, so a break that was fixed and broke again is told again. */
+export const toldBreak = (listed: string, run: string): string => `${listed}::${run}`;
+
 /** The breaks an early answer states, in order. */
 export function earlyRows(early: CheckResult): EarlyRow[] {
   const file = early.file ?? "";
@@ -67,13 +88,89 @@ export function earlyRows(early: CheckResult): EarlyRow[] {
     const label = itemLabel(item);
     if (label === null) continue;
     const places = (item.counterparts ?? []).flatMap((c) => (c.file && c.line !== undefined ? [{ file: c.file, line: c.line }] : []));
-    out.push({ key: keyOf(file, label, item.kind === "call" ? (item.line ?? 0) : undefined), label, item, places });
+    out.push({
+      key: keyOf(file, label, item.kind === "call" ? (item.line ?? 0) : undefined),
+      listed: breakListed(file, label, item.direction, item.verdict?.result),
+      run: item.run ?? "",
+      standing: item.standing === true,
+      label,
+      item,
+      places,
+    });
   }
   for (const row of statedMoved(early)) {
     const label = `${row.method} ${row.path}`;
-    out.push({ key: keyOf(row.file, label, row.role === "call" ? (row.line ?? 0) : undefined), label, moved: row, places: row.counterparts.map(placeOf).filter((p): p is Place => p !== null) });
+    out.push({
+      key: keyOf(row.file, label, row.role === "call" ? (row.line ?? 0) : undefined),
+      listed: breakListed(row.file, label, null, row.after),
+      run: row.run ?? "",
+      standing: row.standing === true,
+      label,
+      moved: row,
+      places: row.counterparts.map(placeOf).filter((p): p is Place => p !== null),
+    });
   }
   return out;
+}
+
+/**
+ * The early rows that say the break `listed` still stands (T1 P1.4): every row
+ * the newest ready early answer of a service lists under it. `newest` holds
+ * one early answer per service (`newestEarlies`). Two emits of one event in one
+ * file share a listing and differ by run, so all are returned. None is no
+ * evidence either way.
+ */
+export function stillStanding(listed: string, newest: Iterable<CheckResult>): EarlyRow[] {
+  const out: EarlyRow[] = [];
+  for (const early of newest) out.push(...earlyRows(early).filter((r) => r.listed === listed));
+  return out;
+}
+
+/** The newest early answer of a service, as `standsAsRun` reads it: its rows, and the engine that answered. */
+export type NewestEarly = { result: CheckResult; engine?: string | undefined };
+
+/**
+ * Whether early row `row` still stands as the same run (T1 P1.4): `newest`, the
+ * newest early answer of the row's own service, lists its break with the run it
+ * carries. An answer of another engine than the one that spoke the run (a
+ * restarted engine re-gates, and a check that speaks is not armed), or no
+ * answer at all, is no evidence it was fixed, and it stands.
+ */
+export function standsAsRun(row: EarlyRow, newest: NewestEarly | undefined): boolean {
+  if (newest?.engine === undefined || engineOfRun(row.run) !== newest.engine) return true;
+  return stillStanding(row.listed, [newest.result]).some((r) => r.run === row.run);
+}
+
+/**
+ * Part 2's breaks with every row the session was already told withheld (T1
+ * P1.3): a row is withheld only on evidence, when an early answer still lists
+ * it (`stillStanding`) and the told key of each run it lists is in `told`. Every other row
+ * prints as it stands. `keys` are the told keys of the rows that print with
+ * that evidence, to mark once they are printed. `relative` is the edited
+ * file, workspace-relative (an item's `result.file` is its repo's).
+ */
+export function withoutTold(full: CheckResult, relative: string, newest: Iterable<CheckResult>, told: (key: string) => boolean): { result: CheckResult; keys: string[] } {
+  const keys: string[] = [];
+  const drop = new Set<CheckItem | MovedRow>();
+  const judge = (row: CheckItem | MovedRow, listed: string): void => {
+    const runs = [...new Set(stillStanding(listed, newest).map((r) => toldBreak(listed, r.run)))];
+    if (runs.length === 0) return;
+    // Withheld only when every standing break it may be was told.
+    const untold = runs.filter((key) => !told(key));
+    if (untold.length === 0) drop.add(row);
+    else keys.push(...untold);
+  };
+  for (const item of problemItems(full)) {
+    const label = itemLabel(item);
+    if (label !== null) judge(item, breakListed(relative, label, item.direction, item.verdict?.result));
+  }
+  for (const row of statedMoved(full)) judge(row, breakListed(row.file, `${row.method} ${row.path}`, null, row.after));
+  if (drop.size === 0) return { result: full, keys };
+  const moved = full.recheck?.moved?.filter((row) => !drop.has(row));
+  return {
+    result: { ...full, items: (full.items ?? []).filter((item) => !drop.has(item)), ...(full.recheck ? { recheck: { ...full.recheck, ...(moved ? { moved } : {}) } } : {}) },
+    keys,
+  };
 }
 
 /** Whether an early answer states any break. */
@@ -204,9 +301,11 @@ const PRECEDENCE: Array<Exclude<HeldBucket, "none">> = ["differ", "part3_only", 
 
 export function heldRecord(compared: Compared): HeldRecord {
   const held_rows = { differ: 0, part3_only: 0, part2_only: compared.part2Only.length, same: 0 };
-  for (const row of compared.rows) held_rows[row.outcome] += 1;
+  // A standing row is an earlier edit's break, already recorded at that edit's entry (T1 P1.2).
+  const own = compared.rows.filter((row) => !row.row.standing);
+  for (const row of own) held_rows[row.outcome] += 1;
   const held = PRECEDENCE.find((bucket) => held_rows[bucket] > 0) ?? "none";
-  const first = compared.rows.find((row) => row.outcome === "part3_only");
+  const first = own.find((row) => row.outcome === "part3_only");
   return { held, held_rows, ...(held === "part3_only" && first?.p2_state ? { p2_state: first.p2_state } : {}) };
 }
 
@@ -271,13 +370,16 @@ function movedBreak(row: MovedRow): CheckItem {
  * The early breaks a full answer did not withdraw, as items of that answer:
  * what Stop's header counts and keeps out of its clean line (P13, H6). A row
  * part 2 states itself is already its item; a row it called compatible is
- * withdrawn; every other row is added as the early answer stated it.
+ * withdrawn; a row the newest early answer of its service no longer lists as
+ * the same run (`newest`, T1 P1.4) was fixed since; every other row is added as
+ * the early answer stated it.
  */
-export function withEarlyBreaks(full: CheckResult, early: CheckResult): CheckResult {
+export function withEarlyBreaks(full: CheckResult, early: CheckResult, newest?: NewestEarly): CheckResult {
   const compared = compareEarly(early, full);
-  const added = compared.rows.filter((c) => c.outcome === "part3_only").map((c) => c.row.item ?? movedBreak(c.row.moved!));
+  const kept = compared.rows.filter((c) => c.outcome === "part3_only" && standsAsRun(c.row, newest));
+  const added = kept.map((c) => c.row.item ?? movedBreak(c.row.moved!));
   if (added.length === 0) return full;
   // A route part 2 did not judge (or holds no row for) gives way to the early break.
-  const replaced = new Set(compared.rows.filter((c) => c.outcome === "part3_only" && c.match && "kind" in c.match).map((c) => c.match));
+  const replaced = new Set(kept.filter((c) => c.match && "kind" in c.match).map((c) => c.match));
   return { ...full, items: [...(full.items ?? []).filter((item) => !replaced.has(item)), ...added] };
 }

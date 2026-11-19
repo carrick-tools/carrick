@@ -6,10 +6,12 @@
 // A row in the edited file is a `CheckItem`; a row in another file is a
 // `recheck.moved` row. The compiler's message is the verdict's detail, with the
 // check's own alias replaced; a message that still names the check's machinery
-// is never written. Every row is `stated`: the daemon checks only a row its
-// gate armed, whose clean check was silent before the edit (`held/place.ts`,
-// `arm`), so each break is this edit's. The full answer's rows carry the
-// CLI's own mark.
+// is never written. Every row is `stated`, and each row the compiler already
+// said at the engine's previous edit answer is also `standing`: the gate armed
+// only checks that were silent at the index (`held/place.ts`, `arm`), so the
+// first edit's breaks are its own, but a later edit's answer lists every break
+// that still stands, in whatever file (T1, carrick#4728). Only a row that is
+// not `standing` is this edit's. The full answer's rows carry the CLI's own mark.
 
 import path from "node:path";
 import type { CheckItem, CheckResult, Counterpart, MovedRow } from "../contract.ts";
@@ -168,6 +170,7 @@ function consumerRow(
       sent_by: "consumer",
       counterparts,
       stated: true,
+      ...marks(line),
     });
     return;
   }
@@ -191,8 +194,24 @@ function consumerRow(
     reason: detail,
     not_judged_before: false,
     stated: true,
+    ...marks(line),
   });
 }
+
+/** The run of a break: the engine that spoke it (`engine`, one id per engine start) and the edit answer it began at. */
+export const runOf = (engine: string, answer: number): string => `${engine}.${answer}`;
+
+/** The engine a run was spoken by (`runOf`), or "" for a run of no known engine. */
+export function engineOfRun(run: string): string {
+  const at = run.lastIndexOf(".");
+  return at < 0 ? "" : run.slice(0, at);
+}
+
+/** A row's marks from its line: the run it belongs to, and `standing` when it is not this edit's. */
+const marks = (line: HeldLine): { run?: string; standing?: boolean } => ({
+  ...(line.run === undefined ? {} : { run: line.run }),
+  ...(line.standing ? { standing: true } : {}),
+});
 
 /** The entry an early answer is for: the edited file, absolute, and the workspace it was queued in. */
 export type EarlyFor = { file: string; root: string };
@@ -238,6 +257,7 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
         expected_type: cutType(line.expected),
         counterparts,
         stated: true,
+        ...marks(line),
       });
       continue;
     }
@@ -261,6 +281,7 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
       reason: detail,
       not_judged_before: false,
       stated: true,
+      ...marks(line),
     });
   }
   return {
