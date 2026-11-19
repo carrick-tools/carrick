@@ -283,6 +283,24 @@ test("a tracked stale skill and settings file are left byte for byte and named i
   assert.equal(fs.readFileSync(path.join(workspace.root, ".carrick", "cli-version"), "utf8").trim(), "0.0.1");
 });
 
+test("a tracked settings file whose committed version holds none of ours is named as an uncommitted edit", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  put(workspace.root, SHARED, `${JSON.stringify({ permissions: { allow: ["Read"] } }, null, 2)}\n`);
+  git(workspace.root, "init", "-q");
+  git(workspace.root, "add", SHARED);
+  git(workspace.root, "commit", "-q", "-m", "team");
+  const edited = put(workspace.root, SHARED, olderSettings());
+  const before = fs.readFileSync(edited, "utf8");
+
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+
+  assert.equal(fs.readFileSync(edited, "utf8"), before);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /Carrick's hook entries in \.claude\/settings\.json are an uncommitted edit from an older version\. Run `carrick init` to move them out of git's way\. There is nothing to commit\./);
+  assert.doesNotMatch(lines[0]!, /commit the change/);
+});
+
 test("when every outdated file is tracked, the held line replaces the version mismatch line", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());

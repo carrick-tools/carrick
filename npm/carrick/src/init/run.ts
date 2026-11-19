@@ -34,7 +34,7 @@ import {
 import { reposUrl } from "./connect.ts";
 import { downloadHostedIndex, hostedReport, nativeRunner, STEP_LABEL } from "./hosted.ts";
 import { listProjects, projectLabel, SLUG, type Project } from "./projects.ts";
-import { writeRepoCopy } from "./repo-copies.ts";
+import { ownRepository, writeFolderCopy, writeRepoCopy } from "./repo-copies.ts";
 import { claudeCodeFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
 import { mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { writeLauncher } from "./launcher.ts";
@@ -777,62 +777,83 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       out.warn(`The global install was not offered: ${(error as Error).message}`);
     }
   }
-  // Every entry calls the launcher written beside the settings file, which
-  // finds Carrick again after the default Node changes (carrick#4759). The
-  // settings file is the shared one: no machine path is in it. An entry an
-  // older version wrote into the local file goes out of it.
-  const settingsName = path.join(".claude", "settings.json");
-  const settingsFile = path.join(workspace, settingsName);
-  try {
-    const settings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : null;
-    const otherFile = path.join(workspace, ".claude", "settings.local.json");
-    const other = fs.existsSync(otherFile) ? fs.readFileSync(otherFile, "utf8") : null;
-    // The same removal `carrick remove` runs, so a file holding no entry of
-    // ours is left byte for byte rather than reformatted on the way past.
-    const cleaned = other === null ? null : removeCarrickHooks(other);
-    const hooks = mergeCarrickHooks(settings);
-    // Validate both documents before migrating our entries between them.
-    if (cleaned?.changed) writeIfChanged(otherFile, cleaned.body);
-    writeIfChanged(settingsFile, hooks.body);
-    writeLauncher(path.join(workspace, ".claude"));
-  } catch (error) {
-    out.refuse(
-      `Could not configure Carrick hooks: ${(error as Error).message}. Fix ${settingsName} and ${again()}.`,
-    );
-  }
-  // The same hooks for Codex, in the file Codex reads project hooks
-  // from. Written for both hosts for the same reason the task skills are
-  // (carrick#1335): which agent opens this workspace is not a thing init can
-  // know, and a hook file for a host nobody runs costs nothing.
-  try {
-    // Said once, last, in the closing block.
-    if (writeCodexHooks(workspace) === "written") codexTrust = true;
-  } catch (error) {
-    out.refuse(
-      `Could not configure the Codex hooks: ${(error as Error).message}. Fix ${CODEX_HOOKS_FILE} and ${again()}.`,
-    );
-  }
-
-  // The task skills, beside the hooks and independent of them: a settings file
-  // somebody hand-edited into invalid JSON is no reason to withhold the bodies
-  // an agent reads. A file this package did not write, or one somebody has
-  // since changed, is left alone and named.
-  try {
-    todo.push(...taskSkillWarnings(writeTaskSkills(workspace, { slug: project })));
-    // Which build wrote them, so a hook running an older `carrick` than this
-    // one says so instead of answering from files it does not match
-    // (carrick#1372). It is also the record a run inside one repo of this
-    // folder finds (`initFolderAbove`).
-    recordCliVersion(workspace, currentVersion());
-    const ignored = ignoredSkillRoots(workspace);
-    if (ignored.length > 0) {
-      const one = ignored.length === 1;
-      todo.push(
-        `${ignored.join(" and ")} ${one ? "is" : "are"} git-ignored here, so these skills stay on this machine. Track ${one ? "it" : "them"} to give the rest of the team the same answers.`,
+  // A folder that is the top of its own git repository keeps everything init
+  // writes here out of git through the repo's exclude file, so the team's
+  // `git status` shows only the rules files below (carrick#4881). Anything
+  // else writes the shared files, as before.
+  const hidden = ownRepository(workspace);
+  if (hidden) {
+    try {
+      const copy = writeFolderCopy(workspace, { slug: project })!;
+      // Said once, last, in the closing block.
+      if (copy.codexWritten) codexTrust = true;
+      if (copy.teamHooksLeft) {
+        out.say("Carrick's hook entries your team committed in .claude/settings.json were left as they are.");
+      }
+      todo.push(...taskSkillWarnings(copy.skills));
+      recordCliVersion(workspace, currentVersion());
+    } catch (error) {
+      out.refuse(`Could not add Carrick's hooks and skills to ${path.basename(workspace)}: ${(error as Error).message}.`);
+    }
+  } else {
+    // Every entry calls the launcher written beside the settings file, which
+    // finds Carrick again after the default Node changes (carrick#4759). The
+    // settings file is the shared one: no machine path is in it. An entry an
+    // older version wrote into the local file goes out of it.
+    const settingsName = path.join(".claude", "settings.json");
+    const settingsFile = path.join(workspace, settingsName);
+    try {
+      const settings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : null;
+      const otherFile = path.join(workspace, ".claude", "settings.local.json");
+      const other = fs.existsSync(otherFile) ? fs.readFileSync(otherFile, "utf8") : null;
+      // The same removal `carrick remove` runs, so a file holding no entry of
+      // ours is left byte for byte rather than reformatted on the way past.
+      const cleaned = other === null ? null : removeCarrickHooks(other);
+      const hooks = mergeCarrickHooks(settings);
+      // Validate both documents before migrating our entries between them.
+      if (cleaned?.changed) writeIfChanged(otherFile, cleaned.body);
+      writeIfChanged(settingsFile, hooks.body);
+      writeLauncher(path.join(workspace, ".claude"));
+    } catch (error) {
+      out.refuse(
+        `Could not configure Carrick hooks: ${(error as Error).message}. Fix ${settingsName} and ${again()}.`,
       );
     }
-  } catch (error) {
-    out.refuse(`Could not write the task skills: ${(error as Error).message}`);
+    // The same hooks for Codex, in the file Codex reads project hooks
+    // from. Written for both hosts for the same reason the task skills are
+    // (carrick#1335): which agent opens this workspace is not a thing init can
+    // know, and a hook file for a host nobody runs costs nothing.
+    try {
+      // Said once, last, in the closing block.
+      if (writeCodexHooks(workspace) === "written") codexTrust = true;
+    } catch (error) {
+      out.refuse(
+        `Could not configure the Codex hooks: ${(error as Error).message}. Fix ${CODEX_HOOKS_FILE} and ${again()}.`,
+      );
+    }
+
+    // The task skills, beside the hooks and independent of them: a settings file
+    // somebody hand-edited into invalid JSON is no reason to withhold the bodies
+    // an agent reads. A file this package did not write, or one somebody has
+    // since changed, is left alone and named.
+    try {
+      todo.push(...taskSkillWarnings(writeTaskSkills(workspace, { slug: project })));
+      // Which build wrote them, so a hook running an older `carrick` than this
+      // one says so instead of answering from files it does not match
+      // (carrick#1372). It is also the record a run inside one repo of this
+      // folder finds (`initFolderAbove`).
+      recordCliVersion(workspace, currentVersion());
+      const ignored = ignoredSkillRoots(workspace);
+      if (ignored.length > 0) {
+        const one = ignored.length === 1;
+        todo.push(
+          `${ignored.join(" and ")} ${one ? "is" : "are"} git-ignored here, so these skills stay on this machine. Track ${one ? "it" : "them"} to give the rest of the team the same answers.`,
+        );
+      }
+    } catch (error) {
+      out.refuse(`Could not write the task skills: ${(error as Error).message}`);
+    }
+
   }
 
   // The check block in AGENTS.md (carrick#2828): only our marked section is
