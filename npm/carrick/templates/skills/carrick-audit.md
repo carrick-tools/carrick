@@ -10,7 +10,7 @@ description: Use when the ask is what is wrong in this codebase, what to clean u
 Cost: this skill opens source for every item it reads. On a monorepo of six
 services and about 1,600 TypeScript files, ten type mismatches and ten groups of
 similar functions took one headless Sonnet run 85 to 100 seconds and 39 to 44
-turns: about 110,000 new input tokens, 1.1 to 1.3 million cached input tokens
+turns: about 100,000 new input tokens, 1.1 to 1.3 million cached input tokens
 and about 12,000 output tokens (2 runs, 19 Nov 2026).
 
 The index states the leads. Your work is to prove or drop each one in source.
@@ -46,8 +46,10 @@ its findings list yet and that the list is built after a scan of main. Do not
 look for issues by hand and present them as the audit.
 
 Page until the last page. For each finding, read the producer's handler, the
-consumer's call site and the code that uses its result. Where the finding does
-not show both types, narrow the pair:
+consumer's call site and the code that uses its result. Open source with your
+file-reading and search tools, not shell commands, which a restricted or
+non-interactive run may refuse. Where the finding does not show both types,
+narrow the pair:
 
 ```
 get_contract_pair({{SCOPE}}, consumer_service: "<consumer>", producer_service: "<producer>", method: "<METHOD>", path: "<path>")

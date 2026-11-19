@@ -207,6 +207,7 @@ test("the audit skill renders for both scopes and names its two finding kinds an
     assert.match(audit, /No findings list has been built/);
     assert.match(audit, /caps each section at 10/);
     assert.match(audit, /refused:/);
+    assert.match(audit, /not shell commands/);
     for (const word of ["GraphQL", "socket", "pub/sub", "queue", "RPC"]) {
       assert.ok(audit.includes(word), `the audit skill does not name ${word}`);
     }
