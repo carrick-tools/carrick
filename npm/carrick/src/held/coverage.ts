@@ -31,6 +31,8 @@ function reasonText(reason: string): string {
       return "with a send position that cannot be checked as written";
     case "top_type":
       return "with no checkable type";
+    case "shared_home":
+      return "whose caller type is declared in a file this service also compiles";
     case "javascript_file":
       return "in a JavaScript file";
     case "graphql_table_unusable":

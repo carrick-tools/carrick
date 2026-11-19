@@ -359,8 +359,11 @@ class HeldService implements ServiceEngine {
       this.values.set(p.id, placed);
       // A GraphQL check never arms on a stated top type or bytes (L-G1a): the engine's form composes none of the judge's gates for them.
       // A socket check neither: a listener typed any, unknown, never or bytes states no contract the held form reads.
-      const groups = p.row.groups.map((_, g) => g).filter((g) => !((isGraphql(p.row) || isMessage(p.row)) && isTopOrBytes(p.row.groups[g]!.type)));
-      p.row.groups.forEach((_, g) => { if (!groups.includes(g)) no(p, g, "top_type"); });
+      const typed = p.row.groups.map((_, g) => g).filter((g) => !((isGraphql(p.row) || isMessage(p.row)) && isTopOrBytes(p.row.groups[g]!.type)));
+      p.row.groups.forEach((_, g) => { if (!typed.includes(g)) no(p, g, "top_type"); });
+      // A caller type declared in a file this program also compiles moves with the value on an edit to it, while the check holds its text (T3, #4658).
+      const groups = typed.filter((g) => !this.sharedHome(p.row, g));
+      typed.forEach((g) => { if (!groups.includes(g)) no(p, g, "shared_home"); });
       if (groups.length > 0) entries.push({ pos: p, value: placed, groups });
     }
     const shadow = this.shadow(rel);
@@ -400,6 +403,18 @@ class HeldService implements ServiceEngine {
       }
     }
     this.known.set(rel, text);
+  }
+
+  /**
+   * The group's home is a file of this engine's program that is not one of the group's own place files: a declaration both ends compile.
+   * `home.file` and a place's file are relative to the place's repo; a home in another repo is never in this program.
+   */
+  private sharedHome(row: ContractRow, g: number): boolean {
+    const group = row.groups[g]!;
+    if (!group.home) return false;
+    const here = group.places.filter((pl) => pl.repo === this.init.repo);
+    if (here.length === 0 || here.some((pl) => pl.file === group.home!.file)) return false;
+    return this.program.has(path.relative(this.init.scan_root, path.join(this.init.repo_path, group.home.file)));
   }
 
   /** The checks' inputs: one per entry, numbered by its place in `entries`. */
