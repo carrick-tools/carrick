@@ -522,7 +522,9 @@ test("an untracked file with current hooks gains the allow entry, a tracked one 
   t.after(() => workspace.cleanup());
   const untracked = put(workspace.root, LOCAL, withoutAllow());
   writeLauncher(path.dirname(untracked));
-  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, running), []);
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, running), [
+    `Carrick allowed its read-only MCP tools in ${LOCAL}, so headless runs (\`claude -p\`) can call them.`,
+  ]);
   assert.deepEqual(JSON.parse(fs.readFileSync(untracked, "utf8")).permissions, { allow: ["mcp__carrick"] });
 
   const repo = path.join(workspace.root, "tracked");
@@ -535,4 +537,32 @@ test("an untracked file with current hooks gains the allow entry, a tracked one 
   assert.deepEqual(bringUpToDate(workspace.root, repo, running, () => {}, held), []);
   assert.equal(fs.readFileSync(tracked, "utf8"), withoutAllow());
   assert.deepEqual(held, []);
+});
+
+/** A later release than the one running here, so a session start looks at every file again. */
+function nextRelease(): string {
+  const [major, minor, patch] = running.split(".").map(Number);
+  return `${major}.${minor}.${patch! + 1}`;
+}
+
+test("an allow entry the developer took out after Carrick gave it stays out at the next release", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const file = put(workspace.root, LOCAL, withoutAllow());
+  writeLauncher(path.dirname(file));
+  bringUpToDate(workspace.root, workspace.root, running);
+  fs.writeFileSync(file, withoutAllow());
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, nextRelease()), []);
+  assert.equal(fs.readFileSync(file, "utf8"), withoutAllow());
+});
+
+test("an allow entry init wrote, then taken out, is not added back by a session start", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const file = put(workspace.root, LOCAL, mergeCarrickHooks(null).body);
+  writeLauncher(path.dirname(file));
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, running), []);
+  fs.writeFileSync(file, withoutAllow());
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, nextRelease()), []);
+  assert.equal(fs.readFileSync(file, "utf8"), withoutAllow());
 });

@@ -46,7 +46,6 @@ import {
   mergeHookSet,
   removeCarrickHooks,
   SHARED_SETTINGS,
-  withCarrickAllow,
 } from "./settings.ts";
 import { CODEX_HOOKS_FILE, codexHooks, isEmptyHooksDocument } from "./codex.ts";
 import {
@@ -267,9 +266,9 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
     teamHooksLeft = committedHooksAreOurs(repo, SHARED_SETTINGS);
     if (!teamHooksLeft && sharedBody !== null && holdsOurs(sharedBody)) {
       const head = tracked.has(SHARED_SETTINGS) ? committedText(repo, SHARED_SETTINGS) : null;
-      // The removal takes out our allow entry too; one a team committed stays.
-      let cleaned = removeCarrickHooks(sharedBody).body;
-      if (holdsCarrickAllow(head)) cleaned = withCarrickAllow(cleaned, true);
+      // The removal takes out our allow entry too. One a team committed stays where
+      // it is: only the hooks come out, so the file can match HEAD byte for byte.
+      const cleaned = holdsCarrickAllow(head) ? mergeHookSet(sharedBody, null, false).body : removeCarrickHooks(sharedBody).body;
       if (head !== null && sameDocument(cleaned, head)) shared = { body: head };
       else if (!tracked.has(SHARED_SETTINGS) && isEmptyHooksDocument(cleaned)) shared = { remove: true };
       else shared = { body: cleaned };

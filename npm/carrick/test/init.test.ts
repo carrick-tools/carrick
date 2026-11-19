@@ -3181,7 +3181,7 @@ test("init in a team's repo writes the allow entry into the personal file only, 
 test("moving an older install's hooks out of the shared file keeps an allow entry the team committed", posixNativeFixture, () => {
   const fixture = executableInitFixture("payments");
   try {
-    const team = `${JSON.stringify({ permissions: { allow: ["Bash(npm test)", "mcp__carrick"] }, hooks: JSON.parse(TEAM_SETTINGS).hooks }, null, 2)}\n`;
+    const team = `${JSON.stringify({ permissions: { allow: ["mcp__carrick", "Bash(npm test)"] }, hooks: JSON.parse(TEAM_SETTINGS).hooks }, null, 2)}\n`;
     commitTeamRepo(fixture.repo, { settings: team });
     oldInstall(fixture.repo);
     runInit(fixture);
