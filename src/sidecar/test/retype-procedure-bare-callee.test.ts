@@ -86,6 +86,27 @@ const out = await client.notes.save.mutate({ body: "x" });
 const bad = out.missing;
 export { bad };
 `,
+  'wrapped-member.ts': `import { client } from "../client-kit.js";
+declare function unwrap<T>(v: Promise<T>): Promise<T>;
+export {};
+const out = await unwrap(client.save.mutate({ body: "x" }));
+const bad = out.missing;
+export { bad };
+`,
+  'unwrapped-member.ts': `import { client } from "../client-kit.js";
+declare function unwrap<T>(v: Promise<T>): Promise<T>;
+export {};
+const out = await client.save.mutate({ body: "x" });
+const bad = out.missing;
+export { bad };
+`,
+  'wrapped-bare.ts': `import { useFn } from "fixture-fn"; declare function log<T>(v: T): T;
+import { saveNote } from "../notes.js";
+const save = useFn(saveNote);
+const out = await log(save({ data: { body: "x" } }));
+const bad = out.missing;
+export { bad };
+`,
   'member-single.ts': `import { client } from "../client-kit.js";
 const x = 1;
 export { x };
@@ -215,5 +236,19 @@ describe('retype procedure form: a bare-identifier callee', () => {
   it('locates a client member call exactly as before (single segment)', async () => {
     const out = await judge('member-single.ts', '{ ok: boolean }', 'save');
     assert.strictEqual(out.outcome, 'mismatch', JSON.stringify(out));
+  });
+
+  it('still locates a member call wrapped in another call (single segment)', async () => {
+    const wrapped = await judge('wrapped-member.ts', '{ ok: boolean }', 'save');
+    const plain = await judge('unwrapped-member.ts', '{ ok: boolean }', 'save');
+    assert.strictEqual(plain.outcome, 'mismatch', JSON.stringify(plain));
+    assert.strictEqual(wrapped.outcome, 'mismatch', JSON.stringify(wrapped));
+    assert.deepStrictEqual(wrapped.diagnostics.map((d) => d.code), plain.diagnostics.map((d) => d.code));
+  });
+
+  it('abstains on a bare procedure call wrapped in another bare call (known limit)', async () => {
+    const out = await judge('wrapped-bare.ts', '{ ok: boolean }', 'saveNote');
+    assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+    assert.match(out.reason ?? '', /two calls to the procedure/);
   });
 });

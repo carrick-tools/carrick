@@ -687,9 +687,18 @@ export class Retyper {
     const sourceFile = this.inferrer.sourceFileOf(item.file_path);
     if (!sourceFile) return 'the procedure call could not be located on its line';
     const segments = procedurePath.split('.');
-    const calls = sourceFile
+    const onLine = sourceFile
       .getDescendantsOfKind(SyntaxKind.CallExpression)
-      .filter((c) => c.getStartLineNumber() === item.line_number && namesProcedure(c, segments));
+      .filter((c) => c.getStartLineNumber() === item.line_number);
+    let calls = onLine.filter((c) => namesProcedure(c, segments));
+    // A procedure named by one segment may also be a function the library
+    // hands out as a value (the procedure itself, or a hook's alias of it): a
+    // bare identifier callee, whose own name is the consumer's and tells
+    // nothing. Considered only when no member-form call is on the line, so
+    // every verdict the member form gave stays as it was.
+    if (calls.length === 0 && segments.length === 1) {
+      calls = onLine.filter((c) => Node.isIdentifier(c.getExpression()));
+    }
     if (calls.length === 0) return 'the procedure call could not be located on its line';
     if (calls.length > 1) {
       return 'two calls to the procedure start on one line, so the call cannot be told apart';
@@ -876,14 +885,10 @@ function awaitedResult(checker: ts.TypeChecker, call: ts.Node): ts.Type {
 
 /**
  * `call`'s callee is `R.s1.….sk.m` with `[s1..sk]` equal to `segments`
- * (`m` any name, `R` any expression). Or, for a procedure named by one
- * segment, a bare identifier: a function the library hands out as a value
- * (the procedure itself, or a hook's alias of it), whose own name is the
- * consumer's and tells nothing, so the call is told apart by its line alone.
+ * (`m` any name, `R` any expression).
  */
 function namesProcedure(call: CallExpression, segments: string[]): boolean {
   const callee = call.getExpression();
-  if (Node.isIdentifier(callee)) return segments.length === 1;
   if (!Node.isPropertyAccessExpression(callee)) return false;
   let at: Node = callee.getExpression();
   for (let i = segments.length - 1; i >= 0; i--) {
