@@ -903,10 +903,10 @@ fn kept_sentence(row: &SyncedRepo) -> (String, String) {
     if row.hosted_commit.is_empty() {
         return (
             format!(
-                "{name}'s local index could not be moved to main's latest, because its commits \
-                 are not one line of history. `carrick refresh` re-reads it at this checkout."
+                "{name}'s local index could not move to main's latest because local and hosted \
+                 history diverged. Run `carrick refresh` to rebuild it from this checkout."
             ),
-            "its commits are not one line of history".into(),
+            "history diverged from main".into(),
         );
     }
     let index = match row.copy_scanned_at.as_deref().and_then(|at| at.get(..10)) {
@@ -916,19 +916,19 @@ fn kept_sentence(row: &SyncedRepo) -> (String, String) {
     if row.head_holds_hosted {
         return (
             format!(
-                "{index} and could not be moved to main's latest as it is. `carrick refresh` \
-                 rebuilds it."
+                "{index} and could not be moved to main's latest. Run `carrick refresh` to \
+                 rebuild it."
             ),
-            "its copy could not be moved as it is".into(),
+            "its copy could not be moved".into(),
         );
     }
     if !row.fetched {
         return (
             format!(
                 "{index} because this clone has not fetched main's latest commit. Run `git \
-                 fetch`, then `git pull` on main, to bring it up to date."
+                 fetch`, then `git pull` on main."
             ),
-            "this clone has not fetched main's latest commit".into(),
+            "latest main commit not fetched".into(),
         );
     }
     let behind = match row.behind {
@@ -936,24 +936,24 @@ fn kept_sentence(row: &SyncedRepo) -> (String, String) {
         Some(n) => format!(" ({n} commits behind)"),
         None => String::new(),
     };
-    let because = format!("because this checkout does not have main's latest commit{behind}");
     if row.head_detached {
         return (
             format!(
-                "{index} {because} and HEAD is detached. Check out main and `git pull`, or run \
-                 `carrick refresh` to re-read it at this checkout."
+                "{index} because HEAD is detached and this checkout is missing main's latest \
+                 commit{behind}. Check out main and run `git pull`, or run `carrick refresh` to \
+                 rebuild from this checkout."
             ),
-            "this checkout is detached and behind main".into(),
+            "detached HEAD behind main".into(),
         );
     }
     let fix = if row.on_default_branch == Some(true) {
-        "`git pull` brings it up to date."
+        "Run `git pull` to update."
     } else {
-        "`git pull` on main, or `carrick refresh` on this branch, brings it up to date."
+        "Run `git pull` on main, or `carrick refresh` on this branch."
     };
     (
-        format!("{index} {because}. {fix}"),
-        "this checkout is behind main".into(),
+        format!("{index} because this checkout is missing main's latest commit{behind}. {fix}"),
+        "checkout is behind main".into(),
     )
 }
 
@@ -4796,7 +4796,7 @@ mod tests {
         assert!(detached.contains("detached") && detached.contains("`git pull`"));
         assert!(unfetched.contains("`git fetch`"));
         assert!(unmovable.contains("`carrick refresh`"));
-        assert!(not_one_line.contains("not one line of history"));
+        assert!(not_one_line.contains("history diverged"), "{not_one_line}");
         assert!(!undated.contains("2026"), "{undated}");
     }
 
