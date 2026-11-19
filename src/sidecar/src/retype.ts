@@ -876,10 +876,14 @@ function awaitedResult(checker: ts.TypeChecker, call: ts.Node): ts.Type {
 
 /**
  * `call`'s callee is `R.s1.….sk.m` with `[s1..sk]` equal to `segments`
- * (`m` any name, `R` any expression).
+ * (`m` any name, `R` any expression). Or, for a procedure named by one
+ * segment, a bare identifier: a function the library hands out as a value
+ * (the procedure itself, or a hook's alias of it), whose own name is the
+ * consumer's and tells nothing, so the call is told apart by its line alone.
  */
 function namesProcedure(call: CallExpression, segments: string[]): boolean {
   const callee = call.getExpression();
+  if (Node.isIdentifier(callee)) return segments.length === 1;
   if (!Node.isPropertyAccessExpression(callee)) return false;
   let at: Node = callee.getExpression();
   for (let i = segments.length - 1; i >= 0; i--) {
