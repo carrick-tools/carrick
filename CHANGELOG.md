@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.165](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.164...carrick-v0.3.165) (2026-11-19)
+
+
+### Features
+
+* **scan:** a client made on an env base the repo serves makes that base internal ([#4846](https://github.com/carrick-tools/carrick/issues/4846)) ([8ad1135](https://github.com/carrick-tools/carrick/commit/8ad113523d938afb6661f7e167a6f3742f9f6d5f))
+* **scanner:** save a call made through a listed client into a never-asked package as package_unmatched ([#4839](https://github.com/carrick-tools/carrick/issues/4839)) ([ab0cfc6](https://github.com/carrick-tools/carrick/commit/ab0cfc6e7e8a1f8edc3a9c2ea4b846266badbd27))
+
+
+### Bug Fixes
+
+* **local-mode:** a re-check marks a verdict against a changed service in another repository ([#4837](https://github.com/carrick-tools/carrick/issues/4837)) ([731d4e5](https://github.com/carrick-tools/carrick/commit/731d4e5973ec258b5cbb58fbd53a6080f4add3a7)), closes [#4819](https://github.com/carrick-tools/carrick/issues/4819)
+* **local-mode:** withhold line numbers about files that differ from the index ([#4842](https://github.com/carrick-tools/carrick/issues/4842)) ([f148401](https://github.com/carrick-tools/carrick/commit/f14840139378339fb34343998ea9962a9eaa9e27))
+* **local:** a rescan at the held commit replaces the local copy ([#4853](https://github.com/carrick-tools/carrick/issues/4853)) ([37e49e2](https://github.com/carrick-tools/carrick/commit/37e49e2eddbb34aafabf49ee92b564278931cf80))
+* **local:** each repo's hosted copy moves on its own ([#4838](https://github.com/carrick-tools/carrick/issues/4838)) ([f1d2e72](https://github.com/carrick-tools/carrick/commit/f1d2e72d1523e2ebd079abe50cde0969edb162f5))
+* **local:** say it when a repo's local copy is kept back, in one sentence (T2) ([#4845](https://github.com/carrick-tools/carrick/issues/4845)) ([957ca7e](https://github.com/carrick-tools/carrick/commit/957ca7eae585dacd3ecef35e8a3c49090df77bd4))
+* **scanner:** key an import's uses by its binding, not its name ([#4590](https://github.com/carrick-tools/carrick/issues/4590)) ([#4832](https://github.com/carrick-tools/carrick/issues/4832)) ([54c388d](https://github.com/carrick-tools/carrick/commit/54c388d97be20ca11c74869f4e566c5524a1a39e))
+* **url:** a declared variable read as import.meta.env.X strips from a template base ([#4844](https://github.com/carrick-tools/carrick/issues/4844)) ([9867ea7](https://github.com/carrick-tools/carrick/commit/9867ea702251f9537b306e3c288853146e3d4346))
+
 ## [0.3.164](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.163...carrick-v0.3.164) (2026-11-18)
 
 
