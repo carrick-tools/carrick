@@ -40,7 +40,8 @@ Copy the first line of the answer (`FINDINGS · project <slug> · index at
 first line names the index commit and the day the list was built.
 
 When the answer is `No findings list has been built for this project yet.`,
-stop this section. Tell the user in one sentence that the index has not built
+stop the audit: the similar-functions list in step 3 comes from the same list.
+Tell the user in one sentence that the index has not built
 its findings list yet and that the list is built after a scan of main. Do not
 look for issues by hand and present them as the audit.
 
