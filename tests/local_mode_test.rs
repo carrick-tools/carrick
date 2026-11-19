@@ -8277,6 +8277,68 @@ fn check_changed_says_when_the_library_store_cannot_be_asked() {
     assert_eq!(code, Some(2), "{text}");
 }
 
+/// carrick#4816: a re-scan that had no compiler engine asked the library
+/// store nothing, so the rows a library package states are gone and a call to
+/// one reads as `no_route`. The check says it did not run instead, for the
+/// re-check and for `check --changed`. The engine here is a stand-in that
+/// exits at once, so the scan finds it and it never becomes ready.
+#[test]
+#[serial]
+fn a_re_scan_with_no_compiler_engine_says_it_did_not_run() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+    let client = "inventory-svc/src/inventory.ts";
+
+    let dead = root.join(".dead-engine/dist/src");
+    std::fs::create_dir_all(&dead).expect("a directory for the engine");
+    std::fs::write(dead.join("index.js"), "process.exit(1);\n").expect("write the engine");
+    let no_engine = [
+        (
+            "CARRICK_SIDECAR_DIR",
+            root.join(".dead-engine").to_string_lossy().into_owned(),
+        ),
+        ("CARRICK_ALLOW_MISSING_TYPES", "1".to_string()),
+        ("CARRICK_RECHECK_BUDGET_MS", "600000".to_string()),
+        ("CARRICK_CHECK_BUDGET_MS", "600000".to_string()),
+    ];
+    let with_no_engine = |args: &[&str]| {
+        let mut command = Command::new(carrick());
+        command
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env("CARRICK_MOCK_ALL", "1");
+        for (key, value) in &no_engine {
+            command.env(key, value);
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        )
+    };
+    let sentence = "compiler engine unavailable: Carrick could not start it on this machine, \
+                    so the re-scan could not read this service.";
+
+    let (_, text) = with_no_engine(&["check", client, "--recheck", "--workspace", ".", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&text).expect("--json is JSON");
+    assert_eq!(json["recheck"]["ran"], "none", "{json:#}");
+    assert_eq!(json["recheck"]["reason"], sentence, "{json:#}");
+    assert!(
+        !text.contains("no_route"),
+        "no row is stated as no route:\n{text}"
+    );
+
+    let (code, text) = with_no_engine(&["check", "--changed", "--workspace", "."]);
+    assert_eq!(code, Some(2), "{text}");
+    assert_eq!(text, format!("carrick check: not checked: {sentence}\n"));
+}
+
 // ---------------------------------------------------------------------------
 // carrick#3192: a call whose handler moved, kept alive only by documentation,
 // reaches no route. The routes package states its operations twice: the

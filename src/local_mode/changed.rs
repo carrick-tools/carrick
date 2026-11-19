@@ -588,7 +588,14 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     if !lost.is_empty() {
         output.not_checked = Some(lost.join(" "));
     } else if let Some(sentence) =
-        super::recheck::library_unavailable(&rejoined.index, changed.keys(), &rejoined.rescanned)
+        super::recheck::engine_unavailable(&rejoined.index, changed.keys(), &rejoined.rescanned)
+            .or_else(|| {
+                super::recheck::library_unavailable(
+                    &rejoined.index,
+                    changed.keys(),
+                    &rejoined.rescanned,
+                )
+            })
     {
         // The re-scan asked the library store and got no answer: a route
         // registered through a server package is missing, so "checked 0
