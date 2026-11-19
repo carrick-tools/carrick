@@ -7,10 +7,11 @@ description: Use when the ask is what is wrong in this codebase, what to clean u
 
 {{SCOPE_NOTE}}
 
-Cost: this skill opens source for every item it reads. Ten type mismatches and
-ten groups of similar functions took between 130,000 and 230,000 tokens on a
-project of six services and 2,200 files. Before reading, tell the user how many items each
-section holds and offer to narrow to one service or cap the count.
+Cost: this skill opens source for every item it reads. On a monorepo of six
+services and about 1,600 TypeScript files, ten type mismatches and ten groups of
+similar functions took one headless Sonnet run 85 to 100 seconds and 39 to 44
+turns: about 110,000 new input tokens, 1.1 to 1.3 million cached input tokens
+and about 12,000 output tokens (2 runs, 19 Nov 2026).
 
 The index states the leads. Your work is to prove or drop each one in source.
 Class nothing from the index's own words alone.
@@ -23,11 +24,25 @@ get_project_map({{SCOPE}})
 
 Note the counts under FOUND ON MAIN: type mismatches and similar functions.
 
+Before you open any source, write the two counts and the cap you will use. Where
+you can ask, offer to narrow to one service or cap the count. Where you cannot
+wait for a reply, such as a non-interactive run, the run caps each section at
+10, says so, and carries on.
+
 ## 2. Type mismatches
 
 ```
 get_findings({{SCOPE}}, kind: "type_mismatch")
 ```
+
+Copy the first line of the answer (`FINDINGS · project <slug> · index at
+<commits> · built <day>`) to the top of the report, word for word. The report's
+first line names the index commit and the day the list was built.
+
+When the answer is `No findings list has been built for this project yet.`,
+stop this section. Tell the user in one sentence that the index has not built
+its findings list yet and that the list is built after a scan of main. Do not
+look for issues by hand and present them as the audit.
 
 Page until the last page. For each finding, read the producer's handler, the
 consumer's call site and the code that uses its result. Where the finding does
@@ -88,8 +103,15 @@ file:line and the change in one line ("send createdAt from
 formatTaskResponse"; "move validateName into a shared package and delete the
 two copies"). TYPE-ONLY items go in a short list after it, as optional tidying.
 
-Not covered yet: calls that reach no route and endpoints nobody calls. Say so in
-the report.
+When a command or tool call you need is refused or fails, class any finding you
+cannot settle without it CAN'T TELL with the reason `refused: <the command>`.
+List every refused call under the tables.
+
+Name the protocols the findings came from (HTTP, GraphQL, sockets, pub/sub,
+queues, RPC routers) and the ones that held none.
+
+Not covered yet: calls that reach no route, endpoints nobody calls, and routes
+that change data without an auth check. Say so in the report.
 
 ## 5. Act
 
