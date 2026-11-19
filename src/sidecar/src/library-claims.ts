@@ -6466,7 +6466,6 @@ class DeclarationReader {
     return fallback !== undefined && this.acceptsString(fallback) ? fallback : slot;
   }
 
-  /** Accepts string, or names an HTTP method as a literal in either case. */
   /**
    * A `when` slot can hold the literal the claim names: a boolean slot holds
    * `true` and `false`, a number slot a number, a string slot any text, and a
@@ -6474,7 +6473,8 @@ class DeclarationReader {
    * Undefined when it holds (V1b).
    */
   private whenFailure(declared: Slot, literal: string | undefined): Outcome | undefined {
-    if (literal === undefined) return failed('when_literal_missing');
+    // The schema requires the literal (`validators.ts`, `when.literal`), so this is never read.
+    if (literal === undefined) return unchecked('claim_invalid');
     const slot = this.throughConstraint(declared);
     if (slot === VARIADIC || this.saysNothing(slot)) return unchecked('member_untyped');
     const flags = (literal === 'true' || literal === 'false' ? ts.TypeFlags.BooleanLike : 0) |
@@ -6489,6 +6489,7 @@ class DeclarationReader {
     return holds ? undefined : failed('when_literal_unaccepted');
   }
 
+  /** Accepts string, or names an HTTP method as a literal in either case. */
   private acceptsMethod(declared: Slot): boolean {
     const slot = this.throughConstraint(declared);
     if (slot === VARIADIC) return false;
