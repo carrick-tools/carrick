@@ -80,7 +80,7 @@ test("a session start rewrites our stale entries, keeps the user's hook and keys
   for (const [event, groups] of Object.entries(expected)) {
     assert.deepEqual(ours(event), groups, `${event} entries are the ones this version writes`);
   }
-  assert.deepEqual(after.permissions, { allow: ["Read"] });
+  assert.deepEqual(after.permissions, { allow: ["Read", "mcp__carrick"] });
   assert.ok(JSON.stringify(after.hooks.PostToolUse).includes("echo mine"), "the user's hook stays");
 });
 
@@ -508,4 +508,31 @@ test("a Codex session start rewrites the AGENTS.md section and skills, never .co
   // The old Codex hooks are still ours to replace, so the mismatch line stays.
   assert.match(context, /Run `carrick init`/);
   assert.equal(fs.readFileSync(path.join(workspace.root, ".carrick", "cli-version"), "utf8").trim(), "0.0.1");
+});
+
+/** Our current entries without the allow entry, as an install from before it was written. */
+function withoutAllow(): string {
+  const document = JSON.parse(mergeCarrickHooks(null).body);
+  delete document.permissions;
+  return `${JSON.stringify(document, null, 2)}\n`;
+}
+
+test("an untracked file with current hooks gains the allow entry, a tracked one is left with no line", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const untracked = put(workspace.root, LOCAL, withoutAllow());
+  writeLauncher(path.dirname(untracked));
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, running), []);
+  assert.deepEqual(JSON.parse(fs.readFileSync(untracked, "utf8")).permissions, { allow: ["mcp__carrick"] });
+
+  const repo = path.join(workspace.root, "tracked");
+  const tracked = put(repo, LOCAL, withoutAllow());
+  writeLauncher(path.dirname(tracked));
+  git(repo, "init", "-q");
+  git(repo, "add", "-f", LOCAL);
+  git(repo, "commit", "-q", "-m", "tracked");
+  const held: string[] = [];
+  assert.deepEqual(bringUpToDate(workspace.root, repo, running, () => {}, held), []);
+  assert.equal(fs.readFileSync(tracked, "utf8"), withoutAllow());
+  assert.deepEqual(held, []);
 });

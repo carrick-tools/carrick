@@ -254,7 +254,57 @@ export type MergeResult = {
  */
 export function mergeCarrickHooks(existing: string | null, command: string | null = CLAUDE_LAUNCHER_CALL): MergeResult {
   // Adding ours replaces the scaffold's hook pack; removing ours leaves it.
-  return mergeHookSet(existing, command === null ? null : carrickHooks(command), command !== null);
+  const hooks = mergeHookSet(existing, command === null ? null : carrickHooks(command), command !== null);
+  // The permission rides with the hooks: wherever init writes ours, a headless
+  // run can call Carrick's tools. `mergeHookSet` is shared with Codex and stays
+  // as it is (carrick#4881).
+  const body = withCarrickAllow(hooks.body, command !== null);
+  return { body, changed: !sameText(existing, body) };
+}
+
+/** The one rule that lets Claude Code call every tool of the `carrick` MCP server. */
+export const CARRICK_ALLOW = "mcp__carrick";
+
+/** Whether a settings document lists `CARRICK_ALLOW`; false for one that is not JSON. */
+export function holdsCarrickAllow(body: string | null): boolean {
+  if (body === null) return false;
+  try {
+    const permissions = (JSON.parse(body) as Record<string, unknown> | null)?.["permissions"] as
+      | { allow?: unknown }
+      | undefined;
+    return Array.isArray(permissions?.allow) && permissions.allow.includes(CARRICK_ALLOW);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A settings document with `CARRICK_ALLOW` in `permissions.allow` (`add`) or
+ * out of it. Every other key and entry stays; an `allow` or `permissions` the
+ * removal leaves empty goes too. Already in the wanted state: returned as it was.
+ */
+export function withCarrickAllow(body: string, add: boolean): string {
+  const doc = JSON.parse(body) as Record<string, unknown>;
+  const permissions = (typeof doc["permissions"] === "object" && doc["permissions"] !== null
+    ? doc["permissions"]
+    : {}) as Record<string, unknown>;
+  const allow = Array.isArray(permissions["allow"]) ? (permissions["allow"] as unknown[]) : [];
+  if (add) {
+    if (allow.includes(CARRICK_ALLOW)) return body;
+    doc["permissions"] = { ...permissions, allow: [...allow, CARRICK_ALLOW] };
+  } else {
+    if (!allow.includes(CARRICK_ALLOW)) return body;
+    const rest = allow.filter((entry) => entry !== CARRICK_ALLOW);
+    // Rebuilt key by key so `allow` keeps its place among its siblings.
+    const left = Object.fromEntries(
+      Object.entries(permissions).flatMap(([key, value]) =>
+        key !== "allow" ? [[key, value]] : rest.length > 0 ? [[key, rest]] : [],
+      ),
+    );
+    if (Object.keys(left).length > 0) doc["permissions"] = left;
+    else delete doc["permissions"];
+  }
+  return `${JSON.stringify(doc, null, 2)}\n`;
 }
 
 /**

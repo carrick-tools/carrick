@@ -434,7 +434,7 @@ test("the hook entries land beside everything else the settings file holds", () 
   );
   const merged = mergeCarrickHooks(existing);
   const written = JSON.parse(merged.body);
-  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
+  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)", "mcp__carrick"] });
   assert.equal(written.hooks.PreToolUse.length, 1);
   // The user's own session-start script survives, with ours after it.
   assert.equal(written.hooks.SessionStart.length, 2);
@@ -485,7 +485,7 @@ test("init replaces the scaffold's session-start entry and keeps its nudges and 
   );
   const merged = mergeCarrickHooks(scaffolded);
   const written = JSON.parse(merged.body);
-  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
+  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)", "mcp__carrick"] });
   assert.deepEqual(
     written.hooks.SessionStart.map((group: { hooks: Array<{ command: string }> }) => group.hooks[0]!.command),
     [`${CLAUDE_LAUNCHER_CALL} hook session-start`],
@@ -3161,5 +3161,33 @@ test("two clones that each ran init stay as they were after one pulls the other'
   } finally {
     first.cleanup();
     second.cleanup();
+  }
+});
+
+test("init in a team's repo writes the allow entry into the personal file only, and git shows the same files", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    runInit(fixture);
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+    const local = JSON.parse(fs.readFileSync(path.join(fixture.repo, LOCAL_FILE), "utf8"));
+    assert.deepEqual(local.permissions, { allow: ["mcp__carrick"] });
+    assert.equal(fs.readFileSync(path.join(fixture.repo, ".claude", "settings.json"), "utf8"), TEAM_SETTINGS);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("moving an older install's hooks out of the shared file keeps an allow entry the team committed", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    const team = `${JSON.stringify({ permissions: { allow: ["Bash(npm test)", "mcp__carrick"] }, hooks: JSON.parse(TEAM_SETTINGS).hooks }, null, 2)}\n`;
+    commitTeamRepo(fixture.repo, { settings: team });
+    oldInstall(fixture.repo);
+    runInit(fixture);
+    assert.equal(fs.readFileSync(path.join(fixture.repo, ".claude", "settings.json"), "utf8"), team);
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+  } finally {
+    fixture.cleanup();
   }
 });

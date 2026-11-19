@@ -55,7 +55,7 @@ import {
   recordCliVersion,
   recordedCliVersion,
 } from "./outdated.ts";
-import { expectedCarrickHooks, installedCarrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
+import { expectedCarrickHooks, holdsCarrickAllow, installedCarrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
 import { launcherDiffers, writeLauncher } from "./launcher.ts";
 import { addToExcludeBlock, committedHooksAreOurs, recordedRepoCopy, trackedPaths } from "./repo-copies.ts";
 import {
@@ -112,6 +112,7 @@ export function updateHooks(
 ): string[] {
   const stamp = readStamp(workspace);
   const changed: string[] = [];
+  let wrote = false;
   for (const relative of SETTINGS_FILES) {
     const target = path.join(projectDir, relative);
     // Keyed by the file's path under the workspace, so a repo's copy is its own entry.
@@ -120,8 +121,13 @@ export function updateHooks(
     try {
       const body = fs.readFileSync(target, "utf8");
       const folder = path.dirname(target);
-      const launcherStale = installedCarrickHooks(body).length > 0 && launcherDiffers(folder);
-      if (!entriesAreStale(body, expectedCarrickHooks) && !launcherStale) continue;
+      const ours = installedCarrickHooks(body).length > 0;
+      const launcherStale = ours && launcherDiffers(folder);
+      const stale = entriesAreStale(body, expectedCarrickHooks) || launcherStale;
+      // The allow entry is no staleness: a file lacking it is written when it is
+      // ours alone to write, and a tracked one is left without a word (carrick#4881).
+      const lacksAllow = ours && !holdsCarrickAllow(body);
+      if (!stale && !(lacksAllow && !tracked.has(relative))) continue;
       const merged = merge(body);
       if (!merged.changed && !launcherStale) continue;
       if (tracked.has(relative)) {
@@ -131,12 +137,14 @@ export function updateHooks(
       writeAtomic(target, merged.body);
       writeLauncher(folder);
       stamp[key] = running;
-      changed.push(relative);
+      wrote = true;
+      // A file written only to add the allow entry is not reported.
+      if (stale) changed.push(relative);
     } catch {
       // Unreadable or not JSON: a file to report (`carrick doctor` does), never to overwrite.
     }
   }
-  if (changed.length > 0) {
+  if (wrote) {
     try {
       writeAtomic(updatedStampFile(workspace), `${JSON.stringify(stamp, null, 2)}\n`);
     } catch {
