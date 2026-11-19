@@ -2909,8 +2909,19 @@ const TEAM_SETTINGS = `${JSON.stringify({ permissions: { allow: ["Bash(npm test)
 const TEAM_CODEX = `${JSON.stringify({ hooks: { PostToolUse: [{ matcher: "apply_patch", hooks: [TEAM_HOOK] }] } }, null, 2)}\n`;
 const TEAM_SKILL = "---\nname: team-skill\n---\nThe team's own skill.\n";
 
+// No global or system git config, and no per-user ignore file, so a laptop that
+// ignores `.claude/settings.local.json` globally reads the same as CI.
+const HERMETIC_GIT: NodeJS.ProcessEnv = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "carrick-no-git-config-")),
+};
+
 function gitIn(repo: string, ...args: string[]): string {
-  return execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { encoding: "utf8" });
+  return execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], {
+    encoding: "utf8",
+    env: { ...process.env, ...HERMETIC_GIT },
+  });
 }
 
 /** The porcelain, one line per entry, in the order git prints it. */
@@ -2941,7 +2952,7 @@ function commitTeamRepo(repo: string, files: { codex?: boolean; settings?: strin
 function runCarrick(fixture: { repo: string; env: NodeJS.ProcessEnv }, ...args: string[]): { status: number | null; stdout: string; stderr: string } {
   return spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), ...args], {
     cwd: fixture.repo,
-    env: fixture.env,
+    env: { ...fixture.env, ...HERMETIC_GIT },
     encoding: "utf8",
   });
 }
@@ -3084,7 +3095,8 @@ test("a settings file that is not JSON is named and the skills and launchers are
       assert.ok(named.includes(written), `${written} is named in .git/info/exclude`);
     }
     assert.ok(!named.includes(LOCAL_FILE));
-    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+    // The broken file was the user's own and untracked before init, so it stays visible.
+    assert.equal(porcelain(fixture.repo), `${TEAM_PORCELAIN}?? .claude/settings.local.json\n`);
   } finally {
     fixture.cleanup();
   }
