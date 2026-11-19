@@ -43,6 +43,16 @@ export function placedPath(root: string, service: string, home?: string): string
   return path.join(heldDir(home), rootKey(root), `${serviceSegment(service)}.placed.json`);
 }
 
+/** What the daemon knows of the service's engine: starting, ready, capped, no compiler, failed (`state.ts`). */
+export function statePath(root: string, service: string, home?: string): string {
+  return path.join(heldDir(home), rootKey(root), `${serviceSegment(service)}.state.json`);
+}
+
+/** The folder holding every service's placed and state files for one checkout. */
+export function serviceFilesDir(root: string, home?: string): string {
+  return path.join(heldDir(home), rootKey(root));
+}
+
 /** One JSON line per request. */
 export function logPath(root: string, home?: string): string {
   return path.join(heldDir(home), `${rootKey(root)}.log`);

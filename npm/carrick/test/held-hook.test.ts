@@ -346,3 +346,66 @@ test("a message that still names the check's machinery is never written", () => 
     assert.equal(heldDetail(broken({ message })), null, message);
   }
 });
+
+// T7 (#4654): an edit the compiler engine did not check says so, once per session,
+// service and state. Agent-facing text.
+
+const note = (state: "cold" | "capped" | "no_compiler" | "error", more: Record<string, unknown> = {}) => ({ service: "api", state, ...more });
+
+test("each not-checked state prints one line with its reason, once per session per service and state", async (t) => {
+  const cases = [
+    { state: "cold" as const, more: { took_s: 41 }, want: "the compiler engine did not check this edit of api: it is starting, which took about 41 s last time." },
+    { state: "capped" as const, more: { budget_mb: 4096, holders: 2 }, want: "the compiler engine did not check this edit of api: the memory budget of 4096 MB is held by 2 other engines." },
+    { state: "no_compiler" as const, more: {}, want: "the compiler engine did not check this edit of api: no TypeScript 7 compiler is installed." },
+    { state: "error" as const, more: { reason: "the shadow tree could not be written" }, want: "the compiler engine did not check this edit of api: it could not start: the shadow tree could not be written." },
+  ];
+  for (const c of cases) {
+    const ws = await workspace(t);
+    const daemon = await fakeDaemon(ws, { state: c.state, lines: [], ms: 1, not_checked: [note(c.state, c.more)] });
+    t.after(() => daemon.close());
+    const first = context((await edit(ws, `n-${c.state}`)).stdout);
+    assert.ok(first.includes(`Carrick: ${c.want} \`carrick doctor\` lists what is not checked.`), `${c.state}: ${first}`);
+    assert.ok(first.includes(PART1), `part 1 stays: ${first}`);
+    const second = context((await edit(ws, `n-${c.state}`)).stdout);
+    assert.ok(!second.includes("compiler engine did not check"), `${c.state} said again: ${second}`);
+  }
+});
+
+test("a different state or service of the same session is a new line; a late answer and a read print none", async (t) => {
+  const ws = await workspace(t);
+  const daemon = await fakeDaemon(ws, { state: "cold", lines: [], ms: 1, not_checked: [note("cold")] });
+  t.after(() => daemon.close());
+  assert.ok(context((await edit(ws, "n-two")).stdout).includes("did not check this edit of api: it is starting"));
+  await daemon.close();
+  const capped = await fakeDaemon(ws, { state: "capped", lines: [], ms: 1, not_checked: [note("capped", { budget_mb: 2048, holders: 1 })] });
+  t.after(() => capped.close());
+  assert.ok(context((await edit(ws, "n-two")).stdout).includes("memory budget of 2048 MB is held by 1 other engines"));
+  await capped.close();
+  const slow = await fakeDaemon(ws, { state: "cold", lines: [], ms: 1, not_checked: [note("cold")] }, 2500);
+  t.after(() => slow.close());
+  assert.ok(!context((await edit(ws, "n-late")).stdout).includes("did not check"), "late says nothing");
+  const file = ws.at("api/src/tasks.ts");
+  const read = await runHook("post-read.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: "Read", session_id: "n-read", cwd: ws.root, tool_input: { file_path: file }, tool_response: { file: { filePath: file, content: TASKS } } },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...ON }),
+  });
+  assert.ok(!read.stdout.includes("did not check"), read.stdout);
+});
+
+// S4: the compiler adds at most 600 ms to an edit and 300 ms to a read, even from a daemon that accepts and never answers.
+test("a daemon that never answers: the edit hook is back within 900 ms of the edit, the read hook within 600 ms", async (t) => {
+  const ws = await workspace(t);
+  const daemon = await fakeDaemon(ws, ready([]), 60_000);
+  t.after(() => daemon.close());
+  const out = await edit(ws, "s4-edit");
+  assert.equal(readTimings(ws.root).at(-1)?.held_state, "late");
+  assert.ok(out.ms < 900 + 500, `the edit hook took ${out.ms} ms (900 ms after the edit, 500 ms of process start allowed)`);
+  const row = readTimings(ws.root).at(-1);
+  assert.ok((row?.held_ms ?? 0) <= 900, String(row?.held_ms));
+  const file = ws.at("api/src/tasks.ts");
+  const read = await runHook("post-read.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: "Read", session_id: "s4-read", cwd: ws.root, tool_input: { file_path: file }, tool_response: { file: { filePath: file, content: TASKS } } },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...ON }),
+  });
+  assert.ok(read.ms < 600 + 500, `the read hook took ${read.ms} ms`);
+});

@@ -21,6 +21,7 @@ import {
 import { askHeld, ensureHeld } from "../src/held/client.ts";
 import { liveEntries, writeEntry } from "../src/held/registry.ts";
 import { lockPath as heldLockPath, logPath, socketPath } from "../src/held/paths.ts";
+import { readState } from "../src/held/state.ts";
 import { compilerLinesEnabled } from "../src/facts/enabled.ts";
 import { takeLock } from "../src/hook/lock.ts";
 
@@ -530,6 +531,56 @@ test("run.ts with the switch unset starts nothing and writes nothing", () => {
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.existsSync(path.join(w.home, ".carrick")), false);
+  } finally {
+    w.done();
+  }
+});
+
+// T7 (#4654): an answer that did not check the edit says why, and the engine's state is kept for the doctor.
+test("starting, ready, capped and no_compiler are each noted on the answer and kept in the service's state record", async () => {
+  const w = world(["a", "b", "c"]);
+  try {
+    const cold = await w.daemon.handle(w.req(w.file("a")));
+    assert.deepEqual(cold.not_checked, [{ service: "a", state: "cold" }]);
+    assert.equal(readState(w.root, "a", w.home)?.state, "starting");
+    w.release();
+    await w.daemon.handle(w.req(w.file("b")));
+    await settle();
+    w.clock.now += 41_000;
+    const ready = await w.daemon.handle(w.req(w.file("b")));
+    assert.equal(ready.not_checked, undefined, "a checked edit carries no note");
+    assert.equal(readState(w.root, "b", w.home)?.state, "ready");
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    const capped = await w.daemon.handle(w.req(w.file("c")));
+    assert.deepEqual(capped.not_checked, [{ service: "c", state: "capped", budget_mb: 4096, holders: 2 }]);
+    assert.deepEqual(readState(w.root, "c", w.home), { at: new Date(w.clock.now).toISOString(), service: "c", repo: "shop", state: "capped", budget_mb: 4096, holders: 2 });
+  } finally {
+    w.done();
+  }
+  const n = world(["x"]);
+  try {
+    n.setNoCompiler();
+    n.release();
+    await n.daemon.handle(n.req(n.file("x")));
+    await settle();
+    const answer = await n.daemon.handle(n.req(n.file("x")));
+    assert.deepEqual(answer.not_checked, [{ service: "x", state: "no_compiler" }]);
+    assert.deepEqual([readState(n.root, "x", n.home)?.state, readState(n.root, "x", n.home)?.reason], ["no_compiler", "no native compiler"]);
+  } finally {
+    n.done();
+  }
+});
+
+test("a ready start's duration is kept in the state record", async () => {
+  const w = world(["a"]);
+  try {
+    w.release();
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    const record = readState(w.root, "a", w.home);
+    assert.equal(record?.state, "ready");
+    assert.equal(typeof record?.start_ms, "number");
   } finally {
     w.done();
   }
