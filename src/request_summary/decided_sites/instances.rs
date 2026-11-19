@@ -65,6 +65,10 @@ use crate::position_rows::{FLAG_ANY, FLAG_DECLARATION_UNNAMED, Kind};
 /// constructed, and the slot of its call that holds the name its instance
 /// is made with, when the claim states one (read for an op whose name is
 /// bound to its maker, carrick#3527).
+///
+/// An `of`-make (contract amendment 12, carrick-cloud#3534) is a maker
+/// member called on one instance receiver, `of`: it labels only where the
+/// declaration ask verified it, at the member declarations in `declared`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MakerLabel {
     pub package: String,
@@ -72,17 +76,32 @@ pub struct MakerLabel {
     pub member: Option<String>,
     pub new: bool,
     pub name: Option<super::ArgSlot>,
+    pub of: Option<String>,
+    pub declared: Vec<(String, u32)>,
 }
 
 impl MakerLabel {
-    /// Every maker the settled claims label.
-    pub fn from_exports(exports: &[crate::library_claims::ExportClaims]) -> Vec<MakerLabel> {
+    /// Every maker the settled claims label, and each `of`-make `answers`
+    /// (the declaration ask's) verified. A refuted, unchecked or unanswered
+    /// `of`-make labels nothing.
+    pub fn from_exports(
+        exports: &[crate::library_claims::ExportClaims],
+        answers: &HashMap<
+            super::super::discovery::AskedScope,
+            super::super::discovery::ScopeAnswer,
+        >,
+    ) -> Vec<MakerLabel> {
         use crate::services::type_sidecar::{LibraryClaim, MakeForm};
         let mut makers = Vec::new();
         for export in exports {
+            // The makes on the export itself, as stated.
             for claim in &export.claims {
                 if let LibraryClaim::Make {
-                    form, member, name, ..
+                    form,
+                    member,
+                    name,
+                    of: None,
+                    ..
                 } = claim
                 {
                     let maker = MakerLabel {
@@ -94,14 +113,67 @@ impl MakerLabel {
                             arg: slot.arg as usize,
                             key: slot.key.clone(),
                         }),
+                        of: None,
+                        declared: Vec::new(),
                     };
                     if !makers.contains(&maker) {
                         makers.push(maker);
                     }
                 }
             }
+            // The `of`-makes the ask verified, by their ids.
+            for (claim_id, claim) in export.claims_by_id() {
+                let LibraryClaim::Make {
+                    form,
+                    member,
+                    name,
+                    of: Some(of),
+                    ..
+                } = claim
+                else {
+                    continue;
+                };
+                let asked = super::super::discovery::AskedScope {
+                    package: export.package.clone(),
+                    export: export.export.clone(),
+                    claim_id,
+                    receiver: of.clone(),
+                };
+                let Some(declared) = answers.get(&asked).and_then(|answer| answer.verified())
+                else {
+                    continue;
+                };
+                let maker = MakerLabel {
+                    package: export.package.clone(),
+                    export: export.export.clone(),
+                    member: member.clone(),
+                    new: *form == MakeForm::New,
+                    name: name.as_ref().map(|slot| super::ArgSlot {
+                        arg: slot.arg as usize,
+                        key: slot.key.clone(),
+                    }),
+                    of: Some(of.clone()),
+                    declared: declared.to_vec(),
+                };
+                if !makers.contains(&maker) {
+                    makers.push(maker);
+                }
+            }
         }
         makers
+    }
+
+    /// The receiver id the instances this maker builds are read through:
+    /// `<of>>make:<member>` for an `of`-make, which no verified scope can
+    /// carry and which never collides with an export-level make of the same
+    /// member (`instance:<member>`).
+    pub fn root_receiver(&self) -> String {
+        match &self.of {
+            Some(of) => format!("{of}>make:{}", self.member.as_deref().unwrap_or("()")),
+            None => {
+                super::super::library_sites::maker_receiver_id(self.new, self.member.as_deref())
+            }
+        }
     }
 }
 
@@ -1213,6 +1285,9 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         if self.library_call(host.file, host.call) && self.passes(&host) {
             return;
         }
+        if self.library_call(host.file, host.call) && self.made_by_member(&host, &at) {
+            return;
+        }
         let labels: Vec<&'w ScopeLabel> = self
             .scopes
             .iter()
@@ -1225,6 +1300,44 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 Some(host.call.callee_text.clone()),
             );
         }
+    }
+
+    /// A root at `host`'s call where an `of`-make was verified at the member
+    /// declaration the call resolves to (contract amendment 12): the call's
+    /// value is an instance the maker member made. `args` stay empty: no base
+    /// or prefix slot rides an `of`-make, and the name it is made with is
+    /// read at `span` ([`super::Walk::maker_named`]). False where no verified
+    /// `of`-make names the declaration.
+    fn made_by_member(&mut self, host: &Placed<'a>, at: &str) -> bool {
+        let Some(declared) = self.declaration_of(host) else {
+            return false;
+        };
+        let makers: &'w [MakerLabel] = self.makers;
+        let Some(maker) = makers.iter().find(|maker| {
+            maker.of.is_some()
+                && maker.member.as_deref() == Some(host.call.callee.as_str())
+                && maker.declared.contains(&declared)
+        }) else {
+            return false;
+        };
+        self.push(
+            at.to_string(),
+            InstanceAt::Root {
+                file: relative(self.root, host.file),
+                line: host.call.site.line,
+                package: maker.package.clone(),
+                export: maker.export.clone(),
+                member: maker.member.clone(),
+                receiver: maker.root_receiver(),
+                made: Some(MakerCall {
+                    form: MakerForm::Call,
+                    args: Vec::new(),
+                    span: (host.call.site.span_start, host.call.site.span_end),
+                    via: vec![self.via.iter().rev().cloned().collect()],
+                }),
+            },
+        );
+        true
     }
 
     /// The value of a pass-through member's call at `host` (K1): each of
@@ -1739,6 +1852,15 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     ValueAt::Field { class, field, .. } => {
                         self.class_field(file, class, &field, at.to_string())
                     }
+                    // A factory that returns a library member call's value is
+                    // read as `value()` reads it.
+                    ValueAt::Returned {
+                        lo,
+                        hi,
+                        member: Some(_),
+                        made: None,
+                        ..
+                    } => self.returned(file, (lo, hi), at.to_string()),
                     _ => self.hole(at.to_string(), InstanceHole::Unread, None),
                 }
             }
@@ -1759,7 +1881,8 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 let package = super::super::package_name(&client.package).to_string();
                 let new = instance.form == MakerForm::New;
                 let labelled = self.makers.iter().any(|maker| {
-                    maker.package == package
+                    maker.of.is_none()
+                        && maker.package == package
                         && maker.export == client.export
                         && maker.member == instance.member
                         && maker.new == new
@@ -2560,6 +2683,58 @@ mod tests {
     use super::super::super::discovery::{AskedScope, ScopeAnswer};
     use super::*;
     use crate::position_rows::Row;
+
+    /// Amendment 12: an `of`-make labels only where the declaration ask
+    /// verified it, and its root receiver is `<of>>make:<member>`.
+    #[test]
+    fn an_of_make_labels_only_where_it_was_verified() {
+        let hub: crate::library_claims::ExportClaims = serde_json::from_value(serde_json::json!({
+            "package": "fixture-hub", "version": "1.0.0", "specifier": "fixture-hub",
+            "export": "Hub", "role": "broker",
+            "claims": [
+                { "kind": "make", "form": "new", "member": null },
+                { "kind": "make", "form": "call", "member": "channel",
+                  "of": "instance:new", "name": { "arg": 0 } }
+            ]
+        }))
+        .unwrap();
+        let (id, _) = hub
+            .claims_by_id()
+            .into_iter()
+            .find(|(id, _)| id.ends_with(":of:instance:new"))
+            .expect("the of-make has an id");
+        let asked = AskedScope {
+            package: hub.package.clone(),
+            export: hub.export.clone(),
+            claim_id: id,
+            receiver: "instance:new".to_string(),
+        };
+        let none = MakerLabel::from_exports(std::slice::from_ref(&hub), &HashMap::new());
+        assert!(none.iter().all(|maker| maker.of.is_none()), "{none:?}");
+        let unanswered = HashMap::from([(asked.clone(), ScopeAnswer::Unanswered)]);
+        let none = MakerLabel::from_exports(std::slice::from_ref(&hub), &unanswered);
+        assert!(none.iter().all(|maker| maker.of.is_none()), "{none:?}");
+        let verified = HashMap::from([(
+            asked,
+            ScopeAnswer::Verified(vec![("node_modules/fixture-hub/index.d.ts".to_string(), 3)]),
+        )]);
+        let makers = MakerLabel::from_exports(std::slice::from_ref(&hub), &verified);
+        let of: Vec<&MakerLabel> = makers.iter().filter(|maker| maker.of.is_some()).collect();
+        let [maker] = of.as_slice() else {
+            panic!("one of-make label: {makers:?}");
+        };
+        assert_eq!(maker.root_receiver(), "instance:new>make:channel");
+        assert_eq!(
+            maker.declared,
+            vec![("node_modules/fixture-hub/index.d.ts".to_string(), 3)]
+        );
+        assert!(
+            makers
+                .iter()
+                .any(|maker| maker.of.is_none() && maker.root_receiver() == "instance:new"),
+            "the export's own maker stays"
+        );
+    }
 
     fn handed(package: &str, side: &str) -> InstanceEnd {
         InstanceEnd {

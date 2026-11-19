@@ -1504,6 +1504,12 @@ pub enum LibraryClaim {
         name_scope: Option<NameScope>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         picker: Option<String>,
+        /// Contract amendment 12: the one instance receiver (by its receiver
+        /// id) a maker member is called on, so a member call on a library
+        /// instance (`hub.channel(name)`) makes an instance of its own. Absent
+        /// is a make on the export itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        of: Option<String>,
         /// Which member of what a hook returns holds the value the function
         /// it runs resolves to (carrick#2819). Never sent with a make check:
         /// a `result` check carries it ([`LibraryClaim::Result`]).
@@ -6957,6 +6963,7 @@ mod tests {
                         key_labels: key_labels(),
                         name_scope: Some(name_scope()),
                         picker: Some("model/q1".into()),
+                        of: None,
                         result: None,
                     }),
                     library(LibraryClaim::Scope {
@@ -7668,6 +7675,7 @@ mod tests {
                             namespace: Some("task".into()),
                         }),
                         picker: Some("model/q1".into()),
+                        of: None,
                         result: None,
                     },
                 ),
@@ -7789,6 +7797,7 @@ mod tests {
                         key_labels: BTreeMap::new(),
                         name_scope: None,
                         picker: None,
+                        of: None,
                         result: None,
                     },
                 ),
@@ -7947,6 +7956,7 @@ mod tests {
                 key_labels: BTreeMap::new(),
                 name_scope: None,
                 picker: None,
+                of: None,
                 result: None,
             },
         };
@@ -9620,6 +9630,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 key_labels: BTreeMap::new(),
                 name_scope: None,
                 picker: None,
+                of: None,
                 result: None,
             },
         }]
