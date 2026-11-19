@@ -1294,6 +1294,22 @@ test("T4 P4.6: a part-2 item carries no copy line", (t) => {
   assert.doesNotMatch(text, /read from main/, text);
 });
 
+test("T4 P4.6: a break whose named caller file the session edited is not counted and the file gets no clean line", (t) => {
+  const { workspace, home } = setup(t);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file, { main_commit: "abcdef1234567890", named_files: [workspace.file] })], clean());
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.doesNotMatch(text, /Carrick checked the .*contract problem/, text);
+  assert.doesNotMatch(text, /found no contract problem|both sides agree/, text);
+  assert.match(text, /You changed user-service\/src\/routes\/users\.ts in this session/, text);
+});
+
+test("T4 P4.6: the same break with no session edit of a named file is counted once", (t) => {
+  const { workspace, home } = setup(t);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file, { main_commit: "abcdef1234567890", named_files: [] })], clean());
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.match(text.split("\n")[0]!, /: 1 contract problem\.$/, text);
+});
+
 test("T4 P4.5: the newest early answer is another engine's: Stop counts no break and says no clean line for the file", (t) => {
   const { workspace, home } = setup(t);
   const full = { ...clean(), file: "src/routes/users.ts", items: [unjudgedRoute("/api/zz", 10)] };
