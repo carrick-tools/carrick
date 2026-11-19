@@ -104,6 +104,8 @@ const broken = (ws: Ws, callLine = 5): HeldLine => ({
   row_path: ws.at("web/src/live.ts"),
   places: [{ service: "orders-api", file: "src/realtime.ts", line: 11 }],
   expected: LISTENER,
+  main_commit: null,
+  named_files: [],
   side: "consumer",
   protocol: "socket",
   call_line: callLine,

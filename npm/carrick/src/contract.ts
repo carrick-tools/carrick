@@ -142,6 +142,16 @@ export type CheckItem = {
   standing?: boolean;
   /** Early answers only: the run of the compiler's check this break belongs to (`HeldLine.run`). */
   run?: string;
+  /**
+   * Early answers only: the commit of main the other side's types were read
+   * from (the fact file's commit for the places' repo), or null when the fact
+   * file names none. Absent on every row part 2 or the CLI states (T2, carrick#4742).
+   */
+  main_commit?: string | null;
+  /** Early answers only: every place file and the group's home file, absolute: the files whose edit the check did not see. */
+  named_files?: string[];
+  /** Set at print time, never filed: the named files this session edited before the line printed, as the hook shows them. */
+  edited_named?: string[];
 };
 
 /** `UnreadItem` from src/local_mode/contract.rs: one call the scan did not read. */
@@ -332,6 +342,12 @@ export type MovedRow = {
   standing?: boolean;
   /** Early answers only, as `CheckItem.run`. */
   run?: string;
+  /** Early answers only, as `CheckItem.main_commit`. */
+  main_commit?: string | null;
+  /** Early answers only, as `CheckItem.named_files`. */
+  named_files?: string[];
+  /** Print time only, as `CheckItem.edited_named`. */
+  edited_named?: string[];
 };
 
 /** The `scope` of a `recheck` block (`docs/local-mode-output.md`, "recheck"). */

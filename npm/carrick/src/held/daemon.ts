@@ -91,6 +91,14 @@ export type HeldLine = {
   run?: string;
   /** Its check spoke the same message at the engine's previous edit answer: not this edit's break (T1 P1.1). */
   standing?: true;
+  /**
+   * The commit of main the other side's types were read from: the fact file's
+   * commit for the places' repo, or null when it names none (T2 P2.1). The check
+   * holds the other side fixed at that copy, whatever the session has edited since.
+   */
+  main_commit: string | null;
+  /** The files that hold the other side as main has it: each place's file and the group's home file, absolute (T2 P2.2). */
+  named_files: string[];
 };
 
 export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "error";

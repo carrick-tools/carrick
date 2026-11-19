@@ -320,23 +320,40 @@ export const MAX_MOVED_ROWS = 3;
  */
 export function movedLines(result: CheckResult): string[] {
   const moved = statedMoved(result);
-  const lines = moved.slice(0, MAX_MOVED_ROWS).map((row) => {
+  const lines = moved.slice(0, MAX_MOVED_ROWS).flatMap((row) => {
     const at = `${row.file}${row.line ? `:${row.line}` : ""}`;
     const what = `${row.role} ${row.method} ${row.path}`;
     if (row.after === "no_route") {
-      return cutLine(`- ${at}: this ${what} matched a route in the index and this edit left it with none.`);
+      return [cutLine(`- ${at}: this ${what} matched a route in the index and this edit left it with none.`)];
     }
     const other = row.counterparts.length > 0 ? ` against ${row.counterparts.join(", ")}` : "";
+    // An early row (it carries its copy of main) is the compiler's clean pass on the working tree, never an index verdict (T2 P2.4);
+    // one that already stood at the previous edit makes no claim about before it.
+    const agreed = row.main_commit === undefined ? "agreed in the index and now reads" : row.standing ? "now reads" : "agreed before the edit and now reads";
     const verdict = row.other_build
       ? `reads ${row.after} now; the index was built by another carrick version, so this edit may not be the cause`
-      : `agreed in the index and now reads ${row.after}`;
-    return cutLine(`- ${at}: this ${what}${other} ${verdict}.`);
+      : `${agreed} ${row.after}`;
+    return [cutLine(`- ${at}: this ${what}${other} ${verdict}.`), ...heldCopyLines(row, row.role === "route")];
   });
   if (moved.length > MAX_MOVED_ROWS) {
     lines.push(`- and ${moved.length - MAX_MOVED_ROWS} more rows outside this file moved: \`carrick check --changed\` lists them.`);
   }
   return lines;
 }
+/**
+ * An early row's copy line (T2, R3): which copy of the other side the compiler
+ * read, and, when this session edited a file that holds it, that the check did
+ * not see the edit. Its own line, so the line cap never cuts it. Nothing for a
+ * row part 2 or the CLI states: it carries no `main_commit`.
+ */
+function heldCopyLines(row: Pick<CheckItem, "main_commit" | "edited_named">, caller: boolean): string[] {
+  if (row.main_commit === undefined) return [];
+  const read = `The ${caller ? "caller's" : "other"} side was read from main ${row.main_commit === null ? "as of the last index" : `at ${row.main_commit.slice(0, 7)}`}`;
+  const edited = row.edited_named ?? [];
+  const changed = edited.length > 0 ? `. You changed ${edited.join(", ")} in this session; the check used main's copy of ${edited.length === 1 ? "it" : "them"}` : "";
+  return [cutLine(`  ${read}${changed}.`)];
+}
+
 /** How long one problem line of an edit's message may run before it is cut. */
 export const MAX_EDIT_LINE_CHARS = 400;
 
@@ -637,7 +654,7 @@ export function renderPostToolUse(
       const head = headline(result, where, problems.length, options.late === true, options.early === true);
       if (head !== null) lines.push(head);
     }
-    for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
+    for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)), ...heldCopyLines(item, item.kind === "route"));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);
     if (hidden > 0) lines.push(`- and ${hidden} more: \`carrick check ${where}\` lists them.`);
     lines.push(...movedLines(result));
