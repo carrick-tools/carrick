@@ -265,6 +265,8 @@ export declare class QueryBuilder {
   upsert(values: object): FilterBuilder;
   update(values: object): FilterBuilder;
   delete(): FilterBuilder;
+  selectCount(columns?: string, options?: { head?: number }): FilterBuilder;
+  selectLoose(columns?: string, options?: { head?: any }): FilterBuilder;
 }
 `;
 const HOSTED = `import { QueryBuilder, FilterBuilder } from "@fixture/hosted-rest";
@@ -1236,6 +1238,20 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
     assert.deepStrictEqual(verdicts(await send(checks)), [
       'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified',
     ]);
+  });
+
+  it('answers failed when_not_accepted for a when slot that cannot hold its literal, and unchecked member_untyped for one that says nothing', async () => {
+    const H = '@fixture/hosted';
+    const at = 'instance:()>scope:from';
+    const head = (member: string): Claim =>
+      op('request', member, { of: at, name: { bound: 'scope' }, method_default: 'HEAD', when: { arg: 1, key: 'head', literal: 'true' } });
+    const got = verdicts(await send([
+      check(H, 'createClient', 'http_client', 'export', make('call', null, { base: { arg: 0 } })),
+      check(H, 'createClient', 'http_client', 'instance:()', scope('from', { arg: 0 }, { of: 'instance:()' })),
+      check(H, 'createClient', 'http_client', at, head('selectCount')),
+      check(H, 'createClient', 'http_client', at, head('selectLoose')),
+    ]));
+    assert.deepStrictEqual(got.slice(2), ['failed when_not_accepted', 'unchecked member_untyped']);
   });
 
   it('judges `when` on a request op: the slot must exist and accept the literal', async () => {
