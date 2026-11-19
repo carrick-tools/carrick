@@ -422,7 +422,9 @@ export function withEarlyBreaks(full: CheckResult, early: CheckResult, newest?: 
   // A break an earlier answer of the session already counted (#4900), or part 2 states itself, counts once.
   const kept = stands.filter((c) => !counted?.has(key(c)));
   for (const c of [...stands, ...compared.rows.filter((r) => r.outcome !== "part3_only" && !r.corrected)]) counted?.add(key(c));
-  const added = kept.map((c) => c.row.item ?? movedBreak(c.row.moved!));
+  // A break on a file the session edited since the check read main's copy may not exist in its tree: its early line says so, and it is not counted (P4.6).
+  const edited = (c: RowCompared): boolean => ((c.row.item ?? c.row.moved)?.edited_named ?? []).length > 0;
+  const added = kept.filter((c) => !edited(c)).map((c) => c.row.item ?? movedBreak(c.row.moved!));
   // A route part 2 did not judge (or holds no row for) gives way to the early break.
   const replaced = new Set(stands.filter((c) => c.match && "kind" in c.match).map((c) => c.match));
   if (added.length === 0) return full;

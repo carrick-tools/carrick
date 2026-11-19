@@ -109,7 +109,7 @@ export function deliverOne(session: string, raw: Answer, home?: string): string[
  * edit of a file that holds it never reached the line. Decided here, at print
  * time, never when the answer is filed: an edit lands between the two.
  */
-function withEditedNamed(early: CheckResult, session: string, root: string, now: number, home?: string): CheckResult {
+export function withEditedNamed(early: CheckResult, session: string, root: string, now: number, home?: string): CheckResult {
   const edited = new Set(Object.entries(readSession(session, home).files).filter(([, edit]) => edit.at <= now).map(([file]) => realPath(file)));
   if (edited.size === 0) return early;
   const shown = (file: string): string => {
