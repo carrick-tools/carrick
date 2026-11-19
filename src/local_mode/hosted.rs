@@ -851,10 +851,13 @@ fn joined_reasons(kept: &[(PathBuf, String)]) -> String {
         .join("; ")
 }
 
-/// Write each kept repo's reason onto its row of the record, where the row
-/// has none yet.
+/// Write each kept repo's reason and its sentence onto its row of the
+/// record, where the row has none yet. A repo with no row (its hosted or held
+/// commits are not one line of history, so [`synced_repos`] skipped it) gets
+/// a row with no commits, so every kept repo has one place its sentence is
+/// read from.
 fn stamp_kept(
-    synced: &mut [SyncedRepo],
+    synced: &mut Vec<SyncedRepo>,
     remotes: &BTreeMap<PathBuf, String>,
     kept: &[(PathBuf, String)],
 ) {
@@ -862,13 +865,96 @@ fn stamp_kept(
         let Some(name) = remotes.get(path) else {
             continue;
         };
+        if !synced.iter().any(|row| row.repo == *name) {
+            synced.push(SyncedRepo {
+                repo: name.clone(),
+                path: path.to_string_lossy().into_owned(),
+                hosted_commit: String::new(),
+                hosted_scanned_at: None,
+                copy_commit: String::new(),
+                copy_scanned_at: None,
+                head_holds_hosted: false,
+                fetched: false,
+                behind: None,
+                head_detached: false,
+                on_default_branch: None,
+                kept_reason: None,
+                kept_line: None,
+                kept_short: None,
+            });
+        }
         for row in synced
             .iter_mut()
             .filter(|row| row.repo == *name && row.kept_reason.is_none())
         {
             row.kept_reason = Some(reason.clone());
+            let (line, short) = kept_sentence(row);
+            row.kept_line = Some(line);
+            row.kept_short = Some(short);
         }
     }
+}
+
+/// What to tell a person about a repo whose copy is kept back: the sentence
+/// (what is true and what to do) and its short clause. Built from the facts
+/// the background forward already holds, so no hook asks git.
+fn kept_sentence(row: &SyncedRepo) -> (String, String) {
+    let name = &row.repo;
+    if row.hosted_commit.is_empty() {
+        return (
+            format!(
+                "{name}'s local index could not move to main's latest because local and hosted \
+                 history diverged. Run `carrick refresh` to rebuild it from this checkout."
+            ),
+            "history diverged from main".into(),
+        );
+    }
+    let index = match row.copy_scanned_at.as_deref().and_then(|at| at.get(..10)) {
+        Some(day) => format!("{name}'s local index is from {day}"),
+        None => format!("{name}'s local index is out of date"),
+    };
+    if row.head_holds_hosted {
+        return (
+            format!(
+                "{index} and could not be moved to main's latest. Run `carrick refresh` to \
+                 rebuild it."
+            ),
+            "its copy could not be moved".into(),
+        );
+    }
+    if !row.fetched {
+        return (
+            format!(
+                "{index} because this clone has not fetched main's latest commit. Run `git \
+                 fetch`, then `git pull` on main."
+            ),
+            "latest main commit not fetched".into(),
+        );
+    }
+    let behind = match row.behind {
+        Some(1) => " (1 commit behind)".to_string(),
+        Some(n) => format!(" ({n} commits behind)"),
+        None => String::new(),
+    };
+    if row.head_detached {
+        return (
+            format!(
+                "{index} because HEAD is detached and this checkout is missing main's latest \
+                 commit{behind}. Check out main and run `git pull`, or run `carrick refresh` to \
+                 rebuild from this checkout."
+            ),
+            "detached HEAD behind main".into(),
+        );
+    }
+    let fix = if row.on_default_branch == Some(true) {
+        "Run `git pull` to update."
+    } else {
+        "Run `git pull` on main, or `carrick refresh` on this branch."
+    };
+    (
+        format!("{index} because this checkout is missing main's latest commit{behind}. {fix}"),
+        "checkout is behind main".into(),
+    )
 }
 
 /// Hold each repo named in `kept` (`owner/repo`) at what `old` held for it,
@@ -1023,21 +1109,7 @@ fn forward_with(
         Ok((outcome, _, synced)) => (outcome, synced),
         Err(reason) => (Forward::Kept(reason), None),
     };
-    // A heal is a move of the read model to the snapshot already held, so it
-    // is what this run did when the cloud had nothing newer.
-    // A heal that rebuilt moved the read model, whatever the cloud said; one
-    // that failed is the run's news unless the network move rebuilt after it.
-    let outcome = match (outcome, healed) {
-        (outcome @ Forward::Moved { .. }, _) => outcome,
-        (_, Some(Ok((moved, kept)))) => {
-            if let Some(synced) = synced.as_mut() {
-                stamp_kept(synced, &remotes, &kept);
-            }
-            Forward::Moved { moved, kept }
-        }
-        (_, Some(Err(reason))) => not_rebuilt(&reason),
-        (outcome, None) => outcome,
-    };
+    let outcome = settle(outcome, healed, synced.as_mut(), &remotes);
     // Only a run the cloud answered says where the hosted index stands; any
     // other keeps the last record, whose own time says how old it is.
     if let Some(synced) = synced {
@@ -1096,18 +1168,20 @@ fn put_back(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
-/// What a [`heal`] that rebuilt did: the repos it healed (path, commit) and
-/// the ones it skipped (path, reason).
-type Healed = (Vec<(PathBuf, String)>, Vec<(PathBuf, String)>);
+/// What [`heal`] did: the rebuild's outcome (`None` when no repo healed), and
+/// every repo it skipped (path, reason), whether or not another repo healed.
+type Healed = (
+    Option<Result<Vec<(PathBuf, String)>, String>>,
+    Vec<(PathBuf, String)>,
+);
 
 /// Rebuild a local index left behind the snapshot it should read, with no
 /// network: where `index.json`'s commits for a repo differ from the
 /// snapshot's and [`may_move`] lets the copy move from the first to the
 /// second. Each repo is decided alone: one that may not move is skipped, with
-/// its reason, one whose copy cannot be carried as it is is skipped, and the
-/// others heal. `None` when no repo heals (the network move then decides),
-/// otherwise the rebuild's outcome: the healed repos and the ones [`may_move`]
-/// refused.
+/// its reason, one whose copy cannot be carried as it is is skipped with its
+/// own, and the others heal. The skips are returned even when nothing healed,
+/// so a copy that stays behind is never left without a reason.
 ///
 /// Before the move rebuilt the read model, a move wrote only the snapshot, so
 /// a workspace can hold an index at one commit and a snapshot at a later one.
@@ -1116,8 +1190,10 @@ fn heal(
     remotes: &BTreeMap<PathBuf, String>,
     snapshot: &Snapshot,
     rebuild: &dyn Fn(&[PathBuf]) -> Result<(), String>,
-) -> Option<Result<Healed, String>> {
-    let index = super::read_model::LocalIndex::read(&workspace.index_file()).ok()?;
+) -> Healed {
+    let Ok(index) = super::read_model::LocalIndex::read(&workspace.index_file()) else {
+        return (None, Vec::new());
+    };
     let input = HostedInput {
         snapshot: Some(snapshot.clone()),
         remotes: remotes.clone(),
@@ -1141,17 +1217,84 @@ fn heal(
         match may_move(path, name, &built, &held) {
             Err(reason) => kept.push((path.clone(), reason)),
             Ok(None) => {}
-            // What the network move would refuse to carry, the heal skips:
-            // the network move then decides, and says why.
-            Ok(Some(_)) if !carried_as_is(&blobs) => {}
+            // What the network move would refuse to carry, the heal skips,
+            // with a reason of its own. The network move may still carry a
+            // newer copy of it, and then it is not kept ([`settle`]).
+            Ok(Some(_)) if !carried_as_is(&blobs) => kept.push((
+                path.clone(),
+                format!(
+                    "{name}: the held copy was scanned from uncommitted changes or by another \
+                     Carrick format, so it cannot be moved as it is"
+                ),
+            )),
             Ok(Some(to)) => moved.push((path.clone(), to)),
         }
     }
     if moved.is_empty() {
-        return None;
+        return (None, kept);
     }
     let paths: Vec<PathBuf> = moved.iter().map(|(path, _)| path.clone()).collect();
-    Some(rebuild(&paths).map(|()| (moved, kept)))
+    (Some(rebuild(&paths).map(|()| moved)), kept)
+}
+
+/// What the run settled on once the heal and the network move have both
+/// run, and what each kept repo's row of the record says.
+///
+/// A network move that moved something is the run's outcome, and a repo it
+/// moved is not kept whatever the heal skipped. Otherwise a heal that
+/// rebuilt moved the read model, whatever the cloud said, and the outcome
+/// states every kept repo: the heal's skips and the repos the network move
+/// refused. A heal that rebuilt nothing leaves the network's outcome, except
+/// that a repo it skipped and nothing moved is kept, not current. One that
+/// failed is the run's news unless the network move rebuilt after it.
+fn settle(
+    outcome: Forward,
+    (healed, skipped): Healed,
+    mut synced: Option<&mut Vec<SyncedRepo>>,
+    remotes: &BTreeMap<PathBuf, String>,
+) -> Forward {
+    let network_moved: Vec<PathBuf> = match &outcome {
+        Forward::Moved { moved, .. } => moved.iter().map(|(path, _)| path.clone()).collect(),
+        _ => Vec::new(),
+    };
+    let healed_paths: Vec<PathBuf> = match &healed {
+        Some(Ok(moved)) => moved.iter().map(|(path, _)| path.clone()).collect(),
+        _ => Vec::new(),
+    };
+    let skipped: Vec<(PathBuf, String)> = skipped
+        .into_iter()
+        .filter(|(path, _)| !network_moved.contains(path) && !healed_paths.contains(path))
+        .collect();
+    if let Some(rows) = synced.as_deref_mut() {
+        stamp_kept(rows, remotes, &skipped);
+    }
+    match (outcome, healed) {
+        (Forward::Moved { moved, mut kept }, _) => {
+            for skip in skipped {
+                if !kept.iter().any(|(path, _)| *path == skip.0) {
+                    kept.push(skip);
+                }
+            }
+            Forward::Moved { moved, kept }
+        }
+        (_, Some(Ok(moved))) => {
+            // The network's own per-repo refusals are on the rows.
+            let mut kept = skipped;
+            for row in synced.iter().flat_map(|rows| rows.iter()) {
+                let path = PathBuf::from(&row.path);
+                if let Some(reason) = &row.kept_reason
+                    && !kept.iter().any(|(seen, _)| *seen == path)
+                    && !moved.iter().any(|(seen, _)| *seen == path)
+                {
+                    kept.push((path, reason.clone()));
+                }
+            }
+            Forward::Moved { moved, kept }
+        }
+        (_, Some(Err(reason))) => not_rebuilt(&reason),
+        (Forward::Current, None) if !skipped.is_empty() => Forward::Kept(joined_reasons(&skipped)),
+        (outcome, None) => outcome,
+    }
 }
 
 /// Where [`forward`] records what it found, under the index directory. Small,
@@ -1164,6 +1307,11 @@ pub(super) const SYNC_RECORD: &str = "hosted/last-sync.json";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct SyncedRepo {
     repo: String,
+    /// The checkout this row describes, so a reader that knows its own
+    /// checkout finds its row without asking git.
+    path: String,
+    /// Empty for a repo whose hosted or held commits are not one line of
+    /// history: it has no single commit to state, and only `kept_line` to say.
     hosted_commit: String,
     /// When the cloud stored the newest hosted row at that commit.
     hosted_scanned_at: Option<String>,
@@ -1178,10 +1326,20 @@ pub(super) struct SyncedRepo {
     /// and HEAD does not.
     behind: Option<u64>,
     head_detached: bool,
+    /// Whether HEAD is on the default branch; `None` when detached or when no
+    /// default branch resolves.
+    on_default_branch: Option<bool>,
     /// Why this repo's copy did not move in this run, when it may not:
     /// [`may_move`]'s reason. Set only on a repo that was refused, whatever
     /// the other repos did; `None` on one that moved or had nothing to move.
     kept_reason: Option<String>,
+    /// The one sentence that says this repo's copy is kept back and what to
+    /// do. The session start, `carrick status` and the edit-time lines print
+    /// this and nothing of their own; `None` where the copy is not kept.
+    kept_line: Option<String>,
+    /// [`SyncedRepo::kept_line`] as a clause for the end of an edit-time
+    /// line: why the copy is kept back, in a few words.
+    kept_short: Option<String>,
 }
 
 /// `.carrick/hosted/last-sync.json`, rewritten by every [`forward`] the cloud
@@ -1238,6 +1396,72 @@ impl SyncRecord {
     }
 }
 
+/// A repo whose copy the last run kept back, as [`SyncRecord`] states it.
+/// The one reader of `kept_line` on the Rust side: `carrick status` prints
+/// `line`, and a `check` answer carries `behind` and `reason_short` for the
+/// edit-time lines, so no surface words it twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptRepo {
+    pub repo: String,
+    /// The checkout the record describes.
+    pub path: String,
+    /// `kept_line` of the record: what is true and what to do.
+    pub line: String,
+    /// `kept_short` of the record, for the end of an edit-time line.
+    pub reason_short: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
+}
+
+/// The repos `last-sync.json` (under `index_dir`) says are kept back, or none
+/// where there is no record, it is of another shape, or a full refresh wrote
+/// the snapshot after it: that copy is gone, so what the record said of it
+/// is not true now (the same rule as `lastSync` in `npm/carrick`). Reads one
+/// small file and stats one other; asks git nothing.
+pub fn kept_repos(index_dir: &Path) -> Vec<KeptRepo> {
+    #[derive(Deserialize)]
+    struct Row {
+        repo: String,
+        path: Option<String>,
+        behind: Option<u64>,
+        kept_line: Option<String>,
+        kept_short: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Record {
+        schema: String,
+        repos: Vec<Row>,
+    }
+    let dir = index_dir.join("hosted");
+    let file = dir.join("last-sync.json");
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let (Some(written), Ok(bytes)) = (modified(&file), std::fs::read(&file)) else {
+        return Vec::new();
+    };
+    if modified(&dir.join("snapshot.json")).is_some_and(|snapshot| snapshot > written) {
+        return Vec::new();
+    }
+    let Ok(record) = serde_json::from_slice::<Record>(&bytes) else {
+        return Vec::new();
+    };
+    if record.schema != "carrick.hosted-sync/0" {
+        return Vec::new();
+    }
+    record
+        .repos
+        .into_iter()
+        .filter_map(|row| {
+            Some(KeptRepo {
+                repo: row.repo,
+                path: row.path?,
+                line: row.kept_line?,
+                reason_short: row.kept_short?,
+                behind: row.behind,
+            })
+        })
+        .collect()
+}
+
 /// Where each local repo's hosted index and this machine's copy of it stand,
 /// for the repos whose hosted and held commits are each one line of history.
 fn synced_repos(resolution: &Resolution, before: &HostedInput) -> Vec<SyncedRepo> {
@@ -1281,6 +1505,7 @@ fn synced_repos(resolution: &Resolution, before: &HostedInput) -> Vec<SyncedRepo
             .flatten();
         synced.push(SyncedRepo {
             repo: name.clone(),
+            path: repo.to_string(),
             hosted_scanned_at: scanned_at(resolution, name, &hosted),
             copy_scanned_at: scanned_at(&old.resolution, name, &copy),
             hosted_commit: hosted,
@@ -1289,7 +1514,10 @@ fn synced_repos(resolution: &Resolution, before: &HostedInput) -> Vec<SyncedRepo
             fetched,
             behind,
             head_detached: crate::git_state::head_is_detached(&repo),
+            on_default_branch: crate::git_state::on_default_branch(&repo),
             kept_reason: None,
+            kept_line: None,
+            kept_short: None,
         });
     }
     synced
@@ -3750,10 +3978,18 @@ mod tests {
             .await;
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
         let synced = synced.expect("the cloud answered, so the run says where things stand");
+        // The sentence is built from the facts on the row, in a hook-free pass.
+        let (line, short) = kept_sentence(&synced[0]);
+        assert_eq!(synced[0].kept_line.as_deref(), Some(line.as_str()));
+        assert_eq!(synced[0].kept_short.as_deref(), Some(short.as_str()));
         assert_eq!(
             synced,
             vec![SyncedRepo {
                 repo: "example/api".into(),
+                path: dir.path().to_string_lossy().into_owned(),
+                on_default_branch: None,
+                kept_line: Some(line),
+                kept_short: Some(short),
                 hosted_commit: b.clone(),
                 hosted_scanned_at: Some(STORED_AT.into()),
                 copy_commit: a.clone(),
@@ -4443,20 +4679,31 @@ mod tests {
             asked.borrow_mut().push(paths.to_vec());
             Ok(())
         });
+        let (healed, mut skipped) = healed;
         assert_eq!(
             healed,
-            Some(Ok((
-                vec![(api.path().to_path_buf(), api_b.clone())],
-                vec![(
-                    web.path().to_path_buf(),
-                    format!(
-                        "example/web: the hosted index is at {}, which this checkout's HEAD \
-                         does not hold",
-                        &web_b[..7]
-                    )
-                )]
-            )))
+            Some(Ok(vec![(api.path().to_path_buf(), api_b.clone())]))
         );
+        // The dirty copy is skipped with a reason of its own, not silently.
+        skipped.sort();
+        let mut expected = vec![
+            (
+                web.path().to_path_buf(),
+                format!(
+                    "example/web: the hosted index is at {}, which this checkout's HEAD does \
+                     not hold",
+                    &web_b[..7]
+                ),
+            ),
+            (
+                jobs.path().to_path_buf(),
+                "example/jobs: the held copy was scanned from uncommitted changes or by another \
+                 Carrick format, so it cannot be moved as it is"
+                    .to_string(),
+            ),
+        ];
+        expected.sort();
+        assert_eq!(skipped, expected);
         assert_eq!(asked.into_inner(), vec![vec![api.path().to_path_buf()]]);
     }
 
@@ -4498,5 +4745,223 @@ mod tests {
             .find(|repo| repo.full_name == "example/web")
             .unwrap();
         assert_eq!(web.services.as_ref().map(Vec::len), Some(0));
+    }
+
+    /// A row for `repo` at `path`, current: nothing kept.
+    fn row_of(repo: &str, path: &Path) -> SyncedRepo {
+        SyncedRepo {
+            repo: repo.into(),
+            path: path.to_string_lossy().into_owned(),
+            hosted_commit: "b".repeat(40),
+            hosted_scanned_at: Some("2026-11-12T10:00:00Z".into()),
+            copy_commit: "a".repeat(40),
+            copy_scanned_at: Some("2026-11-10T08:00:00Z".into()),
+            head_holds_hosted: false,
+            fetched: true,
+            behind: Some(3),
+            head_detached: false,
+            on_default_branch: Some(true),
+            kept_reason: None,
+            kept_line: None,
+            kept_short: None,
+        }
+    }
+
+    /// Every way a copy is kept back says what is true and the move that
+    /// fixes it, and names the repo and the copy's date.
+    #[test]
+    fn the_kept_sentence_names_the_repo_the_date_and_the_fix() {
+        let base = row_of("example/web", Path::new("/w"));
+        let case = |change: &dyn Fn(&mut SyncedRepo)| {
+            let mut row = base.clone();
+            change(&mut row);
+            kept_sentence(&row).0
+        };
+        let on_main = case(&|_| {});
+        let on_branch = case(&|row| row.on_default_branch = Some(false));
+        let detached = case(&|row| row.head_detached = true);
+        let unfetched = case(&|row| row.fetched = false);
+        let unmovable = case(&|row| row.head_holds_hosted = true);
+        let not_one_line = case(&|row| row.hosted_commit.clear());
+        let undated = case(&|row| row.copy_scanned_at = None);
+        for line in [&on_main, &on_branch, &detached, &unfetched, &unmovable] {
+            assert!(line.contains("example/web"), "{line}");
+        }
+        for line in [&on_main, &on_branch, &detached, &unfetched, &unmovable] {
+            assert!(line.contains("2026-11-10"), "{line}");
+        }
+        assert!(on_main.contains("`git pull`") && !on_main.contains("carrick refresh"));
+        assert!(on_main.contains("3 commits behind"), "{on_main}");
+        assert!(on_branch.contains("`git pull`") && on_branch.contains("`carrick refresh`"));
+        assert!(detached.contains("detached") && detached.contains("`git pull`"));
+        assert!(unfetched.contains("`git fetch`"));
+        assert!(unmovable.contains("`carrick refresh`"));
+        assert!(not_one_line.contains("history diverged"), "{not_one_line}");
+        assert!(!undated.contains("2026"), "{undated}");
+    }
+
+    /// Gap (a): a repo whose hosted or held commits are not one line has no
+    /// row from `synced_repos`, and its sentence still has one place to live.
+    #[test]
+    fn a_repo_with_no_row_still_gets_its_kept_sentence() {
+        let remotes = BTreeMap::from([(PathBuf::from("/w"), "example/web".to_string())]);
+        let mut synced = Vec::new();
+        stamp_kept(
+            &mut synced,
+            &remotes,
+            &[(PathBuf::from("/w"), "example/web: not one line".into())],
+        );
+        assert_eq!(synced.len(), 1);
+        let row = &synced[0];
+        assert_eq!(row.path, "/w");
+        assert!(row.hosted_commit.is_empty() && row.copy_commit.is_empty());
+        assert_eq!(
+            row.kept_reason.as_deref(),
+            Some("example/web: not one line")
+        );
+        assert_eq!(
+            row.kept_line.as_deref(),
+            Some(kept_sentence(row).0.as_str())
+        );
+        assert!(row.kept_line.as_deref().unwrap().contains("example/web"));
+    }
+
+    /// Gap (b): the heal moved a repo, then the network move refused another.
+    /// The run's outcome and the record's reason name the refused repo too,
+    /// and its row carries the sentence.
+    #[test]
+    fn a_heal_that_moved_and_a_network_refusal_both_reach_the_record() {
+        let remotes = BTreeMap::from([
+            (PathBuf::from("/api"), "example/api".to_string()),
+            (PathBuf::from("/web"), "example/web".to_string()),
+        ]);
+        let mut synced = vec![
+            row_of("example/api", Path::new("/api")),
+            row_of("example/web", Path::new("/web")),
+        ];
+        // What the network move stamped before the heal's say.
+        stamp_kept(
+            &mut synced,
+            &remotes,
+            &[(PathBuf::from("/web"), "example/web: behind".into())],
+        );
+        let healed = vec![(PathBuf::from("/api"), "b".repeat(40))];
+        let outcome = settle(
+            Forward::Kept("example/web: behind".into()),
+            (Some(Ok(healed.clone())), Vec::new()),
+            Some(&mut synced),
+            &remotes,
+        );
+        assert_eq!(
+            outcome,
+            Forward::Moved {
+                moved: healed,
+                kept: vec![(PathBuf::from("/web"), "example/web: behind".into())]
+            }
+        );
+        let record = SyncRecord::of(&outcome, synced, "now".into());
+        assert_eq!(record.outcome, "moved");
+        assert_eq!(record.reason.as_deref(), Some("example/web: behind"));
+        let web = record
+            .repos
+            .iter()
+            .find(|r| r.repo == "example/web")
+            .unwrap();
+        assert!(web.kept_line.is_some());
+        let api = record
+            .repos
+            .iter()
+            .find(|r| r.repo == "example/api")
+            .unwrap();
+        assert!(api.kept_line.is_none() && api.kept_reason.is_none());
+    }
+
+    /// A copy the heal skipped and nothing else moved is kept, not current:
+    /// the sentence is written even though no repo healed.
+    #[test]
+    fn a_lone_heal_skip_is_kept_with_its_sentence() {
+        let remotes = BTreeMap::from([(PathBuf::from("/web"), "example/web".to_string())]);
+        let mut synced = vec![row_of("example/web", Path::new("/web"))];
+        let skip = (PathBuf::from("/web"), "example/web: dirty".to_string());
+        let outcome = settle(
+            Forward::Current,
+            (None, vec![skip]),
+            Some(&mut synced),
+            &remotes,
+        );
+        assert_eq!(outcome, Forward::Kept("example/web: dirty".into()));
+        assert_eq!(synced[0].kept_reason.as_deref(), Some("example/web: dirty"));
+        assert!(synced[0].kept_line.is_some());
+    }
+
+    /// A repo the network move then moved is not kept because the heal had
+    /// skipped it.
+    #[test]
+    fn a_heal_skip_the_network_move_carried_is_not_kept() {
+        let remotes = BTreeMap::from([(PathBuf::from("/web"), "example/web".to_string())]);
+        let mut synced = vec![row_of("example/web", Path::new("/web"))];
+        let moved = vec![(PathBuf::from("/web"), "b".repeat(40))];
+        let outcome = settle(
+            Forward::Moved {
+                moved: moved.clone(),
+                kept: Vec::new(),
+            },
+            (
+                None,
+                vec![(PathBuf::from("/web"), "example/web: dirty".into())],
+            ),
+            Some(&mut synced),
+            &remotes,
+        );
+        assert_eq!(
+            outcome,
+            Forward::Moved {
+                moved,
+                kept: Vec::new()
+            }
+        );
+        assert!(synced[0].kept_line.is_none());
+    }
+
+    /// `kept_repos` reads one sentence per kept repo from the record, the
+    /// same string the record holds, names only the kept one of three, and
+    /// says nothing once a full refresh has rewritten the snapshot.
+    #[test]
+    fn the_reader_returns_the_records_sentence_for_the_kept_repo_only() {
+        let remotes = BTreeMap::from([
+            (PathBuf::from("/api"), "example/api".to_string()),
+            (PathBuf::from("/web"), "example/web".to_string()),
+            (PathBuf::from("/jobs"), "example/jobs".to_string()),
+        ]);
+        let mut synced = vec![
+            row_of("example/api", Path::new("/api")),
+            row_of("example/web", Path::new("/web")),
+            row_of("example/jobs", Path::new("/jobs")),
+        ];
+        stamp_kept(
+            &mut synced,
+            &remotes,
+            &[(PathBuf::from("/web"), "example/web: behind".into())],
+        );
+        let record = SyncRecord::of(
+            &Forward::Kept("example/web: behind".into()),
+            synced.clone(),
+            "now".into(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        record.write(&dir.path().join(SYNC_RECORD)).unwrap();
+        let kept = kept_repos(dir.path());
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].repo, "example/web");
+        assert_eq!(kept[0].path, "/web");
+        assert_eq!(Some(&kept[0].line), synced[1].kept_line.as_ref());
+        assert_eq!(Some(&kept[0].reason_short), synced[1].kept_short.as_ref());
+        assert_eq!(kept[0].behind, Some(3));
+        // A snapshot written after the record: that copy is gone.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(dir.path().join("hosted/snapshot.json"), b"{}").unwrap();
+        assert!(kept_repos(dir.path()).is_empty());
+        // No record at all.
+        assert!(kept_repos(&dir.path().join("nowhere")).is_empty());
     }
 }

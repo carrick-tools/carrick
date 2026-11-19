@@ -9,8 +9,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
-import { heldLine, hostedLine } from "../src/render.ts";
-import { lastSync, type SyncRecord, type SyncedRepo } from "../src/hosted-snapshot.ts";
+import { hostedLine } from "../src/render.ts";
+import { keptLines, lastSync, type SyncRecord, type SyncedRepo } from "../src/hosted-snapshot.ts";
 
 const HOUR = 60 * 60_000;
 const DAY = 24 * HOUR;
@@ -43,6 +43,11 @@ const behind = row({
   copy_scanned_at: new Date(NOW - 8 * DAY).toISOString(),
   head_holds_hosted: false,
   behind: 93,
+  // As the Rust side writes them (`kept_sentence`): the tests below read the
+  // sentence from the record, never from a literal of their own.
+  kept_reason: "example/api: the hosted index is at bbbbbbb, which this checkout's HEAD does not hold",
+  kept_line: "KEPT-LINE-API-FROM-THE-RECORD",
+  kept_short: "KEPT-SHORT-API-FROM-THE-RECORD",
 });
 
 test("a copy at the hosted commit is fresh and has no hosted line", () => {
@@ -61,19 +66,21 @@ test("an older copy on this machine is stated apart, with its own age", () => {
 test("a record from an old check, with an older copy, says when it was taken", () => {
   assert.match(hostedLine(record([behind], NOW - 3 * DAY), NOW) ?? "", / Last checked 3 days ago\.$/);
 });
-test("the held line names how far behind HEAD is and the move", () => {
-  assert.equal(
-    heldLine(record([behind], NOW, "kept")),
-    "This checkout is 93 commits behind the hosted index of api (bbbbbbb), so this machine's copy cannot move forward. `git pull` (or a rebase onto the default branch) moves it.",
-  );
-  assert.match(heldLine(record([{ ...behind, head_detached: true }])) ?? "", /HEAD is detached\. Check out the default branch and `git pull` to move it\.$/);
-  assert.match(
-    heldLine(record([{ ...behind, fetched: false, behind: null }])) ?? "",
-    /^This clone has not fetched the hosted index of api \(bbbbbbb\), .* `git fetch`, then `git pull` \(or a rebase onto the default branch\), moves it\.$/,
-  );
-  // Nothing held: a copy at the hosted commit, or one HEAD can take.
-  assert.equal(heldLine(record([row()])), null);
-  assert.equal(heldLine(record([{ ...behind, head_holds_hosted: true }])), null);
+test("every kept repo's sentence is the record's, one per repo, and a current repo has none", () => {
+  const web = row({ repo: "example/web", kept_line: "KEPT-LINE-WEB-FROM-THE-RECORD", kept_short: "x" });
+  assert.deepEqual(keptLines(record([behind, row({ repo: "example/jobs" }), web], NOW, "kept")), [
+    behind.kept_line,
+    web.kept_line,
+  ]);
+  assert.deepEqual(keptLines(record([row()])), []);
+});
+
+test("a hosted line skips a repo with no single hosted commit", () => {
+  const noRow = row({ hosted_commit: "", copy_commit: "", kept_line: "KEPT-NO-ROW", kept_short: "y" });
+  assert.equal(hostedLine(record([noRow]), NOW), null);
+  assert.deepEqual(keptLines(record([noRow])), ["KEPT-NO-ROW"]);
+  // Beside a repo that is older, it adds nothing to the hosted line.
+  assert.equal(hostedLine(record([behind, noRow]), NOW), hostedLine(record([behind]), NOW));
 });
 
 test("a record of another shape reads as none", (t) => {
@@ -129,20 +136,49 @@ test("the session start opens with the hosted index, then says once a day that t
     "Carrick's MCP tools and fact lines read the hosted index: api at bbbbbbb (scanned 2 h ago). " +
       "The re-check, Read, uses and search lines read this machine's copy: api at aaaaaaa (scanned 8 days ago).",
   );
-  assert.match(lines[1] ?? "", /^This checkout is 93 commits behind the hosted index of api \(bbbbbbb\)/);
-  // The machine's own scan keeps its date, said to be this machine's.
+  // The record's own sentence, word for word.
+  assert.equal(lines[1], behind.kept_line);
   // A healthy index adds nothing beside them.
   assert.equal(lines.length, 3, first.stdout);
 
   const second = await runHook("session-start.ts", { cwd: workspace.root, env });
   assert.match(second.stdout, /^Carrick's MCP tools and fact lines read the hosted index/);
-  assert.doesNotMatch(second.stdout, /commits behind/, "the held line came twice in a day");
+  assert.doesNotMatch(second.stdout, new RegExp(behind.kept_line ?? "x"), "the kept line came twice in a day");
 
   const daily = await runHook("session-start.ts", {
     cwd: workspace.root,
     env: { ...env, CARRICK_HELD_NOTICE_COOLDOWN_MS: "0" },
   });
-  assert.match(daily.stdout, /commits behind/, "a day later it is said again");
+  assert.match(daily.stdout, new RegExp(behind.kept_line ?? "x"), "a day later it is said again");
+});
+
+test("a workspace with one kept repo and two current ones names only the kept one", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const web = row({ repo: "example/web" });
+  const jobs = row({ repo: "example/jobs" });
+  writeRecord(workspace.root, record([row(), { ...behind, repo: "example/api" }, web, jobs], Date.now() - 60_000, "moved"));
+  const run = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json") }),
+  });
+  assert.equal(run.stdout.split("\n").filter((line) => line === behind.kept_line).length, 1, run.stdout);
+  assert.doesNotMatch(run.stdout, /example\/(web|jobs)/);
+});
+
+test("a copy kept back for a reason that leaves it at the hosted commit is still said", async (t) => {
+  // A copy the heal could not carry, or a repo with no single commit: the
+  // hosted line has nothing to say, and the kept sentence is still printed.
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const dirty = row({ kept_reason: "example/api: dirty", kept_line: "KEPT-LINE-DIRTY", kept_short: "z" });
+  writeRecord(workspace.root, record([dirty], Date.now() - 60_000, "kept"));
+  const env = fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json") });
+  const first = await runHook("session-start.ts", { cwd: workspace.root, env });
+  assert.equal(first.stdout.trim(), "KEPT-LINE-DIRTY");
+  // The 24 hour claim holds for it too.
+  const second = await runHook("session-start.ts", { cwd: workspace.root, env });
+  assert.equal(second.stdout, "");
 });
 
 test("with no record a healthy session start prints nothing", async (t) => {

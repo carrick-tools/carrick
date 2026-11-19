@@ -30,6 +30,9 @@ export function snapshotRepos(root: string): unknown[] | null {
  */
 export type SyncedRepo = {
   repo: string;
+  /** The checkout this row describes. */
+  path?: string;
+  /** Empty where the hosted or held commits are not one line of history. */
   hosted_commit: string;
   hosted_scanned_at: string | null;
   copy_commit: string;
@@ -38,6 +41,17 @@ export type SyncedRepo = {
   fetched: boolean;
   behind: number | null;
   head_detached: boolean;
+  on_default_branch?: boolean | null;
+  /** Why this repo's copy did not move in the last run, or null. */
+  kept_reason?: string | null;
+  /**
+   * The one sentence that says this repo's copy is kept back and what to do,
+   * written by the Rust side (`kept_sentence` in `src/local_mode/hosted.rs`).
+   * Every surface prints this and words nothing of its own.
+   */
+  kept_line?: string | null;
+  /** The same fact as a clause for the end of an edit-time line. */
+  kept_short?: string | null;
 };
 
 /** `.carrick/hosted/last-sync.json` (`carrick.hosted-sync/0`). */
@@ -82,6 +96,14 @@ export function lastSync(root: string): SyncRecord | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The sentence for every repo whose copy the record says is kept back, in the
+ * record's order: the one place the session start reads it from.
+ */
+export function keptLines(sync: SyncRecord): string[] {
+  return sync.repos.flatMap((repo) => (repo.kept_line ? [repo.kept_line] : []));
 }
 
 /** One repo of this machine's copy: its folder, the single commit it was indexed at (null when it has none), and when. */

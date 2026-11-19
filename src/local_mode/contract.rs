@@ -287,6 +287,16 @@ pub struct Item {
 /// bounded and nothing downstream has to re-truncate it.
 pub const MAX_TYPE_TEXT_CHARS: usize = 200;
 
+/// What a `check` answer says of a kept-back copy: the clause the edit-time
+/// lines end with, and how far behind the checkout is when that is known. Both
+/// come from the record the background forward wrote; nothing here asks git.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CopyKept {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
+    pub reason_short: String,
+}
+
 /// The whole answer.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CheckOutput {
@@ -304,6 +314,12 @@ pub struct CheckOutput {
     pub repo: String,
     pub service: String,
     pub index_commit: String,
+    /// Set when this repo's local copy is kept back from the hosted index
+    /// (`kept_repos` in `hosted.rs`, read from `last-sync.json`): the edit-time
+    /// lines end with `reason_short`, so a reader is told the rows may be older
+    /// than the checkout. Absent on a repo whose copy is current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_kept: Option<CopyKept>,
     pub indexed_at: String,
     pub scanner_version: String,
     pub changed_since_index: usize,
@@ -1212,6 +1228,11 @@ pub struct StatusOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub analysing: Vec<String>,
     pub services: Vec<StatusService>,
+    /// Each repo whose local copy is kept back from the hosted index, with the
+    /// one sentence that says so and what to do (`kept_line` of
+    /// `last-sync.json`). Empty in the ordinary case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_back: Vec<super::hosted::KeptRepo>,
     /// What the last build's type check did: whether it ran, what it judged,
     /// and which verdicts are not in Carrick Cloud (carrick#1490). Absent
     /// for an index that predates it.
@@ -1294,6 +1315,11 @@ impl StatusOutput {
                 ));
             }
         }
+        // The record's sentence for each kept repo, word for word: this and
+        // the session start and the edit-time lines say it from one place.
+        for kept in &self.kept_back {
+            out.push_str(&format!("  {}\n", kept.line));
+        }
         for line in self.type_check.iter().flat_map(|check| check.lines()) {
             out.push_str(&format!("  {line}\n"));
         }
@@ -1356,6 +1382,7 @@ mod tests {
 
     pub(super) fn output() -> CheckOutput {
         CheckOutput {
+            copy_kept: None,
             hosted: None,
             hosted_state: Default::default(),
             hosted_checked_at: None,
@@ -2095,6 +2122,7 @@ mod hosted_wire_tests {
     /// a time against.
     fn status_output() -> StatusOutput {
         StatusOutput {
+            kept_back: Vec::new(),
             analysing: Vec::new(),
             repos_detected_by: None,
             repos_added: Vec::new(),

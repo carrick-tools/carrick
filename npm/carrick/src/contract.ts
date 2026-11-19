@@ -164,6 +164,12 @@ export type CheckResult = {
   repo?: string;
   service?: string;
   index_commit?: string;
+  /**
+   * Present when this repo's local copy is kept back from the hosted index:
+   * the clause the record holds (`kept_short` of `last-sync.json`), which
+   * the edit-time lines end with. Absent on a current copy.
+   */
+  copy_kept?: { behind?: number; reason_short: string };
   /** RFC 3339 time the index or the last refresh of this service ran. */
   indexed_at?: string;
   /** The scanner release that wrote the index. */
@@ -619,6 +625,11 @@ function checkResultOf(parsed: unknown): CheckResult | null {
   if (typeof parsed["repo"] === "string") result.repo = parsed["repo"];
   if (typeof parsed["service"] === "string") result.service = parsed["service"];
   if (typeof parsed["index_commit"] === "string") result.index_commit = parsed["index_commit"];
+  const kept = parsed["copy_kept"];
+  if (isRecord(kept) && typeof kept["reason_short"] === "string") {
+    result.copy_kept = { reason_short: kept["reason_short"] };
+    if (typeof kept["behind"] === "number") result.copy_kept.behind = kept["behind"];
+  }
   if (typeof parsed["indexed_at"] === "string") result.indexed_at = parsed["indexed_at"];
   if (typeof parsed["scanner_version"] === "string") {
     result.scanner_version = parsed["scanner_version"];

@@ -21,8 +21,8 @@ import { readStdin } from "./stdin.ts";
 import { status } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { heldLine, hostedLine, renderSessionStart } from "../render.ts";
-import { lastSync } from "../hosted-snapshot.ts";
+import { hostedLine, renderSessionStart } from "../render.ts";
+import { keptLines, lastSync } from "../hosted-snapshot.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { currentVersion } from "../update.ts";
 import { upgradeLines } from "./upgrade.ts";
@@ -207,12 +207,16 @@ export function hostedSync(
   // the fact file's own commits (`generation.ts`); that sentence says what the
   // record's line would.
   const hosted = generation ?? (sync ? hostedLine(sync, now) : null);
-  if (!hosted) return null;
-  const lines = [hosted];
-  const held = sync ? heldLine(sync) : null;
+  const lines = hosted ? [hosted] : [];
+  // Every kept repo's own sentence, from the record, whether or not the
+  // hosted line has anything to say: a copy kept back for a reason other than
+  // being older than the hosted commit has no hosted line to ride on.
+  const kept = sync ? keptLines(sync) : [];
   const cooldown = cooldownMs(env, "CARRICK_HELD_NOTICE_COOLDOWN_MS", HELD_NOTICE_COOLDOWN_MS);
-  if (held && claimRefresh(markerPath(root, "last-held-notice"), now, cooldown)) lines.push(held);
-  return lines;
+  if (kept.length > 0 && claimRefresh(markerPath(root, "last-held-notice"), now, cooldown)) {
+    lines.push(...kept);
+  }
+  return lines.length > 0 ? lines : null;
 }
 
 /** One write at the end, so the Codex form is a single JSON document. */
