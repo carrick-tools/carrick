@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "owner_node": "saveNote",
+      "method": "POST",
+      "path": "/saveNote",
+      "handler_name": "anonymous",
+      "pattern_matched": ".handler(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

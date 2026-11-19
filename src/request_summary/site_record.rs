@@ -2865,6 +2865,7 @@ mod tests {
             from: None,
             default: default.map(str::to_string),
             literal: literal.map(str::to_string),
+            maker: false,
         };
         let stated = |label: MethodLabel, member: &str| {
             let (label, stop) = procedure_wire_label(label, Some(member));
@@ -2904,6 +2905,7 @@ mod tests {
                 from: None,
                 default: None,
                 literal: literal.map(str::to_string),
+                maker: false,
             };
             let (label, stop) = procedure_wire_label(label, Some(member));
             (label.literal.or(label.default), stop)

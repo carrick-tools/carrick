@@ -515,7 +515,13 @@ fn procedure_route(
         file: site.file.clone(),
         line: site.line,
         method: method.to_uppercase(),
-        path: crate::utils::join_prefix_and_path("/", &key_path),
+        // A procedure named by its binding (contract amendment 13) is served
+        // at a path the code never writes.
+        path: if procedure.binding {
+            String::new()
+        } else {
+            crate::utils::join_prefix_and_path("/", &key_path)
+        },
         full_paths: procedure.full_paths.clone(),
         addresses: std::collections::BTreeMap::new(),
         handler: site

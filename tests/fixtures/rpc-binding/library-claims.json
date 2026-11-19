@@ -1,0 +1,97 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/rpc",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture/rpc",
+          "export": "defineFn",
+          "role": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": null
+            }
+          ],
+          "scopes": [
+            {
+              "of": "instance:()",
+              "member": "use",
+              "passes": true
+            },
+            {
+              "of": "instance:()",
+              "member": "validate",
+              "passes": true
+            }
+          ],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "handler",
+              "of": "instance:()",
+              "protocol": "rpc",
+              "handler": {
+                "arg": 0
+              },
+              "name": {
+                "bound": "binding"
+              },
+              "method_default": "GET",
+              "payload": {
+                "arg": 0,
+                "key": "data"
+              },
+              "method_key": {
+                "arg": 0,
+                "key": "method",
+                "maker": true
+              }
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/rpc",
+          "export": "useFn",
+          "role": "http_client",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "name": {
+                "arg": 0,
+                "ref": "function"
+              }
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": null,
+              "of": "instance:()",
+              "protocol": "rpc",
+              "name": {
+                "bound": "maker"
+              },
+              "payload": {
+                "arg": 0,
+                "key": "data"
+              }
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
