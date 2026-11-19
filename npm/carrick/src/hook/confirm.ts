@@ -133,12 +133,53 @@ export type NewestEarly = { result: CheckResult; engine?: string | undefined };
  * Whether early row `row` still stands as the same run (T1 P1.4): `newest`, the
  * newest early answer of the row's own service, lists its break with the run it
  * carries. An answer of another engine than the one that spoke the run (a
- * restarted engine re-gates, and a check that speaks is not armed), or no
- * answer at all, is no evidence it was fixed, and it stands.
+ * restarted engine re-gates, and a check that speaks is not armed) is no
+ * evidence either way (`engineChanged`): nothing prints or counts the break.
+ * No answer at all is no evidence it was fixed, and it stands.
  */
 export function standsAsRun(row: EarlyRow, newest: NewestEarly | undefined): boolean {
-  if (newest?.engine === undefined || engineOfRun(row.run) !== newest.engine) return true;
+  if (newest?.engine === undefined) return true;
+  if (engineChanged(row, newest)) return false;
   return stillStanding(row.listed, [newest.result]).some((r) => r.run === row.run);
+}
+
+/** Whether the newest early answer of the row's service came from another engine than the one that spoke the row's run. */
+const engineChanged = (row: EarlyRow, newest: NewestEarly | undefined): boolean => newest?.engine !== undefined && engineOfRun(row.run) !== newest.engine;
+
+/**
+ * An engine restart leaves an early break with no evidence either way (T4 P4.5):
+ * it is not counted, and the route it names is not called unjudged or clean
+ * either. `result` without the route items an unsettled break of `earlies`
+ * names.
+ */
+export function withoutUnsettled(result: CheckResult, earlies: Iterable<NewestEarly & { service?: string | undefined }>, newest: ReadonlyMap<string, NewestEarly>): CheckResult {
+  const labels = new Set<string>();
+  for (const early of earlies) {
+    const latest = early.service === undefined ? undefined : newest.get(early.service);
+    for (const row of earlyRows(early.result)) if (engineChanged(row, latest)) labels.add(row.label);
+  }
+  if (labels.size === 0) return result;
+  return { ...result, items: (result.items ?? []).filter((item) => !(item.kind === "route" && labels.has(itemLabel(item) ?? ""))) };
+}
+
+/**
+ * The files (workspace-relative, as an early answer names them) holding an early
+ * break that is not provably fixed (T4 P4.2, P4.5): listed by the newest early
+ * answer of its service as the same run, or left by another engine's answer.
+ * A clean line is never said for such a file.
+ */
+export function unsettledFiles(earlies: Iterable<NewestEarly & { service?: string | undefined; relative: string }>, newest: ReadonlyMap<string, NewestEarly>): Set<string> {
+  const files = new Set<string>();
+  for (const early of earlies) {
+    const latest = early.service === undefined ? undefined : newest.get(early.service);
+    for (const row of earlyRows(early.result)) {
+      if (latest === undefined || engineChanged(row, latest) || standsAsRun(row, latest)) {
+        files.add(early.relative);
+        files.add(row.moved?.file ?? early.relative);
+      }
+    }
+  }
+  return files;
 }
 
 /**
@@ -374,12 +415,16 @@ function movedBreak(row: MovedRow): CheckItem {
  * the same run (`newest`, T1 P1.4) was fixed since; every other row is added as
  * the early answer stated it.
  */
-export function withEarlyBreaks(full: CheckResult, early: CheckResult, newest?: NewestEarly): CheckResult {
+export function withEarlyBreaks(full: CheckResult, early: CheckResult, newest?: NewestEarly, counted?: Set<string>): CheckResult {
   const compared = compareEarly(early, full);
-  const kept = compared.rows.filter((c) => c.outcome === "part3_only" && standsAsRun(c.row, newest));
+  const key = (c: RowCompared): string => toldBreak(c.row.listed, c.row.run);
+  const stands = compared.rows.filter((c) => c.outcome === "part3_only" && standsAsRun(c.row, newest));
+  // A break an earlier answer of the session already counted (#4900), or part 2 states itself, counts once.
+  const kept = stands.filter((c) => !counted?.has(key(c)));
+  for (const c of [...stands, ...compared.rows.filter((r) => r.outcome !== "part3_only" && !r.corrected)]) counted?.add(key(c));
   const added = kept.map((c) => c.row.item ?? movedBreak(c.row.moved!));
-  if (added.length === 0) return full;
   // A route part 2 did not judge (or holds no row for) gives way to the early break.
-  const replaced = new Set(kept.filter((c) => c.match && "kind" in c.match).map((c) => c.match));
+  const replaced = new Set(stands.filter((c) => c.match && "kind" in c.match).map((c) => c.match));
+  if (added.length === 0) return full;
   return { ...full, items: [...(full.items ?? []).filter((item) => !replaced.has(item)), ...added] };
 }

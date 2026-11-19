@@ -14,9 +14,9 @@ import type { CheckResult } from "../contract.ts";
 import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedCleanLine, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
-import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, newestEarlies, owedFor, readAnswer, readEarly, sessionListing } from "./rechecks.ts";
+import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, newestEarlies, owedFor, readAnswer, readEarly, sessionEarlies, sessionListing } from "./rechecks.ts";
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
-import { confirmedResult, earlyRows, keepRows, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
+import { confirmedResult, earlyRows, keepRows, standingEarly, standsAsRun, toldBreak, unsettledFiles, withoutTold } from "./confirm.ts";
 import { markLed, markSaid, markTold, readSession, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
@@ -171,7 +171,9 @@ export function deliverEarlies(session: string, seen: Set<string>, home?: string
  */
 function cleanNamedLine(session: string, answer: Answer, home?: string): string | null {
   if (!isChanged(answer) || answer.changed?.exit !== 0) return null;
-  const files = [...new Set(answer.named ?? [])].sort();
+  // A file whose early break still stands, or that another engine's answer left unsettled, is not called clean (#4786).
+  const unsettled = unsettledFiles(sessionEarlies(session, home), newestEarlies(session, home));
+  const files = [...new Set(answer.named ?? [])].filter((file) => ![...unsettled].some((u) => u === file || file.endsWith(`/${u}`))).sort();
   if (files.length === 0) return null;
   const key = `clean:${files.join("\n")}`;
   if (wasSaid(session, answer.root, key, home)) return null;
