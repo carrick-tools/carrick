@@ -57,7 +57,7 @@ import {
 } from "./outdated.ts";
 import { expectedCarrickHooks, installedCarrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
 import { launcherDiffers, writeLauncher } from "./launcher.ts";
-import { trackedPaths } from "./repo-copies.ts";
+import { committedHooksAreOurs, trackedPaths } from "./repo-copies.ts";
 import { inspectTaskSkills, renderTaskSkill, scopeOf, SKILL_ROOTS, TASK_SKILLS, type TaskSkill } from "./task-skills.ts";
 
 /** Which settings files were rewritten for which version, so one removed on purpose stays removed. */
@@ -133,6 +133,11 @@ export function updateHooks(
     }
   }
   return changed;
+}
+
+/** File names as one phrase: "a", "a and b", "a, b and c". */
+function listed(files: string[]): string {
+  return files.length === 1 ? files[0]! : `${files.slice(0, -1).join(", ")} and ${files.at(-1)}`;
 }
 
 /** Task skills still ours and an older body, rewritten with the scope each was written with. */
@@ -282,15 +287,25 @@ export function bringUpToDate(
   if (written.length > 0) {
     lines.push(`Carrick brought its rules section in ${written.join(" and ")} up to date for ${running}.`);
   }
+  // A held settings file whose committed version holds none of our entries is an
+  // older version's uncommitted edit: nothing to commit, and `carrick init` puts
+  // it back (carrick#4881).
+  const ours = (file: string): boolean => projectDir !== null && !committedHooksAreOurs(projectDir, file);
+  const stray = settingsHeld.filter(ours);
   const skipped = [
-    ...settingsHeld.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))),
+    ...settingsHeld.filter((file) => !ours(file)).map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))),
     ...rootHeld,
   ];
-  held.push(...skipped);
-  if (skipped.length > 0) {
-    const named = skipped.length === 1 ? skipped[0]! : `${skipped.slice(0, -1).join(", ")} and ${skipped.at(-1)}`;
+  held.push(...stray.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))), ...skipped);
+  if (stray.length > 0) {
+    const named = listed(stray.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))));
     lines.push(
-      `Carrick did not update ${named} because git tracks them here. Run \`carrick init\`, then commit the change in its own pull request.`,
+      `An older Carrick version added hooks to ${named}, which git tracks. Run \`carrick init\` to move them to a file git ignores. Do not commit them.`,
+    );
+  }
+  if (skipped.length > 0) {
+    lines.push(
+      `Carrick did not update ${listed(skipped)} because git tracks them here. Run \`carrick init\`, then commit the change in its own pull request.`,
     );
   }
   // The recorded version is what the mismatch line compares. Move it only when

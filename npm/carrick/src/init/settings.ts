@@ -25,10 +25,8 @@ import { STOP_TIMEOUT_S } from "../hook/rechecks.ts";
  * of them, `carrick remove` clears both, and `carrick doctor` and the refresh
  * notice read both (carrick#1333).
  */
-export const SETTINGS_FILES = [
-  path.join(".claude", "settings.json"),
-  path.join(".claude", "settings.local.json"),
-];
+export const SHARED_SETTINGS = path.join(".claude", "settings.json");
+export const SETTINGS_FILES = [SHARED_SETTINGS, path.join(".claude", "settings.local.json")];
 
 export type HookEntry = {
   type: "command";
