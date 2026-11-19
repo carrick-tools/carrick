@@ -737,7 +737,7 @@ test("an early answer with no break is filed, never printed, and never reads as 
 test("switch off: nothing is asked, no early answer is filed", async (t) => {
   const ws = await workspace(t);
   const live = await liveDaemon(t, ws, () => [broken(ws)]);
-  await edit(ws, "s4", { CARRICK_COMPILER_LINES: "" });
+  await edit(ws, "s4", { CARRICK_COMPILER_LINES: "0" });
   assert.equal(live.requests.length, 0);
   assert.ok(!names(ws, "s4").some((n) => n.includes(".early.")), names(ws, "s4").join(" "));
 });

@@ -13,6 +13,7 @@
 // these repos the workspace holds, installs the local tools for them, and
 // reads their index in.
 
+import { memoryBudgetMb } from "../held/registry.ts";
 import { realPath } from "../fs-util.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -62,6 +63,11 @@ export const READY_SENTENCE =
   "The index is on this machine: `carrick check <file>` answers for a file, and your agent can ask who calls an operation.";
 
 /** The title of the block a run closes on (carrick#3286). */
+/** What the run says about the compiler check, which is on unless `CARRICK_COMPILER_LINES=0`. */
+export function compilerCheckNote(budgetMb: number = memoryBudgetMb()): string {
+  return `The compiler check is on by default. It starts on your first read or edit of a service, takes about 20 s on a large one, and holds up to ${budgetMb} MB of memory across all checkouts. To turn it off, set CARRICK_COMPILER_LINES=0 in the "env" block of .claude/settings.local.json, or in the shell you start Claude Code from.`;
+}
+
 export const CLOUD_NEXT_TITLE = "Done. Open a new agent session in this folder, then ask it:";
 
 /** The question the ready email also carries, so both say the same first thing. */
@@ -964,6 +970,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   const install = installSentence(installCommands(derived, readFromHosted));
   if (install !== null) out.warn(install);
   if (downloaded) out.done(READY_SENTENCE);
+  out.say(compilerCheckNote());
   out.note(CLOUD_NEXT_TITLE, cloudNextLines(codexTrust, plan.waiting.length > 0 || !downloaded));
   return 0;
 }

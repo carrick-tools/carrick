@@ -747,7 +747,7 @@ test("doctor says why an engine holds no check: capped, no placed file, no route
 test("doctor prints nothing about the compiler check when it is off and has never run", () => {
   const root = workspace({ "carrick.json": JSON.stringify({ services: [{ name: "api" }] }) });
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-")));
-  assert.deepEqual(checkCompilerCoverage(root, configuredRepos(root), home, {}), []);
+  assert.deepEqual(checkCompilerCoverage(root, configuredRepos(root), home, { CARRICK_COMPILER_LINES: "0" }), []);
 });
 
 test("a workspace of two repos: the records sit under the workspace root and each service reads under its own repo", () => {
