@@ -46,10 +46,9 @@ its findings list yet and that the list is built after a scan of main. Do not
 look for issues by hand and present them as the audit.
 
 Page until the last page. For each finding, read the producer's handler, the
-consumer's call site and the code that uses its result. Open source with your
-file-reading and search tools, not shell commands, which a restricted or
-non-interactive run may refuse. Where the finding does not show both types,
-narrow the pair:
+consumer's call site and the code that uses its result. Run one command per shell
+call, with no `;`, `&&`, `|` or `$(...)`: a non-interactive run refuses compound
+commands. Where the finding does not show both types, narrow the pair:
 
 ```
 get_contract_pair({{SCOPE}}, consumer_service: "<consumer>", producer_service: "<producer>", method: "<METHOD>", path: "<path>")
@@ -108,7 +107,7 @@ two copies"). TYPE-ONLY items go in a short list after it, as optional tidying.
 
 When a command or tool call you need is refused or fails, class any finding you
 cannot settle without it CAN'T TELL with the reason `refused: <the command>`.
-List every refused call under the tables.
+List every refused call under the tables, including any you then worked around.
 
 Name the protocols the findings came from (HTTP, GraphQL, sockets, pub/sub,
 queues, RPC routers) and the ones that held none.
