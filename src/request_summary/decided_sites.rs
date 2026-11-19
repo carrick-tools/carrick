@@ -5527,18 +5527,28 @@ fn base_slot<'e>(
     })
 }
 
-/// The environment variable the maker call `site` of `export` is handed as
-/// its base, as the resolver reads the claimed base slot through the
-/// module's bindings and the callers: `Some(name)` only where every value
-/// it reads renders as exactly one read of that one variable
-/// (`createClient(import.meta.env.URL, …)`, or a `const` holding it). A
-/// keyed slot (`{ url }`), a literal, a spread argument, or values that name
-/// another variable or more than one piece read `None`.
-fn maker_base_env(
+/// One environment read a maker's base is: the read as the source writes it
+/// (`import.meta.env.VITE_ORDERS_URL`, never re-spelled) and the variable it
+/// names (`VITE_ORDERS_URL`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EnvBase {
+    pub written: String,
+    pub name: String,
+}
+
+/// The environment read the maker call `site` of `export` is handed as its
+/// base, as the resolver reads the claimed base slot through the module's
+/// bindings and the callers: `Some` only where every value it reads renders
+/// as exactly one read of that one variable, spelled one way, with no `??`
+/// or `||` fallback (`createClient(import.meta.env.URL, …)`, or a `const`
+/// holding it). A keyed slot (`{ url }`), a literal, a spread argument, a
+/// fallback, or values that read another variable or more than one piece
+/// read `None`.
+pub(in crate::request_summary) fn maker_base_env(
     export: &crate::library_claims::ExportClaims,
     site: &super::LibrarySite,
     resolver: &Resolver<'_>,
-) -> Option<String> {
+) -> Option<EnvBase> {
     let slot = base_slot(export, site.form, site.member.as_deref())?;
     if slot.key.is_some()
         || site
@@ -5550,7 +5560,7 @@ fn maker_base_env(
     }
     let term = site.arg_texts.get(slot.arg as usize)?.as_ref()?;
     let values = resolver.pieces_through_callers(&site.file, term);
-    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut reads: BTreeSet<EnvBase> = BTreeSet::new();
     for value in &values {
         if falls_back(resolver, value).is_some() {
             return None;
@@ -5558,18 +5568,26 @@ fn maker_base_env(
         match rendered(resolver, value, value.callers.len()).as_slice() {
             [
                 Piece::Opaque {
-                    end: super::Root::Env { name, .. },
+                    end:
+                        super::Root::Env {
+                            written,
+                            name,
+                            fallback: None,
+                        },
                     ..
                 },
             ] => {
-                names.insert(name.clone());
+                reads.insert(EnvBase {
+                    written: written.clone(),
+                    name: name.clone(),
+                });
             }
             _ => return None,
         }
     }
-    let mut names = names.into_iter();
-    match (names.next(), names.next()) {
-        (Some(name), None) => Some(name),
+    let mut reads = reads.into_iter();
+    match (reads.next(), reads.next()) {
+        (Some(read), None) => Some(read),
         _ => None,
     }
 }
@@ -5609,8 +5627,8 @@ pub fn served_base_vars(
         else {
             continue;
         };
-        if let Some(name) = maker_base_env(export, site, &resolver) {
-            learned.entry(name).or_default().push((
+        if let Some(base) = maker_base_env(export, site, &resolver) {
+            learned.entry(base.name).or_default().push((
                 site.package().to_string(),
                 format!("{}:{}", relative(root, &site.file), site.line),
             ));
@@ -10065,7 +10083,15 @@ pub(crate) mod tests {
     /// What [`served_base_vars`] learns from `source`, written as
     /// `src/platform.ts` of a service that depends on the platform package,
     /// read with the rows a scan walks. `None` where the sidecar is not built.
-    fn learned_from(source: &str) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+    /// What [`served_base_vars`] learns from `source`, and every
+    /// [`maker_base_env`] of its library sites.
+    #[allow(clippy::type_complexity)]
+    fn learned_from(
+        source: &str,
+    ) -> Option<(
+        std::collections::BTreeMap<String, Vec<String>>,
+        Vec<EnvBase>,
+    )> {
         let manifest_text =
             "{ \"name\": \"web\", \"dependencies\": { \"@fixture/platform\": \"1.0.0\" } }\n";
         let on = super::super::fixture_walk::walked(
@@ -10077,47 +10103,59 @@ pub(crate) mod tests {
         )?;
         let library = crate::request_summary::library_sites(&on.inputs);
         let served = BTreeSet::from(["@fixture/platform".to_string()]);
+        let export = platform_export();
         let learned = served_base_vars(
             &on.repo,
             &library,
-            &[platform_export()],
+            std::slice::from_ref(&export),
             &on.inputs,
             &[],
             &served,
         );
-        Some(
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let bases = library
+            .sites
+            .iter()
+            .filter(|site| site.package() == "@fixture/platform")
+            .filter_map(|site| maker_base_env(&export, site, &resolver))
+            .collect();
+        Some((
             learned
                 .into_iter()
                 .map(|(name, makers)| (name, makers.into_iter().map(|(_, at)| at).collect()))
                 .collect(),
-        )
+            bases,
+        ))
     }
 
     /// A maker call handed a module constant that holds one env read, in
     /// either spelling, or the read itself, learns that variable at the
-    /// maker's line.
+    /// maker's line, and the read keeps the source's spelling.
     #[test]
     fn a_maker_made_on_an_env_read_learns_the_variable() {
-        for (source, name) in [
+        for (source, written, name) in [
             (
                 "import { createClient } from \"@fixture/platform\";\n\
                  const PLATFORM_URL = import.meta.env.VITE_PLATFORM_URL;\n\
                  export const client = createClient(PLATFORM_URL, \"anon\");\n",
+                "import.meta.env.VITE_PLATFORM_URL",
                 "VITE_PLATFORM_URL",
             ),
             (
                 "import { createClient } from \"@fixture/platform\";\n\
                  const PLATFORM_URL = process.env.PLATFORM_URL;\n\
                  export const client = createClient(PLATFORM_URL, \"anon\");\n",
+                "process.env.PLATFORM_URL",
                 "PLATFORM_URL",
             ),
             (
                 "import { createClient } from \"@fixture/platform\";\n\n\
                  export const client = createClient(import.meta.env.VITE_PLATFORM_URL, \"anon\");\n",
+                "import.meta.env.VITE_PLATFORM_URL",
                 "VITE_PLATFORM_URL",
             ),
         ] {
-            let Some(learned) = learned_from(source) else {
+            let Some((learned, bases)) = learned_from(source) else {
                 return;
             };
             let at = "services/web/src/platform.ts:3".to_string();
@@ -10126,11 +10164,20 @@ pub(crate) mod tests {
                 std::collections::BTreeMap::from([(name.to_string(), vec![at])]),
                 "{source}"
             );
+            assert_eq!(
+                bases,
+                vec![EnvBase {
+                    written: written.to_string(),
+                    name: name.to_string(),
+                }],
+                "{source}"
+            );
         }
     }
 
-    /// A literal base, a base two callers hand different variables, and a
-    /// spread argument learn nothing.
+    /// A literal base, a base two callers hand different variables, a
+    /// spread argument, and an env read with a `??` or `||` fallback learn
+    /// nothing.
     #[test]
     fn a_maker_not_made_on_one_env_read_learns_nothing() {
         for source in [
@@ -10143,11 +10190,17 @@ pub(crate) mod tests {
             "import { createClient } from \"@fixture/platform\";\n\
              const args: [string, string] = [process.env.PLATFORM_URL as string, \"anon\"];\n\
              export const client = createClient(...args);\n",
+            "import { createClient } from \"@fixture/platform\";\n\
+             const PLATFORM_URL = import.meta.env.VITE_PLATFORM_URL ?? \"https://abc.example.co\";\n\
+             export const client = createClient(PLATFORM_URL, \"anon\");\n",
+            "import { createClient } from \"@fixture/platform\";\n\
+             export const client = createClient(process.env.PLATFORM_URL || \"https://abc.example.co\", \"anon\");\n",
         ] {
-            let Some(learned) = learned_from(source) else {
+            let Some((learned, bases)) = learned_from(source) else {
                 return;
             };
             assert!(learned.is_empty(), "{source}: {learned:?}");
+            assert!(bases.is_empty(), "{source}: {bases:?}");
         }
     }
 }
