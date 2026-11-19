@@ -683,6 +683,17 @@ impl Reader {
             match may_move(path, name, &held, &now) {
                 // This repo keeps its copy; the others are decided alone.
                 Err(reason) => kept.push((path.clone(), reason)),
+                // The same commits: the copy still moves when the cloud
+                // stores a newer generation of them (a rescan at one commit).
+                Ok(None) if rescanned_in_place(&resolution, &old, name) => {
+                    match rescan_may_replace(path, name, &now) {
+                        Err(reason) => kept.push((path.clone(), reason)),
+                        Ok(to) => {
+                            approved.insert(path.clone(), now);
+                            moved.push((path.clone(), to));
+                        }
+                    }
+                }
                 Ok(None) => {
                     approved.insert(path.clone(), now);
                 }
@@ -791,13 +802,7 @@ fn may_move(
     if now == held {
         return Ok(None);
     }
-    let head = crate::git_state::head_commit(&repo).unwrap_or_default();
-    if !crate::git_state::is_ancestor(&repo, &to, &head) {
-        return Err(format!(
-            "{name}: the hosted index is at {}, which this checkout's HEAD does not hold",
-            short(&to)
-        ));
-    }
+    held_by_head(&repo, name, &to)?;
     if !crate::git_state::is_ancestor(&repo, &from, &to) {
         return Err(format!(
             "{name}: the hosted index at {} does not descend from {}",
@@ -806,6 +811,84 @@ fn may_move(
         ));
     }
     Ok(Some(to))
+}
+
+/// The one "never ahead of HEAD" test of a move: `to` must be held by the
+/// checkout's HEAD. [`may_move`] applies it to a move to a newer commit and
+/// [`rescan_may_replace`] to a rescan at the commit already held.
+fn held_by_head(repo: &str, name: &str, to: &str) -> Result<(), String> {
+    let head = crate::git_state::head_commit(repo).unwrap_or_default();
+    if crate::git_state::is_ancestor(repo, to, &head) {
+        return Ok(());
+    }
+    Err(format!(
+        "{name}: the hosted index is at {}, which this checkout's HEAD does not hold",
+        short(to)
+    ))
+}
+
+/// Whether the cloud stores a different generation of repo `name`'s index than
+/// the one `old` downloaded, at the commits both hold: a rescan at the same
+/// commit (a new release, a late label, another machine) stores new rows under
+/// the same hash, and only the row's `updated_at` says so (carrick#1673). The
+/// rows compared are [`project_is_unchanged`]'s fourth rule, for this repo
+/// alone. A row with no `updated_at` cannot be compared and is never "newer".
+fn rescanned_in_place(resolution: &Resolution, old: &Snapshot, name: &str) -> bool {
+    let Some(project) = resolution
+        .repos
+        .iter()
+        .find(|repo| repo.connected && repo.full_name.eq_ignore_ascii_case(name))
+        .and_then(|repo| repo.project_id.clone())
+    else {
+        return false;
+    };
+    let basename = name
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut named: Vec<StoredRow> = Vec::new();
+    for (repo, service) in service_rows(resolution, &project) {
+        if repo != basename {
+            continue;
+        }
+        let (Some(hash), Some(updated_at)) = (service.hash.clone(), service.updated_at.clone())
+        else {
+            return false;
+        };
+        named.push(StoredRow {
+            repo,
+            service: service.service.clone(),
+            hash,
+            updated_at: Some(updated_at),
+        });
+    }
+    named.sort();
+    let mut held: Vec<StoredRow> = old
+        .stored_rows
+        .get(&project)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.repo == basename)
+        .cloned()
+        .collect();
+    held.sort();
+    !named.is_empty() && named != held
+}
+
+/// The commit a rescan at the commits already held replaces the copy at, or
+/// the reason it may not: the same HEAD test as any move ([`held_by_head`]).
+fn rescan_may_replace(
+    path: &Path,
+    name: &str,
+    now: &std::collections::BTreeSet<String>,
+) -> Result<String, String> {
+    let repo = path.to_string_lossy();
+    let to = newest_commit(&repo, now).ok_or_else(|| {
+        format!("{name}: the hosted index spans commits that are not one line of history")
+    })?;
+    held_by_head(&repo, name, &to)?;
+    Ok(to)
 }
 
 /// The commit of `commits` that holds every other one in its history, or
@@ -3817,6 +3900,99 @@ mod tests {
         BTreeMap::from([(repo.to_path_buf(), "example/api".to_string())])
     }
 
+    const RESCANNED_AT: &str = "2026-10-04T10:00:00.000Z";
+
+    /// [`resolved_at`] after the cloud rescanned the repo at the same commit:
+    /// the row's `updated_at` is `at`.
+    fn rescanned_at(hash: &str, at: &str) -> serde_json::Value {
+        let mut metadata = resolved_at(hash);
+        metadata["repos"][0]["services"][0]["updated_at"] = json!(at);
+        metadata
+    }
+
+    /// T3: the cloud rescanned at the commit this machine holds. The copy is
+    /// replaced by the new generation, which the readers then read.
+    #[tokio::test]
+    async fn a_rescan_at_the_held_commit_replaces_the_copy() {
+        let (dir, _, b, _) = moved_on_repo();
+        let (url, requests) = serve_sequence(vec![
+            (
+                "200 OK",
+                serde_json::to_vec(&rescanned_at(&b, RESCANNED_AT)).unwrap(),
+            ),
+            (
+                "200 OK",
+                answered(&[(named_blob("api", "api", &b), RESCANNED_AT)]),
+            ),
+        ]);
+        let remotes = remotes_of(dir.path());
+        let (outcome, snapshot, _) = reader(url)
+            .forward(&credential("test"), &remotes, held_at(&b))
+            .await;
+        assert_eq!(
+            outcome,
+            Forward::Moved {
+                moved: vec![(dir.path().to_path_buf(), b.clone())],
+                kept: Vec::new()
+            }
+        );
+        assert_eq!(requests.join().unwrap().len(), 2);
+        let snapshot = snapshot.unwrap();
+        assert_eq!(
+            snapshot.stored_rows["p"][0].updated_at.as_deref(),
+            Some(RESCANNED_AT)
+        );
+        let input = HostedInput {
+            snapshot: Some(snapshot),
+            remotes,
+            ..Default::default()
+        };
+        assert_eq!(input.local_blobs(dir.path()).len(), 1);
+    }
+
+    /// T3: the same commit and the same scan is current: one metadata
+    /// request and nothing downloaded.
+    #[tokio::test]
+    async fn the_same_scan_at_the_held_commit_is_current_for_one_request() {
+        let (dir, _, b, _) = moved_on_repo();
+        let (url, requests) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&resolved_at(&b)).unwrap(),
+        )]);
+        let (outcome, snapshot, _) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&b))
+            .await;
+        assert_eq!(outcome, Forward::Current);
+        assert!(snapshot.is_none());
+        assert_eq!(requests.join().unwrap().len(), 1);
+    }
+
+    /// T3: a rescan at the held commit follows the rule of any move: a
+    /// checkout whose HEAD does not hold the commit keeps its copy, with the
+    /// reason, for one request.
+    #[tokio::test]
+    async fn a_rescan_the_checkout_does_not_hold_is_kept_with_its_reason() {
+        use crate::git_state::tests::git_in;
+        let (dir, a, b, _) = moved_on_repo();
+        git_in(dir.path(), &["checkout", "-q", &a]);
+        let (url, requests) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&rescanned_at(&b, RESCANNED_AT)).unwrap(),
+        )]);
+        let (outcome, snapshot, _) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&b))
+            .await;
+        assert_eq!(
+            outcome,
+            Forward::Kept(format!(
+                "example/api: the hosted index is at {}, which this checkout's HEAD does not hold",
+                short(&b)
+            ))
+        );
+        assert!(snapshot.is_none());
+        assert_eq!(requests.join().unwrap().len(), 1);
+    }
+
     /// The hosted index moved from A to B, B is in HEAD's history: the
     /// snapshot moves to B, and the change base of `check --changed` with it,
     /// so the manifest main changed between A and B no longer re-reads every
@@ -4256,14 +4432,22 @@ mod tests {
         /// The cloud now: every repo at B, where `web` gained a second
         /// service, so a kept `web` must keep the service list it had.
         fn hosted(&self) -> serde_json::Value {
-            in_one_project(&[
+            let mut hosted = in_one_project(&[
                 ("example/api", vec![("api", &self.api.2)]),
                 (
                     "example/web",
                     vec![("web", &self.web.2), ("web-worker", &self.web.2)],
                 ),
                 ("example/jobs", vec![("jobs", &self.jobs.2)]),
-            ])
+            ]);
+            // The rows say what the download says ([`Self::downloaded`]): a
+            // row stored at another time than its blob is a rescan.
+            for repo in hosted["repos"].as_array_mut().unwrap() {
+                for service in repo["services"].as_array_mut().unwrap() {
+                    service["updated_at"] = json!(MOVED_AT);
+                }
+            }
+            hosted
         }
 
         /// The download of project `p` at B, every row stored at
