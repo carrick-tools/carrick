@@ -240,6 +240,28 @@ fn flat_rows(scan: &Scan, service: &str) -> Vec<String> {
     rows
 }
 
+/// The unread sites `scan` saves for `service` with `reason`, as
+/// `file:line reason`.
+fn unread_sites(scan: &Scan, service: &str, reason: &str) -> Vec<String> {
+    let mut sites = Vec::new();
+    for blob in &scan.blobs {
+        if blob["service_name"].as_str() != Some(service) {
+            continue;
+        }
+        for site in blob["unread_sites"].as_array().cloned().unwrap_or_default() {
+            if site["reason"].as_str() == Some(reason) {
+                sites.push(format!(
+                    "{}:{} {reason}",
+                    site["file"].as_str().unwrap_or_default(),
+                    site["line"]
+                ));
+            }
+        }
+    }
+    sites.sort();
+    sites
+}
+
 /// The count `key` of `service`'s fallbacks line in `scan`, 0 when unstated.
 fn count(scan: &Scan, service: &str, key: &str) -> u64 {
     scan.fallbacks
@@ -336,7 +358,8 @@ fn a_model_row_at_the_definition_is_replaced_not_duplicated() {
 
 /// Without a pass-through claim on the builder's chained members the maker
 /// call is not reached from `saveNote`'s op call, so its method is unread:
-/// no row is written there and the site is counted. The definitions written
+/// no row is written there, and the definition is saved as an unread site
+/// with the instance walk's reason (`unread`). The definitions written
 /// directly on the maker's result keep theirs.
 #[test]
 fn a_chained_definition_reads_its_method_only_through_pass_through_members() {
@@ -349,18 +372,31 @@ fn a_chained_definition_reads_its_method_only_through_pass_through_members() {
             format!(r#"{NOTES}:5 POST "/saveNote" "/saveNote" model saveNote => -"#),
         ]
     );
+    let saved = unread_sites(scan, "declared", "unread");
+    assert_eq!(saved, vec![format!("{NOTES}:5 unread")], "{saved:#?}");
+    // With the pass-through claims nothing there is unread.
     assert_eq!(
-        count(scan, "declared", "routes_untraced_method_unstated"),
-        1
+        unread_sites(&declared()[0], "declared", "unread"),
+        Vec::<String>::new()
     );
 }
 
 /// Two definitions one declaration holds (an object of them under
-/// `grouped`) would share one key: neither states a row.
+/// `grouped`) would share one key: neither states a row, and each is saved
+/// as an unread site with `procedure_router_ambiguous`.
 #[test]
-fn two_definitions_under_one_declaration_state_no_row() {
-    let rows = producer_rows(&declared()[0], "declared");
+fn two_definitions_under_one_declaration_are_saved_ambiguous() {
+    let scan = &declared()[0];
+    let rows = producer_rows(scan, "declared");
     assert!(!rows.iter().any(|row| row.contains("grouped")), "{rows:#?}");
+    let grouped = "services/declared/src/grouped.ts";
+    assert_eq!(
+        unread_sites(scan, "declared", "procedure_router_ambiguous"),
+        vec![
+            format!("{grouped}:4 procedure_router_ambiguous"),
+            format!("{grouped}:5 procedure_router_ambiguous"),
+        ]
+    );
 }
 
 /// A definition no model row stands at (`unused`, no caller) is written,

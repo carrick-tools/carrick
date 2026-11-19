@@ -2352,6 +2352,8 @@ fn record(
     // A procedure subscription the library's HTTP adapter does not serve: the
     // site is a lead with its stop, never a row (carrick#4048).
     let mut no_wire_method = false;
+    // Set where a binding-named procedure's maker method is unread.
+    let mut maker_method_unread = false;
     if procedure {
         let (wire, stop) = procedure_wire_label(method_label, label.member.as_deref());
         method_label = wire;
@@ -2507,8 +2509,22 @@ fn record(
         };
         match methods.as_slice() {
             [one] if stated_word(one) => decide(Slot::Method, methods.clone(), true, method_basis),
-            _ => decide(Slot::Method, Vec::new(), true, method_basis),
+            _ => {
+                // A procedure named by its binding (contract amendment 13)
+                // whose method sits on the maker call the instance walk did
+                // not reach: the site is saved unread, with the walk's own
+                // reason, never left as a counted route.
+                maker_method_unread = method_label.maker
+                    && site
+                        .procedure
+                        .as_ref()
+                        .is_some_and(|procedure| procedure.binding);
+                decide(Slot::Method, Vec::new(), true, method_basis)
+            }
         }
+    }
+    if maker_method_unread {
+        note_hole(&name_hole, Stop::Unread);
     }
     if !several_names.is_empty() {
         basis.insert(Slot::Name, Basis::Code);
@@ -2519,7 +2535,7 @@ fn record(
         note_hole(&name_hole, stop);
     }
 
-    let bucket = if name_unstated {
+    let bucket = if name_unstated || maker_method_unread {
         Bucket::Lead
     } else if asked.is_empty() {
         Bucket::Forced

@@ -21,12 +21,13 @@ Both store answers carry the D3 op on `defineFn`, the D4 make and op on
 `useFn`, and two pass-through scopes on `defineFn`'s instance (`use`,
 `validate`, `passes: true`). Without them the instance walk stops at a
 chained call, so `saveNote`'s op call never reaches its maker call and its
-method (`maker: true`) is unread: no row is written at line 5 and the model's
-row stands (`routes_untraced_method_unstated`; the control test strips them).
+method (`maker: true`) is unread: no row is written at line 5, the model's
+row stands, and the definition is saved as an unread site with reason
+`unread` (the instance walk's own reason; the control test strips them).
 
 `services/declared/src/grouped.ts` holds two definitions under one
-declaration: they would share one key, so neither states a row
-(`procedure_router_ambiguous`).
+declaration: they would share one key, so neither states a row, and both
+(lines 4 and 5) are saved as unread sites with `procedure_router_ambiguous`.
 
 `__llm__/analyze-file/notes.functions.json` is the model's answer for
 `notes.functions.ts`: one row, `POST /saveNote` at line 5, a path the app
@@ -60,3 +61,18 @@ procedure.
 
 Two pairs, one orphan (`unused`). Request types `{ body: string }` and
 `undefined`; response types `{ ok: boolean }` and `{ id: number }[]` (T1).
+
+## For S2
+
+- The analyzer's matched and orphan keys carry no procedure: `analyzer/mod.rs`
+  keys a producer as `method:full_path` plus the dispatch case, where pairing
+  inserts its winners (`matched_endpoints`, about line 2941), in the consumed
+  key (about line 3153) and in the orphan lookup (about line 3391). Every
+  `POST ""` procedure of a service therefore shares one key: one paired
+  procedure marks the others consumed, and their orphans go unreported.
+  The procedure belongs on those keys, as `procedure_suffix` is on the
+  merge key (`mount_graph.rs` `endpoint_merge_key`).
+- The run's procedure set is the decided sites: read `DecidedSite.procedure`
+  where `binding` is true. Its `at` holds the key path, the file and the
+  router binding; the wire method is the site record's (the Method slot),
+  read once there.
