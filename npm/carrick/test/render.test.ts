@@ -19,6 +19,7 @@ import {
 } from "../src/render.ts";
 import fs from "node:fs";
 import path from "node:path";
+import { parseCheckResult, SCHEMA } from "../src/contract.ts";
 import type { Boundary, CheckItem, CheckResult } from "../src/contract.ts";
 import { messageOf } from "../src/diagnostics.ts";
 import { asStated, fixture, statusFixture, testDir } from "./helpers.ts";
@@ -1330,6 +1331,26 @@ test("the Read hook withholds the row's line in a changed file and prints counte
   assert.match(moved, /- index\.ts route POST/);
   assert.doesNotMatch(moved, /index\.ts:1:1/);
   assert.match(moved, /cli src\/a\.ts \(changed since the index\), web src\/b\.ts:9 \(line as of abc1234\)/);
+});
+
+// Local-copy refresh T2: the Read hook says the repo's copy is kept back, with
+// the clause the record holds and no wording of its own; a current copy adds nothing.
+test("the Read hook ends its header with the record's kept clause, and only for a kept copy", () => {
+  const base = { ...dispatchRows(["start-scan"]), index_commit: "abcdef1234567" } as CheckResult;
+  const plain = renderPostRead(base, "index.ts") ?? "";
+  assert.doesNotMatch(plain, /kept back/);
+  const clause = "CLAUSE-FROM-THE-RECORD";
+  const kept = renderPostRead({ ...base, copy_kept: { reason_short: clause, behind: 3 } }, "index.ts") ?? "";
+  assert.match(kept, new RegExp(`\\(indexed at abcdef1, kept back: ${clause}\\)`));
+  assert.equal(kept.replace(`, kept back: ${clause}`, ""), plain);
+});
+
+test("a check answer's copy_kept is read from the wire, and absent stays absent", () => {
+  const wire = (extra: object) =>
+    parseCheckResult(JSON.stringify({ schema: SCHEMA, items: [], ...extra }));
+  assert.deepEqual(wire({ copy_kept: { reason_short: "x", behind: 2 } })?.copy_kept, { reason_short: "x", behind: 2 });
+  assert.equal(wire({})?.copy_kept, undefined);
+  assert.equal(wire({ copy_kept: { behind: 2 } })?.copy_kept, undefined);
 });
 
 // HM4 T3: an early answer's moved-rows headline follows the moved rows' roles.

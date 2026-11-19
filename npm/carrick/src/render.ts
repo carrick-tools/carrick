@@ -655,6 +655,16 @@ export function renderPostToolUse(
 }
 
 /**
+ * `, kept back: <why>` for an edit-time line whose repo's local copy is kept
+ * back from the hosted index, the clause the Rust side wrote into the record
+ * (`kept_short`, carried by the check answer as `copy_kept`); empty for a
+ * current copy. Nothing is worded here.
+ */
+export function keptClause(result: CheckResult): string {
+  return result.copy_kept ? `, kept back: ${result.copy_kept.reason_short}` : "";
+}
+
+/**
  * The PostToolUse context for a file the agent has just read (carrick#2069), or
  * `null` when there is nothing to say: no header on an empty answer, because a
  * header on every Read would be noise.
@@ -671,7 +681,7 @@ export function renderPostRead(result: CheckResult, displayFile?: string): strin
   if (uses.length === 0 && items.length === 0) return null;
 
   const lines: string[] = [
-    `Carrick: other code depends on ${where} (indexed at ${shortHash(result.index_commit)}). Open these before you change what they use:`,
+    `Carrick: other code depends on ${where} (indexed at ${shortHash(result.index_commit)}${keptClause(result)}). Open these before you change what they use:`,
   ];
   lines.push(...uses.slice(0, MAX_USE_LINES));
   // A line printed twice tells the agent nothing the first did not (carrick#3956).
@@ -813,7 +823,11 @@ export function hostedLine(sync: SyncRecord, now: number): string | null {
   const older = sync.repos.filter((repo) => repo.copy_commit !== repo.hosted_commit);
   // A copy at the hosted commit is a fresh index: nothing to say.
   if (!older.length) return null;
-  const hosted = sync.repos.map((repo) => indexAt(repo, repo.hosted_commit, repo.hosted_scanned_at, now));
+  // A repo with no single hosted commit (empty) has none to name here; its
+  // own sentence is the record's `kept_line`.
+  const hosted = sync.repos
+    .filter((repo) => repo.hosted_commit !== "")
+    .map((repo) => indexAt(repo, repo.hosted_commit, repo.hosted_scanned_at, now));
   const copies = older.map((repo) => indexAt(repo, repo.copy_commit, repo.copy_scanned_at, now));
   let line = generationStatement(named(hosted), named(copies));
   const checked = Date.parse(sync.at);
@@ -821,33 +835,6 @@ export function hostedLine(sync: SyncRecord, now: number): string | null {
     line += ` Last checked ${ago(sync.at, now)}.`;
   }
   return line;
-}
-
-/**
- * The line for a copy HEAD keeps back (carrick#3433): the hosted commit is
- * not in HEAD's history, so `refresh --hosted-only` cannot move the copy to
- * it. Staying on the branch's base is correct; the line makes it visible and
- * names the move. Null when no repo is held.
- */
-export function heldLine(sync: SyncRecord): string | null {
-  const held = sync.repos.find(
-    (repo) => repo.copy_commit !== repo.hosted_commit && !repo.head_holds_hosted,
-  );
-  if (!held) return null;
-  const target = `the hosted index of ${repoName(held)} (${held.hosted_commit.slice(0, 7)})`;
-  const stuck = "so this machine's copy cannot move forward.";
-  const pull = "`git pull` (or a rebase onto the default branch)";
-  if (!held.fetched) {
-    return `This clone has not fetched ${target}, ${stuck} \`git fetch\`, then ${pull}, moves it.`;
-  }
-  const behind =
-    held.behind !== null
-      ? `This checkout is ${held.behind} commit${held.behind === 1 ? "" : "s"} behind ${target}`
-      : `This checkout's HEAD does not hold ${target}`;
-  if (held.head_detached) {
-    return `${behind}, ${stuck} HEAD is detached. Check out the default branch and \`git pull\` to move it.`;
-  }
-  return `${behind}, ${stuck} ${pull} moves it.`;
 }
 
 /**

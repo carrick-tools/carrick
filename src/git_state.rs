@@ -493,6 +493,16 @@ pub fn head_is_detached(repo_path: &str) -> bool {
     run_git(repo_path, &["symbolic-ref", "-q", "HEAD"]).is_err()
 }
 
+/// Whether HEAD is on the repo's default branch ([`main_branch`], without its
+/// remote prefix): where `git pull` brings a checkout up to the hosted
+/// commit. `None` when HEAD is detached or no default branch resolves.
+pub fn on_default_branch(repo_path: &str) -> Option<bool> {
+    let current = run_git(repo_path, &["symbolic-ref", "-q", "--short", "HEAD"]).ok()?;
+    let default = main_branch(repo_path)?;
+    let default = default.strip_prefix("origin/").unwrap_or(&default);
+    Some(current.trim() == default)
+}
+
 /// Whether the trees of commits `a` and `b` differ under `repo_path`.
 ///
 /// `Err` when either is not a commit id this clone holds, or git could not

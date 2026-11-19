@@ -393,8 +393,19 @@ pub fn answer(
         .map(|uses| uses.lines(&service))
         .unwrap_or_default();
 
+    // From the record the background forward wrote: one small file, and no
+    // git call, so a hook that asks for this answer pays nothing for it.
+    let copy_kept = super::hosted::kept_repos(&workspace_root.join(super::workspace::INDEX_DIR))
+        .into_iter()
+        .find(|kept| Path::new(&kept.path) == Path::new(&repo.path))
+        .map(|kept| super::contract::CopyKept {
+            behind: kept.behind,
+            reason_short: kept.reason_short,
+        });
+
     super::recheck::took("check/answer", started);
     Ok(CheckOutput {
+        copy_kept,
         hosted: enrichment.hosted,
         hosted_state: enrichment.hosted_state,
         hosted_checked_at: index.hosted_checked_at.clone(),
@@ -528,6 +539,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
     }
 
     Ok(StatusOutput {
+        kept_back: super::hosted::kept_repos(&workspace_root.join(super::workspace::INDEX_DIR)),
         repos_detected_by: index.repos_detected_by.clone(),
         repos_added: index.repos_added.clone(),
         repos_excluded: index.repos_excluded.clone(),
@@ -2072,6 +2084,110 @@ mod drift_tests {
             ask("api").is_ok(),
             "and the repo this install covers still is"
         );
+    }
+
+    /// A repo whose copy `last-sync.json` says is kept back is said so by
+    /// `status` and by the `check` answer for its files, from the record's own
+    /// words; the two repos that are current say nothing, and a workspace with
+    /// no record says nothing at all.
+    #[test]
+    fn a_kept_repo_is_said_by_status_and_check_and_a_current_one_is_not() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut paths = BTreeMap::new();
+        for name in ["api", "web", "jobs"] {
+            std::fs::create_dir_all(folder.path().join(name).join("src")).unwrap();
+            std::fs::write(
+                folder.path().join(name).join("src/main.ts"),
+                "export const a = 1;",
+            )
+            .unwrap();
+            paths.insert(
+                name,
+                folder
+                    .path()
+                    .join(name)
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        let repo = |name: &str| IndexedRepo {
+            path: paths[name].clone(),
+            name: name.to_string(),
+            services: vec![service(None, "")],
+            files: Default::default(),
+            uses: None,
+            unread: Default::default(),
+            read_from_hosted: false,
+        };
+        let index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_source_key: None,
+            hosted_checked_at: None,
+            version: crate::local_mode::read_model::READ_MODEL_VERSION,
+            scanner_version: "test".to_string(),
+            scanner_build: None,
+            indexed_at: "2026-09-12T10:00:00Z".to_string(),
+            repos: vec![repo("api"), repo("web"), repo("jobs")],
+            type_check: None,
+        };
+        let index_dir = folder.path().join(crate::local_mode::workspace::INDEX_DIR);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        index.write(&index_dir.join("index.json")).unwrap();
+        let ask = |name: &str| {
+            answer(
+                &mut Asked::default(),
+                folder.path(),
+                &folder.path().join(name).join("src/main.ts"),
+                Mode::Check,
+                Freshness::Indexed,
+            )
+            .expect("an answer")
+        };
+
+        // No record: nothing is said anywhere.
+        assert!(status(folder.path()).unwrap().kept_back.is_empty());
+        assert!(ask("web").copy_kept.is_none());
+
+        // The record's words, written once and read by both surfaces.
+        let line = "RECORD-SENTENCE-FOR-WEB";
+        let short = "RECORD-CLAUSE-FOR-WEB";
+        let row = |name: &str, kept: bool| {
+            serde_json::json!({
+                "repo": format!("example/{name}"), "path": paths[name],
+                "hosted_commit": "b", "copy_commit": "a",
+                "behind": 2,
+                "kept_line": kept.then_some(line), "kept_short": kept.then_some(short)
+            })
+        };
+        std::fs::create_dir_all(index_dir.join("hosted")).unwrap();
+        std::fs::write(
+            index_dir.join(super::super::hosted::SYNC_RECORD),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "carrick.hosted-sync/0", "at": "now", "outcome": "kept",
+                "reason": null,
+                "repos": [row("api", false), row("web", true), row("jobs", false)]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let said = status(folder.path()).unwrap();
+        assert_eq!(said.kept_back.len(), 1, "{:?}", said.kept_back);
+        assert_eq!(said.kept_back[0].repo, "example/web");
+        assert_eq!(said.kept_back[0].line, line);
+        let text = said.render();
+        assert_eq!(text.matches(line).count(), 1, "{text}");
+        let web = ask("web")
+            .copy_kept
+            .expect("the kept repo's answer says so");
+        assert_eq!(web.reason_short, short);
+        assert_eq!(web.behind, Some(2));
+        assert!(ask("api").copy_kept.is_none() && ask("jobs").copy_kept.is_none());
     }
 
     /// An index that predates `uses` and one that recorded none for the file
