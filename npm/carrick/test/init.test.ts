@@ -45,6 +45,7 @@ import {
   cloudNextLines,
   ASK_YOUR_AGENT_PROMPT,
   type InitOptions,
+  compilerCheckNote,
 } from "../src/init/run.ts";
 import { inspectTaskSkills, removeTaskSkills, taskSkillPaths, taskSkillWarnings, writeTaskSkills } from "../src/init/task-skills.ts";
 import { checkTaskSkills } from "../src/init/doctor.ts";
@@ -3190,4 +3191,11 @@ test("moving an older install's hooks out of the shared file keeps an allow entr
   } finally {
     fixture.cleanup();
   }
+});
+
+test("init says the compiler check is on, its memory budget and its off switch", () => {
+  const text = compilerCheckNote(4096);
+  assert.match(text, /^The compiler check is on by default\./);
+  assert.match(text, /holds up to 4096 MB of memory across all checkouts/);
+  assert.match(text, /CARRICK_COMPILER_LINES=0 in your shell or in the "env" block of \.claude\/settings\.local\.json/);
 });

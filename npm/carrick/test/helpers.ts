@@ -246,6 +246,9 @@ export function fakeEnv(overrides: Record<string, string> = {}): NodeJS.ProcessE
     ...withoutLineSwitches(),
     CARRICK_BIN: fakeBin,
     CARRICK_LOG_QUIET: "1",
+    // The compiler check is on by default and would start a real daemon from a session start; these
+    // tests are about the CLI's lines, so it is off here. A test of the compiler check sets it after this.
+    CARRICK_COMPILER_LINES: "0",
     CARRICK_FAKE_FIXTURE: fixturePath("check-mismatch.json"),
     // The fixtures speak in absolute paths under /workspace; an integration
     // test's workspace is a fresh temp directory, so the fake CLI rebases them.

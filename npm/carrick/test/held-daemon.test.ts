@@ -139,13 +139,15 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r));
 }
 
-test("the switch needs CARRICK_COMPILER_LINES=1 and the contract line on", () => {
-  assert.equal(compilerLinesEnabled({}), false);
-  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1" }), true, "the contract line is on by default");
+test("the switch is on unless CARRICK_COMPILER_LINES is exactly 0, and needs the contract line on", () => {
+  assert.equal(compilerLinesEnabled({}), true, "unset is on");
+  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "" }), true, "empty is on");
+  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1" }), true);
+  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "true" }), true);
+  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "0" }), false);
   assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "0" }), false);
-  assert.equal(compilerLinesEnabled({ CARRICK_CONTRACT_LINES: "1" }), false);
-  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" }), true);
-  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "true", CARRICK_CONTRACT_LINES: "1" }), false);
+  assert.equal(compilerLinesEnabled({ CARRICK_CONTRACT_LINES: "0" }), false);
+  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1", CARRICK_FACT_LINES: "0" }), false);
 });
 
 test("a file in no service answers none at once and starts nothing", async () => {
@@ -480,7 +482,7 @@ test("a second ensureHeld starts nothing; with the switch off, none starts", () 
   try {
     const started: string[][] = [];
     const start = (_c: string, args: string[]) => void started.push(args);
-    assert.equal(ensureHeld(w.root, { env: {}, home: w.home, start }), false);
+    assert.equal(ensureHeld(w.root, { env: { CARRICK_COMPILER_LINES: "0" }, home: w.home, start }), false);
     assert.equal(ensureHeld(w.root, { env: { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "0" }, home: w.home, start }), false);
     assert.equal(started.length, 0);
     assert.equal(fs.existsSync(heldLockPath(w.root, w.home)), false);
@@ -527,7 +529,7 @@ test("over the socket: none, cold, ready", async () => {
     // No daemon: unavailable, never a throw.
     assert.equal((await askHeld(w.root + "-none", [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit" })).state, "unavailable");
     // Switch off: no connection is tried.
-    assert.equal((await askHeld(w.root, [w.file("api")], { env: {}, home: w.home, session: "s", kind: "edit" })).state, "off");
+    assert.equal((await askHeld(w.root, [w.file("api")], { env: { CARRICK_COMPILER_LINES: "0" }, home: w.home, session: "s", kind: "edit" })).state, "off");
   } finally {
     stop.abort();
     await served;
@@ -568,12 +570,12 @@ test("a request not answered within the wait is late, and the daemon still logs 
   }
 });
 
-test("run.ts with the switch unset starts nothing and writes nothing", () => {
+test("run.ts with the switch off starts nothing and writes nothing", () => {
   const w = world(["api"]);
   try {
     const run = fileURLToPath(new URL("../src/held/run.ts", import.meta.url));
     const result = spawnSync(process.execPath, [run, w.root], {
-      env: { ...process.env, HOME: w.home, CARRICK_COMPILER_LINES: "", CARRICK_CONTRACT_LINES: "1" },
+      env: { ...process.env, HOME: w.home, CARRICK_COMPILER_LINES: "0", CARRICK_CONTRACT_LINES: "1" },
       encoding: "utf8",
       timeout: 15_000,
     });
