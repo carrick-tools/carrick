@@ -985,6 +985,25 @@ test("the refresh starts once per cooldown, sooner after a building answer, and 
   assert.equal(started.length, 2);
 });
 
+test("a fact file is stale after 60 s, and the refresh claim is granted after 60 s", async (t) => {
+  const ws = await factsWorkspace(t);
+  const edited = { file: ws.at("orders-api/src/routes/orders.ts"), snippets: null };
+  const now = Date.parse("2026-01-01T12:00:00Z");
+  const quiet = { ...process.env, CARRICK_NO_FACTS_REFRESH: "1" };
+  const { touchFetched } = await import("../src/facts/store.ts");
+  await touchFetched(ws.root, new Date(now - 59_000).toISOString());
+  assert.equal((await factLines(ws.root, [edited], undefined, { now, env: quiet })).stale, false, "fetched 59 s ago is fresh");
+  await touchFetched(ws.root, new Date(now - 61_000).toISOString());
+  assert.equal((await factLines(ws.root, [edited], undefined, { now, env: quiet })).stale, true, "fetched 61 s ago is stale");
+  const env = { ...process.env, CARRICK_NO_FACTS_REFRESH: "" };
+  delete env["CARRICK_FACTS_COOLDOWN_MS"];
+  const start = () => undefined;
+  assert.equal(startFactsRefresh(ws.root, { env, now, start }), true);
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + 59_000, start }), false, "refused at 59 s");
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + 61_000, start }), true, "granted at 61 s");
+  assert.equal(startFactsRefresh(ws.root, { env: { ...env, CARRICK_FACTS_COOLDOWN_MS: "5000" }, now: now + 61_000 + 6_000, start }), true, "the env override still applies");
+});
+
 test("factsEnabled is off only for exactly \"0\"", () => {
   assert.equal(factsEnabled({}), true, "unset");
   assert.equal(factsEnabled({ CARRICK_FACT_LINES: "" }), true, "empty");
