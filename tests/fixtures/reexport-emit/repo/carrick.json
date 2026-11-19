@@ -1,0 +1,8 @@
+{
+  "services": [
+    { "name": "reexport", "directory": "services/reexport", "tsconfig": "tsconfig.json" },
+    { "name": "control", "directory": "services/control", "tsconfig": "tsconfig.json" },
+    { "name": "asked", "directory": "services/asked", "tsconfig": "tsconfig.json" },
+    { "name": "declared", "directory": "services/declared", "tsconfig": "tsconfig.json" }
+  ]
+}

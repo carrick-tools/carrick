@@ -788,6 +788,32 @@ pub struct DeclarationAsk {
     pub checks: Vec<LibraryCheck>,
     pub ops: Vec<Option<DeclaredOp>>,
     pub scopes: Vec<Option<AskedScope>>,
+    /// The packages the answer held as answered, which the ask read a call
+    /// landing outside of ([`lands_outside`]).
+    answered: BTreeSet<String>,
+}
+
+/// Whether a call's declaration is in a package the answer did not hold as
+/// answered (carrick#4878): a class a labelled package re-exports from its
+/// dependency is declared there, so the call's store keys name the
+/// dependency, never the labelled package. The default library and the
+/// runtime's modules are asked by their own keys and never re-exported
+/// through a package. A row naming no declaration lands nowhere.
+fn lands_outside(row: &Row, exports: &[ExportClaims], answered: &BTreeSet<String>) -> bool {
+    let keys = store_keys(row, exports);
+    !keys.is_empty()
+        && keys.iter().all(|key| {
+            !is_language_key(key) && !key.starts_with("node:") && !answered.contains(key)
+        })
+}
+
+/// What a service's rows call outside the repo ([`declaration_ask_answered`]).
+#[derive(Default)]
+struct Called {
+    /// Each `(store key, member)` a row's declaration and symbol name.
+    pairs: HashSet<(String, String)>,
+    /// The members called through a declaration in no answered package.
+    outside: HashSet<String>,
 }
 
 /// One scope claim the trace asks, by its claim id, on one receiver id
@@ -868,30 +894,76 @@ pub fn declaration_ask(
     siblings: &[&RequestSummaryInputs],
     exports: &[ExportClaims],
 ) -> DeclarationAsk {
-    let mut ask = DeclarationAsk::default();
+    let answered = exports
+        .iter()
+        .map(|export| export.package.clone())
+        .collect();
+    declaration_ask_answered(inputs, siblings, exports, &answered)
+}
+
+/// [`declaration_ask`] with the packages the store answered, with or without
+/// an export (carrick#4878). A labelled op or scope claim on member `m` is
+/// also asked when a call or member row outside the repo has symbol `m` and
+/// its declaration is in no answered package ([`lands_outside`]): the
+/// verifier decides whether the export's member resolves to that
+/// declaration, as it does for a class the package re-exports from its
+/// dependency. Every other claim is asked on the `(package, member)` match.
+pub fn declaration_ask_answered(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    exports: &[ExportClaims],
+    answered: &BTreeSet<String>,
+) -> DeclarationAsk {
+    let mut ask = DeclarationAsk {
+        answered: answered.clone(),
+        ..DeclarationAsk::default()
+    };
     let Some(positions) = inputs.positions.as_ref() else {
         return ask;
     };
-    let called_by = |positions: &crate::position_rows::PositionIndex| -> HashSet<(String, String)> {
-        positions
+    // The `(store key, member)` pairs the rows call, and the members called
+    // through a declaration outside every answered package.
+    let called_by = |positions: &crate::position_rows::PositionIndex| -> Called {
+        let mut called = Called::default();
+        for row in positions
             .call_rows()
             .chain(positions.member_rows())
             .filter(|row| !in_repo(row))
-            .flat_map(|row| {
-                let symbol = row.symbol().map(str::to_string);
+        {
+            let Some(symbol) = row.symbol() else {
+                continue;
+            };
+            if lands_outside(row, exports, answered) {
+                called.outside.insert(symbol.to_string());
+            }
+            called.pairs.extend(
                 store_keys(row, exports)
                     .into_iter()
-                    .filter_map(move |key| Some((key, symbol.clone()?)))
-            })
-            .collect()
+                    .map(|key| (key, symbol.to_string())),
+            );
+        }
+        called
     };
     let own = called_by(positions);
-    let sibling_only: HashSet<(String, String)> = siblings
+    let mut sibling_only = Called::default();
+    for called in siblings
         .iter()
         .filter_map(|sibling| sibling.positions.as_ref())
-        .flat_map(called_by)
-        .filter(|pair| !own.contains(pair))
-        .collect();
+        .map(called_by)
+    {
+        sibling_only.pairs.extend(
+            called
+                .pairs
+                .into_iter()
+                .filter(|pair| !own.pairs.contains(pair)),
+        );
+        sibling_only.outside.extend(
+            called
+                .outside
+                .into_iter()
+                .filter(|member| !own.outside.contains(member)),
+        );
+    }
     // The scope checks, asked once every export's op checks are in.
     let mut scope_checks: Vec<(LibraryCheck, AskedScope)> = Vec::new();
     // Each entry of the store's answer asks its makers once over both
@@ -915,7 +987,10 @@ pub fn declaration_ask(
                         ..
                     }
                     | LibraryClaim::Scope { member, .. } => {
-                        called.contains(&(export.package.clone(), member.clone()))
+                        called
+                            .pairs
+                            .contains(&(export.package.clone(), member.clone()))
+                            || called.outside.contains(member)
                     }
                     _ => false,
                 })
@@ -1010,6 +1085,8 @@ pub struct MemberDeclarations {
     /// theirs verified (carrick#4473). Empty when the verifier answered and
     /// left no such pair, including answers that verified nothing.
     unanswered: HashSet<(String, String)>,
+    /// The packages the answer held as answered ([`DeclarationAsk`]'s).
+    answered: BTreeSet<String>,
 }
 
 impl MemberDeclarations {
@@ -1064,9 +1141,17 @@ impl MemberDeclarations {
         };
         !self.unanswered.is_empty()
             && !in_repo(row)
-            && store_keys(row, exports)
+            && (store_keys(row, exports)
                 .into_iter()
                 .any(|key| self.unanswered.contains(&(key, symbol.to_string())))
+                // A call landing outside every answered package had every
+                // labelled op of its member asked (carrick#4878): one of
+                // them left open leaves the call open. Only a call with a
+                // reason of its own reads this ([`Discovery::declarations_unanswered`]
+                // marks saved sites, `unfollowed` re-reads a package
+                // mismatch), so it saves no call of its own.
+                || (lands_outside(row, exports, &self.answered)
+                    && self.unanswered.iter().any(|(_, member)| member == symbol)))
     }
 
     /// The declarations the verdicts for `ask` name. A verdict counts only
@@ -1074,6 +1159,7 @@ impl MemberDeclarations {
     pub fn of(ask: &DeclarationAsk, verdicts: &[SemanticsResult]) -> Self {
         let mut out = MemberDeclarations {
             checks: ask.checks.len(),
+            answered: ask.answered.clone(),
             not_reached: crate::services::type_sidecar::not_reached_in_time(verdicts),
             ..MemberDeclarations::default()
         };
