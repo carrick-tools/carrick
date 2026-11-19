@@ -109,6 +109,18 @@ export declare class SocketServer {
 }
 `;
 
+// A table client: a factory, `from(table)` returns a builder whose members send.
+const TABLES = `export interface Builder {
+  select(): Promise<unknown>;
+  insert(row: unknown): Promise<unknown>;
+}
+export interface Tables {
+  from(table: string): Builder;
+  get(path: string): Promise<unknown>;
+}
+export declare function createTables(url: string): Tables;
+`;
+
 function writeTree(root: string, files: Record<string, string>): void {
   for (const [rel, text] of Object.entries(files)) {
     const file = path.join(root, rel);
@@ -182,6 +194,8 @@ describe('verify_library_claims: label structure v2 (carrick#2434)', () => {
       'node_modules/fixture-http/index.d.ts': HTTP,
       'node_modules/fixture-hooks/package.json': packageJson('fixture-hooks'),
       'node_modules/fixture-hooks/index.d.ts': HOOKS,
+      'node_modules/fixture-tables/package.json': packageJson('fixture-tables'),
+      'node_modules/fixture-tables/index.d.ts': TABLES,
       'node_modules/fixture-router/package.json': packageJson('fixture-router'),
       'node_modules/fixture-router/index.d.ts': ROUTER,
       'node_modules/fixture-sockets/package.json': packageJson('fixture-sockets'),
@@ -259,6 +273,41 @@ describe('verify_library_claims: label structure v2 (carrick#2434)', () => {
         'verified',
         'unchecked claim_invalid',
         'verified',
+        'unchecked claim_invalid',
+      ]
+    );
+  });
+
+  it('name_prefix on a scope-bound name: placed only on an HTTP request op whose receiver has a scope step', async () => {
+    const T = 'fixture-tables';
+    const tables = (receiver: string, claim: Claim) => check(T, 'createTables', 'http_client', receiver, claim);
+    const from: Claim = { kind: 'scope', member: 'from', name: { arg: 0 }, on: 'instance' };
+    const scoped = (parts: Record<string, unknown>) =>
+      tables('instance:()>scope:from', op('request', 'select', { name: { bound: 'scope' }, method_default: 'GET', ...parts }));
+    assert.deepStrictEqual(
+      verdicts(
+        await send([
+          tables('export', make('call', null)),
+          tables('instance:()', from),
+          // Placed: a scope-bound name, a scope step on the receiver.
+          scoped({ name_prefix: '/rest/v1/' }),
+          // Control: the same op with no prefix.
+          scoped({}),
+          // Invalid: the name is bound by a scope on a receiver no scope made.
+          tables('instance:()', op('request', 'get', { name: { bound: 'scope' }, name_prefix: '/rest/v1/' })),
+          // Invalid: a maker-bound name still takes no prefix.
+          scoped({ name: { bound: 'maker' }, name_prefix: '/rest/v1/' }),
+          // Invalid: a literal name takes no prefix.
+          scoped({ name: { literal: 'items' }, name_prefix: '/rest/v1/' }),
+        ])
+      ),
+      [
+        'verified',
+        'verified',
+        'verified',
+        'verified',
+        'unchecked claim_invalid',
+        'unchecked claim_invalid',
         'unchecked claim_invalid',
       ]
     );

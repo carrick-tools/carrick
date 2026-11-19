@@ -301,15 +301,18 @@ const ROLE_TABLE: Readonly<Record<LibraryRole, RoleRules | undefined>> = {
  * sit: a non-empty string on an HTTP `request` op whose name is a slot, the
  * value it stands before. The schema already refuses a value that is not a
  * non-empty string; this holds any other caller of the verifier to it too.
+ * The slot is `{arg}`, or `{bound: "scope"}` on a receiver that came through
+ * a `>scope:` step (`scoped`): the scope's name is the value the prefix
+ * stands before.
  */
-function namePrefixPlaced(claim: OpClaim): boolean {
+function namePrefixPlaced(claim: OpClaim, scoped: boolean): boolean {
   return (
     typeof claim.name_prefix === 'string' &&
     claim.name_prefix.length > 0 &&
     claim.op === 'request' &&
     (claim.protocol === undefined || claim.protocol === 'http') &&
     claim.name !== undefined &&
-    'arg' in claim.name
+    ('arg' in claim.name || ('bound' in claim.name && claim.name.bound === 'scope' && scoped))
   );
 }
 
@@ -3695,7 +3698,8 @@ class DeclarationReader {
    * - `options` belongs to the #1564 checks and is `claim_invalid`;
    * - `name_prefix` (contract amendment R27) is the text the library puts
    *   before the name slot's value: a non-empty string on an HTTP `request`
-   *   op whose name is a slot, else `claim_invalid`. Its value is the
+   *   op whose name is a slot (`{arg}`, or `{bound: 'scope'}` on a receiver
+   *   that has a `>scope:` step), else `claim_invalid`. Its value is the
    *   picker's reading of the library's source and is never checked.
    * Undefined when the fields hold so far; their slots are read with the
    * call's other parts.
@@ -3740,7 +3744,7 @@ class DeclarationReader {
         claim.base !== undefined;
       return any ? unchecked('claim_invalid') : undefined;
     }
-    if (claim.name_prefix !== undefined && !namePrefixPlaced(claim)) return unchecked('claim_invalid');
+    if (claim.name_prefix !== undefined && !namePrefixPlaced(claim, receiver.scoped)) return unchecked('claim_invalid');
     if (claim.options !== undefined) return unchecked('claim_invalid');
     if (claim.method !== undefined && (claim.method_key !== undefined || claim.method_default !== undefined)) {
       return unchecked('claim_invalid');
