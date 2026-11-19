@@ -33,6 +33,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { status as runStatus } from "../cli.ts";
+import { compilerLinesEnabled } from "../facts/enabled.ts";
+import { compilerCoverage } from "../held/coverage.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { TEMPLATE_PATHS } from "../templates.ts";
 import { inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
@@ -307,6 +309,21 @@ export function checkDeclaredPaths(repos: ConfiguredRepo[]): Line[] {
     lines.push(done(`Declared paths exist: ${checked} in ${configs} carrick.json file(s).`));
   }
   return lines;
+}
+
+/**
+ * What the compiler check does not check, per service (T7, #4654). Never a
+ * finding: the check is quiet by design, and the doctor says what it covers.
+ */
+export function checkCompilerCoverage(
+  repos: ConfiguredRepo[],
+  home?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Line[] {
+  return repos.flatMap((repo) => {
+    const services = repo.config === null ? [] : declaredServices(repo.config).map((service) => service.name);
+    return compilerCoverage({ root: repo.root, label: repo.label, services }, compilerLinesEnabled(env), home).map(say);
+  });
 }
 
 function isDirectory(target: string): boolean {
@@ -868,6 +885,7 @@ export async function doctor(
     ...(await checkVersion()),
     ...checkPathVersion(workspace, pathCarrick()),
     ...checkDeclaredPaths(repos),
+    ...checkCompilerCoverage(repos),
     ...checkWorkflow(repos),
     ...checkHooks(workspace, realMachine()),
     ...checkCodexHooks(workspace),

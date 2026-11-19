@@ -31,6 +31,7 @@ import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEna
 import { askHeld } from "../held/client.ts";
 import type { AskAnswer } from "../held/client.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
+import { notCheckedLines } from "./not-checked.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
 
 const log = createLogger("carrick-hook");
@@ -266,6 +267,9 @@ export async function editFlow(
     input.timing.heldMs = held.ms;
     input.timing.heldState = held.state;
   }
+  // An edit the engine did not check says so once per session, service and state (T7).
+  const unchecked = session ? notCheckedLines(session, choice.root, answered.flatMap((a) => a.answer.not_checked ?? [])) : { lines: [], keys: [] };
+  told.push(...unchecked.keys);
   const seen = new Set<string>();
   const earlyNow: string[] = [];
   for (const { entry, answer } of answered) {
@@ -309,6 +313,7 @@ export async function editFlow(
   if (generation) contexts.splice(generationAt, 0, generation);
   // An early line is ADDED to part 1's: it never replaces a contract line.
   contexts.push(...earlyNow);
+  contexts.push(...unchecked.lines);
   contexts.push(...facts.lines);
   // A missing or stale fact file is refreshed in the background, detached.
   if (facts.stale) (await import("../facts/fetch.ts")).startFactsRefresh(choice.root);

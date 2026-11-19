@@ -20,6 +20,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
+  checkCompilerCoverage,
   checkDeclaredPaths,
   checkHooks,
   checkIndex,
@@ -46,6 +47,8 @@ import {
 import { recordCliVersion } from "../src/init/outdated.ts";
 import { renderTemplate, TEMPLATE_PATHS } from "../src/templates.ts";
 import { statusFixture } from "./helpers.ts";
+import { placedPath } from "../src/held/paths.ts";
+import { writeState } from "../src/held/state.ts";
 import type { StatusResult } from "../src/contract.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -666,6 +669,8 @@ test("the whole command, on a workspace with exactly three findings", () => {
       // this test asserts the exact set of lines. Its own coverage is in
       // test/update.test.ts, with an injected fetch.
       CARRICK_NO_UPDATE_CHECK: "1",
+      // The compiler check is the one switch that changes this exact set of lines (T7): off here.
+      CARRICK_COMPILER_LINES: "0",
     },
   });
 
@@ -686,4 +691,61 @@ test("the whole command, on a workspace with exactly three findings", () => {
   assert.deepEqual(fs.readdirSync(root).sort(), [".claude", ".github", "api", "carrick.json", "status.json"]);
 
   for (const target of [root, home]) fs.rmSync(target, { recursive: true, force: true });
+});
+
+// T7 (#4654): what the compiler check does not check, per service, from the
+// records the daemon keeps beside each service's placed file.
+
+function heldFixture(): { root: string; home: string; repos: ReturnType<typeof configuredRepos> } {
+  const root = workspace({
+    "carrick.json": JSON.stringify({ services: [{ name: "api" }, { name: "web" }, { name: "empty" }, { name: "worker" }] }),
+  });
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-")));
+  const row = (label: string) => ({ label, protocol: "http", file: "src/a.ts", group: 0, position: 0 });
+  const placed = (service: string, armed: number, unarmed: Array<[string, number]>) => {
+    const file = placedPath(root, service, home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        at: "2026-11-19T10:00:00Z",
+        service,
+        armed: Array.from({ length: armed }, (_, i) => row(`GET /a${i}`)),
+        unarmed: unarmed.flatMap(([reason, n]) => Array.from({ length: n }, (_, i) => ({ ...row(`GET /u${i}`), reason }))),
+      }),
+    );
+  };
+  placed("api", 4, [["no_values", 2], ["clean_check_fails:TS2322", 1]]);
+  placed("empty", 0, []);
+  writeState(root, "api", { at: "2026-11-19T10:00:00Z", service: "api", state: "ready", start_ms: 41_000 }, home);
+  writeState(root, "web", { at: "2026-11-19T10:01:00Z", service: "web", state: "capped", budget_mb: 4096, holders: 2 }, home);
+  return { root, home, repos: configuredRepos(root) };
+}
+
+test("doctor lists, per service, the rows checked at edit time and the rest by reason; the counts add up", () => {
+  const { home, repos } = heldFixture();
+  const lines = checkCompilerCoverage(repos, home, { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" }).map((l) => l.text);
+  const api = lines.find((l) => l.includes('service "api"')) ?? "";
+  assert.match(api, /4 of 7 rows are checked after an edit/, api);
+  assert.match(api, /2 rows with no stored send position/, api);
+  assert.match(api, /1 row already reporting TS2322/, api);
+  assert.match(api, /The compiler engine is ready \(started in 41 s\)/, api);
+  assert.equal(4 + 2 + 1, 7);
+});
+
+test("doctor says why an engine holds no check: capped, no placed file, no route with a stored send position", () => {
+  const { home, repos } = heldFixture();
+  const lines = checkCompilerCoverage(repos, home, { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" }).map((l) => l.text);
+  assert.match(lines.find((l) => l.includes('service "web"')) ?? "", /4096 MB memory budget is held by 2 other engines/);
+  assert.match(lines.find((l) => l.includes('service "empty"')) ?? "", /no route with a stored send position/);
+  assert.match(lines.find((l) => l.includes('service "worker"')) ?? "", /not started yet/);
+  assert.ok(lines.every((l) => !/sidecar/i.test(l)), lines.join("\n"));
+  // None of it is a finding: the check is quiet by design.
+  assert.equal(findingCount(checkCompilerCoverage(repos, home, { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" })), 0);
+});
+
+test("doctor prints nothing about the compiler check when it is off and has never run", () => {
+  const root = workspace({ "carrick.json": JSON.stringify({ services: [{ name: "api" }] }) });
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-")));
+  assert.deepEqual(checkCompilerCoverage(configuredRepos(root), home, {}), []);
 });
