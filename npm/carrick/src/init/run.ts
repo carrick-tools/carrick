@@ -787,8 +787,15 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       const copy = writeFolderCopy(workspace, { slug: project })!;
       // Said once, last, in the closing block.
       if (copy.codexWritten) codexTrust = true;
+      for (const refused of copy.refused) {
+        out.refuse(
+          refused.file === CODEX_HOOKS_FILE
+            ? `Could not configure the Codex hooks: ${refused.message}. Fix ${CODEX_HOOKS_FILE} and ${again()}.`
+            : `Could not configure Carrick hooks: ${refused.message}. Fix ${refused.file} and ${again()}.`,
+        );
+      }
       if (copy.teamHooksLeft) {
-        out.say("Carrick's hook entries your team committed in .claude/settings.json were left as they are.");
+        out.say("Carrick's hooks are committed in .claude/settings.json, so init left them unchanged and added no second set.");
       }
       todo.push(...taskSkillWarnings(copy.skills));
       recordCliVersion(workspace, currentVersion());

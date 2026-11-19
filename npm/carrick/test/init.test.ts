@@ -3042,7 +3042,7 @@ test("hooks the team committed are left, with the launcher they call hidden and 
     assert.ok(!fs.existsSync(local) || installedCarrickHooksIn(local) === 0);
     assert.ok(fs.existsSync(path.join(fixture.repo, LAUNCHERS[0]!)));
     assert.ok(excludeBlock(fixture.repo).includes(LAUNCHERS[0]!));
-    assert.match(stdout, /hook entries your team committed in \.claude\/settings\.json were left as they are/);
+    assert.match(stdout, /Carrick's hooks are committed in \.claude\/settings\.json, so init left them unchanged and added no second set\./);
   } finally {
     fixture.cleanup();
   }
@@ -3065,6 +3065,26 @@ test("a session start rewrites older local entries and git still shows the same 
     assert.deepEqual(JSON.parse(fs.readFileSync(local, "utf8")).hooks.PostToolUse.at(-1).hooks[0].timeout !== 10, true);
     assert.equal(porcelain(fixture.repo), before);
     assert.equal(before, TEAM_PORCELAIN);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a settings file that is not JSON is named and the skills and launchers are still written", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    fs.writeFileSync(path.join(fixture.repo, LOCAL_FILE), "{not json");
+    const result = runCarrick(fixture, "init", "--yes", fixture.repo);
+    assert.match(result.stdout + result.stderr, /Could not configure Carrick hooks: .*Fix \.claude\/settings\.local\.json and run carrick init again\./);
+    assert.equal(fs.readFileSync(path.join(fixture.repo, LOCAL_FILE), "utf8"), "{not json");
+    const named = excludeBlock(fixture.repo);
+    for (const written of [...LAUNCHERS, ...taskSkillPaths()]) {
+      assert.ok(fs.existsSync(path.join(fixture.repo, written)), written);
+      assert.ok(named.includes(written), `${written} is named in .git/info/exclude`);
+    }
+    assert.ok(!named.includes(LOCAL_FILE));
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
   } finally {
     fixture.cleanup();
   }

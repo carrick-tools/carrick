@@ -214,6 +214,8 @@ export type FolderCopy = {
   teamHooksLeft: boolean;
   /** Skill paths left alone, as `writeTaskSkills` reports them. */
   skills: SkillOutcome[];
+  /** Hooks files that are not JSON: neither written nor recorded, the rest still is. */
+  refused: Array<{ file: string; message: string }>;
 };
 
 type Planned = { relative: string; body: string; record: boolean };
@@ -233,6 +235,18 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
   }
   const writes: Planned[] = [];
   const skills: SkillOutcome[] = [];
+  const refused: FolderCopy["refused"] = [];
+  // A hooks file that is not JSON is a file to report, never to overwrite. Init's
+  // own folder reports it and still writes everything else, as the shared-file
+  // path always did; a repo below a folder keeps its all-or-nothing copy.
+  const hooksFile = (relative: string, body: () => string, record: boolean): void => {
+    try {
+      writes.push({ relative, body: body(), record });
+    } catch (error) {
+      if (!own) throw error;
+      refused.push({ file: relative, message: (error as Error).message });
+    }
+  };
   // What init put into the shared settings file before it kept its own files out
   // of git, and the file it is put back to. Decided now, written last.
   let shared: { body: string } | { remove: true } | null = null;
@@ -255,20 +269,20 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
   if (!tracked.has(LOCAL_SETTINGS)) {
     if (teamHooksLeft) {
       // The committed entries run already; a second set here would run twice.
-      if (holdsOurs(localExisting)) writes.push({ relative: LOCAL_SETTINGS, body: removeCarrickHooks(localExisting!).body, record: true });
+      if (holdsOurs(localExisting)) hooksFile(LOCAL_SETTINGS, () => removeCarrickHooks(localExisting!).body, true);
     } else {
-      writes.push({ relative: LOCAL_SETTINGS, body: mergeCarrickHooks(localExisting).body, record: true });
+      hooksFile(LOCAL_SETTINGS, () => mergeCarrickHooks(localExisting).body, true);
     }
     if (!(own && tracked.has(CLAUDE_LAUNCHER))) writes.push({ relative: CLAUDE_LAUNCHER, body: launcherSource(), record: true });
   }
   const codexExisting = readOrNull(path.join(repo, CODEX_HOOKS_FILE));
   if (!tracked.has(CODEX_HOOKS_FILE)) {
-    writes.push({ relative: CODEX_HOOKS_FILE, body: mergeHookSet(codexExisting, codexHooks()).body, record: true });
+    hooksFile(CODEX_HOOKS_FILE, () => mergeHookSet(codexExisting, codexHooks()).body, true);
     writes.push({ relative: CODEX_LAUNCHER, body: launcherSource(), record: true });
   } else if (own) {
     // Codex reads project hooks from this one file, so there is no copy of it
     // to keep out of git; only the launcher its entries call stays hidden.
-    writes.push({ relative: CODEX_HOOKS_FILE, body: mergeHookSet(codexExisting, codexHooks()).body, record: false });
+    hooksFile(CODEX_HOOKS_FILE, () => mergeHookSet(codexExisting, codexHooks()).body, false);
     writes.push({ relative: CODEX_LAUNCHER, body: launcherSource(), record: true });
   }
   for (const root of SKILL_ROOTS) {
@@ -304,6 +318,7 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
     codexWritten: changed.has(CODEX_HOOKS_FILE),
     teamHooksLeft,
     skills,
+    refused,
   };
 }
 

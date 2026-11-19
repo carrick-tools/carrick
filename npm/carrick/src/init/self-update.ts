@@ -300,7 +300,7 @@ export function bringUpToDate(
   if (stray.length > 0) {
     const named = listed(stray.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))));
     lines.push(
-      `Carrick's hook entries in ${named} are an uncommitted edit from an older version. Run \`carrick init\` to move them out of git's way. There is nothing to commit.`,
+      `An older Carrick version added hooks to ${named}, which git tracks. Run \`carrick init\` to move them to a file git ignores. Do not commit them.`,
     );
   }
   if (skipped.length > 0) {

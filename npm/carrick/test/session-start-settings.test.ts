@@ -283,7 +283,7 @@ test("a tracked stale skill and settings file are left byte for byte and named i
   assert.equal(fs.readFileSync(path.join(workspace.root, ".carrick", "cli-version"), "utf8").trim(), "0.0.1");
 });
 
-test("a tracked settings file whose committed version holds none of ours is named as an uncommitted edit", (t) => {
+test("a tracked settings file whose committed version holds none of ours is named as an older version's edit", (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   put(workspace.root, SHARED, `${JSON.stringify({ permissions: { allow: ["Read"] } }, null, 2)}\n`);
@@ -297,7 +297,7 @@ test("a tracked settings file whose committed version holds none of ours is name
 
   assert.equal(fs.readFileSync(edited, "utf8"), before);
   assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /Carrick's hook entries in \.claude\/settings\.json are an uncommitted edit from an older version\. Run `carrick init` to move them out of git's way\. There is nothing to commit\./);
+  assert.match(lines[0]!, /An older Carrick version added hooks to \.claude\/settings\.json, which git tracks\. Run `carrick init` to move them to a file git ignores\. Do not commit them\./);
   assert.doesNotMatch(lines[0]!, /commit the change/);
 });
 
