@@ -694,8 +694,8 @@ class HeldService implements ServiceEngine {
       const base = top(p.repo);
       return base === null ? [] : [path.join(base, p.file)];
     });
-    const homeBase = group.home === null || group.places.length === 0 ? null : top(group.places[0]!.repo);
-    if (group.home !== null && homeBase !== null) files.push(path.join(homeBase, group.home.file));
+    const homeBase = !group.home || group.places.length === 0 ? null : top(group.places[0]!.repo);
+    if (group.home && homeBase !== null) files.push(path.join(homeBase, group.home.file));
     const main = group.places.map((p) => indexedCommit(this.commits, p.repo)).find((commit) => commit !== null) ?? null;
     return { main_commit: main, named_files: [...new Set(files)] };
   }
