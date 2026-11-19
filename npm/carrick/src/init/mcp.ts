@@ -85,6 +85,14 @@ export type McpEnvironment = {
   run: (command: string, args: string[]) => number | null;
   /** A command's exit status and what it printed, for a read we have to parse. */
   capture: (command: string, args: string[]) => { status: number | null; stdout: string };
+  /**
+   * A client's own command with this terminal handed to it, for a command that
+   * asks the person something (Codex's `mcp add` opens a browser sign-in and
+   * waits for it). Exit status, or null when it could not be started.
+   */
+  runInteractive: (command: string, args: string[]) => number | null;
+  /** Whether a person is at a terminal that `runInteractive` can hand over. */
+  hasTerminal: () => boolean;
   home: string;
   platform: NodeJS.Platform;
   /**
@@ -123,6 +131,12 @@ export function realEnvironment(): McpEnvironment {
       const result = spawnSync(command, args, { encoding: "utf8", timeout: 15_000 });
       return { status: result.status, stdout: result.stdout ?? "" };
     },
+    // No stdin and a 15 s limit would kill a sign-in midway and leave an entry
+    // half set up, so the person's terminal goes to the command, with a limit
+    // long enough for them to finish in a browser.
+    runInteractive: (command, args) =>
+      spawnSync(command, args, { stdio: "inherit", timeout: 300_000 }).status,
+    hasTerminal: () => process.stdout.isTTY === true && process.stdin.isTTY === true,
     home: os.homedir(),
     platform: process.platform,
     installId: () => installIdOrNull(),
@@ -314,6 +328,49 @@ function configureClaudeCode(env: McpEnvironment): McpOutcome | null {
     : { client: "Claude Code", state: "failed", detail: mcpLine(installId) };
 }
 
+/** The line to paste for Codex. It carries no install id: Codex's `mcp add` has no header option. */
+export const CODEX_ADD_LINE = `codex mcp add ${MCP_NAME} --url ${MCP_URL}`;
+
+/** Codex is on this machine when its command is. */
+export function codexFound(env: McpEnvironment = realEnvironment()): boolean {
+  return env.onPath("codex");
+}
+
+/** The URL in `codex mcp get <name> --json`, or null when it prints none we can read. */
+function codexEntryUrl(stdout: string): string | null {
+  try {
+    const entry: unknown = JSON.parse(stdout);
+    if (!isRecord(entry)) return null;
+    const transport = entry["transport"];
+    return entryUrl(isRecord(transport) ? transport : entry);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Codex, through the command it ships.
+ *
+ * Its `mcp add` replaces an entry of the same name, which would drop the
+ * user's per-tool settings, so an existing entry is left alone. When the
+ * server supports OAuth it also starts a browser sign-in and waits for it, so
+ * it runs only with a terminal handed over: anywhere else the line is printed.
+ * It has no header option, so a Codex connection carries no install id.
+ */
+function configureCodex(env: McpEnvironment): McpOutcome | null {
+  if (!codexFound(env)) return null;
+  if (env.capture("codex", ["mcp", "get", MCP_NAME, "--json"]).status === 0) {
+    return { client: "Codex", state: "present", detail: `already connected as "${MCP_NAME}"` };
+  }
+  if (!env.hasTerminal()) return { client: "Codex", state: "failed", detail: CODEX_ADD_LINE };
+  const status = env.runInteractive("codex", ["mcp", "add", MCP_NAME, "--url", MCP_URL]);
+  // The sign-in's outcome is Codex's business; the entry is what is read back.
+  if (status === 0 && env.capture("codex", ["mcp", "get", MCP_NAME, "--json"]).status === 0) {
+    return { client: "Codex", state: "written", detail: "connected for this user" };
+  }
+  return { client: "Codex", state: "failed", detail: CODEX_ADD_LINE };
+}
+
 function configureFileClient(env: McpEnvironment, client: FileClient): McpOutcome | null {
   const directory = client.directory(env);
   const file = client.file(env);
@@ -399,6 +456,8 @@ export function connectMcpClients(
   const outcomes: McpOutcome[] = [];
   const claude = configureClaudeCode(env);
   if (claude) outcomes.push(claude);
+  const codex = configureCodex(env);
+  if (codex) outcomes.push(codex);
   for (const client of FILE_CLIENTS) {
     if (!editors.includes(client.name)) continue;
     const outcome = configureFileClient(env, client);
@@ -510,6 +569,25 @@ function disconnectClaudeCode(env: McpEnvironment): McpRemoval | null {
       };
 }
 
+/** Codex: read its entry, and remove it with its own command only when it is ours. */
+function disconnectCodex(env: McpEnvironment): McpRemoval | null {
+  if (!codexFound(env)) return null;
+  const read = env.capture("codex", ["mcp", "get", MCP_NAME, "--json"]);
+  if (read.status !== 0) return { client: "Codex", state: "absent", detail: "no carrick server" };
+  if (!isCarrickUrl(codexEntryUrl(read.stdout))) {
+    return {
+      client: "Codex",
+      state: "kept",
+      detail: `"${MCP_NAME}" there does not point at ${MCP_HOST}, so it was left alone`,
+    };
+  }
+  const command = `codex mcp remove ${MCP_NAME}`;
+  const status = env.run("codex", ["mcp", "remove", MCP_NAME]);
+  return status === 0
+    ? { client: "Codex", state: "removed", detail: command }
+    : { client: "Codex", state: "failed", detail: command };
+}
+
 function disconnectFileClient(env: McpEnvironment, client: FileClient): McpRemoval | null {
   const directory = client.directory(env);
   const file = client.file(env);
@@ -582,6 +660,19 @@ export function inspectMcpClients(env: McpEnvironment = realEnvironment()): McpI
       found.push({ client: "Claude Code", state: "connected", detail: MCP_URL });
     }
   }
+  if (codexFound(env)) {
+    const read = env.capture("codex", ["mcp", "get", MCP_NAME, "--json"]);
+    const url = codexEntryUrl(read.stdout);
+    if (read.status === null) {
+      found.push({ client: "Codex", state: "unreadable", detail: "`codex mcp get carrick` did not answer" });
+    } else if (read.status !== 0) {
+      found.push({ client: "Codex", state: "absent", detail: `no "${MCP_NAME}" server for this user` });
+    } else if (!isCarrickUrl(url)) {
+      found.push({ client: "Codex", state: "elsewhere", detail: `"${MCP_NAME}" there points at ${url ?? "no URL"}` });
+    } else {
+      found.push({ client: "Codex", state: "connected", detail: MCP_URL });
+    }
+  }
   for (const client of FILE_CLIENTS) {
     const directory = client.directory(env);
     const file = client.file(env);
@@ -631,6 +722,8 @@ export function disconnectMcpClients(env: McpEnvironment = realEnvironment()): M
   const removals: McpRemoval[] = [];
   const claude = disconnectClaudeCode(env);
   if (claude) removals.push(claude);
+  const codex = disconnectCodex(env);
+  if (codex) removals.push(codex);
   for (const client of FILE_CLIENTS) {
     const removal = disconnectFileClient(env, client);
     if (removal) removals.push(removal);

@@ -35,7 +35,7 @@ import { reposUrl } from "./connect.ts";
 import { downloadHostedIndex, hostedReport, nativeRunner, STEP_LABEL } from "./hosted.ts";
 import { listProjects, projectLabel, SLUG, type Project } from "./projects.ts";
 import { ownRepository, writeFolderCopy, writeRepoCopy } from "./repo-copies.ts";
-import { claudeCodeFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
+import { claudeCodeFound, codexFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
 import { mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { writeLauncher } from "./launcher.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
@@ -332,11 +332,13 @@ export function writesLine(options: {
   workspaceFile: boolean;
   editorFiles: string[];
   claudeCode: boolean;
+  codex: boolean;
   folder: string | null;
   home?: string;
 }): string {
   const mcp = [
     ...(options.claudeCode ? ["Claude Code"] : []),
+    ...(options.codex ? ["Codex"] : []),
     ...options.editorFiles.map((file) => tilde(file, options.home)),
   ];
   const where = options.folder === null ? "" : ` in ${options.folder} and in each repo`;
@@ -598,6 +600,7 @@ async function planRun(input: {
         workspaceFile: deselected.length > 0,
         editorFiles: offered.filter((client) => editors.includes(client.name)).map((client) => client.file),
         claudeCode: claudeCodeFound(),
+        codex: codexFound(),
         folder: selected.some((repo) => realPath(repo.path) !== realPath(workspace)) ? tilde(realPath(workspace)) : null,
       }),
     ]),
