@@ -850,7 +850,7 @@ test("the refresh sends the local file's digest and writer", async (t) => {
 });
 
 test("facts_unavailable is silent and does not schedule an early retry", async (t) => {
-  const { runFactsRefresh, FACTS_BUILDING_RETRY_MS } = await import("../src/facts/fetch.ts");
+  const { runFactsRefresh, FACTS_BUILDING_RETRY_MS, FACTS_FAILED_WAIT_MS } = await import("../src/facts/fetch.ts");
   const ws = await factsWorkspace(t, { ndjson: null });
   fs.mkdirSync(path.join(ws.root, ".carrick", "hosted"), { recursive: true });
   fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo-shop" }] } }));
@@ -864,6 +864,10 @@ test("facts_unavailable is silent and does not schedule an early retry", async (
   assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_unavailable", false), env, now }), "none");
   assert.equal(fs.existsSync(factsPath(ws.root)), false);
   assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_BUILDING_RETRY_MS + 1_000, start }), false, "no early retry");
+  // It waits the failed-answer time, not the one-minute cooldown, and then asks again.
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_FAILED_WAIT_MS - 1_000, start }), false, "still held just before the failed-answer wait ends");
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_FAILED_WAIT_MS + 1_000, start }), true, "asks again after the failed-answer wait");
+  assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_unavailable", false), env, now }), "none");
   // The same code, retriable (a build in flight, HTTP 409), moves the next ask a minute on: the flag decides, not the code.
   assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_unavailable", true, 409), env, now }), "retry");
   assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_BUILDING_RETRY_MS + 1_000, start }), true);
