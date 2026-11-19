@@ -37,7 +37,7 @@ import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { compilerCoverage } from "../held/coverage.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { TEMPLATE_PATHS } from "../templates.ts";
-import { inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
+import { CODEX_ADD_LINE, inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
 import { readInstallId } from "./install-id.ts";
 import { createOutput, DOCS_INIT_FILES, type InitOutput } from "./output.ts";
 import {
@@ -637,7 +637,7 @@ export function checkMcp(inspections: McpInspection[]): Line[] {
     if (client.state === "absent") {
       lines.push(
         warn(
-          `${client.client} is on this machine and is not connected to Carrick (${client.detail}), so it answers nothing across your repos. \`carrick init\` connects it; by hand it is \`${byHand}\`.`,
+          `${client.client} is on this machine and is not connected to Carrick (${client.detail}), so it answers nothing across your repos. \`carrick init\` connects it; by hand it is \`${client.client === "Codex" ? CODEX_ADD_LINE : byHand}\`.`,
         ),
       );
       continue;

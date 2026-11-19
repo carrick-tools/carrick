@@ -2151,25 +2151,25 @@ test("an editor file is written only for an editor found here, or one somebody n
   // every writer merges, and a list of folders read as though it replaced
   // them (carrick#1512).
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, folder: null, home: "/home/dev" }),
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, codex: false, folder: null, home: "/home/dev" }),
     "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
   );
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: false, folder: null, home: "/home/dev" }),
+    writesLine({ workspaceFile: false, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: false, codex: false, folder: null, home: "/home/dev" }),
     "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to ~/.cursor/mcp.json",
   );
   assert.equal(
-    writesLine({ workspaceFile: true, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: true, folder: "~/shop", home: "/home/dev" }),
+    writesLine({ workspaceFile: true, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: true, codex: false, folder: "~/shop", home: "/home/dev" }),
     `Add Carrick's hooks and skills to .claude/, .agents/ and .codex/ in ~/shop and in each repo, create .carrick/ and ${WORKSPACE_FILE}, and add Carrick's MCP server to Claude Code and ~/.cursor/mcp.json`,
   );
   // A folder run writes into each repo too, so the line says where
   // (carrick#1512, option A as ruled).
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, folder: "~/shop", home: "/home/dev" }),
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, codex: false, folder: "~/shop", home: "/home/dev" }),
     "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/ in ~/shop and in each repo, create .carrick/, and add Carrick's MCP server to Claude Code",
   );
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: false, folder: null, home: "/home/dev" }),
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: false, codex: false, folder: null, home: "/home/dev" }),
     "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, and create .carrick/",
   );
 });

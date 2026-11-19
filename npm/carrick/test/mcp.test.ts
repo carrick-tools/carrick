@@ -16,6 +16,7 @@ import {
   inspectMcpClients,
   mcpLine,
   mergeServerEntry,
+  CODEX_ADD_LINE,
   removeServerEntry,
   MCP_URL,
   type McpEnvironment,
@@ -41,6 +42,8 @@ type Machine = {
   outputs?: Record<string, string>;
   /** This machine's install id; null is a machine that could not make one. */
   installId?: string | null;
+  /** Whether a person is at a terminal; Codex's add asks for one. */
+  terminal?: boolean;
 };
 
 function machine(state: Machine): { env: McpEnvironment; written: Record<string, string>; ran: string[] } {
@@ -59,6 +62,12 @@ function machine(state: Machine): { env: McpEnvironment; written: Record<string,
       ran.push(line);
       return { status: state.statuses?.[line] ?? 0, stdout: state.outputs?.[line] ?? "" };
     },
+    runInteractive: (command, args) => {
+      const line = [command, ...args].join(" ");
+      ran.push(`interactive: ${line}`);
+      return state.statuses?.[line] ?? 0;
+    },
+    hasTerminal: () => state.terminal ?? false,
     home: HOME,
     platform: "linux",
     appData: null,
@@ -631,4 +640,76 @@ test("a client with no entry, one whose file will not parse, and one this machin
       ["Cursor", "unreadable"],
     ],
   );
+});
+
+// Codex: its own `mcp add`, which starts a browser sign-in, so it runs only
+// with a terminal handed over, and never over an entry that is already there.
+const CODEX_GET = "codex mcp get carrick --json";
+const CODEX_ADD = `codex mcp add carrick --url ${MCP_URL}`;
+const codexEntry = (url: string): string =>
+  JSON.stringify({ name: "carrick", enabled: true, transport: { type: "streamable_http", url } });
+
+test("Codex is connected by its own add, with the terminal handed over", () => {
+  const { env, ran } = machine({ commands: ["codex"], terminal: true, statuses: {} });
+  // The read before the add finds nothing; the read after it finds the entry.
+  let reads = 0;
+  const capture = env.capture;
+  env.capture = (command, args) => {
+    const result = capture(command, args);
+    if ([command, ...args].join(" ") === CODEX_GET) return { status: reads++ === 0 ? 1 : 0, stdout: codexEntry(MCP_URL) };
+    return result;
+  };
+  assert.deepEqual(connectMcpClients([], env), [
+    { client: "Codex", state: "written", detail: "connected for this user" },
+  ]);
+  assert.deepEqual(ran, [CODEX_GET, `interactive: ${CODEX_ADD}`, CODEX_GET]);
+  assert.equal(CODEX_ADD_LINE, CODEX_ADD);
+});
+
+test("Codex with no terminal is not run, and gets the line to paste", () => {
+  const { env, ran } = machine({ commands: ["codex"], terminal: false, statuses: { [CODEX_GET]: 1 } });
+  assert.deepEqual(connectMcpClients([], env), [{ client: "Codex", state: "failed", detail: CODEX_ADD }]);
+  assert.deepEqual(ran, [CODEX_GET]);
+});
+
+test("a Codex entry that is already there is left as it is", () => {
+  const { env, ran } = machine({ commands: ["codex"], terminal: true, outputs: { [CODEX_GET]: codexEntry(MCP_URL) } });
+  assert.deepEqual(connectMcpClients([], env), [
+    { client: "Codex", state: "present", detail: 'already connected as "carrick"' },
+  ]);
+  assert.deepEqual(ran, [CODEX_GET]);
+});
+
+test("no codex command, no Codex outcome", () => {
+  const { env, ran } = machine({ commands: [], terminal: true });
+  assert.deepEqual(connectMcpClients([], env), []);
+  assert.deepEqual(disconnectMcpClients(env), []);
+  assert.deepEqual(ran, []);
+});
+
+test("Codex is disconnected by its own command, and only on our URL", () => {
+  const ours = machine({ commands: ["codex"], outputs: { [CODEX_GET]: codexEntry(MCP_URL) } });
+  assert.deepEqual(disconnectMcpClients(ours.env), [
+    { client: "Codex", state: "removed", detail: "codex mcp remove carrick" },
+  ]);
+  assert.deepEqual(ours.ran, [CODEX_GET, "codex mcp remove carrick"]);
+
+  const other = machine({ commands: ["codex"], outputs: { [CODEX_GET]: codexEntry("https://mcp.example.test/mcp") } });
+  const [removal] = disconnectMcpClients(other.env);
+  assert.equal(removal?.state, "kept");
+  assert.match(removal?.detail ?? "", /left alone/);
+  assert.deepEqual(other.ran, [CODEX_GET]);
+});
+
+test("doctor reads the Codex entry and writes nothing", () => {
+  const read = (outputs: Record<string, string>, statuses: Record<string, number> = {}) => {
+    const m = machine({ commands: ["codex"], outputs, statuses });
+    return { found: inspectMcpClients(m.env), m };
+  };
+  const ours = read({ [CODEX_GET]: codexEntry(MCP_URL) });
+  assert.deepEqual(ours.found.map((c) => [c.client, c.state]), [["Codex", "connected"]]);
+  assert.deepEqual(ours.m.ran, [CODEX_GET]);
+  assert.deepEqual(ours.m.written, {});
+  assert.equal(read({ [CODEX_GET]: codexEntry("https://mcp.example.test/mcp") }).found[0]?.state, "elsewhere");
+  assert.equal(read({}, { [CODEX_GET]: 1 }).found[0]?.state, "absent");
 });
