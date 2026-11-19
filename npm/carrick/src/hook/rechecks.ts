@@ -436,14 +436,16 @@ export function readEarly(session: string, seq: string, home?: string): EarlyAns
  */
 export function newestEarlies(session: string, home?: string, listing?: readonly string[]): Map<string, EarlyAnswer> {
   const newest = new Map<string, EarlyAnswer>();
+  for (const early of sessionEarlies(session, home, listing)) if (early.service !== undefined) newest.set(early.service, early);
+  return newest;
+}
+
+/** Every early answer `session` filed, oldest entry first. */
+export function sessionEarlies(session: string, home?: string, listing?: readonly string[]): EarlyAnswer[] {
   const names = sessionNames(session, home, listing)
     .filter((n) => n.endsWith(".early.json"))
     .sort((a, b) => seqOf(session, a).localeCompare(seqOf(session, b)));
-  for (const name of names) {
-    const early = readJson<EarlyAnswer>(path.join(sessionsDir(home), name));
-    if (early?.service !== undefined) newest.set(early.service, early);
-  }
-  return newest;
+  return names.flatMap((name) => readJson<EarlyAnswer>(path.join(sessionsDir(home), name)) ?? []);
 }
 
 /** Claim the right to print entry `seq`'s early answer, naming the rows printed: true for exactly one caller. */

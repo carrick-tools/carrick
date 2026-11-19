@@ -37,8 +37,8 @@ import {
   staleClause,
 } from "../render.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
-import { adoptedLine, changedLine, confirmAnswer, deliverEarlies, deliverOne, hasFindings } from "./late.ts";
-import { withEarlyBreaks } from "./confirm.ts";
+import { adoptedLine, changedLine, confirmAnswer, deliverEarlies, deliverOne, hasFindings, withEditedNamed } from "./late.ts";
+import { withEarlyBreaks, withoutUnsettled } from "./confirm.ts";
 import {
   changedAnsweredAt,
   claimDelivery,
@@ -48,6 +48,7 @@ import {
   sessionListing,
   isChanged,
   newestEarlies,
+  sessionEarlies,
   newestPerFile,
   pendingFor,
   readEarly,
@@ -147,11 +148,14 @@ function collect(session: string, home: string | undefined, now: number): { own:
  * with the early breaks its full answer did not withdraw, so the header counts
  * them and the clean line never names their route.
  */
-function stated(answer: Answer, home?: string): CheckResult {
+function stated(answer: Answer, counted: Set<string>, now: number, home?: string): CheckResult {
   const early = readEarly(answer.session, answer.seq, home);
-  if (early === null) return answer.result!;
-  const newest = early.service === undefined ? undefined : newestEarlies(answer.session, home).get(early.service);
-  return withEarlyBreaks(answer.result!, early.result, newest);
+  const all = newestEarlies(answer.session, home);
+  const result = withoutUnsettled(answer.result!, sessionEarlies(answer.session, home).filter((e) => e.service === early?.service), all);
+  if (early === null) return result;
+  // Early rows on a named file this session edited by Stop are not counted (P4.6).
+  const marked = withEditedNamed(early.result, answer.session, answer.root, now, home);
+  return withEarlyBreaks(result, marked, early.service === undefined ? undefined : all.get(early.service), counted);
 }
 
 export type Coverage = {
@@ -290,8 +294,10 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
       const fresh = delivered
         .filter((answer) => answer.root === root && !isChanged(answer) && !answer.instead_of_probe && answer.result !== undefined)
         .map((answer) => ({ result: confirmAnswer(answer, home).answer.result!, where: answer.relative }));
+      // One early break counts once however many files' early answers list it (#4900).
+      const counted = new Set<string>();
       const said = sessionCheckedLines(
-        coverage.covered.map((answer) => ({ result: answer.result ? stated(answer, home) : answer.result!, where: answer.relative })),
+        coverage.covered.map((answer) => ({ result: answer.result ? stated(answer, counted, clock(), home) : answer.result!, where: answer.relative })),
         fresh,
       );
       // A clean or not-checked line names a set of operations: once per set.

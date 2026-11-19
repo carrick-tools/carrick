@@ -1234,3 +1234,108 @@ test("T1: break, fix, break again: the break prints twice", (t) => {
   texts.push(...deliverLate(SESSION, Date.now(), new Set(), home));
   assert.equal(zzLines(texts.join("\n")), 2, texts.join("\n"));
 });
+
+// --- Stop never contradicts or miscounts a stated early break (T4; carrick#4703, #4786, #4900) ---
+
+const yyBreak = (file: string, over: Partial<HeldLine> = {}): HeldLine =>
+  zzBreak(file, { row_key: "contract::user-service::src/routes/users.ts::producer::GET /api/yy::0", label: "GET /api/yy", row_path: file, ...over });
+
+/** A route of the edited file whose part-2 verdict was not judged: the file's own calls are `not_checked`. */
+function unjudgedRoute(routePath: string, line: number): NonNullable<CheckResult["items"]>[number] {
+  return { ...judgedRoute(routePath, line), counterparts: [], verdict: { state: "unresolved", detail: "" } as never };
+}
+
+/** An edit whose early answer lists `lines` (from `engine`) and whose part 2 answered `full`. */
+function editWith(root: string, home: string, file: string, lines: HeldLine[], full: CheckResult, engine = "e1"): void {
+  edit(root, home, file, Date.now() - 1000);
+  const entry = queue(root, home, file);
+  assert.ok(answerEarly(SESSION, entry.seq, { state: "ready", lines, ms: 3, service: "user-service/user-service", engine }, Date.now(), home));
+  answer(home, entry, reread(full));
+}
+
+test("T4 step 0 (CF1 shape): 2 early breaks, part 2 judged neither: Stop counts 2 and names no missing verdict", (t) => {
+  const { workspace, home } = setup(t);
+  const full = { ...clean(), file: "src/routes/users.ts", items: [unjudgedRoute("/api/zz", 10), unjudgedRoute("/api/yy", 20)] };
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file), yyBreak(workspace.file)], full);
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.match(text.split("\n")[0]!, /: 2 contract problems\.$/, text);
+  assert.doesNotMatch(text, /no contract verdict|found no contract problem/, text);
+});
+
+test("T4 P4.4 (#4900): one break listed by two files' early answers is counted once", (t) => {
+  const { workspace, home } = setup(t);
+  const other = otherFile(workspace);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file)], clean());
+  editWith(workspace.root, home, other, [zzBreak(workspace.file, { standing: true })], clean());
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.match(text.split("\n")[0]!, /: 1 contract problem\.$/, text);
+});
+
+test("T4 P4.6: an early break whose named file the session edited: Stop's line says main's copy was read and the file changed", (t) => {
+  const { workspace, home } = setup(t);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file, { main_commit: "abcdef1234567890", named_files: [workspace.file] })], clean());
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.match(text, /The caller's side was read from main at abcdef1\. You changed user-service\/src\/routes\/users\.ts in this session; the check used main's copy of it\./, text);
+});
+
+test("T4 P4.6: an early break with no session edit of a named file: the read-from-main line alone", (t) => {
+  const { workspace, home } = setup(t);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file, { main_commit: "abcdef1234567890", named_files: [] })], clean());
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.match(text, /The caller's side was read from main at abcdef1\.$/m, text);
+  assert.doesNotMatch(text, /You changed/, text);
+});
+
+test("T4 P4.6: a part-2 item carries no copy line", (t) => {
+  const { workspace, home } = setup(t);
+  editWith(workspace.root, home, workspace.file, [], problem());
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.match(text, /type_mismatch/, text);
+  assert.doesNotMatch(text, /read from main/, text);
+});
+
+test("T4 P4.6: a break whose named caller file the session edited is not counted and the file gets no clean line", (t) => {
+  const { workspace, home } = setup(t);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file, { main_commit: "abcdef1234567890", named_files: [workspace.file] })], clean());
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.doesNotMatch(text, /Carrick checked the .*contract problem/, text);
+  assert.doesNotMatch(text, /found no contract problem|both sides agree/, text);
+  assert.match(text, /You changed user-service\/src\/routes\/users\.ts in this session/, text);
+});
+
+test("T4 P4.6: the same break with no session edit of a named file is counted once", (t) => {
+  const { workspace, home } = setup(t);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file, { main_commit: "abcdef1234567890", named_files: [] })], clean());
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.match(text.split("\n")[0]!, /: 1 contract problem\.$/, text);
+});
+
+test("T4 P4.5: the newest early answer is another engine's: Stop counts no break and says no clean line for the file", (t) => {
+  const { workspace, home } = setup(t);
+  const full = { ...clean(), file: "src/routes/users.ts", items: [unjudgedRoute("/api/zz", 10)] };
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file)], full, "e1");
+  editWith(workspace.root, home, workspace.file, [], full, "e2");
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.doesNotMatch(text, /contract problem|no contract verdict|both sides agree/, text);
+});
+
+test("T4 P4.5: a late carrier does not print a break the newest answer of another engine does not list", (t) => {
+  const { workspace, home } = setup(t);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file)], clean(), "e1");
+  const other = otherFile(workspace);
+  editWith(workspace.root, home, other, [], clean(), "e2");
+  assert.equal(zzLines(deliverLate(SESSION, Date.now(), new Set(), home).join("\n")), 0);
+});
+
+test("T4 P4.2 (#4786): a clean check --changed for a file whose early break stands prints no clean line", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file)], clean());
+  edit(workspace.root, home, workspace.file, Date.now());
+  gapQueue(workspace.root, home, workspace.file);
+  await stopWith(home);
+  const [changedEntry] = changedQueued(workspace.root);
+  answerChangedClean(home, changedEntry!);
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.doesNotMatch(text, /found no contract problem/, text);
+});
