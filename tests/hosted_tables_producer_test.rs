@@ -62,11 +62,6 @@ fn scan(tree: Tree<'_>) -> Scanned {
     scans_of(tree, 1).remove(0)
 }
 
-/// [`scan`], returned as a one-element list.
-fn scans(tree: Tree<'_>) -> Vec<Scanned> {
-    scans_of(tree, 1)
-}
-
 /// `runs` scans of one committed copy of `tree`, sharing one store and
 /// cache: every scan after the first takes the incremental path.
 fn scans_of(tree: Tree<'_>, runs: usize) -> Vec<Scanned> {
