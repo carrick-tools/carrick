@@ -21,7 +21,7 @@ import {
 import { askHeld, ensureHeld } from "../src/held/client.ts";
 import { liveEntries, writeEntry } from "../src/held/registry.ts";
 import { lockPath as heldLockPath, logPath, socketPath } from "../src/held/paths.ts";
-import { readState } from "../src/held/state.ts";
+import { readState, writeState } from "../src/held/state.ts";
 import { compilerLinesEnabled } from "../src/facts/enabled.ts";
 import { takeLock } from "../src/hook/lock.ts";
 
@@ -60,10 +60,10 @@ function world(services: string[]) {
   const startCalls: string[] = [];
   let hold = true;
   let outcome: "engine" | "no_compiler" = "engine";
-  let shape: { holdsCompiler?: boolean; nullRss?: boolean } = {};
+  let shape: { holdsCompiler?: boolean; nullRss?: boolean; rss?: number } = {};
   const make = (init: ServiceInit): StartResult => {
     if (outcome === "no_compiler") return { state: "no_compiler", reason: "no native compiler" };
-    const fake: Fake = { init, closed: false, rss: 2000, asked: [], events: [] };
+    const fake: Fake = { init, closed: false, rss: shape.rss ?? 2000, asked: [], events: [] };
     fakes.set(init.service, fake);
     const engine: ServiceEngine = {
       async answer(files) {
@@ -98,6 +98,7 @@ function world(services: string[]) {
     root,
     home,
     env: { ...ON },
+    totalmem: () => 16 * 1024 ** 3,
     clock: () => clock.now,
     programs: async () => inits,
     runtime,
@@ -123,7 +124,7 @@ function world(services: string[]) {
     release: () => {
       hold = false;
     },
-    setEngine: (next: { holdsCompiler?: boolean; nullRss?: boolean }) => {
+    setEngine: (next: { holdsCompiler?: boolean; nullRss?: boolean; rss?: number }) => {
       shape = next;
     },
     setNoCompiler: () => {
@@ -337,6 +338,53 @@ test("an engine above 3072 MB is closed at the next tick", async () => {
     assert.equal(w.fakes.get("api")!.closed, true);
     const again = await w.daemon.handle(w.req(w.file("api")));
     assert.equal(again.state, "cold", "the next request starts a fresh engine");
+  } finally {
+    w.done();
+  }
+});
+
+test("an engine that settled at 3500 MB is not closed, and one above 1.5 times that is", async () => {
+  const w = world(["api"]);
+  try {
+    w.release();
+    w.setEngine({ rss: 3500 });
+    await w.daemon.handle(w.req(w.file("api")));
+    await settle();
+    assert.equal(readState(w.root, "api", w.home)?.settled_mb, 3500, "the first gate's size is stored in the service's state record");
+    w.fakes.get("api")!.rss = 5000;
+    await w.daemon.tick();
+    assert.equal(w.fakes.get("api")!.closed, false, "5000 MB is under 1.5 x 3500");
+    w.fakes.get("api")!.rss = 5300;
+    await w.daemon.tick();
+    assert.equal(w.fakes.get("api")!.closed, true);
+  } finally {
+    w.done();
+  }
+});
+
+test("a new engine is counted at the service's last settled size", async () => {
+  const w = world(["a", "b"]);
+  try {
+    w.release();
+    writeState(w.root, "a", { at: "x", service: "a", state: "ready", settled_mb: 3500 }, w.home);
+    await w.daemon.handle(w.req(w.file("a")));
+    assert.equal(liveEntries(w.home).find((e) => e.service === "a")?.rss_mb, 3500);
+    // 3500 + the default 2048 is over 4096: b finds no room.
+    const second = await w.daemon.handle(w.req(w.file("b")));
+    assert.equal(second.state, "capped");
+  } finally {
+    w.done();
+  }
+});
+
+test("a service whose settled size alone exceeds the budget is not started: capped", async () => {
+  const w = world(["big"]);
+  try {
+    w.release();
+    writeState(w.root, "big", { at: "x", service: "big", state: "ready", settled_mb: 5000 }, w.home);
+    const answer = await w.daemon.handle(w.req(w.file("big")));
+    assert.equal(answer.state, "capped");
+    assert.deepEqual(w.startCalls, []);
   } finally {
     w.done();
   }

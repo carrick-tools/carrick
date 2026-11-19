@@ -4,6 +4,7 @@
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { alive, readJson } from "../hook/lock.ts";
 import { writeAtomic } from "../hook/reuse.ts";
@@ -11,12 +12,17 @@ import { heldDir } from "./paths.ts";
 
 /** What a TypeScript 7 engine was measured to settle at, and so what a new one is counted as. */
 export const ADMISSION_MB = 2048;
-/** 1.5 x the plateau: an engine above this is restarted. */
+/** The least an engine may grow to before it is restarted. */
 export const RSS_CEILING_MB = 3072;
+/** An engine is restarted above this many times the size it settled at (when that is above the floor). */
+const CEILING_FACTOR = 1.5;
 /** An engine idle this long may be closed to make room for another. */
 export const EVICT_IDLE_MS = 2 * 60_000;
 
-const DEFAULT_BUDGET_MB = 4096;
+/** The budget is a quarter of the machine's memory, within these bounds (D8). */
+const BUDGET_SHARE = 0.25;
+const MIN_BUDGET_MB = 2048;
+const MAX_BUDGET_MB = 8192;
 
 export type EngineEntry = {
   /** The daemon that owns the engine: the entry is live while this process is. */
@@ -27,9 +33,17 @@ export type EngineEntry = {
   last_used: number;
 };
 
-export function memoryBudgetMb(env: NodeJS.ProcessEnv = process.env): number {
+/** `CARRICK_HELD_MEMORY_MB` when set, else 25% of the machine's RAM (`totalBytes`), at least 2,048 and at most 8,192 MB. */
+export function memoryBudgetMb(env: NodeJS.ProcessEnv = process.env, totalBytes: number = os.totalmem()): number {
   const parsed = Number.parseInt(env["CARRICK_HELD_MEMORY_MB"] ?? "", 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BUDGET_MB;
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  const share = Math.floor((totalBytes / (1024 * 1024)) * BUDGET_SHARE);
+  return Math.min(MAX_BUDGET_MB, Math.max(MIN_BUDGET_MB, share));
+}
+
+/** The size above which an engine is closed: 1.5 x the size its first gate settled at, never under the floor. */
+export function closeCeilingMb(settledMb: number | undefined): number {
+  return settledMb === undefined ? RSS_CEILING_MB : Math.max(RSS_CEILING_MB, Math.round(settledMb * CEILING_FACTOR));
 }
 
 export function registryDir(home?: string): string {
@@ -80,7 +94,7 @@ export function liveEntries(home?: string): EngineEntry[] {
   return out;
 }
 
-/** Whether one more engine, counted at its plateau, keeps the live total within the budget. */
-export function admits(entries: readonly EngineEntry[], budgetMb: number): boolean {
-  return entries.reduce((sum, e) => sum + e.rss_mb, 0) + ADMISSION_MB <= budgetMb;
+/** Whether one more engine, counted at `newMb` (its last settled size, else the plateau), keeps the live total within the budget. */
+export function admits(entries: readonly EngineEntry[], budgetMb: number, newMb: number = ADMISSION_MB): boolean {
+  return entries.reduce((sum, e) => sum + e.rss_mb, 0) + newMb <= budgetMb;
 }

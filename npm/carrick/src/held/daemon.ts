@@ -25,7 +25,7 @@ import {
   liveEntries,
   memoryBudgetMb,
   removeEntry,
-  RSS_CEILING_MB,
+  closeCeilingMb,
   writeEntry,
 } from "./registry.ts";
 
@@ -126,6 +126,8 @@ export type DaemonDeps = {
   root: string;
   home?: string;
   env?: NodeJS.ProcessEnv;
+  /** The machine's memory in bytes; `os.totalmem` by default. */
+  totalmem?: () => number;
   clock?: () => number;
   programs: () => Promise<ServiceInit[]>;
   runtime: ServiceRuntime;
@@ -157,6 +159,8 @@ type Slot = {
   lastUsed: number;
   failedAt: number;
   begunAt: number;
+  /** MB the engine held when its first gate finished (or, before that, the service's last one). */
+  settledMb?: number;
   /** Why the start failed, one line. */
   reason?: string;
   /** Engine calls run one at a time, in arrival order. */
@@ -253,7 +257,7 @@ export class HeldDaemon {
       slot = undefined;
     }
     if (slot === undefined) {
-      if (!(await this.makeRoom())) return this.notChecked(init, "capped");
+      if (!(await this.makeRoom(init))) return this.notChecked(init, "capped");
       this.begin(init, now);
       return this.notChecked(init, "cold");
     }
@@ -271,7 +275,7 @@ export class HeldDaemon {
     if (reason !== undefined) note.reason = reason;
     if (state === "capped") {
       const holders = liveEntries(this.deps.home).length;
-      note.budget_mb = memoryBudgetMb(this.deps.env);
+      note.budget_mb = this.budget();
       note.holders = holders;
       this.keep(init, { state: "capped", budget_mb: note.budget_mb, holders });
     }
@@ -286,7 +290,8 @@ export class HeldDaemon {
   private keep(init: ServiceInit, change: Pick<ServiceState, "state"> & Partial<ServiceState>): void {
     const before = readState(this.root, init.service, this.deps.home);
     const lastStart = change.start_ms ?? before?.start_ms ?? before?.last_start_ms;
-    writeState(this.root, init.service, { at: new Date(this.now()).toISOString(), service: init.service, repo: init.repo, ...change, ...(lastStart === undefined || change.state === "ready" ? {} : { last_start_ms: lastStart }) }, this.deps.home);
+    const settled = change.settled_mb ?? before?.settled_mb;
+    writeState(this.root, init.service, { at: new Date(this.now()).toISOString(), service: init.service, repo: init.repo, ...(settled === undefined ? {} : { settled_mb: settled }), ...change, ...(lastStart === undefined || change.state === "ready" ? {} : { last_start_ms: lastStart }) }, this.deps.home);
   }
 
   /** Asked through the slot's queue; `null` when the engine could not answer. */
@@ -343,12 +348,21 @@ export class HeldDaemon {
     }
   }
 
-  /** Free room for one more engine: close idle engines, least recently used first. */
-  private async makeRoom(): Promise<boolean> {
-    const budget = memoryBudgetMb(this.deps.env);
+  private budget(): number {
+    return memoryBudgetMb(this.deps.env, this.deps.totalmem?.());
+  }
+
+  /**
+   * Free room for one more engine, counted at the service's last settled size: close idle
+   * engines, least recently used first. A service that alone exceeds the budget is never started.
+   */
+  private async makeRoom(init: ServiceInit): Promise<boolean> {
+    const budget = this.budget();
     const now = this.now();
+    const need = readState(this.root, init.service, this.deps.home)?.settled_mb ?? ADMISSION_MB;
+    if (need > budget) return false;
     for (;;) {
-      if (admits(liveEntries(this.deps.home), budget)) return true;
+      if (admits(liveEntries(this.deps.home), budget, need)) return true;
       const victim = [...this.slots.values()]
         .filter((s) => s.status === "ready" && now - s.lastUsed >= EVICT_IDLE_MS)
         .sort((a, b) => a.lastUsed - b.lastUsed)[0];
@@ -358,11 +372,12 @@ export class HeldDaemon {
   }
 
   private begin(init: ServiceInit, now: number): void {
-    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve() };
+    const settledMb = readState(this.root, init.service, this.deps.home)?.settled_mb;
+    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), ...(settledMb === undefined ? {} : { settledMb }) };
     this.slots.set(key(init), slot);
     this.keep(init, { state: "starting" });
     this.emptySince = null;
-    this.entry(slot, ADMISSION_MB);
+    this.entry(slot, slot.settledMb ?? ADMISSION_MB);
     void this.deps.runtime.start(init).then(
       (result) => this.started(slot, result),
       (error: unknown) => this.started(slot, { state: "error", reason: String(error) }),
@@ -377,7 +392,10 @@ export class HeldDaemon {
       }
       slot.engine = result.engine;
       slot.status = "ready";
-      this.keep(slot.init, { state: "ready", start_ms: this.now() - slot.begunAt });
+      // The start returns once the first gate has run: the engine's size now is its settled size.
+      const size = result.engine.holdsCompiler === false ? null : result.engine.rss();
+      if (size !== null) slot.settledMb = Math.round(size);
+      this.keep(slot.init, { state: "ready", start_ms: this.now() - slot.begunAt, ...(size === null ? {} : { settled_mb: Math.round(size) }) });
       // Give back the admission slot; the slot stays ready so its asks still answer.
       if (result.engine.holdsCompiler === false) removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
       return;
@@ -416,7 +434,10 @@ export class HeldDaemon {
       if (slot.status !== "ready" || slot.engine === null) continue;
       const holdsEntry = slot.engine.holdsCompiler !== false;
       const rss = slot.engine.rss();
-      if (now - slot.lastUsed >= ENGINE_IDLE_MS || (rss !== null && rss > RSS_CEILING_MB)) {
+      const ceiling = closeCeilingMb(slot.settledMb);
+      const oversized = rss !== null && rss > ceiling;
+      if (oversized) log(`closing ${slot.init.service} for size: ${Math.round(rss)} MB is above ${ceiling} MB (1.5 x ${slot.settledMb ?? "the floor"})`);
+      if (now - slot.lastUsed >= ENGINE_IDLE_MS || oversized) {
         await this.closeSlot(slot);
       } else if (holdsEntry && rss !== null) {
         this.entry(slot, rss);
