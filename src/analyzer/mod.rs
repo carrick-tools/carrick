@@ -354,6 +354,14 @@ pub struct ApiEndpointDetails {
     /// from a tracked `carrick.json`. Retention only: matching never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_at: Option<String>,
+    /// The resource a row stated by a type is, as the mount-graph row carries
+    /// it ([`crate::type_resources::Resource`]): `public.accounts` is
+    /// `{schema: "public", name: "accounts", kind: "table"}`. The one table
+    /// key a REST row and a realtime listener both derive. `None` on every
+    /// other row; outside the key and every hash. Wire path:
+    /// `endpoints[].resource`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<crate::type_resources::Resource>,
     /// On a pub/sub or socket row stated through verified library claims
     /// (`resolution_source: library_claim`, carrick#1662): where its name
     /// means something. `global` pairs across services, any other scope
@@ -413,6 +421,7 @@ impl Default for ApiEndpointDetails {
             handler_span: None,
             handler_file: None,
             declared_at: None,
+            resource: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -6217,6 +6226,7 @@ mod tests {
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         }
     }
 
@@ -7894,6 +7904,7 @@ mod tests {
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         }
     }
 

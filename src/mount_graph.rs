@@ -114,6 +114,13 @@ pub struct ResolvedEndpoint {
     /// `HandlerSpan` (mcp-server `types.ts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler_file: Option<String>,
+    /// The resource a row stated by a type is (`schema`, `name`, `kind`), read
+    /// off the type's key path ([`crate::type_resources`]). `None` on every
+    /// other row. Outside the row's key and every hash: nothing in matching
+    /// reads it. `default`, skipped when absent, so a graph serialized before
+    /// the field existed reads, and every other row writes, as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<crate::type_resources::Resource>,
     /// The parts this route's address is composed of, outermost first, each
     /// with the `file:line` that states it (`docs/reference/address-chain.md`).
     /// `None` means this scanner recorded none for the row (a graph
@@ -236,7 +243,10 @@ impl ConsumerRole {
             | S::EventBus
             // A built request (carrick#3470) is sent by whoever takes it,
             // which the site does not show: no call role describes it.
-            | S::RequestDescriptor => None,
+            | S::RequestDescriptor
+            // A row a type states (a key of a resource type) is a producer
+            // row: no call role describes it.
+            | S::TypeResource => None,
         }
     }
 }

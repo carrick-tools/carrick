@@ -271,6 +271,7 @@ pub fn apply_declared_operations(
                     declared_location(operation, carried.as_ref(), handlers);
                 graph.endpoints.push(crate::mount_graph::ResolvedEndpoint {
                     procedure: None,
+                    resource: None,
                     declared_at: (!block.is_generated())
                         .then(|| operation.line.map(|line| format!("carrick.json:{line}")))
                         .flatten(),
@@ -1379,6 +1380,7 @@ mod tests {
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         });
 
         apply_declared_operations(
@@ -1432,6 +1434,7 @@ mod tests {
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         };
         // Inference found two of the three, and misread one of them.
         graph.endpoints.push(inferred("search-by-intent"));
@@ -1540,6 +1543,7 @@ mod tests {
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
+            resource: None,
         });
 
         let findings = dispatch_operation_findings(&[&producer, &consumer]);
@@ -1632,6 +1636,7 @@ mod tests {
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
+            resource: None,
         }
     }
 

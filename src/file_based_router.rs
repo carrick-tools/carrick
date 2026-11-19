@@ -941,6 +941,93 @@ pub fn builtin_conventions(dependency_names: &[String]) -> Vec<RoutingConvention
 /// the convention.
 const MARKER_CONVENTIONS: &[fn() -> RoutingConvention] = &[RoutingConvention::supabase_functions];
 
+/// Resources stated by a TYPE rather than by a file path: one type states
+/// many rows, and only the compiler can list its keys. Selected by a marker
+/// file exactly as [`RoutingConvention::marker_files`] selects a layout. The
+/// type is type argument [`Self::type_arg`] of the make call of
+/// [`Self::served_package`]'s client; each [`ResourceGroup`] names a key path
+/// in it whose keys are rows. Plain data: nothing here branches on a name.
+/// Governed by `docs/reference/type-resource-rows.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceTypeConvention {
+    /// Diagnostic only.
+    pub name: String,
+    /// A file whose presence under the repository selects this convention.
+    pub marker_files: Vec<String>,
+    /// The package whose make call carries the type as a type argument.
+    pub served_package: String,
+    /// Which type argument of the make call holds the type.
+    pub type_arg: u32,
+    pub groups: Vec<ResourceGroup>,
+}
+
+/// The keys at one path of a resource type and the row each states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceGroup {
+    /// Key path in the type. Its first step is the row's schema.
+    pub at: Vec<String>,
+    /// What each key at the path is.
+    pub kind: crate::type_resources::ResourceKind,
+    /// The row's path, `{key}` standing for the key.
+    pub path: String,
+    /// The row's method.
+    pub method: String,
+}
+
+impl ResourceTypeConvention {
+    /// A hosted database's generated schema type: the tables and views of a
+    /// schema are served at `/rest/v1/<key>`, its functions at
+    /// `/rest/v1/rpc/<key>`, each for every method (a read-only table does
+    /// not get three rows nothing calls). The members each key's type holds
+    /// (`Row`, `Insert`, `Update`, `Args`, `Returns`) are not read here.
+    pub fn hosted_database() -> Self {
+        use crate::type_resources::ResourceKind;
+        let group = |at: [&str; 2], kind, path: &str| ResourceGroup {
+            at: at.map(str::to_string).to_vec(),
+            kind,
+            path: path.to_string(),
+            method: carrick_match::ANY_METHOD.to_string(),
+        };
+        Self {
+            name: "hosted-database".to_string(),
+            marker_files: vec!["supabase/config.toml".to_string()],
+            served_package: "@supabase/supabase-js".to_string(),
+            type_arg: 0,
+            groups: vec![
+                group(["public", "Tables"], ResourceKind::Table, "/rest/v1/{key}"),
+                group(["public", "Views"], ResourceKind::View, "/rest/v1/{key}"),
+                group(
+                    ["public", "Functions"],
+                    ResourceKind::Function,
+                    "/rest/v1/rpc/{key}",
+                ),
+            ],
+        }
+    }
+}
+
+/// Every resource-type convention. A further layout of this kind is one more
+/// entry here.
+const RESOURCE_TYPE_CONVENTIONS: &[fn() -> ResourceTypeConvention] =
+    &[ResourceTypeConvention::hosted_database];
+
+/// Every [`RESOURCE_TYPE_CONVENTIONS`] entry whose marker file exists under
+/// `repo_root`: none for a repository with no marker.
+pub fn resource_type_conventions(repo_root: &Path) -> Vec<ResourceTypeConvention> {
+    RESOURCE_TYPE_CONVENTIONS
+        .iter()
+        .map(|make| make())
+        .filter(|convention| marker_present(&convention.marker_files, repo_root))
+        .collect()
+}
+
+/// Whether any of `markers` is a file under `repo_root`.
+fn marker_present(markers: &[String], repo_root: &Path) -> bool {
+    markers
+        .iter()
+        .any(|marker| repo_root.join(marker).is_file())
+}
+
 /// The routing conventions one service runs under: the bootstrap its declared
 /// dependencies select ([`builtin_conventions`]), plus every
 /// [`MARKER_CONVENTIONS`] entry whose marker file exists under `repo_root`,
@@ -970,12 +1057,7 @@ fn marked_conventions(repo_root: &Path) -> impl Iterator<Item = RoutingConventio
     MARKER_CONVENTIONS
         .iter()
         .map(|make| make())
-        .filter(|convention| {
-            convention
-                .marker_files
-                .iter()
-                .any(|marker| repo_root.join(marker).is_file())
-        })
+        .filter(|convention| marker_present(&convention.marker_files, repo_root))
 }
 
 /// The packages whose client, made anywhere in the repository, addresses a

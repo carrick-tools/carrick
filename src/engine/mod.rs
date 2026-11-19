@@ -6416,6 +6416,15 @@ async fn analyze_current_repo_incremental(
                 guessed_withdrawn,
                 ..applied
             };
+            add_type_resource_rows(
+                &mut mount_graph,
+                &request_inputs,
+                library_ask.as_ref().map(|ask| &ask.sites),
+                &claims,
+                sidecar,
+                &semantics_root,
+                repo_path,
+            );
             let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
             let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
             let unread_registrations = std::mem::take(&mut protocol_extractions.site.traced.unread);
@@ -9423,6 +9432,102 @@ fn row_place(location: &str, repo_root: &Path) -> Option<(String, String, u32)> 
     Some((file.to_string(), relative, line))
 }
 
+/// What the graph's own file locations put before a repo-relative path:
+/// empty when they are repo-relative, the repo path when they are not (or
+/// when the graph holds no row to read it from).
+fn graph_file_prefix(mount_graph: &MountGraph, repo_root: &Path) -> String {
+    mount_graph
+        .endpoints
+        .iter()
+        .find_map(|endpoint| {
+            let (raw, relative, _) = row_place(&endpoint.file_location, repo_root)?;
+            raw.strip_suffix(&relative).map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// The owner of a row a type states: it matches no mount, so the row's path
+/// is used as written (as a file-based route's owner does).
+const TYPE_RESOURCE_OWNER: &str = "__type_resource__";
+
+/// Write the rows the resource types of this repository state into the mount
+/// graph ([`crate::type_resources`]): one `ALL` producer row per key of a
+/// type the served package's make call carries, source `type_resource`, at
+/// the key's own line, with its [`crate::type_resources::Resource`] and no
+/// handler. A repository with no marker (no convention) asks nothing and
+/// writes nothing. Returns how many rows were written.
+fn add_type_resource_rows(
+    mount_graph: &mut MountGraph,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    library: Option<&crate::request_summary::LibrarySites>,
+    claims: &[crate::library_claims::ExportClaims],
+    sidecar: Option<&TypeSidecar>,
+    scan_root: &Path,
+    repo_path: &str,
+) -> usize {
+    use crate::agents::file_analyzer_agent::ResolutionSource;
+    let conventions = crate::file_based_router::resource_type_conventions(Path::new(repo_path));
+    debug!(
+        conventions = conventions.len(),
+        library = library.is_some(),
+        sidecar = sidecar.is_some(),
+        positions = inputs.positions.is_some(),
+        "type resources: inputs"
+    );
+    let (Some(library), Some(sidecar)) = (library, sidecar) else {
+        return 0;
+    };
+    if conventions.is_empty() {
+        return 0;
+    }
+    let rows = crate::type_resources::rows_of(inputs, library, claims, &conventions, |queries| {
+        sidecar.resource_keys(queries, scan_root)
+    });
+    let repo_root = normalize_protocol_file(Path::new(repo_path));
+    let prefix = graph_file_prefix(mount_graph, &repo_root);
+    let mut written = 0;
+    for row in rows {
+        let held = mount_graph.endpoints.iter().any(|existing| {
+            existing.resolution_source == Some(ResolutionSource::TypeResource)
+                && existing.method == row.method
+                && existing.full_path == row.path
+        });
+        if held {
+            continue;
+        }
+        // The declaring file as the graph names its files: relative to the
+        // repository, under the prefix the graph's rows carry.
+        let declared = normalize_protocol_file(&scan_root.join(&row.file));
+        let relative = declared
+            .strip_prefix(&repo_root)
+            .map(|rest| rest.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| row.file.clone());
+        mount_graph
+            .endpoints
+            .push(crate::mount_graph::ResolvedEndpoint {
+                method: row.method,
+                path: row.path.clone(),
+                full_path: row.path,
+                handler: None,
+                owner: TYPE_RESOURCE_OWNER.to_string(),
+                file_location: format!("{prefix}{relative}:{}", row.line),
+                provenance: crate::file_finder::endpoint_provenance(
+                    &Path::new(repo_path).join(&relative),
+                    Path::new(repo_path),
+                ),
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
+                resolution_source: Some(ResolutionSource::TypeResource),
+                resource: Some(row.resource),
+                ..Default::default()
+            });
+        written += 1;
+    }
+    if written > 0 {
+        debug!(written, "type resources: producer rows written");
+    }
+    written
+}
+
 /// The rows a scope or a host decides, at every traced route's site: the
 /// writer [`apply_traced_routes`] (one service, before the payload is built)
 /// and [`crate::route_boundaries`] (across services, at the join point)
@@ -9462,14 +9567,7 @@ fn write_traced_routes(
     let place = |location: &str| row_place(location, &repo_root);
     // The graph names its files as the walk did (repo-relative, or under
     // the repo path): a written row names its file the same way.
-    let prefix = mount_graph
-        .endpoints
-        .iter()
-        .find_map(|endpoint| {
-            let (raw, relative, _) = place(&endpoint.file_location)?;
-            raw.strip_suffix(&relative).map(str::to_string)
-        })
-        .unwrap_or_default();
+    let prefix = graph_file_prefix(mount_graph, &repo_root);
     let mut sites: std::collections::BTreeMap<(&str, u32), Vec<&crate::site_rows::TracedRoute>> =
         std::collections::BTreeMap::new();
     for route in traced {
@@ -9757,6 +9855,7 @@ fn write_traced_routes(
                         handler_file: None,
                         address: route.addresses.get(full_path).cloned(),
                         procedure: procedure_at(route, full_path),
+                        resource: None,
                     },
                 };
                 written.push(row);
@@ -14894,6 +14993,14 @@ fn build_type_manifest_entries(
         if !is_producer_method(&method) {
             continue;
         }
+        // A row a type states (a key of a resource type) carries no type
+        // entries: the judge would compare a key's members with a typed
+        // client, a column-level verdict this stage does not give.
+        if endpoint.resolution_source
+            == Some(crate::agents::file_analyzer_agent::ResolutionSource::TypeResource)
+        {
+            continue;
+        }
         // Call-site-evidence entries (#379) never anchor Producer types: they
         // are client encodings of an external contract, and a producer
         // manifest entry would make the type check run a request-vs-request
@@ -16200,6 +16307,15 @@ async fn analyze_current_repo(
         guessed_withdrawn,
         ..applied
     };
+    add_type_resource_rows(
+        &mut analysis_result.mount_graph,
+        &request_inputs,
+        library_ask.as_ref().map(|ask| &ask.sites),
+        &claims,
+        sidecar,
+        &service_root,
+        repo_path,
+    );
     let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
     let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
     let unread_registrations = std::mem::take(&mut protocol_extractions.site.traced.unread);
@@ -21080,6 +21196,7 @@ unfollowed_member_calls_total: 0,
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![
@@ -21162,6 +21279,7 @@ unfollowed_member_calls_total: 0,
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         }];
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
             procedure: None,
@@ -28717,6 +28835,7 @@ unfollowed_member_calls_total: 0,
                 name_scope: None,
                 library_semantics: Vec::new(),
                 inference: None,
+                resource: None,
             };
         let procedures = procedure_sites(
             &[
@@ -33260,6 +33379,7 @@ unfollowed_member_calls_total: 0,
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         };
         let mut mount_graph = crate::mount_graph::MountGraph::new();
         mount_graph.endpoints = vec![
@@ -33693,6 +33813,7 @@ unfollowed_member_calls_total: 0,
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         }
     }
 

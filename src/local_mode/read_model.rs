@@ -758,6 +758,7 @@ mod tests {
             SocketCall,
             EventBus,
             RequestDescriptor,
+            TypeResource,
         ];
         for source in &all {
             match source {
@@ -765,7 +766,7 @@ mod tests {
                 | EnvBasePath | LiteralBasePath | NewUrl | FileBasedRoute | DescriptorRoute
                 | ClassController | DecoratorRoute | ReceiverType | InlineLiteral
                 | LibraryClaim | Model | DeclaredOperation | GraphqlSchema | GraphqlDocument
-                | SocketCall | EventBus | RequestDescriptor => {}
+                | SocketCall | EventBus | RequestDescriptor | TypeResource => {}
             }
         }
         all
