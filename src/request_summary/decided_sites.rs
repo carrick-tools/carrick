@@ -220,6 +220,12 @@ pub struct MethodLabel {
     pub default: Option<String>,
     #[serde(default)]
     pub literal: Option<String>,
+    /// `from` is a slot of the call that made the op's receiver, not of the
+    /// op's own call (`maker: true`, contract amendment 13): read at the
+    /// maker call the receiver's instance walk ends at. Never sent: the
+    /// label's wire shape is unchanged.
+    #[serde(skip)]
+    pub maker: bool,
 }
 
 /// One op of a labelled export, as the library store answers it: the
@@ -533,6 +539,7 @@ impl SiteLabel {
                         from: method_key.as_ref().map(slot),
                         default: method_default.clone(),
                         literal: method.clone(),
+                        maker: method_key.as_ref().is_some_and(|slot| slot.maker),
                     });
                 labels.push(SiteLabel {
                     new,
@@ -3109,15 +3116,23 @@ impl<'a> Walk<'a, '_> {
         }
         let file = relative(self.root, placed.file);
         let id = (file.clone(), placed.call.site.span_start, None, end.at());
-        let method = self
-            .label
-            .and_then(|label| label.method.as_ref())
-            .and_then(|method| method.from.as_ref())
-            .and_then(|slot| {
-                method_value(down, slot, &self.value_hops, &|callee, index, key| {
-                    self.default_text((callee.file, callee.key), index, Some(key))
-                })
-            });
+        let method_label = self.label.and_then(|label| label.method.as_ref());
+        let method = match method_label {
+            // A slot of the call that made the receiver (contract amendment
+            // 13): read there.
+            Some(MethodLabel {
+                from: Some(slot),
+                maker: true,
+                ..
+            }) => Some(self.maker_method(down, slot)),
+            _ => method_label
+                .and_then(|method| method.from.as_ref())
+                .and_then(|slot| {
+                    method_value(down, slot, &self.value_hops, &|callee, index, key| {
+                        self.default_text((callee.file, callee.key), index, Some(key))
+                    })
+                }),
+        };
         if !self.seen.insert(id.clone()) {
             // Another walk reached this call and labelled end. The same
             // operation (a diamond) is one site; a different one means the
@@ -3974,6 +3989,40 @@ impl<'a> Walk<'a, '_> {
     /// `SeveralOperations` lead; an instance or a name no walk reads leaves
     /// the site unnamed, as before ([`Self::unnamed`]). True where the site
     /// is the labelled call.
+    /// The method a label's `maker: true` slot reads (contract amendment
+    /// 13): written at the maker call each of the receiver's instances is
+    /// made by. One value where every maker call writes the same; unread
+    /// where the walk reached no maker call, or the calls write different
+    /// values.
+    fn maker_method(&self, down: &[Placed<'a>], slot: &ArgSlot) -> MethodValue {
+        let unread = || MethodValue::Pieces(vec![Piece::Unknown]);
+        let mut values: Vec<MethodValue> = Vec::new();
+        for instance in self.instances(down) {
+            let InstanceAt::Root {
+                file,
+                made: Some(made),
+                ..
+            } = &instance.end
+            else {
+                return unread();
+            };
+            let Some(maker) = self
+                .calls
+                .at_span(&self.root.join(file), made.span.0, made.span.1)
+            else {
+                return unread();
+            };
+            let value = written_at(maker.call, slot.arg, slot.key.as_deref());
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        match <[MethodValue; 1]>::try_from(values) {
+            Ok([value]) => value,
+            Err(_) => unread(),
+        }
+    }
+
     fn maker_named(&mut self, chain: &[Placed<'a>], end: &LabelledEnd) -> bool {
         let last = chain[chain.len() - 1];
         let Some(makers) = self.makers else {
@@ -6505,6 +6554,7 @@ pub(crate) mod tests {
                         from: None,
                         default: None,
                         literal: Some("POST".into()),
+                        maker: false,
                     }),
                 },
                 SiteLabel {
@@ -6534,6 +6584,7 @@ pub(crate) mod tests {
                         }),
                         default: Some("GET".into()),
                         literal: None,
+                        maker: false,
                     }),
                 },
             ]
@@ -7574,6 +7625,7 @@ pub(crate) mod tests {
                 }),
                 default: Some("GET".into()),
                 literal: None,
+                maker: false,
             }),
         }
     }
@@ -8723,6 +8775,7 @@ pub(crate) mod tests {
                 from: None,
                 default: None,
                 literal: Some("GET".into()),
+                maker: false,
             }),
         }
     }

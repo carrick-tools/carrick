@@ -9405,6 +9405,17 @@ struct TracedWrite {
     added: std::ops::Range<usize>,
 }
 
+/// Whether the trace writes a row served at `full_path`: a path a route is
+/// served at ([`crate::swc_scanner::is_producer_route_path`]), or for a
+/// procedure, also no path at all: a procedure named by the variable that
+/// holds it is served at a path the library chooses when the app is built
+/// (contract amendment 13), so its row is keyed by `procedure` and states
+/// `""`. Every row without a procedure reads the route rule alone.
+fn is_served_row_path(full_path: &str, procedure: Option<&carrick_match::ProcedureKey>) -> bool {
+    crate::swc_scanner::is_producer_route_path(full_path)
+        || (procedure.is_some() && full_path.is_empty())
+}
+
 /// A graph row's `file_location` as the file it names, that file relative
 /// to `repo_root` (a [`normalize_protocol_file`] path), and its line.
 fn row_place(location: &str, repo_root: &Path) -> Option<(String, String, u32)> {
@@ -9707,7 +9718,11 @@ fn write_traced_routes(
                 if held {
                     continue;
                 }
-                if !crate::swc_scanner::is_producer_route_path(full_path) {
+                // A procedure the library serves at a path the code never
+                // writes (contract amendment 13) is keyed by its procedure,
+                // and states no path.
+                let procedure = procedure_at(route, full_path);
+                if !is_served_row_path(full_path, procedure.as_ref()) {
                     applied.refused += 1;
                     continue;
                 }
@@ -9720,7 +9735,7 @@ fn write_traced_routes(
                         handler_span: None,
                         handler_file: None,
                         address: route.addresses.get(full_path).cloned(),
-                        procedure: procedure_at(route, full_path),
+                        procedure,
                         ..template.clone()
                     },
                     // With no binding symbol there is no owner to write: the
@@ -9756,7 +9771,7 @@ fn write_traced_routes(
                         handler_span: None,
                         handler_file: None,
                         address: route.addresses.get(full_path).cloned(),
-                        procedure: procedure_at(route, full_path),
+                        procedure,
                     },
                 };
                 written.push(row);
@@ -33802,6 +33817,93 @@ unfollowed_member_calls_total: 0,
             ".",
         );
         assert_eq!(walked.endpoints[1].file_location, "./src/users.ts:8");
+    }
+
+    /// Contract amendment 13: a procedure named by its binding is served at
+    /// a path the code never writes, so its row states `""` and is written
+    /// keyed by its procedure, where no row stands at its line (one replaced
+    /// model row stands at the other). A route with no procedure and no path
+    /// is still refused, and the route rule itself is unchanged.
+    #[test]
+    fn a_procedure_served_at_no_path_is_written_and_a_route_with_none_is_not() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let bound = |line: u32, method: &str, name: &str| crate::site_rows::TracedRoute {
+            procedures: vec![crate::request_summary::decided_sites::ProcedureAt {
+                full_path: String::new(),
+                key_path: name.to_string(),
+                router_file: "src/notes.ts".to_string(),
+                router_binding: String::new(),
+            }],
+            owner: Some(name.to_string()),
+            handler: None,
+            corrects: false,
+            ..traced_route("src/notes.ts", line, method, "", &[""])
+        };
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![traced_row(
+            "src/notes.ts:5",
+            "POST",
+            "/saveNote",
+            "/saveNote",
+            ResolutionSource::Model,
+        )];
+        let (applied, _) = apply_traced_routes(
+            &mut graph,
+            &[
+                bound(3, "GET", "listNotes"),
+                bound(5, "POST", "saveNote"),
+                bound(10, "GET", "unused"),
+                traced_route("src/odd.ts", 4, "GET", "", &[""]),
+            ],
+            ".",
+        );
+        assert_eq!(
+            (applied.added, applied.replaced, applied.refused),
+            (2, 1, 1)
+        );
+        let rows: Vec<String> = graph
+            .endpoints
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} {} {:?} {:?} {}",
+                    row.file_location,
+                    row.method,
+                    row.full_path,
+                    row.path,
+                    row.procedure
+                        .as_ref()
+                        .map(|key| format!("{}#{}", key.path, key.router.binding))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                r#"src/notes.ts:5 POST "" "" saveNote#"#,
+                r#"src/notes.ts:3 GET "" "" listNotes#"#,
+                r#"src/notes.ts:10 GET "" "" unused#"#,
+            ]
+        );
+        // Every row without a procedure reads the route rule alone.
+        for path in ["", "ping", "GET", "/", "/users/:id", "`/orders/${id}`"] {
+            assert_eq!(
+                is_served_row_path(path, None),
+                crate::swc_scanner::is_producer_route_path(path),
+                "{path}"
+            );
+        }
+        let key = carrick_match::ProcedureKey {
+            path: "saveNote".to_string(),
+            router: carrick_match::RouterId {
+                repo: "r".to_string(),
+                file: "src/notes.ts".to_string(),
+                binding: String::new(),
+            },
+        };
+        assert!(is_served_row_path("", Some(&key)));
+        assert!(!is_served_row_path("ping", Some(&key)));
     }
 
     /// carrick#4071: each row the trace writes asks for its response, as a

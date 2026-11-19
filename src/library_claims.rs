@@ -3152,6 +3152,51 @@ mod tests {
         );
     }
 
+    /// Amendment 13: a procedure named by its binding. `bound: "binding"` and
+    /// `maker: true` on the `method_key` are read from the store and written
+    /// back as stored; `maker: false` is no flag and is not written.
+    #[test]
+    fn a_binding_name_and_a_maker_slot_round_trip() {
+        let rpc = export(json!({
+            "package": "fixture-rpc", "version": "1.0.0", "specifier": "fixture-rpc",
+            "export": "defineFn", "role": "server_framework",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": "handler", "of": "instance:()",
+                  "protocol": "rpc", "handler": { "arg": 0 }, "name": { "bound": "binding" },
+                  "method_default": "GET", "payload": { "arg": 0, "key": "data" },
+                  "method_key": { "arg": 0, "key": "method", "maker": true } }
+            ]
+        }));
+        let LibraryClaim::Op {
+            name, method_key, ..
+        } = &rpc.claims[0]
+        else {
+            panic!("an op")
+        };
+        assert!(matches!(
+            name.as_deref(),
+            Some(OpName::Bound {
+                bound: BoundName::Binding,
+                ..
+            })
+        ));
+        assert!(method_key.as_ref().unwrap().maker);
+        let written = serde_json::to_string(&rpc.claims[0]).unwrap();
+        assert!(
+            written.contains(r#""name":{"bound":"binding"}"#),
+            "{written}"
+        );
+        assert!(
+            written.contains(r#""method_key":{"arg":0,"key":"method","maker":true}"#),
+            "{written}"
+        );
+        assert!(
+            !serde_json::to_string(&ClaimSlot::at_arg(0))
+                .unwrap()
+                .contains("maker")
+        );
+    }
+
     /// QW-1: `or_file` on a handler is read from the store, written back as
     /// stored, and moves no claim id.
     #[test]
