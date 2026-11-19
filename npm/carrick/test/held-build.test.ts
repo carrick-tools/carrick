@@ -21,6 +21,7 @@ const ON = { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
 const LINE: HeldLine = {
   row_key: "GET /orders", group: 0, label: "GET /orders", consumer: "web", file: "src/orders.ts", line: 8, message: "broken",
   row_file: "src/orders.ts", row_line: 8, row_path: "/w/src/orders.ts", places: [], expected: "{ id: string }",
+  main_commit: null, named_files: [],
 };
 
 function world() {

@@ -16,6 +16,7 @@ import type { HeldLine, ServiceInit } from "../src/held/daemon.ts";
 import type { Diag, Engine } from "../src/held/engine.ts";
 import { earlyResult } from "../src/held/early.ts";
 import { createRuntime } from "../src/held/runtime.ts";
+import type { RuntimeDeps } from "../src/held/runtime.ts";
 import { buildFacts, factsPath } from "../src/facts/store.ts";
 
 const REPO = "shop";
@@ -93,17 +94,17 @@ function spanOf(text: string, snippet: string): [number, number] {
 }
 
 type Wire = Record<string, unknown>;
-const place = (file: string, line: number): Wire => ({ service: "web", repo: REPO, file, line, loc: `${file}:${line}`, alias: "A", infer_kind: "call_result", span: null, symbol: null, home: null });
-const group = (places: Wire[]): Wire => ({ type: "{ ok: boolean }", symbol: null, home: null, places, total: places.length, shown: places.length, lead: "", more: "", tail: "", shortened: false });
+const place = (file: string, line: number, repo = REPO): Wire => ({ service: "web", repo, file, line, loc: `${file}:${line}`, alias: "A", infer_kind: "call_result", span: null, symbol: null, home: null });
+const group = (places: Wire[], home: Wire | null = null): Wire => ({ type: "{ ok: boolean }", symbol: null, home, places, total: places.length, shown: places.length, lead: "", more: "", tail: "", shortened: false });
 const route = (label: string, file: string, text: string): Wire => ({
   k: "contract", side: "producer", protocol: "http", label, direction: "response", repo: REPO, service: SERVICE, file, line: 1, name: null, site: null,
-  locator: "registration", untyped: [], groups: [group([place(`web/${label.slice(5)}.ts`, 4)])], total: 1, values: [{ file, span: spanOf(text, "{ ok: true }") }],
+  locator: "registration", untyped: [], groups: [group([place(`web/${label.slice(5)}.ts`, 4), ...(label === "GET /b" ? [place("view/b.ts", 2, "ext")] : [])], label === "GET /a" ? { file: "src/shared.ts", line: 2 } : null)], total: 1, values: [{ file, span: spanOf(text, "{ ok: true }") }],
 });
 
 /** `filed: false` is an answer the daemon did not file (a superseded ask): it is never committed. */
 type Rig = { root: string; edit: (rel: string, text: string, options?: { filed?: boolean }) => Promise<HeldLine[]> };
 
-async function rig(t: { after: (fn: () => void | Promise<void>) => void }): Promise<Rig> {
+async function rig(t: { after: (fn: () => void | Promise<void>) => void }, more: Partial<RuntimeDeps> = {}): Promise<Rig> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-standing-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, "ws");
@@ -115,6 +116,7 @@ async function rig(t: { after: (fn: () => void | Promise<void>) => void }): Prom
   git(root, "add", "-A");
   git(root, "commit", "-q", "-m", "index");
   const commit = git(root, "rev-parse", "HEAD");
+  lastCommit = commit;
   fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
   fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "shop" }] } }));
   const header = { schema: 1, writer: 12, project_id: "p", project_slug: "shop", digest: "d", built_at: "2026-01-01T00:00:00Z", repos: [{ repo: REPO, service: SERVICE, commit }] };
@@ -124,7 +126,7 @@ async function rig(t: { after: (fn: () => void | Promise<void>) => void }): Prom
   fs.writeFileSync(entry, FAKE_ENGINE);
   const compiler = new FakeCompiler();
   const init: ServiceInit = { repo: REPO, service: SERVICE, repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
-  const runtime = createRuntime({ root, home, entry, env: { ...process.env }, site: async () => ({ reason: "value_edited" }), makeEngine: () => compiler });
+  const runtime = createRuntime({ root, home, entry, env: { ...process.env }, site: async () => ({ reason: "value_edited" }), makeEngine: () => compiler, ...more });
   const started = await runtime.start(init);
   assert.ok("engine" in started, JSON.stringify(started));
   const service = started.engine;
@@ -143,6 +145,27 @@ async function rig(t: { after: (fn: () => void | Promise<void>) => void }): Prom
   };
   return { root, edit };
 }
+
+let lastCommit = "";
+
+// T2 (carrick#4742, R3): each line says which copy of the other side its check read.
+test("a line carries main's commit for the places' repo and the files that hold the other side", async (t) => {
+  const r = await rig(t);
+  const [line] = await r.edit(A, A_TEXT.replace("ok: true", "BROKEN: true"));
+  assert.equal(line!.main_commit, lastCommit, "the fact file's commit for the places' repo");
+  assert.deepEqual(line!.named_files, [path.join(r.root, "web/a.ts"), path.join(r.root, "src/shared.ts")], "each place's file, then the group's home file, absolute");
+});
+
+test("a place in another repo is named under that repo's checkout; one with no checkout names no file; the commit is the first place's repo that has one", async (t) => {
+  const other = "b".repeat(40);
+  const r = await rig(t, { commits: async () => ({ ext: other, [REPO]: lastCommit }), repoPaths: async () => ({ ext: "/elsewhere/ext" }) });
+  const [line] = await r.edit(B, B_TEXT.replace("ok: true", "BROKEN: true"));
+  assert.deepEqual(line!.named_files, [path.join(r.root, "web/b.ts"), "/elsewhere/ext/view/b.ts"]);
+  assert.equal(line!.main_commit, lastCommit, "web/b.ts is the first place: its repo's commit, not ext's");
+  const bare = await rig(t, { commits: async () => ({ [REPO]: lastCommit }), repoPaths: async () => ({}) });
+  const [alone] = await bare.edit(B, B_TEXT.replace("ok: true", "BROKEN: true"));
+  assert.deepEqual(alone!.named_files, [path.join(bare.root, "web/b.ts")], "ext is not checked out here");
+});
 
 const breakA = A_TEXT.replace("ok: true", "BROKEN: true");
 const summary = (lines: HeldLine[]): Array<[string, boolean]> => lines.map((l) => [l.label, l.standing === true]);

@@ -41,6 +41,8 @@ const LINE: HeldLine = {
   row_path: "/w/src/orders.ts",
   places: [{ service: "web", file: "src/view.ts", line: 3 }],
   expected: "{ id: string }",
+  main_commit: null,
+  named_files: [],
 };
 
 type Fake = { init: ServiceInit; closed: boolean; rss: number; asked: string[]; events: string[]; afterGate?: Promise<void> };

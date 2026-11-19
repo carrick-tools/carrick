@@ -20,7 +20,7 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 import { parseCheckResult, SCHEMA } from "../src/contract.ts";
-import type { Boundary, CheckItem, CheckResult } from "../src/contract.ts";
+import type { Boundary, CheckItem, CheckResult, MovedRow } from "../src/contract.ts";
 import { messageOf } from "../src/diagnostics.ts";
 import { asStated, fixture, statusFixture, testDir } from "./helpers.ts";
 
@@ -1369,4 +1369,66 @@ test("moved call rows head their early block as calls, routes as routes, a mix a
   assert.match(head(["call"])!, /; calls in other files broke:$/);
   assert.match(head(["route"])!, /; routes in other files broke:$/);
   assert.match(head(["route", "call"])!, /; routes and calls in other files broke:$/);
+});
+
+// T2 (carrick#4742, R3; the compiler half of carrick#4720): an early row says which copy of the other side it read.
+const earlyMoved = (over: Partial<MovedRow> = {}): MovedRow => ({
+  file: "api/src/widgets.ts",
+  line: 9,
+  role: "route",
+  method: "GET",
+  path: "/api/widgets/:id",
+  before: "compatible",
+  after: "type_mismatch",
+  counterparts: ["web web/src/client.ts:20"],
+  reason: "x",
+  not_judged_before: false,
+  stated: true,
+  main_commit: "0123456789abcdef0123456789abcdef01234567",
+  ...over,
+});
+const earlyResultOf = (moved: MovedRow[]): CheckResult => ({ ...rechecked(), items: [], recheck: { ran: "extraction+types", elapsed_ms: 0, moved } });
+
+test("T2: an early moved row agreed before the edit, not in the index, and names the commit it read", () => {
+  const lines = movedLines(earlyResultOf([earlyMoved()]));
+  assert.match(lines[0]!, /agreed before the edit and now reads type_mismatch\.$/);
+  assert.doesNotMatch(lines.join("\n"), /in the index/);
+  assert.match(lines[1]!, /^ {2}The caller's side was read from main at 0123456\.$/);
+});
+
+test("T2: an early moved row that already stood makes no claim about before", () => {
+  const lines = movedLines(earlyResultOf([earlyMoved({ standing: true })]));
+  assert.doesNotMatch(lines[0]!, /agreed/);
+  assert.match(lines[0]!, /now reads type_mismatch\.$/);
+});
+
+test("T2: the session clause names each edited file, or says the index has no commit", () => {
+  const lines = movedLines(earlyResultOf([earlyMoved({ main_commit: null, edited_named: ["web/src/client.ts", "web/src/types.ts"] })]));
+  assert.equal(lines[1], "  The caller's side was read from main as of the last index. You changed web/src/client.ts, web/src/types.ts in this session; the check used main's copy of them.");
+});
+
+test("T2: part 2's moved row keeps its words and gets no copy line", () => {
+  const { main_commit: _drop, ...part2 } = earlyMoved();
+  const lines = movedLines(earlyResultOf([part2 as MovedRow]));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /agreed in the index and now reads type_mismatch\.$/);
+});
+
+test("T2: an early item line is followed by its copy line, outside the 400-character cap", () => {
+  const item: CheckItem = {
+    kind: "route",
+    method: "GET",
+    path: "/widgets",
+    line: 3,
+    direction: "response",
+    verdict: { state: "resolved", result: "type_mismatch", detail: "x".repeat(380) },
+    stated: true,
+    main_commit: "0123456789abcdef0123456789abcdef01234567",
+    edited_named: ["web/src/client.ts"],
+  };
+  const text = renderPostToolUse({ ...rechecked(), items: [item] }, "api/src/widgets.ts", { early: true }) ?? "";
+  const rows = text.split("\n");
+  const at = rows.findIndex((row) => row.startsWith("- api/src/widgets.ts:3"));
+  assert.ok(rows[at]!.length <= 400, `${rows[at]!.length}`);
+  assert.equal(rows[at + 1], "  The caller's side was read from main at 0123456. You changed web/src/client.ts in this session; the check used main's copy of it.");
 });

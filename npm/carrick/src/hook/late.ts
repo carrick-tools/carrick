@@ -8,13 +8,16 @@
 // hooks print it once.
 
 import { resolveChannel } from "../channel.ts";
+import path from "node:path";
 import { problemItems } from "../contract.ts";
+import type { CheckResult } from "../contract.ts";
+import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedCleanLine, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
 import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, newestEarlies, owedFor, readAnswer, readEarly, sessionListing } from "./rechecks.ts";
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
 import { confirmedResult, earlyRows, keepRows, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
-import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
+import { markLed, markSaid, markTold, readSession, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
@@ -101,6 +104,30 @@ export function deliverOne(session: string, raw: Answer, home?: string): string[
 }
 
 /**
+ * The early rows with the named files `session` edited before `now` marked on
+ * them (T2 P2.3): the check held the other side fixed at main's copy, so an
+ * edit of a file that holds it never reached the line. Decided here, at print
+ * time, never when the answer is filed: an edit lands between the two.
+ */
+function withEditedNamed(early: CheckResult, session: string, root: string, now: number, home?: string): CheckResult {
+  const edited = new Set(Object.entries(readSession(session, home).files).filter(([, edit]) => edit.at <= now).map(([file]) => realPath(file)));
+  if (edited.size === 0) return early;
+  const shown = (file: string): string => {
+    const rel = path.relative(realPath(root), realPath(file));
+    return rel.startsWith("..") || path.isAbsolute(rel) ? file : rel;
+  };
+  const mark = <T extends { named_files?: string[] }>(row: T): T => {
+    const hit = [...new Set((row.named_files ?? []).filter((file) => edited.has(realPath(file))).map(shown))].sort();
+    return hit.length === 0 ? row : { ...row, edited_named: hit };
+  };
+  return {
+    ...early,
+    items: (early.items ?? []).map(mark),
+    ...(early.recheck ? { recheck: { ...early.recheck, moved: (early.recheck.moved ?? []).map(mark) } } : {}),
+  };
+}
+
+/**
  * What a carrier prints for one early answer (part 3, B1) it owes: the breaks
  * not yet printed in this message (`seen`, the rows' keys), through the one
  * renderer, claimed once under `<seq>.early.said` with the keys of every row the
@@ -123,7 +150,7 @@ export function deliverEarly(owner: string, early: EarlyAnswer, seen: Set<string
   const told = (row: (typeof rows)[number]): boolean => wasTold(reader, toldBreak(row.listed, row.run), options.home);
   const fresh = keepRows(view, (row) => !seen.has(row.key) && !told(row));
   for (const row of rows) seen.add(row.key);
-  const text = renderPostToolUse(fresh, early.relative, { early: true, uses: false, late: options.late !== false });
+  const text = renderPostToolUse(withEditedNamed(fresh, reader, early.root, options.now ?? Date.now(), options.home), early.relative, { early: true, uses: false, late: options.late !== false });
   if (text) {
     markTold(reader, earlyRows(fresh).map((row) => toldBreak(row.listed, row.run)), options.home);
     log(`early answer ${early.relative} delivered ${Math.round(((options.now ?? Date.now()) - Date.parse(early.enqueued_at)) / 1000)} s after the edit`);
