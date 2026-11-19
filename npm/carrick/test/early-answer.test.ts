@@ -971,7 +971,7 @@ test("T1: two emits of one event in one file: the second, broken at a later edit
   forgetQueue(ws);
 });
 
-test("T1: a restarted engine's answer is no evidence a break was fixed: it still prints and Stop still counts it", async (t) => {
+test("T1/T4 P4.5: a restarted engine's answer is no evidence either way: the break neither prints nor counts", async (t) => {
   const ws = await workspace(t);
   const { deliverLate } = await import("../src/hook/late.ts");
   const { withEarlyBreaks } = await import("../src/hook/confirm.ts");
@@ -979,11 +979,11 @@ test("T1: a restarted engine's answer is no evidence a break was fixed: it still
   const seq = await filed(ws, "t1i", "api/src/tasks.ts", [run1(ws)]);
   // The engine restarted: it re-gated and armed no check that speaks, so its answer lists nothing.
   await filed(ws, "t1i", C_FILE, [], "e2");
-  assert.equal(statesBreak(deliverLate("t1i", Date.now(), new Set(), ws.home)), 1);
+  assert.equal(statesBreak(deliverLate("t1i", Date.now(), new Set(), ws.home)), 0);
   const { newestEarlies } = await import("../src/hook/rechecks.ts");
   const newest = newestEarlies("t1i", ws.home).get("api/api");
   const clean: CheckResult = { schema: "carrick.check/0", file: "src/tasks.ts", items: [], recheck: { ran: "extraction+types", elapsed_ms: 5 } };
-  assert.equal((withEarlyBreaks(clean, readEarly("t1i", seq, ws.home)!.result, newest).items ?? []).length, 1);
+  assert.equal((withEarlyBreaks(clean, readEarly("t1i", seq, ws.home)!.result, newest).items ?? []).length, 0);
   forgetQueue(ws);
 });
 
