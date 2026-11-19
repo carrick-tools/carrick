@@ -42,6 +42,7 @@ import { LAUNCHER_FILE, launcherSource } from "./launcher.ts";
 import { installedCarrickHooks, mergeCarrickHooks, mergeHookSet, removeCarrickHooks, SHARED_SETTINGS } from "./settings.ts";
 import { CODEX_HOOKS_FILE, codexHooks, isEmptyHooksDocument } from "./codex.ts";
 import {
+  recordWrittenSkills,
   removeTaskSkills,
   renderTaskSkill,
   skillFile,
@@ -308,6 +309,8 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
   for (const write of writes) {
     if (writeIfChanged(path.join(repo, write.relative), write.body) === "written") changed.add(write.relative);
   }
+  // Init's own folder keeps the record self-update reads (`.carrick/task-skills-written.json`).
+  if (own) recordWrittenSkills(repo, writes.map((write) => write.relative).filter((relative) => taskSkillPaths().includes(relative)));
   if (shared !== null) {
     const target = path.join(repo, SHARED_SETTINGS);
     if ("remove" in shared) fs.rmSync(target);
@@ -374,6 +377,19 @@ export function recordedRepoCopy(repo: string): { exclude: string; block: Return
   const block = withoutExcludeBlock(existing);
   if (!block.found) return null;
   return { exclude, block, recorded: block.lines.filter((line) => line.startsWith("/")).map(fromPattern) };
+}
+
+/**
+ * Add paths to the repo's exclude block, which must exist already. The block is
+ * written before any file it names, so a caller adds here first and writes after.
+ * Returns false where the repo holds no block.
+ */
+export function addToExcludeBlock(repo: string, relatives: string[]): boolean {
+  const copy = recordedRepoCopy(repo);
+  if (copy === null) return false;
+  const all = [...new Set([...copy.recorded, ...relatives])];
+  writeIfChanged(copy.exclude, withExcludeBlock(readOrNull(copy.exclude), all));
+  return true;
 }
 
 /**

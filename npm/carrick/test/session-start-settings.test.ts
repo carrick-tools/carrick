@@ -15,7 +15,7 @@ import { CODEX_HOOKS_FILE, codexHooks } from "../src/init/codex.ts";
 import { carrickHooks, mergeCarrickHooks } from "../src/init/settings.ts";
 import { renderCheckSection } from "../src/init/agents-section.ts";
 import { bringUpToDate, updateHooks } from "../src/init/self-update.ts";
-import { skillFile, SKILL_ROOTS, stamped, writeTaskSkills } from "../src/init/task-skills.ts";
+import { recordWrittenSkills, skillFile, SKILL_ROOTS, stamped, TASK_SKILLS, writeTaskSkills } from "../src/init/task-skills.ts";
 
 const LOCAL = path.join(".claude", "settings.local.json");
 const SHARED = path.join(".claude", "settings.json");
@@ -267,6 +267,8 @@ test("a tracked stale skill and settings file are left byte for byte and named i
   const settings = put(workspace.root, LOCAL, olderSettings());
   const skillPath = skillFile(SKILL_ROOTS[0]!, "carrick-impact");
   const skill = put(workspace.root, skillPath, stamped("an older body"));
+  // The other skills were given to this install and removed since: not new, so not named.
+  recordWrittenSkills(workspace.root, SKILL_ROOTS.flatMap((root) => TASK_SKILLS.map((name) => skillFile(root, name))));
   recordVersion(workspace.root, "0.0.1");
   git(workspace.root, "init", "-q");
   git(workspace.root, "add", "-f", LOCAL, skillPath);

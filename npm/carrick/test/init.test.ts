@@ -1215,6 +1215,9 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
         // Which build wrote the files below, so a hook running an older
         // `carrick` than this one says so (carrick#1372).
         path.join(".carrick", "cli-version"),
+        // Which skills this install was given, so a session start adds only
+        // the ones new to it (carrick#1333).
+        path.join(".carrick", "task-skills-written.json"),
         // Kept out of git in a repo of its own, so no shared settings file
         // is written (carrick#4881).
         path.join(".claude", "settings.local.json"),
