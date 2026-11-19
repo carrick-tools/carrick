@@ -53,6 +53,7 @@ import {
 } from './infer-cache.js';
 import { writePositionRows } from './position-rows.js';
 import { findImplementations } from './implementations.js';
+import { findResourceKeys } from './resource-keys.js';
 import { importGraphOf, mergeGraphs, reach, serialiseGraph } from './affected-set.js';
 import type {
   BundleResult,
@@ -81,6 +82,7 @@ import type {
   AddProgramFilesResponse,
   PositionRowsResponse,
   ImplementationsResponse,
+  ResourceKeysResponse,
   ErrorResponse,
   ServerClaims,
   InferRequestItem,
@@ -1079,6 +1081,36 @@ function handleImplementations(
 }
 
 /**
+ * Handle the 'resource_keys' action - the property keys at key paths of a
+ * make call's type argument, with their declarations. Asked of the analysis
+ * process like `implementations`: it reads the programs the service's other
+ * actions read, and releases none of them.
+ */
+function handleResourceKeys(request: SidecarRequest & { action: 'resource_keys' }): ResourceKeysResponse {
+  try {
+    const loader = initializedLoader();
+    let done = 0;
+    const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
+      writeProgress(request.request_id, 'resource_keys', `${done} of ${request.queries.length}`)
+    );
+    const answers = findResourceKeys({
+      loader,
+      scanRoot: request.scan_root,
+      queries: request.queries,
+      onAnswer: () => {
+        done += 1;
+        report();
+      },
+    });
+    return { request_id: request.request_id, status: 'success', result: { answers } };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Resource keys failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'position_rows' action - write the compiler's rows for each
  * call, member access, comparison and identifier of the given files
  * (carrick#2405). Asked of a process of its own: it releases each owner's
@@ -1194,6 +1226,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handlePositionRows(request);
     case 'implementations':
       return handleImplementations(request);
+    case 'resource_keys':
+      return handleResourceKeys(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':
