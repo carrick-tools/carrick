@@ -995,7 +995,7 @@ test("a fact file is stale after 60 s, and the refresh claim is granted after 60
   assert.equal((await factLines(ws.root, [edited], undefined, { now, env: quiet })).stale, false, "fetched 59 s ago is fresh");
   await touchFetched(ws.root, new Date(now - 61_000).toISOString());
   assert.equal((await factLines(ws.root, [edited], undefined, { now, env: quiet })).stale, true, "fetched 61 s ago is stale");
-  const env = { ...process.env, CARRICK_NO_FACTS_REFRESH: "" };
+  const env: NodeJS.ProcessEnv = { ...process.env, CARRICK_NO_FACTS_REFRESH: "" };
   delete env["CARRICK_FACTS_COOLDOWN_MS"];
   const start = () => undefined;
   assert.equal(startFactsRefresh(ws.root, { env, now, start }), true);
