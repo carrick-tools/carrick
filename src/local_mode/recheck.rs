@@ -138,8 +138,42 @@ pub(super) fn engine_ready_of(
         .filter(|repo| repo.name == name)
         .flat_map(|repo| repo.services.iter())
         .filter(|service| reread.contains(&service.name))
-        .filter_map(|service| service.boundary.as_ref()?.types_degraded.as_ref())
-        .any(|degraded| matches!(degraded.stage.as_str(), "spawn" | "init"))
+        .any(engine_lost)
+}
+
+/// Whether the boundary `service` was re-scanned with records that the
+/// compiler engine was not found or never became ready (`spawn`, `init`).
+fn engine_lost(service: &super::read_model::IndexedService) -> bool {
+    service
+        .boundary
+        .as_ref()
+        .and_then(|boundary| boundary.types_degraded.as_ref())
+        .is_some_and(|degraded| matches!(degraded.stage.as_str(), "spawn" | "init"))
+}
+
+/// What a check says when a re-scanned service ran with no compiler engine
+/// (carrick#4816). That scan asked the library store nothing, so every row a
+/// library package states is missing: a pass would read a socket emit or a
+/// route call as `no_route`, which is a result the run could not read. Same
+/// rule as [`library_unavailable`]: only a service this run re-scanned
+/// (`rescanned`) stops it, and a carried one is untouched.
+pub const ENGINE_UNAVAILABLE: &str =
+    "the compiler engine was not found or was not ready in time to re-read the edited code.";
+
+pub(super) fn engine_unavailable<'a>(
+    rebuilt: &super::read_model::LocalIndex,
+    repos: impl IntoIterator<Item = &'a String>,
+    rescanned: &std::collections::BTreeSet<String>,
+) -> Option<&'static str> {
+    let repos: std::collections::BTreeSet<&String> = repos.into_iter().collect();
+    rebuilt
+        .repos
+        .iter()
+        .filter(|repo| repos.contains(&repo.name))
+        .flat_map(|repo| repo.services.iter())
+        .filter(|service| rescanned.contains(&service.name))
+        .any(engine_lost)
+        .then_some(ENGINE_UNAVAILABLE)
 }
 
 /// How many new functions one answer carries.
@@ -1853,7 +1887,9 @@ fn inside(
     if !lost.is_empty() {
         return Err(lost.join(" "));
     }
-    if let Some(sentence) = library_unavailable(&rejoined.index, [&name], &rejoined.rescanned) {
+    if let Some(sentence) = engine_unavailable(&rejoined.index, [&name], &rejoined.rescanned)
+        .or_else(|| library_unavailable(&rejoined.index, [&name], &rejoined.rescanned))
+    {
         return Err(sentence.to_string());
     }
 
