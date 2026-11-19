@@ -45,6 +45,7 @@ import {
   type SiteFinder,
   type Value,
 } from "./place.ts";
+import { runOf } from "./early.ts";
 import { messageSendRows } from "./message-rows.ts";
 import { engineEntry, engineSiteFinder, writeShadow, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
 import { StepTimer, type Steps } from "./steps.ts";
@@ -105,6 +106,8 @@ type GraphqlChecks = { wire: string[]; leaves: Map<string, string>; reason: stri
 const identity = (row: ContractRow): string => `${row.repo}\0${row.file}\0${row.label}\0${row.site ?? ""}${row.side === "consumer" ? `\0${row.side}\0${row.line ?? ""}` : ""}`;
 /** A consumer row's call line, for its placed row and its held key; every other row adds nothing (HTTP and GraphQL keep their keys). */
 const callLine = (row: ContractRow): { line?: number | null } => (row.side === "consumer" ? { line: row.line } : {});
+/** A compiler message without the check's own names (`O<row>_<group>`, `send<row>_<group>`), which a re-placed overlay may renumber. */
+const ownNamesOut = (message: string): string => message.replace(/\bO\d+_\d+\b/g, "O").replace(/\bsend\d+_\d+\b/g, "send");
 /** The once-per-session key of a held line: `contractKey` plus, for a consumer row, its index line (two emits of one event are two lines). */
 const heldKey = (row: ContractRow, g: number): string => `${contractKey(row, g)}${row.side === "consumer" ? `::line::${row.line ?? ""}` : ""}`;
 const groupKey = (row: ContractRow, group: number): string => `${identity(row)}\0${row.groups[group]!.type}`;
@@ -202,6 +205,19 @@ class HeldService implements ServiceEngine {
   /** Where the answer in flight spends its time; the after-answer work has its own (the queue runs them one at a time). */
   private timer = new StepTimer();
   private afterTimer = new StepTimer();
+  /**
+   * Per line (row, group), what its check spoke at the last edit answer that was
+   * filed (T1 P1.1): the message without the check's own names, and the run it
+   * belongs to, the answer it first spoke at. A line whose check spoke the same
+   * message then is `standing`; a new engine starts empty, as its gate armed only
+   * silent checks. An answer's map takes over only when the daemon commits it
+   * (`answer`'s `commit`), so a superseded ask leaves the last filed one.
+   */
+  private spoke = new Map<string, { message: string; run: string }>();
+  /** Edit answers computed so far; with the engine's id, names a run (`runOf`). */
+  private answers = 0;
+  /** This engine's id, one per start: a later engine's answers say nothing of this one's runs. */
+  private readonly engineId = `${process.pid}-${Date.now()}`;
 
   private readonly init: ServiceInit;
   private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
@@ -574,23 +590,27 @@ class HeldService implements ServiceEngine {
     for (const rel of files) this.setView(rel);
   }
 
-  async answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps; after: () => Promise<Steps> }> {
+  async answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps; after: () => Promise<Steps>; commit?: () => void; engine?: string }> {
     this.timer = new StepTimer();
     await this.timer.run("refresh", () => this.refreshRows());
     const requested = files
       .map((file) => path.relative(this.init.scan_root, file))
       .filter((rel) => rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel));
     await this.sync(requested);
-    const lines = request.kind === "edit" ? await this.lines() : [];
-    return { lines, steps: this.timer.steps(), after: () => this.afterAnswer() };
+    if (request.kind !== "edit") return { lines: [], steps: this.timer.steps(), after: () => this.afterAnswer() };
+    const { lines, spoke } = await this.lines();
+    return { lines, steps: this.timer.steps(), after: () => this.afterAnswer(), commit: () => (this.spoke = spoke), engine: this.engineId };
   }
 
-  private async lines(): Promise<HeldLine[]> {
+  /** Every view's lines, each marked against what the last filed answer spoke, and what this answer spoke (to commit when filed). */
+  private async lines(): Promise<{ lines: HeldLine[]; spoke: Map<string, { message: string; run: string }> }> {
     const rels = [...this.views.keys()];
-    if (rels.length === 0) return [];
+    if (rels.length === 0) return { lines: [], spoke: new Map() };
     const pulled = await this.timer.run("pull", () => this.engine.pull(rels.map((rel) => this.shadow(rel))));
     const out: HeldLine[] = [];
     const said = new Set<string>();
+    const run = runOf(this.engineId, ++this.answers);
+    const spoke = new Map<string, { message: string; run: string }>();
     for (const rel of rels) {
       const view = this.views.get(rel)!;
       const at = lineMap(view.ov.text);
@@ -613,6 +633,10 @@ class HeldService implements ServiceEngine {
         if (said.has(key)) continue;
         said.add(key);
         const first = diags[0]!;
+        const message = ownNamesOut(first.message);
+        const before = this.spoke.get(key);
+        const standing = before !== undefined && before.message === message;
+        spoke.set(key, { message, run: standing ? before.run : run });
         out.push({
           row_key: heldKey(row, g),
           group: g,
@@ -629,10 +653,12 @@ class HeldService implements ServiceEngine {
           expected: row.groups[g]!.type,
           // A consumer line names its protocol (the sentence's other side) and its call's line (part 2's join, HM4 D2).
           ...(isMessage(row) ? { side: "consumer" as const, protocol: row.protocol, call_line: callLineOf(entry) } : {}),
+          run: spoke.get(key)!.run,
+          ...(standing ? { standing: true as const } : {}),
         });
       }
     }
-    return out;
+    return { lines: out, spoke };
   }
 
   /** The twin pass, restored in a `finally`; then files that lost a check's place, then rows the fact file added or changed. */

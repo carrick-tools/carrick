@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { asStated, fakeEnv, fixture, fixturePath, makeWorkspace, pluginDir, runHook, type HookRun } from "./helpers.ts";
 import { parseChangedResult, type CheckResult } from "../src/contract.ts";
 import {
+  answerEarly,
   answerInHand,
   enqueue,
   enqueueChanged,
@@ -26,7 +27,8 @@ import type { Answer, QueueEntry } from "../src/hook/rechecks.ts";
 import { checkedSinceLastEdit, checkMarkerPath } from "../src/hook/checked.ts";
 import { readSession, recordEdit, sessionRecords, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
 import { stopAnswers } from "../src/hook/stop-wait.ts";
-import { adoptedLine, hasFindings } from "../src/hook/late.ts";
+import { adoptedLine, deliverLate, hasFindings } from "../src/hook/late.ts";
+import type { HeldLine } from "../src/held/daemon.ts";
 import { changedLines } from "../src/render.ts";
 import { carrickHooks } from "../src/init/settings.ts";
 
@@ -1165,4 +1167,68 @@ test("the --changed line states the listed problems, on exit 1 and on exit 2", (
   assert.match(changedLines(otherBuild), /: 1 contract problem in 1 changed file\./);
   const unlisted = { ...base, problems: base.problems.map((p) => ({ ...p, stated: false })) };
   assert.equal(changedLines(unlisted), "");
+});
+
+// --- an early break counts at Stop only while it still stands (T1, carrick#4728) ---
+
+/** The break the held compiler states for GET /api/zz, whose route is on the workspace's file. */
+function zzBreak(file: string, over: Partial<HeldLine> = {}): HeldLine {
+  return {
+    row_key: "contract::user-service::src/routes/users.ts::producer::GET /api/zz::0",
+    group: 0,
+    label: "GET /api/zz",
+    consumer: "order-service",
+    file: "src/routes/users.ts",
+    line: 12,
+    message: "Type '{ name: string; }' is not assignable to type 'O1_0'.",
+    row_file: "src/routes/users.ts",
+    row_line: 10,
+    row_path: file,
+    places: [{ service: "order-service", file: "src/clients/users.ts", line: 4 }],
+    expected: "{ id: string }",
+    run: "e1.1",
+    ...over,
+  };
+}
+
+/** An edit of `file` whose early answer lists `lines` and whose part 2 answered clean. */
+function editWithEarly(root: string, home: string, file: string, lines: HeldLine[]): void {
+  edit(root, home, file, Date.now() - 1000);
+  const entry = queue(root, home, file);
+  assert.ok(answerEarly(SESSION, entry.seq, { state: "ready", lines, ms: 3, service: "user-service/user-service", engine: "e1" }, Date.now(), home));
+  answer(home, entry, reread(clean()));
+}
+
+const zzLines = (text: string): number => text.split("\n").filter((line) => line.includes("GET /api/zz") && line.includes("type_mismatch")).length;
+
+test("T1: an early break, then a comment edit of the same file: Stop counts it once", (t) => {
+  const { workspace, home } = setup(t);
+  editWithEarly(workspace.root, home, workspace.file, [zzBreak(workspace.file)]);
+  editWithEarly(workspace.root, home, workspace.file, [zzBreak(workspace.file, { standing: true })]);
+  const head = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n").split("\n")[0]!;
+  assert.match(head, CHECKED);
+  assert.match(head, /: 1 contract problem\.$/, head);
+});
+
+test("T1: an early break fixed in another file: Stop counts none and nothing prints it", (t) => {
+  const { workspace, home } = setup(t);
+  const other = path.join(workspace.service, "src", "routes", "orders.ts");
+  fs.writeFileSync(other, "export {};\n");
+  editWithEarly(workspace.root, home, workspace.file, [zzBreak(workspace.file)]);
+  editWithEarly(workspace.root, home, other, []);
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.equal(zzLines(text), 0, text);
+  assert.doesNotMatch(text, /contract problem/, text);
+});
+
+test("T1: break, fix, break again: the break prints twice", (t) => {
+  const { workspace, home } = setup(t);
+  const texts: string[] = [];
+  editWithEarly(workspace.root, home, workspace.file, [zzBreak(workspace.file)]);
+  texts.push(...deliverLate(SESSION, Date.now(), new Set(), home));
+  editWithEarly(workspace.root, home, workspace.file, []);
+  texts.push(...deliverLate(SESSION, Date.now(), new Set(), home));
+  editWithEarly(workspace.root, home, workspace.file, [zzBreak(workspace.file, { run: "e1.2" })]);
+  texts.push(...deliverLate(SESSION, Date.now(), new Set(), home));
+  assert.equal(zzLines(texts.join("\n")), 2, texts.join("\n"));
 });
