@@ -6520,7 +6520,7 @@ class DeclarationReader {
       if (part.flags & ts.TypeFlags.BooleanLiteral) return (part as ts.Type & { intrinsicName?: string }).intrinsicName === literal;
       return (part.flags & flags) !== 0;
     });
-    return holds ? undefined : failed('when_literal_unaccepted');
+    return holds ? undefined : failed('when_not_accepted');
   }
 
   /** Accepts string, or names an HTTP method as a literal in either case. */
