@@ -157,8 +157,8 @@ fn engine_lost(service: &super::read_model::IndexedService) -> bool {
 /// route call as `no_route`, which is a result the run could not read. Same
 /// rule as [`library_unavailable`]: only a service this run re-scanned
 /// (`rescanned`) stops it, and a carried one is untouched.
-pub const ENGINE_UNAVAILABLE: &str = "compiler engine unavailable: Carrick could not start it \
-     on this machine, so the re-scan could not read this service.";
+pub const ENGINE_UNAVAILABLE: &str =
+    "the compiler engine was not found or was not ready in time to re-read the edited code.";
 
 pub(super) fn engine_unavailable<'a>(
     rebuilt: &super::read_model::LocalIndex,

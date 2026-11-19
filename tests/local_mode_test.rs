@@ -8322,8 +8322,8 @@ fn a_re_scan_with_no_compiler_engine_says_it_did_not_run() {
             String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
         )
     };
-    let sentence = "compiler engine unavailable: Carrick could not start it on this machine, \
-                    so the re-scan could not read this service.";
+    let sentence =
+        "the compiler engine was not found or was not ready in time to re-read the edited code.";
 
     let (_, text) = with_no_engine(&["check", client, "--recheck", "--workspace", ".", "--json"]);
     let json: serde_json::Value = serde_json::from_str(&text).expect("--json is JSON");
