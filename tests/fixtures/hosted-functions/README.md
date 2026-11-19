@@ -47,3 +47,28 @@ the repository's own address, read as a declared `internalEnvVars` entry is.
 - Without `supabase/config.toml` nothing is learned and `src/quote.ts:2`
   keeps its env base.
 - A second scan sharing the store and cache keys the same.
+
+## Answer key (client calls that name a function, with `library-claims.json`)
+
+`library-claims.json` also claims a `request` op on the client's
+`functions` sub-object: member `invoke`, the name in argument 0 with the
+library's prefix `/functions/v1/` before it, the method from argument 1's
+`method` (default `POST`), the payload from its `body`. `invoke` is declared
+in `@supabase/functions-js`, a package the app does not declare (it comes in
+through `@supabase/supabase-js`), as in the real library.
+
+| File:line | Row | Pairs with |
+|---|---|---|
+| `src/direct.ts:4` | `POST /functions/v1/price-quote` (literal name) | `ALL /functions/v1/price-quote` |
+| `src/digest.ts:6` | `POST /functions/v1/team-digest` (module `const`) | `ALL /functions/v1/team-digest` |
+| `src/page.ts:5` | `POST /functions/v1/send-invite` (wrapper `callEdge`, stated at the caller) | `ALL /functions/v1/send-invite` |
+| `src/page.ts:6` | `POST /functions/v1/report-export` (wrapper `useEdge` returning a function, at the caller) | `ALL /functions/v1/report-export` |
+| `src/method.ts:4` | `GET /functions/v1/price-quote` (method from the options) | `ALL /functions/v1/price-quote` |
+| `src/quote.ts:2` | the `fetch` row above | `ALL /functions/v1/price-quote` |
+| `src/callEdge.ts`, `src/useEdge.ts` | no row (the callers state it) | - |
+| `purge-sessions` | no consumer | - |
+
+- The base is the client's env read, internal because the repository serves
+  it (the learned variable above). Without `supabase/config.toml` the rows
+  keep `${import.meta.env.VITE_SUPABASE_URL}` before the path.
+- Without the `invoke` op no call row is stated in these files.
