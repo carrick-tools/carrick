@@ -24,6 +24,8 @@ export type ServiceState = {
   /** `ready`: how long the start took. `starting`: how long the previous one took, when there was one. */
   start_ms?: number;
   last_start_ms?: number;
+  /** The engine's size in MB when its first gate finished; a new engine of this service is counted at it. */
+  settled_mb?: number;
 };
 
 /** One edit the engine did not check, for the hook's line. `state` is the answer's state. */
