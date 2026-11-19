@@ -34,6 +34,13 @@ const log = createLogger("carrick-facts");
 
 /** After a retriable error, the next trigger may ask again this soon. */
 export const FACTS_BUILDING_RETRY_MS = 60_000;
+/**
+ * How long the next ask waits after an answer that is neither a file nor a
+ * retriable error (no facts for this project, a refused request). The ordinary
+ * cooldown is now a minute, so without this a workspace with no facts would
+ * ask the cloud every minute.
+ */
+export const FACTS_FAILED_WAIT_MS = 10 * 60_000;
 export const FACTS_MARKER = "last-facts-refresh";
 
 /** `retry`: the cloud answered a retriable error (a build in flight). */
@@ -233,9 +240,10 @@ export function startFactsRefresh(
 }
 
 /**
- * One detached refresh (`refresh-run.ts`): bring the file up to date and,
- * after a retriable error only, let the next trigger ask again a minute on.
- * Every other outcome waits out the cooldown.
+ * One detached refresh (`refresh-run.ts`): bring the file up to date. After a
+ * retriable error the next trigger asks again a minute on; after an answer
+ * with no file and no retry it waits `FACTS_FAILED_WAIT_MS`; every other
+ * outcome waits out the cooldown.
  */
 export async function runFactsRefresh(root: string, options: FactsRefreshOptions = {}): Promise<RefreshOutcome> {
   const outcome = await refreshFacts(root, options);
@@ -245,6 +253,7 @@ export async function runFactsRefresh(root: string, options: FactsRefreshOptions
   // `status` runs here, in the detached runner, never in a hook's path.
   if (outcome === "written") await startHostedMove(root, options);
   if (outcome === "retry") allowEarlyRetry(root, options.env ?? process.env, options.now ?? Date.now());
+  if (outcome === "none") holdAfterFailure(root, options.env ?? process.env, options.now ?? Date.now());
   return outcome;
 }
 
@@ -259,6 +268,20 @@ async function startHostedMove(root: string, options: FactsRefreshOptions): Prom
     log(`hosted move after a new fact file: ${started ? "started" : "not started"}`);
   } catch (error) {
     log("hosted move not started", String(error));
+  }
+}
+
+/**
+ * After an answer with no file and no retry, move the claim forward so the
+ * next ask waits `FACTS_FAILED_WAIT_MS` from now, not the one-minute cooldown.
+ */
+export function holdAfterFailure(root: string, env: NodeJS.ProcessEnv = process.env, now: number = Date.now()): void {
+  const cooldown = cooldownMs(env, "CARRICK_FACTS_COOLDOWN_MS", FACTS_STALE_MS);
+  if (cooldown >= FACTS_FAILED_WAIT_MS) return;
+  try {
+    fs.writeFileSync(markerPath(root, FACTS_MARKER), `${new Date(now + FACTS_FAILED_WAIT_MS - cooldown).toISOString()}\n`);
+  } catch {
+    // The next trigger after the ordinary cooldown asks instead.
   }
 }
 
