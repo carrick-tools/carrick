@@ -286,7 +286,7 @@ export class HeldDaemon {
   private keep(init: ServiceInit, change: Pick<ServiceState, "state"> & Partial<ServiceState>): void {
     const before = readState(this.root, init.service, this.deps.home);
     const lastStart = change.start_ms ?? before?.start_ms ?? before?.last_start_ms;
-    writeState(this.root, init.service, { at: new Date(this.now()).toISOString(), service: init.service, ...change, ...(lastStart === undefined || change.state === "ready" ? {} : { last_start_ms: lastStart }) }, this.deps.home);
+    writeState(this.root, init.service, { at: new Date(this.now()).toISOString(), service: init.service, repo: init.repo, ...change, ...(lastStart === undefined || change.state === "ready" ? {} : { last_start_ms: lastStart }) }, this.deps.home);
   }
 
   /** Asked through the slot's queue; `null` when the engine could not answer. */

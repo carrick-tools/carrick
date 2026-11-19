@@ -554,7 +554,7 @@ test("starting, ready, capped and no_compiler are each noted on the answer and k
     await settle();
     const capped = await w.daemon.handle(w.req(w.file("c")));
     assert.deepEqual(capped.not_checked, [{ service: "c", state: "capped", budget_mb: 4096, holders: 2 }]);
-    assert.deepEqual(readState(w.root, "c", w.home), { at: new Date(w.clock.now).toISOString(), service: "c", state: "capped", budget_mb: 4096, holders: 2 });
+    assert.deepEqual(readState(w.root, "c", w.home), { at: new Date(w.clock.now).toISOString(), service: "c", repo: "shop", state: "capped", budget_mb: 4096, holders: 2 });
   } finally {
     w.done();
   }

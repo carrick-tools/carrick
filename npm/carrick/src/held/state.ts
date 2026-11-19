@@ -13,6 +13,8 @@ import { statePath } from "./paths.ts";
 export type ServiceState = {
   at: string;
   service: string;
+  /** The repo the service belongs to (`init.repo`); the doctor files the line under it. */
+  repo?: string;
   state: "starting" | "ready" | "capped" | "no_compiler" | "failed";
   /** Why a start failed, one line. */
   reason?: string;
