@@ -3197,5 +3197,5 @@ test("init says the compiler check is on, its memory budget and its off switch",
   const text = compilerCheckNote(4096);
   assert.match(text, /^The compiler check is on by default\./);
   assert.match(text, /holds up to 4096 MB of memory across all checkouts/);
-  assert.match(text, /CARRICK_COMPILER_LINES=0 in your shell or in the "env" block of \.claude\/settings\.local\.json/);
+  assert.match(text, /CARRICK_COMPILER_LINES=0 in the "env" block of \.claude\/settings\.local\.json, or in the shell you start Claude Code from/);
 });

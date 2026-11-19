@@ -65,7 +65,7 @@ export const READY_SENTENCE =
 /** The title of the block a run closes on (carrick#3286). */
 /** What the run says about the compiler check, which is on unless `CARRICK_COMPILER_LINES=0`. */
 export function compilerCheckNote(budgetMb: number = memoryBudgetMb()): string {
-  return `The compiler check is on by default. It starts on your first read or edit of a service, takes about 20 s on a large one, and holds up to ${budgetMb} MB of memory across all checkouts. To turn it off, set CARRICK_COMPILER_LINES=0 in your shell or in the "env" block of .claude/settings.local.json.`;
+  return `The compiler check is on by default. It starts on your first read or edit of a service, takes about 20 s on a large one, and holds up to ${budgetMb} MB of memory across all checkouts. To turn it off, set CARRICK_COMPILER_LINES=0 in the "env" block of .claude/settings.local.json, or in the shell you start Claude Code from.`;
 }
 
 export const CLOUD_NEXT_TITLE = "Done. Open a new agent session in this folder, then ask it:";
