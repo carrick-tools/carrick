@@ -610,7 +610,7 @@ function listItems() {
 
     fn id_at(text: &str, line: usize) -> String {
         SwcScanner::new()
-            .scan_content(Path::new("routes.ts"), text, &[], &[])
+            .scan_every_call(Path::new("routes.ts"), text)
             .candidates
             .iter()
             .find(|c| c.line_number == line)
