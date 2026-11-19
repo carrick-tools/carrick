@@ -59,6 +59,7 @@ function world(services: string[]) {
   const startCalls: string[] = [];
   let hold = true;
   let outcome: "engine" | "no_compiler" = "engine";
+  let shape: { holdsCompiler?: boolean; nullRss?: boolean } = {};
   const make = (init: ServiceInit): StartResult => {
     if (outcome === "no_compiler") return { state: "no_compiler", reason: "no native compiler" };
     const fake: Fake = { init, closed: false, rss: 2000, asked: [], events: [] };
@@ -76,7 +77,8 @@ function world(services: string[]) {
           },
         };
       },
-      rss: () => fake.rss,
+      rss: () => (shape.nullRss ? null : fake.rss),
+      ...(shape.holdsCompiler === undefined ? {} : { holdsCompiler: shape.holdsCompiler }),
       async close() {
         fake.closed = true;
       },
@@ -119,6 +121,9 @@ function world(services: string[]) {
     file: (name: string) => path.join(root, name, "src", "a.ts"),
     release: () => {
       hold = false;
+    },
+    setEngine: (next: { holdsCompiler?: boolean; nullRss?: boolean }) => {
+      shape = next;
     },
     setNoCompiler: () => {
       outcome = "no_compiler";
@@ -280,6 +285,41 @@ test("another process's engines count against the budget", async () => {
     const answer = await w.daemon.handle(w.req(w.file("a")));
     assert.equal(answer.state, "capped");
     assert.deepEqual(w.startCalls, []);
+  } finally {
+    w.done();
+  }
+});
+
+test("a service that holds no compiler gives back its slot, so the next service is admitted", async () => {
+  const w = world(["a", "b"]);
+  try {
+    w.release();
+    w.setEngine({ holdsCompiler: false, nullRss: true });
+    // Another checkout's engine holds half of the 4096 MB budget.
+    writeEntry(w.home, { pid: process.ppid, root: "/other", service: "x", rss_mb: 2048, last_used: w.clock.now });
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    await w.daemon.tick();
+    const next = await w.daemon.handle(w.req(w.file("b")));
+    assert.equal(next.state, "cold");
+    assert.deepEqual(w.startCalls, ["a", "b"]);
+  } finally {
+    w.done();
+  }
+});
+
+test("a real engine whose rss is unreadable keeps its slot", async () => {
+  const w = world(["a", "b"]);
+  try {
+    w.release();
+    w.setEngine({ nullRss: true });
+    writeEntry(w.home, { pid: process.ppid, root: "/other", service: "x", rss_mb: 2048, last_used: w.clock.now });
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    await w.daemon.tick();
+    const next = await w.daemon.handle(w.req(w.file("b")));
+    assert.equal(next.state, "capped");
+    assert.deepEqual(w.startCalls, ["a"]);
   } finally {
     w.done();
   }
