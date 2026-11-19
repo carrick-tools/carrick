@@ -24,3 +24,26 @@ All names are invented.
 - Without `supabase/config.toml` no file states a row.
 - The same rows come out with `carrick.json` (the folder is its own service)
   and without it (one service at the root).
+
+## Answer key (consumer rows)
+
+Read with `library-claims.json` replayed as the store's answer (the tests
+copy it to `__llm__/library-claims/default.json`): the `fetch` claim, and
+`createClient` of `@supabase/supabase-js` making a client on argument 0.
+`src/client.ts:5` makes that client on `VITE_SUPABASE_URL`, and the repository
+serves the platform's functions (`supabase/config.toml`), so that variable is
+the repository's own address, read as a declared `internalEnvVars` entry is.
+
+| File | Row |
+|---|---|
+| `src/quote.ts:2` | `POST /functions/v1/price-quote`, one row (the model's reading in `__llm__/analyze-file/quote.json` and the base-path reading fold onto it), pairing with the `ALL /functions/v1/price-quote` row |
+| `src/other.ts:2` | `POST`, still keyed on its `VITE_OTHER_URL` env base and `/x`: no client is made on that variable |
+| `src/client.ts:5` | no row (the client is made, nothing is sent) |
+
+- The scan's run log says what it learned: `Treating env var
+  VITE_SUPABASE_URL as internal because the @supabase/supabase-js client
+  created at src/client.ts:5 uses it as its base address and this
+  repository serves that platform's functions`.
+- Without `supabase/config.toml` nothing is learned and `src/quote.ts:2`
+  keeps its env base.
+- A second scan sharing the store and cache keys the same.

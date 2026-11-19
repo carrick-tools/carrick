@@ -188,6 +188,12 @@ pub struct RoutingConvention {
     /// Empty: the convention is selected by declared dependencies only.
     #[serde(default)]
     pub marker_files: Vec<String>,
+    /// Packages whose client, made in this repository, addresses the
+    /// platform this layout serves: a base such a client is made with is
+    /// this repository's own address ([`served_packages`]). Plain data;
+    /// empty for a layout that names none.
+    #[serde(default)]
+    pub served_base_of: Vec<String>,
 }
 
 /// A folder served statically and the URL prefix it is served under.
@@ -410,6 +416,7 @@ impl RoutingConvention {
             directory_depth: None,
             roots_repo_relative: false,
             marker_files: Vec::new(),
+            served_base_of: Vec::new(),
         }
     }
 
@@ -446,6 +453,7 @@ impl RoutingConvention {
             directory_depth: None,
             roots_repo_relative: false,
             marker_files: Vec::new(),
+            served_base_of: Vec::new(),
         }
     }
 
@@ -489,6 +497,7 @@ impl RoutingConvention {
             directory_depth: None,
             roots_repo_relative: false,
             marker_files: Vec::new(),
+            served_base_of: Vec::new(),
         }
     }
 
@@ -560,6 +569,7 @@ impl RoutingConvention {
             directory_depth: None,
             roots_repo_relative: false,
             marker_files: Vec::new(),
+            served_base_of: Vec::new(),
         }
     }
 
@@ -601,6 +611,7 @@ impl RoutingConvention {
             directory_depth: Some(1),
             roots_repo_relative: true,
             marker_files: vec!["supabase/config.toml".to_string()],
+            served_base_of: vec!["@supabase/supabase-js".to_string()],
         }
     }
 
@@ -945,20 +956,38 @@ pub fn conventions_for_service(
     let Some(service_dir) = service_dir_in_repo(repo_root, service_root) else {
         return out;
     };
-    for make in MARKER_CONVENTIONS {
-        let convention = make();
-        let marked = convention
-            .marker_files
-            .iter()
-            .any(|marker| repo_root.join(marker).is_file());
-        if !marked {
-            continue;
-        }
+    for convention in marked_conventions(repo_root) {
         if let Some(convention) = convention.for_service(&service_dir) {
             out.push(convention);
         }
     }
     out
+}
+
+/// Every [`MARKER_CONVENTIONS`] entry whose marker file exists under
+/// `repo_root`.
+fn marked_conventions(repo_root: &Path) -> impl Iterator<Item = RoutingConvention> + '_ {
+    MARKER_CONVENTIONS
+        .iter()
+        .map(|make| make())
+        .filter(|convention| {
+            convention
+                .marker_files
+                .iter()
+                .any(|marker| repo_root.join(marker).is_file())
+        })
+}
+
+/// The packages whose client, made anywhere in the repository, addresses a
+/// platform the repository serves: the [`RoutingConvention::served_base_of`]
+/// of every marker convention whose marker exists under `repo_root`. Read
+/// for every service of the repository, wherever its directory is: the
+/// client that calls the platform usually sits in another service than the
+/// functions it serves.
+pub fn served_packages(repo_root: &Path) -> std::collections::BTreeSet<String> {
+    marked_conventions(repo_root)
+        .flat_map(|convention| convention.served_base_of)
+        .collect()
 }
 
 /// `service_root` relative to `repo_root`, `/`-separated, `""` for the root
@@ -991,6 +1020,31 @@ mod tests {
 
     fn route(p: &str) -> Option<DerivedRoute> {
         derive_route(&PathBuf::from(p), &next())
+    }
+
+    /// A repository holding the hosted-functions marker serves that
+    /// platform's client package; one without it serves none. The set is the
+    /// repository's: a client service in a subfolder (`apps/web`) reads it
+    /// from the repository root, where `conventions_for_service` gives that
+    /// service no folder of functions.
+    #[test]
+    fn served_packages_come_from_the_repository_marker() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(served_packages(repo.path()).is_empty());
+        std::fs::create_dir_all(repo.path().join("supabase")).unwrap();
+        std::fs::write(repo.path().join("supabase/config.toml"), "").unwrap();
+        let served = served_packages(repo.path());
+        assert_eq!(
+            served,
+            std::collections::BTreeSet::from(["@supabase/supabase-js".to_string()])
+        );
+        let web = repo.path().join("apps/web");
+        std::fs::create_dir_all(&web).unwrap();
+        assert!(
+            conventions_for_service(&[], repo.path(), &web).is_empty(),
+            "the client service serves no functions"
+        );
+        assert_eq!(served_packages(repo.path()), served);
     }
 
     // --- App Router ---
