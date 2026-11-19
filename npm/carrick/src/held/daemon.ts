@@ -103,6 +103,8 @@ export interface ServiceEngine {
   answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps?: Steps; after?: () => Promise<Steps | void> }>;
   /** Resident memory in MB, or null. */
   rss(): number | null;
+  /** False for a service that started with no compiler: it holds no memory, so it holds no registry slot. */
+  holdsCompiler?: boolean;
   close(): Promise<void>;
 }
 
@@ -334,6 +336,8 @@ export class HeldDaemon {
       }
       slot.engine = result.engine;
       slot.status = "ready";
+      // Give back the admission slot; the slot stays ready so its asks still answer.
+      if (result.engine.holdsCompiler === false) removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
       return;
     }
     log(`no engine for ${slot.init.service}: ${result.reason}`);
@@ -366,10 +370,11 @@ export class HeldDaemon {
     const now = this.now();
     for (const slot of [...this.slots.values()]) {
       if (slot.status !== "ready" || slot.engine === null) continue;
+      const holdsEntry = slot.engine.holdsCompiler !== false;
       const rss = slot.engine.rss();
       if (now - slot.lastUsed >= ENGINE_IDLE_MS || (rss !== null && rss > RSS_CEILING_MB)) {
         await this.closeSlot(slot);
-      } else if (rss !== null) {
+      } else if (holdsEntry && rss !== null) {
         this.entry(slot, rss);
       }
     }

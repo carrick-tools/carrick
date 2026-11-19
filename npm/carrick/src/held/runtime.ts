@@ -700,6 +700,7 @@ function sameFitOptions(a: FitOptions, b: FitOptions): boolean {
 class IdleService implements ServiceEngine {
   answer = async (): Promise<{ lines: HeldLine[] }> => ({ lines: [] });
   rss = (): number | null => null;
+  holdsCompiler = false;
   close = async (): Promise<void> => undefined;
 }
 
