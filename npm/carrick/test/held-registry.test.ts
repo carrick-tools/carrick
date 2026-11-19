@@ -11,6 +11,7 @@ import {
   admits,
   liveEntries,
   memoryBudgetMb,
+  closeCeilingMb,
   registryDir,
   removeEntry,
   writeEntry,
@@ -70,9 +71,18 @@ test("a new engine fits when live memory plus 2048 stays within the budget", () 
   assert.equal(admits([entry({ rss_mb: 1000 }), entry({ service: "b", rss_mb: 1100 })], 4096), false);
 });
 
-test("the budget is CARRICK_HELD_MEMORY_MB, 4096 when unset or unusable", () => {
-  assert.equal(memoryBudgetMb({}), 4096);
-  assert.equal(memoryBudgetMb({ CARRICK_HELD_MEMORY_MB: "8192" }), 8192);
-  assert.equal(memoryBudgetMb({ CARRICK_HELD_MEMORY_MB: "lots" }), 4096);
-  assert.equal(memoryBudgetMb({ CARRICK_HELD_MEMORY_MB: "-5" }), 4096);
+test("the budget is CARRICK_HELD_MEMORY_MB, else a quarter of the RAM within 2048 and 8192", () => {
+  const gb = (n: number): number => n * 1024 ** 3;
+  assert.equal(memoryBudgetMb({}, gb(8)), 2048);
+  assert.equal(memoryBudgetMb({}, gb(4)), 2048, "never under 2,048");
+  assert.equal(memoryBudgetMb({}, gb(16)), 4096);
+  assert.equal(memoryBudgetMb({}, gb(36)), 8192);
+  assert.equal(memoryBudgetMb({}, gb(64)), 8192);
+  assert.equal(memoryBudgetMb({}, gb(128)), 8192, "never over 8,192");
+  assert.equal(memoryBudgetMb({ CARRICK_HELD_MEMORY_MB: "1024" }, gb(64)), 1024);
+  assert.equal(memoryBudgetMb({ CARRICK_HELD_MEMORY_MB: "lots" }, gb(16)), 4096);
+  assert.equal(memoryBudgetMb({ CARRICK_HELD_MEMORY_MB: "-5" }, gb(16)), 4096);
+  assert.equal(closeCeilingMb(undefined), 3072);
+  assert.equal(closeCeilingMb(2000), 3072);
+  assert.equal(closeCeilingMb(3500), 5250);
 });

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { cpSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { Ts7Lsp } from "../src/held/engine.ts";
+import { StalePull, Ts7Lsp } from "../src/held/engine.ts";
 import { testDir } from "./helpers.ts";
 
 /** The native compiler the `typescript-native` alias installs for this host. */
@@ -59,3 +59,114 @@ test("a pull answered with anything but a full report throws", async () => {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+/** A `Ts7Lsp` over the stand-in server in `mode`, with the server's log of sends and pulls. */
+function fakeEngine(mode: string): { engine: Ts7Lsp; cwd: string; log: () => string[] } {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "held-engine-"));
+  const logFile = path.join(cwd, "server.log");
+  const engine = new Ts7Lsp(process.execPath, cwd, [path.join(testDir, "fake-lsp.mjs"), mode, logFile]);
+  return { engine, cwd, log: () => (existsSync(logFile) ? readFileSync(logFile, "utf8").trim().split("\n") : []) };
+}
+
+test("a pull answered with the previous text's report sends again and returns the report of the text just set", async () => {
+  const { engine, cwd, log } = fakeEngine("stale-once");
+  try {
+    const file = path.join(cwd, "a.ts");
+    engine.set(file, "const x = 1;\n");
+    assert.deepEqual((await engine.pull([file])).get(file), []);
+    engine.set(file, "const x = 1;\nERR\n");
+    const items = (await engine.pull([file])).get(file) ?? [];
+    assert.deepEqual(items.map((d) => [d.message, d.range.start.line]), [["fake error", 1]]);
+    // One request per pull when the answer is fresh, a second only after the stale one.
+    assert.equal(log().filter((l) => l === "pull").length, 3);
+  } finally {
+    await engine.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a server that only ever answers an older text makes the pull throw after 3 sends", async () => {
+  const { engine, cwd, log } = fakeEngine("always-stale");
+  try {
+    const file = path.join(cwd, "a.ts");
+    engine.set(file, "const x = 1;\n");
+    assert.deepEqual((await engine.pull([file])).get(file), []);
+    engine.set(file, "ERR\n");
+    const before = log().length;
+    await assert.rejects(engine.pull([file]), StalePull);
+    assert.equal(log().slice(before).filter((l) => l === "pull").length, 3);
+  } finally {
+    await engine.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a pull of a file set in an earlier ask sends it again under a new version first", async () => {
+  const { engine, cwd, log } = fakeEngine("fresh");
+  try {
+    const file = path.join(cwd, "a.ts");
+    engine.set(file, "const x = 1;\n");
+    await engine.pull([file]);
+    const before = log().length;
+    assert.deepEqual((await engine.pull([file])).get(file), []);
+    const since = log().slice(before);
+    assert.deepEqual(since, ["change 3", "pull"]);
+  } finally {
+    await engine.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("declaration and JavaScript files are sent and pulled unmarked, as they stand", async () => {
+  const { engine, cwd, log } = fakeEngine("fresh");
+  try {
+    const files = ["a.d.ts", "b.d.mts", "c.js"].map((f) => path.join(cwd, f));
+    for (const f of files) engine.set(f, "ERR\n");
+    const pulled = await engine.pull(files);
+    for (const f of files) assert.deepEqual((pulled.get(f) ?? []).map((d) => d.message), ["fake error"]);
+    assert.deepEqual(log(), ["open 1", "open 1", "open 1", "pull", "pull", "pull"]);
+  } finally {
+    await engine.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+for (const real of [false, true]) {
+  const where = real ? "on TypeScript 7" : "on the stand-in";
+  const start = (): { engine: Ts7Lsp; cwd: string } => {
+    if (!real) return fakeEngine("fresh");
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "held-engine-"));
+    cpSync(shadowFixture, cwd, { recursive: true });
+    return { engine: new Ts7Lsp(nativeTsc(), cwd), cwd };
+  };
+
+  test(`a file whose marker error can never appear (@ts-nocheck) throws, never answers empty (${where})`, async () => {
+    const { engine, cwd } = start();
+    try {
+      const file = path.join(cwd, "nocheck.ts");
+      engine.set(file, "// @ts-nocheck\nconst x: string = 1;\n");
+      await assert.rejects(engine.pull([file]), StalePull);
+    } finally {
+      await engine.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test(`a text ending in an unclosed block keeps its end-of-file error at the text's end; the marker's own error never shows (${where})`, async () => {
+    const { engine, cwd } = start();
+    try {
+      const file = path.join(cwd, "open.ts");
+      const text = "export function f(): void {\n  const n = 1;\n";
+      engine.set(file, text);
+      const items = (await engine.pull([file])).get(file) ?? [];
+      assert.ok(!items.some((d) => /__carrick_rev|"r\d/.test(d.message)), JSON.stringify(items));
+      const eof = items.filter((d) => d.message === "'}' expected.");
+      assert.equal(eof.length, 1, JSON.stringify(items));
+      assert.deepEqual(eof[0]!.range.start, { line: 2, character: 0 });
+      assert.deepEqual(eof[0]!.range.end, { line: 2, character: 0 });
+    } finally {
+      await engine.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}

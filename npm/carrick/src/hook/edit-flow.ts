@@ -18,7 +18,7 @@ import type { SimilarLines } from "./similar.ts";
 import { deliverEarly, deliverLateFirst, emitPostToolUse } from "./late.ts";
 import { needsBackground, probeEdits, probeTimeoutMs } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
-import { answerInHand, enqueue, ensureRunner, readEarly } from "./rechecks.ts";
+import { answerInHand, earlyOwedFor, enqueue, ensureRunner, readEarly } from "./rechecks.ts";
 import type { QueueEntry } from "./rechecks.ts";
 import { engineReadyOf } from "./timings.ts";
 import type { Timing } from "./timings.ts";
@@ -31,6 +31,7 @@ import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEna
 import { askHeld } from "../held/client.ts";
 import type { AskAnswer } from "../held/client.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
+import { notCheckedLines } from "./not-checked.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
 
 const log = createLogger("carrick-hook");
@@ -266,8 +267,21 @@ export async function editFlow(
     input.timing.heldMs = held.ms;
     input.timing.heldState = held.state;
   }
+  // An edit the engine did not check says so once per session, service and state (T7).
+  const unchecked = session ? notCheckedLines(session, choice.root, answered.flatMap((a) => a.answer.not_checked ?? [])) : { lines: [], keys: [] };
+  told.push(...unchecked.keys);
   const seen = new Set<string>();
-  const earlyNow: string[] = [];
+  // Early answers owed from earlier edits are said first, oldest first, so a break
+  // one of them states as new is said as that edit's; this edit's answer then lists
+  // it standing, already told (T1, carrick#4728).
+  const inHand = new Set(answered.filter((a) => a.answer.state === "ready").map((a) => a.entry.seq));
+  const earlier =
+    channel.channel === "hook" && session
+      ? earlyOwedFor(session)
+          .filter(({ owner, early }) => !(owner === session && inHand.has(early.seq)))
+          .flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { reader: session }))
+      : [];
+  const earlyNow: string[] = [...earlier];
   for (const { entry, answer } of answered) {
     if (answer.state !== "ready") continue;
     const early = readEarly(entry.session, entry.seq);
@@ -309,6 +323,7 @@ export async function editFlow(
   if (generation) contexts.splice(generationAt, 0, generation);
   // An early line is ADDED to part 1's: it never replaces a contract line.
   contexts.push(...earlyNow);
+  contexts.push(...unchecked.lines);
   contexts.push(...facts.lines);
   // A missing or stale fact file is refreshed in the background, detached.
   if (facts.stale) (await import("../facts/fetch.ts")).startFactsRefresh(choice.root);

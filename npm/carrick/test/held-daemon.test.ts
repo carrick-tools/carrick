@@ -21,6 +21,7 @@ import {
 import { askHeld, ensureHeld } from "../src/held/client.ts";
 import { liveEntries, writeEntry } from "../src/held/registry.ts";
 import { lockPath as heldLockPath, logPath, socketPath } from "../src/held/paths.ts";
+import { readState, writeState } from "../src/held/state.ts";
 import { compilerLinesEnabled } from "../src/facts/enabled.ts";
 import { takeLock } from "../src/hook/lock.ts";
 
@@ -59,9 +60,10 @@ function world(services: string[]) {
   const startCalls: string[] = [];
   let hold = true;
   let outcome: "engine" | "no_compiler" = "engine";
+  let shape: { holdsCompiler?: boolean; nullRss?: boolean; rss?: number } = {};
   const make = (init: ServiceInit): StartResult => {
     if (outcome === "no_compiler") return { state: "no_compiler", reason: "no native compiler" };
-    const fake: Fake = { init, closed: false, rss: 2000, asked: [], events: [] };
+    const fake: Fake = { init, closed: false, rss: shape.rss ?? 2000, asked: [], events: [] };
     fakes.set(init.service, fake);
     const engine: ServiceEngine = {
       async answer(files) {
@@ -76,7 +78,8 @@ function world(services: string[]) {
           },
         };
       },
-      rss: () => fake.rss,
+      rss: () => (shape.nullRss ? null : fake.rss),
+      ...(shape.holdsCompiler === undefined ? {} : { holdsCompiler: shape.holdsCompiler }),
       async close() {
         fake.closed = true;
       },
@@ -95,6 +98,7 @@ function world(services: string[]) {
     root,
     home,
     env: { ...ON },
+    totalmem: () => 16 * 1024 ** 3,
     clock: () => clock.now,
     programs: async () => inits,
     runtime,
@@ -119,6 +123,9 @@ function world(services: string[]) {
     file: (name: string) => path.join(root, name, "src", "a.ts"),
     release: () => {
       hold = false;
+    },
+    setEngine: (next: { holdsCompiler?: boolean; nullRss?: boolean; rss?: number }) => {
+      shape = next;
     },
     setNoCompiler: () => {
       outcome = "no_compiler";
@@ -285,6 +292,41 @@ test("another process's engines count against the budget", async () => {
   }
 });
 
+test("a service that holds no compiler gives back its slot, so the next service is admitted", async () => {
+  const w = world(["a", "b"]);
+  try {
+    w.release();
+    w.setEngine({ holdsCompiler: false, nullRss: true });
+    // Another checkout's engine holds half of the 4096 MB budget.
+    writeEntry(w.home, { pid: process.ppid, root: "/other", service: "x", rss_mb: 2048, last_used: w.clock.now });
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    await w.daemon.tick();
+    const next = await w.daemon.handle(w.req(w.file("b")));
+    assert.equal(next.state, "cold");
+    assert.deepEqual(w.startCalls, ["a", "b"]);
+  } finally {
+    w.done();
+  }
+});
+
+test("a real engine whose rss is unreadable keeps its slot", async () => {
+  const w = world(["a", "b"]);
+  try {
+    w.release();
+    w.setEngine({ nullRss: true });
+    writeEntry(w.home, { pid: process.ppid, root: "/other", service: "x", rss_mb: 2048, last_used: w.clock.now });
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    await w.daemon.tick();
+    const next = await w.daemon.handle(w.req(w.file("b")));
+    assert.equal(next.state, "capped");
+    assert.deepEqual(w.startCalls, ["a"]);
+  } finally {
+    w.done();
+  }
+});
+
 test("an engine above 3072 MB is closed at the next tick", async () => {
   const w = world(["api"]);
   try {
@@ -296,6 +338,53 @@ test("an engine above 3072 MB is closed at the next tick", async () => {
     assert.equal(w.fakes.get("api")!.closed, true);
     const again = await w.daemon.handle(w.req(w.file("api")));
     assert.equal(again.state, "cold", "the next request starts a fresh engine");
+  } finally {
+    w.done();
+  }
+});
+
+test("an engine that settled at 3500 MB is not closed, and one above 1.5 times that is", async () => {
+  const w = world(["api"]);
+  try {
+    w.release();
+    w.setEngine({ rss: 3500 });
+    await w.daemon.handle(w.req(w.file("api")));
+    await settle();
+    assert.equal(readState(w.root, "api", w.home)?.settled_mb, 3500, "the first gate's size is stored in the service's state record");
+    w.fakes.get("api")!.rss = 5000;
+    await w.daemon.tick();
+    assert.equal(w.fakes.get("api")!.closed, false, "5000 MB is under 1.5 x 3500");
+    w.fakes.get("api")!.rss = 5300;
+    await w.daemon.tick();
+    assert.equal(w.fakes.get("api")!.closed, true);
+  } finally {
+    w.done();
+  }
+});
+
+test("a new engine is counted at the service's last settled size", async () => {
+  const w = world(["a", "b"]);
+  try {
+    w.release();
+    writeState(w.root, "a", { at: "x", service: "a", state: "ready", settled_mb: 3500 }, w.home);
+    await w.daemon.handle(w.req(w.file("a")));
+    assert.equal(liveEntries(w.home).find((e) => e.service === "a")?.rss_mb, 3500);
+    // 3500 + the default 2048 is over 4096: b finds no room.
+    const second = await w.daemon.handle(w.req(w.file("b")));
+    assert.equal(second.state, "capped");
+  } finally {
+    w.done();
+  }
+});
+
+test("a service whose settled size alone exceeds the budget is not started: capped", async () => {
+  const w = world(["big"]);
+  try {
+    w.release();
+    writeState(w.root, "big", { at: "x", service: "big", state: "ready", settled_mb: 5000 }, w.home);
+    const answer = await w.daemon.handle(w.req(w.file("big")));
+    assert.equal(answer.state, "capped");
+    assert.deepEqual(w.startCalls, []);
   } finally {
     w.done();
   }
@@ -490,6 +579,56 @@ test("run.ts with the switch unset starts nothing and writes nothing", () => {
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.existsSync(path.join(w.home, ".carrick")), false);
+  } finally {
+    w.done();
+  }
+});
+
+// T7 (#4654): an answer that did not check the edit says why, and the engine's state is kept for the doctor.
+test("starting, ready, capped and no_compiler are each noted on the answer and kept in the service's state record", async () => {
+  const w = world(["a", "b", "c"]);
+  try {
+    const cold = await w.daemon.handle(w.req(w.file("a")));
+    assert.deepEqual(cold.not_checked, [{ service: "a", state: "cold" }]);
+    assert.equal(readState(w.root, "a", w.home)?.state, "starting");
+    w.release();
+    await w.daemon.handle(w.req(w.file("b")));
+    await settle();
+    w.clock.now += 41_000;
+    const ready = await w.daemon.handle(w.req(w.file("b")));
+    assert.equal(ready.not_checked, undefined, "a checked edit carries no note");
+    assert.equal(readState(w.root, "b", w.home)?.state, "ready");
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    const capped = await w.daemon.handle(w.req(w.file("c")));
+    assert.deepEqual(capped.not_checked, [{ service: "c", state: "capped", budget_mb: 4096, holders: 2 }]);
+    assert.deepEqual(readState(w.root, "c", w.home), { at: new Date(w.clock.now).toISOString(), service: "c", repo: "shop", state: "capped", budget_mb: 4096, holders: 2 });
+  } finally {
+    w.done();
+  }
+  const n = world(["x"]);
+  try {
+    n.setNoCompiler();
+    n.release();
+    await n.daemon.handle(n.req(n.file("x")));
+    await settle();
+    const answer = await n.daemon.handle(n.req(n.file("x")));
+    assert.deepEqual(answer.not_checked, [{ service: "x", state: "no_compiler" }]);
+    assert.deepEqual([readState(n.root, "x", n.home)?.state, readState(n.root, "x", n.home)?.reason], ["no_compiler", "no native compiler"]);
+  } finally {
+    n.done();
+  }
+});
+
+test("a ready start's duration is kept in the state record", async () => {
+  const w = world(["a"]);
+  try {
+    w.release();
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    const record = readState(w.root, "a", w.home);
+    assert.equal(record?.state, "ready");
+    assert.equal(typeof record?.start_ms, "number");
   } finally {
     w.done();
   }

@@ -73,15 +73,47 @@ so in its own numbers.
 .agents/skills/<name>/SKILL.md
 ```
 
-Run in a folder of repos, init also writes the skills and the hooks into each
-repo it covers that is a git repository of its own, because an agent started
-inside a repo reads neither host's files from the folder above (carrick#1512).
-The hooks go in `.claude/settings.local.json` and `.codex/hooks.json`, and a
-path git already tracks is left alone. Every path is listed in a marked block
-at the top of that repo's `.git/info/exclude`, written before any of the files
-it names, so git ignores the copy. `carrick remove` reads the block back,
-removes exactly those files and entries, then the block, which leaves the
-exclude file as it was (`npm/carrick/src/init/repo-copies.ts`).
+`carrick init` keeps its own files out of `git status` (carrick#4881) in two
+cases. The first is a folder that is the top of a git repository. The second is
+each repository inside a folder of repos, because an agent started inside a
+repo reads neither host's files from the folder above (carrick#1512). In each
+such repository:
+
+- The Claude Code hook entries go in `.claude/settings.local.json`, not
+  `.claude/settings.json`.
+- The skills and the hook launchers (`.claude/carrick-hook.sh`,
+  `.codex/carrick-hook.sh`) are written as usual. So is `.codex/hooks.json`,
+  when git does not track it.
+- Every path init writes is listed in a marked block at the top of
+  `.git/info/exclude`. The block is written before any of the files it names.
+
+`carrick remove` reads the block back and removes exactly those files and
+entries, then the block, which leaves the exclude file as it was
+(`npm/carrick/src/init/repo-copies.ts`). A folder that is not a git repository,
+or one below the top of a repository, keeps the earlier layout. Its hooks go in
+`.claude/settings.json`, and nothing is written to an exclude file.
+
+Init does not hide a path git already tracks:
+
+- When the committed `.claude/settings.json` holds Carrick's hook entries,
+  init leaves the file as it is. It adds no second set to
+  `.claude/settings.local.json`, so the hooks do not run twice.
+- When `.codex/hooks.json` is tracked, init adds Carrick's entries to it, and
+  git shows the file as changed. Codex reads hooks only from that file and from
+  `$CODEX_HOME/hooks.json`, so it has no file per clone.
+- The Carrick rules section is written as before, in `AGENTS.md` and in a
+  `CLAUDE.md` the repository already has, and git shows those files as changed.
+  Whether the section stays is under review.
+
+An older install that put Carrick's entries in a tracked `.claude/settings.json`
+is moved, and `carrick init` takes them out of that file. When nothing else in
+the file changed, it writes the file back exactly as the last commit has it.
+The entries go in `.claude/settings.local.json`.
+
+Init also adds `"mcp__carrick"` to `permissions.allow` in the settings file that
+holds its hooks. A headless run such as `claude -p` can then call Carrick's
+tools, which only read. `carrick remove` takes out that entry and leaves every
+other one.
 
 Where init has settled a Carrick project, its slug is written into every tool
 call in the bodies. Where no repository in the workspace names a GitHub
@@ -154,6 +186,15 @@ workspace keeps the hook entries and skill bodies of whichever version first ran
   removed on purpose stays removed until the next upgrade. `.codex/hooks.json`
   is never written: Codex holds a changed project hook as untrusted until the
   user approves it, so while it is out of date the "run `carrick init`" line stays.
+- **A task skill new in a release** reaches an install at its next session
+  start (carrick#4893). It is written beside Carrick's other skills in that
+  folder, and kept hidden or untracked as they are. Where git tracks them it is
+  not written, and the session-start line names it.
+  `.carrick/task-skills-written.json` records which skills each folder has been
+  given, so a skill someone removed stays removed. An install made before that
+  record existed gets each missing skill once. The allow entry follows the same
+  rule: it is added once per settings file and never again after someone takes
+  it out.
 - **`carrick init`, run again**, is the full refresh. It rewrites only what is
   still ours and names what it left, so it is safe to run unattended.
 

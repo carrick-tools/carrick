@@ -340,6 +340,7 @@ test("an emitter break is a call item at the emit's line, through earlyResult", 
       sent_by: "consumer",
       counterparts: [{ role: "producer", service: "listener", file: "src/listen.ts", line: 3 }],
       stated: true,
+      run: lines[0]!["run"],
     },
   ]);
 });
@@ -392,6 +393,7 @@ test("a type edit in another file gives a moved call row at the emit", async (t)
       reason: "This code sends 'string'; the listener expects '{ id: number; }'.",
       not_judged_before: false,
       stated: true,
+      run: lines[0]!["run"],
     },
   ]);
 });

@@ -15,7 +15,7 @@ import { CODEX_HOOKS_FILE, codexHooks } from "../src/init/codex.ts";
 import { carrickHooks, mergeCarrickHooks } from "../src/init/settings.ts";
 import { renderCheckSection } from "../src/init/agents-section.ts";
 import { bringUpToDate, updateHooks } from "../src/init/self-update.ts";
-import { skillFile, SKILL_ROOTS, stamped, writeTaskSkills } from "../src/init/task-skills.ts";
+import { recordWrittenSkills, skillFile, SKILL_ROOTS, stamped, TASK_SKILLS, writeTaskSkills } from "../src/init/task-skills.ts";
 
 const LOCAL = path.join(".claude", "settings.local.json");
 const SHARED = path.join(".claude", "settings.json");
@@ -80,7 +80,7 @@ test("a session start rewrites our stale entries, keeps the user's hook and keys
   for (const [event, groups] of Object.entries(expected)) {
     assert.deepEqual(ours(event), groups, `${event} entries are the ones this version writes`);
   }
-  assert.deepEqual(after.permissions, { allow: ["Read"] });
+  assert.deepEqual(after.permissions, { allow: ["Read", "mcp__carrick"] });
   assert.ok(JSON.stringify(after.hooks.PostToolUse).includes("echo mine"), "the user's hook stays");
 });
 
@@ -267,6 +267,8 @@ test("a tracked stale skill and settings file are left byte for byte and named i
   const settings = put(workspace.root, LOCAL, olderSettings());
   const skillPath = skillFile(SKILL_ROOTS[0]!, "carrick-impact");
   const skill = put(workspace.root, skillPath, stamped("an older body"));
+  // The other skills were given to this install and removed since: not new, so not named.
+  recordWrittenSkills(workspace.root, SKILL_ROOTS.flatMap((root) => TASK_SKILLS.map((name) => skillFile(root, name))));
   recordVersion(workspace.root, "0.0.1");
   git(workspace.root, "init", "-q");
   git(workspace.root, "add", "-f", LOCAL, skillPath);
@@ -281,6 +283,24 @@ test("a tracked stale skill and settings file are left byte for byte and named i
   assert.equal(lines.length, 1);
   assert.match(lines[0]!, heldLine([LOCAL, skillPath]));
   assert.equal(fs.readFileSync(path.join(workspace.root, ".carrick", "cli-version"), "utf8").trim(), "0.0.1");
+});
+
+test("a tracked settings file whose committed version holds none of ours is named as an older version's edit", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  put(workspace.root, SHARED, `${JSON.stringify({ permissions: { allow: ["Read"] } }, null, 2)}\n`);
+  git(workspace.root, "init", "-q");
+  git(workspace.root, "add", SHARED);
+  git(workspace.root, "commit", "-q", "-m", "team");
+  const edited = put(workspace.root, SHARED, olderSettings());
+  const before = fs.readFileSync(edited, "utf8");
+
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+
+  assert.equal(fs.readFileSync(edited, "utf8"), before);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /An older Carrick version added hooks to \.claude\/settings\.json, which git tracks\. Run `carrick init` to move them to a file git ignores\. Do not commit them\./);
+  assert.doesNotMatch(lines[0]!, /commit the change/);
 });
 
 test("when every outdated file is tracked, the held line replaces the version mismatch line", async (t) => {
@@ -488,4 +508,61 @@ test("a Codex session start rewrites the AGENTS.md section and skills, never .co
   // The old Codex hooks are still ours to replace, so the mismatch line stays.
   assert.match(context, /Run `carrick init`/);
   assert.equal(fs.readFileSync(path.join(workspace.root, ".carrick", "cli-version"), "utf8").trim(), "0.0.1");
+});
+
+/** Our current entries without the allow entry, as an install from before it was written. */
+function withoutAllow(): string {
+  const document = JSON.parse(mergeCarrickHooks(null).body);
+  delete document.permissions;
+  return `${JSON.stringify(document, null, 2)}\n`;
+}
+
+test("an untracked file with current hooks gains the allow entry, a tracked one is left with no line", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const untracked = put(workspace.root, LOCAL, withoutAllow());
+  writeLauncher(path.dirname(untracked));
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, running), [
+    `Carrick allowed its read-only MCP tools in ${LOCAL}, so headless runs (\`claude -p\`) can call them.`,
+  ]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(untracked, "utf8")).permissions, { allow: ["mcp__carrick"] });
+
+  const repo = path.join(workspace.root, "tracked");
+  const tracked = put(repo, LOCAL, withoutAllow());
+  writeLauncher(path.dirname(tracked));
+  git(repo, "init", "-q");
+  git(repo, "add", "-f", LOCAL);
+  git(repo, "commit", "-q", "-m", "tracked");
+  const held: string[] = [];
+  assert.deepEqual(bringUpToDate(workspace.root, repo, running, () => {}, held), []);
+  assert.equal(fs.readFileSync(tracked, "utf8"), withoutAllow());
+  assert.deepEqual(held, []);
+});
+
+/** A later release than the one running here, so a session start looks at every file again. */
+function nextRelease(): string {
+  const [major, minor, patch] = running.split(".").map(Number);
+  return `${major}.${minor}.${patch! + 1}`;
+}
+
+test("an allow entry the developer took out after Carrick gave it stays out at the next release", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const file = put(workspace.root, LOCAL, withoutAllow());
+  writeLauncher(path.dirname(file));
+  bringUpToDate(workspace.root, workspace.root, running);
+  fs.writeFileSync(file, withoutAllow());
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, nextRelease()), []);
+  assert.equal(fs.readFileSync(file, "utf8"), withoutAllow());
+});
+
+test("an allow entry init wrote, then taken out, is not added back by a session start", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const file = put(workspace.root, LOCAL, mergeCarrickHooks(null).body);
+  writeLauncher(path.dirname(file));
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, running), []);
+  fs.writeFileSync(file, withoutAllow());
+  assert.deepEqual(bringUpToDate(workspace.root, workspace.root, nextRelease()), []);
+  assert.equal(fs.readFileSync(file, "utf8"), withoutAllow());
 });

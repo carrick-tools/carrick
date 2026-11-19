@@ -16,6 +16,7 @@ import { releaseLock, takeLock, touchLock } from "../hook/lock.ts";
 import { answerEarly, supersededEntry } from "../hook/rechecks.ts";
 import { heldBuildId } from "./build.ts";
 import { heldDir, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
+import { readState, writeState, type NotChecked, type ServiceState } from "./state.ts";
 import { addSteps, tenth, type Steps } from "./steps.ts";
 import {
   admits,
@@ -24,7 +25,7 @@ import {
   liveEntries,
   memoryBudgetMb,
   removeEntry,
-  RSS_CEILING_MB,
+  closeCeilingMb,
   writeEntry,
 } from "./registry.ts";
 
@@ -83,14 +84,27 @@ export type HeldLine = {
   protocol?: string;
   /** A consumer line's call line on the current text, for joining part 2's call row. */
   call_line?: number | null;
+  /**
+   * The run this break belongs to: the edit answer at which its check began to
+   * speak this message. A break that stopped and spoke again is a new run.
+   */
+  run?: string;
+  /** Its check spoke the same message at the engine's previous edit answer: not this edit's break (T1 P1.1). */
+  standing?: true;
 };
 
 export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "error";
 
-export type HeldAnswer = { state: HeldState; lines: HeldLine[]; ms: number };
+export type HeldAnswer = {
+  state: HeldState;
+  lines: HeldLine[];
+  ms: number;
+  /** The services whose engine did not check the edit, with why (T7): the hook says each once. */
+  not_checked?: NotChecked[];
+};
 
 /** What serving a request found, and where its time went. */
-type Served = { state: HeldState; lines: HeldLine[]; steps: Steps };
+type Served = { state: HeldState; lines: HeldLine[]; steps: Steps; note?: NotChecked; service?: string; engine?: string; commits?: Array<() => void> };
 
 /** A started engine for one service. */
 export interface ServiceEngine {
@@ -99,10 +113,16 @@ export interface ServiceEngine {
    * been sent, still inside the engine's queue: no request reaches the engine
    * until it ends (the twin pass edits the engine's texts). `steps` is where
    * the answer's time went, in ms by step; `after` answers the same for its own.
+   * `commit` is called once the answer is filed as an early answer: what its
+   * lines spoke becomes what the next answer's are marked `standing` against
+   * (T1 P1.1). An answer that was not filed is never committed. `engine` is
+   * the engine's id, one per start: a break's run names it (`runOf`).
    */
-  answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps?: Steps; after?: () => Promise<Steps | void> }>;
+  answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps?: Steps; after?: () => Promise<Steps | void>; commit?: () => void; engine?: string }>;
   /** Resident memory in MB, or null. */
   rss(): number | null;
+  /** False for a service that started with no compiler: it holds no memory, so it holds no registry slot. */
+  holdsCompiler?: boolean;
   close(): Promise<void>;
 }
 
@@ -117,6 +137,8 @@ export type DaemonDeps = {
   root: string;
   home?: string;
   env?: NodeJS.ProcessEnv;
+  /** The machine's memory in bytes; `os.totalmem` by default. */
+  totalmem?: () => number;
   clock?: () => number;
   programs: () => Promise<ServiceInit[]>;
   runtime: ServiceRuntime;
@@ -147,9 +169,17 @@ type Slot = {
   engine: ServiceEngine | null;
   lastUsed: number;
   failedAt: number;
+  begunAt: number;
+  /** MB the engine held when its first gate finished (or, before that, the service's last one). */
+  settledMb?: number;
+  /** Why the start failed, one line. */
+  reason?: string;
   /** Engine calls run one at a time, in arrival order. */
   queue: Promise<void>;
 };
+
+/** A reason as one short line. */
+const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim().slice(0, 160);
 
 const key = (init: ServiceInit): string => `${init.repo}\0${init.service}`;
 
@@ -194,37 +224,50 @@ export class HeldDaemon {
     let state: HeldState = "none";
     let lines: HeldLine[] = [];
     let steps: Steps = {};
+    let notes: NotChecked[] = [];
+    let service: string | undefined;
+    let engine: string | undefined;
+    let commits: Array<() => void> = [];
     try {
-      ({ state, lines, steps } = await this.route(request));
+      ({ state, lines, steps, notes, service, engine, commits = [] } = await this.route(request));
     } catch (error) {
       log("request failed", String(error));
       state = "error";
     }
     const ms = Math.round(performance.now() - started);
     this.record(request, state, lines.length, ms, steps);
-    this.file(request, state, lines, ms);
-    return { state, lines, ms };
+    if (this.file(request, state, lines, ms, { service, engine })) for (const commit of commits) commit();
+    return { state, lines, ms, ...(notes.length > 0 ? { not_checked: notes } : {}) };
   }
 
-  private async route(request: HeldRequest): Promise<Served> {
+  private async route(request: HeldRequest): Promise<Served & { notes: NotChecked[] }> {
     const started = performance.now();
     const programs = await this.loadPrograms();
     const files = request.files.map(realPath);
     const lines: HeldLine[] = [];
     const states: HeldState[] = [];
+    const notes: NotChecked[] = [];
+    const ready: string[] = [];
+    const engines: string[] = [];
+    const commits: Array<() => void> = [];
     const steps: Steps = { programs: tenth(performance.now() - started) };
     for (const { init, dir } of programs) {
       const mine = files.filter((f) => within(f, dir));
       if (mine.length === 0) continue;
       const answer = await this.serveService(init, mine, request);
       states.push(answer.state);
+      if (answer.state === "ready") ready.push(`${init.repo}/${init.service}`);
       lines.push(...answer.lines);
+      if (answer.note !== undefined) notes.push(answer.note);
+      commits.push(...(answer.commits ?? []));
+      if (answer.engine !== undefined) engines.push(answer.engine);
       addSteps(steps, answer.steps);
     }
     // One state for the whole request: the most useful one any service gave.
     const order: HeldState[] = ["ready", "cold", "capped", "no_compiler", "error"];
     const state = order.find((s) => states.includes(s)) ?? "none";
-    return { state, lines, steps };
+    // The services whose engines answered, and those engines: what an early answer's rows are the whole list of (T1 P1.4).
+    return { state, lines, steps, notes, commits, ...(ready.length > 0 ? { service: ready.join(", ") } : {}), ...(engines.length > 0 ? { engine: engines.join(", ") } : {}) };
   }
 
   private async serveService(init: ServiceInit, files: string[], request: HeldRequest): Promise<Served> {
@@ -235,20 +278,45 @@ export class HeldDaemon {
       slot = undefined;
     }
     if (slot === undefined) {
-      if (!(await this.makeRoom())) return { state: "capped", lines: [], steps: {} };
+      if (!(await this.makeRoom(init))) return this.notChecked(init, "capped");
       this.begin(init, now);
-      return { state: "cold", lines: [], steps: {} };
+      return this.notChecked(init, "cold");
     }
     slot.lastUsed = now;
-    if (slot.status === "starting") return { state: "cold", lines: [], steps: {} };
-    if (slot.status === "no_compiler") return { state: "no_compiler", lines: [], steps: {} };
-    if (slot.status === "failed" || slot.engine === null) return { state: "error", lines: [], steps: {} };
+    if (slot.status === "starting") return this.notChecked(init, "cold");
+    if (slot.status === "no_compiler") return this.notChecked(init, "no_compiler");
+    if (slot.status === "failed" || slot.engine === null) return this.notChecked(init, "error", slot.reason);
     const asked = await this.ask(slot, slot.engine, files, request);
-    return asked === null ? { state: "error", lines: [], steps: {} } : { state: "ready", ...asked };
+    return asked === null ? this.notChecked(init, "error", "the engine could not answer") : { state: "ready", ...asked };
+  }
+
+  /** An answer that did not check the edit, with the facts the hook's line and the doctor's read (T7). */
+  private notChecked(init: ServiceInit, state: NotChecked["state"], reason?: string): Served {
+    const note: NotChecked = { service: init.service, state };
+    if (reason !== undefined) note.reason = reason;
+    if (state === "capped") {
+      const holders = liveEntries(this.deps.home).length;
+      note.budget_mb = this.budget();
+      note.holders = holders;
+      this.keep(init, { state: "capped", budget_mb: note.budget_mb, holders });
+    }
+    if (state === "cold") {
+      const took = readState(this.root, init.service, this.deps.home)?.last_start_ms;
+      if (took !== undefined) note.took_s = Math.round(took / 1000);
+    }
+    return { state, lines: [], steps: {}, note };
+  }
+
+  /** Write the service's state record (`state.ts`); a start's duration carries over to the next one. */
+  private keep(init: ServiceInit, change: Pick<ServiceState, "state"> & Partial<ServiceState>): void {
+    const before = readState(this.root, init.service, this.deps.home);
+    const lastStart = change.start_ms ?? before?.start_ms ?? before?.last_start_ms;
+    const settled = change.settled_mb ?? before?.settled_mb;
+    writeState(this.root, init.service, { at: new Date(this.now()).toISOString(), service: init.service, repo: init.repo, ...(settled === undefined ? {} : { settled_mb: settled }), ...change, ...(lastStart === undefined || change.state === "ready" ? {} : { last_start_ms: lastStart }) }, this.deps.home);
   }
 
   /** Asked through the slot's queue; `null` when the engine could not answer. */
-  private ask(slot: Slot, engine: ServiceEngine, files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps } | null> {
+  private ask(slot: Slot, engine: ServiceEngine, files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps; engine?: string; commits?: Array<() => void> } | null> {
     const queued = performance.now();
     return new Promise((resolve) => {
       slot.queue = slot.queue.then(async () => {
@@ -267,6 +335,8 @@ export class HeldDaemon {
           resolve({
             lines: answered.lines,
             steps: { queue_wait: tenth(begun - queued), engine: tenth(engineMs), ...answered.steps },
+            ...(answered.commit ? { commits: [answered.commit] } : {}),
+            ...(answered.engine === undefined ? {} : { engine: answered.engine }),
           });
         } catch (error) {
           log("engine could not answer", String(error));
@@ -287,26 +357,37 @@ export class HeldDaemon {
     return request.seq !== undefined && supersededEntry(request.session, request.seq, this.deps.home);
   }
 
-  /** File the early answer for an ask that named its entry, unless a newer edit superseded it. Never throws. */
-  private file(request: HeldRequest, state: HeldState, lines: HeldLine[], ms: number): void {
-    if (request.seq === undefined || request.kind !== "edit") return;
+  /** File the early answer for an ask that named its entry, unless a newer edit superseded it: true when filed. Never throws. */
+  private file(request: HeldRequest, state: HeldState, lines: HeldLine[], ms: number, by: { service?: string | undefined; engine?: string | undefined }): boolean {
+    if (request.seq === undefined || request.kind !== "edit") return false;
     try {
       if (this.superseded(request)) {
         log("held ask superseded by a newer edit; nothing filed");
-        return;
+        return false;
       }
-      answerEarly(request.session, request.seq, { state, lines, ms }, this.now(), this.deps.home);
+      const named = { ...(by.service === undefined ? {} : { service: by.service }), ...(by.engine === undefined ? {} : { engine: by.engine }) };
+      return answerEarly(request.session, request.seq, { state, lines, ms, ...named }, this.now(), this.deps.home);
     } catch (error) {
       log("could not file the held answer", String(error));
+      return false;
     }
   }
 
-  /** Free room for one more engine: close idle engines, least recently used first. */
-  private async makeRoom(): Promise<boolean> {
-    const budget = memoryBudgetMb(this.deps.env);
+  private budget(): number {
+    return memoryBudgetMb(this.deps.env, this.deps.totalmem?.());
+  }
+
+  /**
+   * Free room for one more engine, counted at the service's last settled size: close idle
+   * engines, least recently used first. A service that alone exceeds the budget is never started.
+   */
+  private async makeRoom(init: ServiceInit): Promise<boolean> {
+    const budget = this.budget();
     const now = this.now();
+    const need = readState(this.root, init.service, this.deps.home)?.settled_mb ?? ADMISSION_MB;
+    if (need > budget) return false;
     for (;;) {
-      if (admits(liveEntries(this.deps.home), budget)) return true;
+      if (admits(liveEntries(this.deps.home), budget, need)) return true;
       const victim = [...this.slots.values()]
         .filter((s) => s.status === "ready" && now - s.lastUsed >= EVICT_IDLE_MS)
         .sort((a, b) => a.lastUsed - b.lastUsed)[0];
@@ -316,10 +397,12 @@ export class HeldDaemon {
   }
 
   private begin(init: ServiceInit, now: number): void {
-    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, queue: Promise.resolve() };
+    const settledMb = readState(this.root, init.service, this.deps.home)?.settled_mb;
+    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), ...(settledMb === undefined ? {} : { settledMb }) };
     this.slots.set(key(init), slot);
+    this.keep(init, { state: "starting" });
     this.emptySince = null;
-    this.entry(slot, ADMISSION_MB);
+    this.entry(slot, slot.settledMb ?? ADMISSION_MB);
     void this.deps.runtime.start(init).then(
       (result) => this.started(slot, result),
       (error: unknown) => this.started(slot, { state: "error", reason: String(error) }),
@@ -334,11 +417,19 @@ export class HeldDaemon {
       }
       slot.engine = result.engine;
       slot.status = "ready";
+      // The start returns once the first gate has run: the engine's size now is its settled size.
+      const size = result.engine.holdsCompiler === false ? null : result.engine.rss();
+      if (size !== null) slot.settledMb = Math.round(size);
+      this.keep(slot.init, { state: "ready", start_ms: this.now() - slot.begunAt, ...(size === null ? {} : { settled_mb: Math.round(size) }) });
+      // Give back the admission slot; the slot stays ready so its asks still answer.
+      if (result.engine.holdsCompiler === false) removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
       return;
     }
     log(`no engine for ${slot.init.service}: ${result.reason}`);
     slot.status = result.state === "no_compiler" ? "no_compiler" : "failed";
     slot.failedAt = this.now();
+    slot.reason = oneLine(result.reason);
+    this.keep(slot.init, { state: slot.status === "no_compiler" ? "no_compiler" : "failed", reason: slot.reason });
     removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
   }
 
@@ -366,10 +457,14 @@ export class HeldDaemon {
     const now = this.now();
     for (const slot of [...this.slots.values()]) {
       if (slot.status !== "ready" || slot.engine === null) continue;
+      const holdsEntry = slot.engine.holdsCompiler !== false;
       const rss = slot.engine.rss();
-      if (now - slot.lastUsed >= ENGINE_IDLE_MS || (rss !== null && rss > RSS_CEILING_MB)) {
+      const ceiling = closeCeilingMb(slot.settledMb);
+      const oversized = rss !== null && rss > ceiling;
+      if (oversized) log(`closing ${slot.init.service} for size: ${Math.round(rss)} MB is above ${ceiling} MB (1.5 x ${slot.settledMb ?? "the floor"})`);
+      if (now - slot.lastUsed >= ENGINE_IDLE_MS || oversized) {
         await this.closeSlot(slot);
-      } else if (rss !== null) {
+      } else if (holdsEntry && rss !== null) {
         this.entry(slot, rss);
       }
     }

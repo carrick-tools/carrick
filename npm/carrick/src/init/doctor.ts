@@ -33,9 +33,11 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { status as runStatus } from "../cli.ts";
+import { compilerLinesEnabled } from "../facts/enabled.ts";
+import { compilerCoverage } from "../held/coverage.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { TEMPLATE_PATHS } from "../templates.ts";
-import { inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
+import { CODEX_ADD_LINE, inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
 import { readInstallId } from "./install-id.ts";
 import { createOutput, DOCS_INIT_FILES, type InitOutput } from "./output.ts";
 import {
@@ -307,6 +309,25 @@ export function checkDeclaredPaths(repos: ConfiguredRepo[]): Line[] {
     lines.push(done(`Declared paths exist: ${checked} in ${configs} carrick.json file(s).`));
   }
   return lines;
+}
+
+/**
+ * What the compiler check does not check, per service (T7, #4654). Never a
+ * finding: the check is quiet by design, and the doctor says what it covers.
+ */
+export function checkCompilerCoverage(
+  workspace: string,
+  repos: ConfiguredRepo[],
+  home?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Line[] {
+  // The daemon files its records under the checkout root it was started with, the workspace.
+  const declared = repos.map((repo) => ({
+    name: path.basename(repo.root),
+    label: repo.label,
+    services: repo.config === null ? [] : declaredServices(repo.config).map((service) => service.name),
+  }));
+  return compilerCoverage({ root: workspace, label: path.basename(workspace), repos: declared }, compilerLinesEnabled(env), home).map(say);
 }
 
 function isDirectory(target: string): boolean {
@@ -616,7 +637,7 @@ export function checkMcp(inspections: McpInspection[]): Line[] {
     if (client.state === "absent") {
       lines.push(
         warn(
-          `${client.client} is on this machine and is not connected to Carrick (${client.detail}), so it answers nothing across your repos. \`carrick init\` connects it; by hand it is \`${byHand}\`.`,
+          `${client.client} is on this machine and is not connected to Carrick (${client.detail}), so it answers nothing across your repos. \`carrick init\` connects it; by hand it is \`${client.client === "Codex" ? CODEX_ADD_LINE : byHand}\`.`,
         ),
       );
       continue;
@@ -868,6 +889,7 @@ export async function doctor(
     ...(await checkVersion()),
     ...checkPathVersion(workspace, pathCarrick()),
     ...checkDeclaredPaths(repos),
+    ...checkCompilerCoverage(workspace, repos),
     ...checkWorkflow(repos),
     ...checkHooks(workspace, realMachine()),
     ...checkCodexHooks(workspace),

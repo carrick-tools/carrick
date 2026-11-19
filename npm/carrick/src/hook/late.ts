@@ -11,9 +11,9 @@ import { resolveChannel } from "../channel.ts";
 import { problemItems } from "../contract.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedCleanLine, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
-import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, owedFor, readAnswer, readEarly, sessionListing } from "./rechecks.ts";
+import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, newestEarlies, owedFor, readAnswer, readEarly, sessionListing } from "./rechecks.ts";
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
-import { confirmedResult, earlyRows, keepRows, standingEarly } from "./confirm.ts";
+import { confirmedResult, earlyRows, keepRows, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
 import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
@@ -69,7 +69,13 @@ export function confirmAnswer(answer: Answer, home?: string): { answer: Answer; 
  * place of the probe (R46.2), so both print it the same way.
  */
 export function deliverOne(session: string, raw: Answer, home?: string): string[] {
-  const { answer, corrections } = confirmAnswer(raw, home);
+  const confirmed = confirmAnswer(raw, home);
+  const corrections = confirmed.corrections;
+  // A break the session was told and that still stands is not said again at a later entry (T1 P1.3).
+  const fresh = !isChanged(confirmed.answer) && confirmed.answer.result && !confirmed.answer.result.error
+    ? withoutTold(confirmed.answer.result, confirmed.answer.relative, [...newestEarlies(session, home).values()].map((e) => e.result), (key) => wasTold(session, key, home))
+    : null;
+  const answer = fresh ? { ...confirmed.answer, result: fresh.result } : confirmed.answer;
   const contexts: string[] = [];
   const key = answer.result ? toldKey(answer.result, answer.relative) : null;
   // As the edit-time answer would have: no uses-count line where the fact
@@ -88,6 +94,7 @@ export function deliverOne(session: string, raw: Answer, home?: string): string[
   if (context) {
     contexts.push(context);
     if (key !== null && uses && answer.result?.uses_lines?.length) markTold(session, [key], home);
+    if (fresh) markTold(session, fresh.keys, home);
   }
   contexts.push(...corrections);
   return contexts;
@@ -99,22 +106,34 @@ export function deliverOne(session: string, raw: Answer, home?: string): string[
  * renderer, claimed once under `<seq>.early.said` with the keys of every row the
  * message states. When the full answer has already landed, only the rows it did
  * not judge stand and print (R5a); the rest are its to say.
+ *
+ * A break is said once (T1, carrick#4728): a row the session's newest early
+ * answers no longer list as the same run was fixed since and is dropped; a row
+ * `reader` was already told of is kept in the claim and not printed. Each
+ * printed row's told key is marked for `reader`, the session the words reach.
  */
-export function deliverEarly(owner: string, early: EarlyAnswer, seen: Set<string>, options: { home?: string; now?: number; late?: boolean } = {}): string[] {
+export function deliverEarly(owner: string, early: EarlyAnswer, seen: Set<string>, options: { home?: string; now?: number; late?: boolean; reader?: string } = {}): string[] {
+  const reader = options.reader ?? owner;
   const full = readAnswer(owner, early.seq, options.home);
-  const view = full?.state === "answered" && full.result && !full.result.error ? standingEarly(early.result, full.result) : early.result;
+  const judged = full?.state === "answered" && full.result && !full.result.error ? standingEarly(early.result, full.result) : early.result;
+  const newest = early.service === undefined ? undefined : newestEarlies(owner, options.home).get(early.service);
+  const view = keepRows(judged, (row) => standsAsRun(row, newest));
   const rows = earlyRows(view);
   if (!claimEarly(owner, early.seq, rows.map((row) => row.key), options.home, options.now)) return [];
-  const fresh = keepRows(view, (row) => !seen.has(row.key));
+  const told = (row: (typeof rows)[number]): boolean => wasTold(reader, toldBreak(row.listed, row.run), options.home);
+  const fresh = keepRows(view, (row) => !seen.has(row.key) && !told(row));
   for (const row of rows) seen.add(row.key);
   const text = renderPostToolUse(fresh, early.relative, { early: true, uses: false, late: options.late !== false });
-  if (text) log(`early answer ${early.relative} delivered ${Math.round(((options.now ?? Date.now()) - Date.parse(early.enqueued_at)) / 1000)} s after the edit`);
+  if (text) {
+    markTold(reader, earlyRows(fresh).map((row) => toldBreak(row.listed, row.run)), options.home);
+    log(`early answer ${early.relative} delivered ${Math.round(((options.now ?? Date.now()) - Date.parse(early.enqueued_at)) / 1000)} s after the edit`);
+  }
   return text ? [text] : [];
 }
 
 /** Every early answer `session` is owed, printed oldest first (`deliverEarly`). */
 export function deliverEarlies(session: string, seen: Set<string>, home?: string, now: number = Date.now(), listing?: readonly string[]): string[] {
-  return earlyOwedFor(session, home, listing).flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { home, now }));
+  return earlyOwedFor(session, home, listing).flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { home, now, reader: session }));
 }
 
 /**

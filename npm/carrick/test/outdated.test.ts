@@ -91,6 +91,22 @@ test("a body an older version rendered is found, and an edited one is not called
   }
 });
 
+test("a current install without the allow entry is not out of date", () => {
+  const dir = workspace();
+  try {
+    writeTaskSkills(dir, { slug: "acme-index" });
+    const file = path.join(dir, SETTINGS_FILES[0]!);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const document = JSON.parse(mergeCarrickHooks(null).body);
+    delete document.permissions;
+    fs.writeFileSync(file, `${JSON.stringify(document, null, 2)}\n`);
+    writeLauncher(path.dirname(file));
+    assert.deepEqual(outdatedInstall(dir), { skills: [], hooks: [] });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a hook entry this version no longer writes is out of date", () => {
   const dir = workspace();
   try {

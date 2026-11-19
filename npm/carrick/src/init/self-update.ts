@@ -55,10 +55,28 @@ import {
   recordCliVersion,
   recordedCliVersion,
 } from "./outdated.ts";
-import { expectedCarrickHooks, installedCarrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
+import {
+  expectedCarrickHooks,
+  holdsCarrickAllow,
+  installedCarrickHooks,
+  mergeCarrickHooks,
+  SETTINGS_FILES,
+  withCarrickAllow,
+} from "./settings.ts";
 import { launcherDiffers, writeLauncher } from "./launcher.ts";
-import { trackedPaths } from "./repo-copies.ts";
-import { inspectTaskSkills, renderTaskSkill, scopeOf, SKILL_ROOTS, TASK_SKILLS, type TaskSkill } from "./task-skills.ts";
+import { addToExcludeBlock, committedHooksAreOurs, recordedRepoCopy, trackedPaths } from "./repo-copies.ts";
+import {
+  inspectTaskSkills,
+  recordWrittenSkills,
+  renderTaskSkill,
+  scopeOf,
+  skillFile,
+  SKILL_ROOTS,
+  skillRootLink,
+  TASK_SKILLS,
+  writtenSkills,
+  type TaskSkill,
+} from "./task-skills.ts";
 
 /** Which settings files were rewritten for which version, so one removed on purpose stays removed. */
 export function updatedStampFile(workspace: string): string {
@@ -98,9 +116,11 @@ export function updateHooks(
   merge: typeof mergeCarrickHooks = mergeCarrickHooks,
   tracked: Set<string> = new Set(),
   held: string[] = [],
+  allowed: string[] = [],
 ): string[] {
   const stamp = readStamp(workspace);
   const changed: string[] = [];
+  let wrote = false;
   for (const relative of SETTINGS_FILES) {
     const target = path.join(projectDir, relative);
     // Keyed by the file's path under the workspace, so a repo's copy is its own entry.
@@ -109,9 +129,28 @@ export function updateHooks(
     try {
       const body = fs.readFileSync(target, "utf8");
       const folder = path.dirname(target);
-      const launcherStale = installedCarrickHooks(body).length > 0 && launcherDiffers(folder);
-      if (!entriesAreStale(body, expectedCarrickHooks) && !launcherStale) continue;
-      const merged = merge(body);
+      const ours = installedCarrickHooks(body).length > 0;
+      const launcherStale = ours && launcherDiffers(folder);
+      const stale = entriesAreStale(body, expectedCarrickHooks) || launcherStale;
+      // The allow entry is no staleness. It is given once per file: added where the
+      // file is ours alone to write, and never again once a file has held it, so a
+      // developer who takes it out keeps it out. A tracked file is left without a
+      // word (carrick#4881).
+      const allowKey = `allow:${key}`;
+      const holdsAllow = holdsCarrickAllow(body);
+      if (ours && holdsAllow && stamp[allowKey] === undefined) {
+        stamp[allowKey] = running;
+        wrote = true;
+      }
+      const allowGiven = stamp[allowKey] !== undefined;
+      const lacksAllow = ours && !holdsAllow;
+      const addAllow = lacksAllow && !allowGiven && !tracked.has(relative);
+      if (!stale && !addAllow) continue;
+      let merged = merge(body);
+      if (lacksAllow && allowGiven) {
+        const kept = withCarrickAllow(merged.body, false);
+        merged = { body: kept, changed: kept !== body };
+      }
       if (!merged.changed && !launcherStale) continue;
       if (tracked.has(relative)) {
         held.push(relative);
@@ -120,12 +159,17 @@ export function updateHooks(
       writeAtomic(target, merged.body);
       writeLauncher(folder);
       stamp[key] = running;
-      changed.push(relative);
+      wrote = true;
+      if (!holdsAllow && holdsCarrickAllow(merged.body)) {
+        stamp[allowKey] = running;
+        allowed.push(relative);
+      }
+      if (stale) changed.push(relative);
     } catch {
       // Unreadable or not JSON: a file to report (`carrick doctor` does), never to overwrite.
     }
   }
-  if (changed.length > 0) {
+  if (wrote) {
     try {
       writeAtomic(updatedStampFile(workspace), `${JSON.stringify(stamp, null, 2)}\n`);
     } catch {
@@ -133,6 +177,11 @@ export function updateHooks(
     }
   }
   return changed;
+}
+
+/** File names as one phrase: "a", "a and b", "a, b and c". */
+function listed(files: string[]): string {
+  return files.length === 1 ? files[0]! : `${files.slice(0, -1).join(", ")} and ${files.at(-1)}`;
 }
 
 /** Task skills still ours and an older body, rewritten with the scope each was written with. */
@@ -155,6 +204,50 @@ function updateSkills(workspace: string, tracked: Set<string>, held: string[]): 
     }
   }
   return changed;
+}
+
+/**
+ * Task skills that are absent and new to this install, written beside their
+ * siblings. A root counts only where it is no link and already holds a skill of
+ * ours; the new one takes that sibling's scope. Where the siblings are in the
+ * repo's exclude block the new path joins the block first; where git tracks
+ * them it is named in `notAdded` and not written. A skill the record names was
+ * removed on purpose and stays removed.
+ */
+function addNewSkills(workspace: string, tracked: Set<string>, notAdded: string[]): string[] {
+  const added: string[] = [];
+  const given = writtenSkills(workspace);
+  const installed = inspectTaskSkills(workspace);
+  for (const root of SKILL_ROOTS) {
+    if (skillRootLink(workspace, root) !== null) continue;
+    const siblings = installed.filter((skill) => skill.path.startsWith(`${root}${path.sep}`) && skill.state === "ours");
+    if (siblings.length === 0) continue;
+    const missing = TASK_SKILLS.filter((name) => {
+      const relative = skillFile(root, name);
+      return installed.find((skill) => skill.path === relative)?.state === "absent" && !given.has(relative);
+    });
+    if (missing.length === 0) continue;
+    if (siblings.some((skill) => tracked.has(skill.path))) {
+      notAdded.push(...missing.map((name) => skillFile(root, name)));
+      continue;
+    }
+    try {
+      const scope = scopeOf(fs.readFileSync(path.join(workspace, siblings[0]!.path), "utf8"));
+      const hidden = new Set(recordedRepoCopy(workspace)?.recorded ?? []);
+      const paths = missing.map((name) => skillFile(root, name));
+      if (siblings.some((skill) => hidden.has(skill.path)) && !addToExcludeBlock(workspace, paths)) continue;
+      for (const name of missing) {
+        const relative = skillFile(root, name);
+        fs.mkdirSync(path.dirname(path.join(workspace, relative)), { recursive: true });
+        writeAtomic(path.join(workspace, relative), renderTaskSkill(name, scope));
+        recordWrittenSkills(workspace, [relative]);
+        added.push(relative);
+      }
+    } catch {
+      // Left as it was; the next session tries again.
+    }
+  }
+  return added;
 }
 
 /** Repos and services the snapshot's resolution holds; null where it cannot be read. */
@@ -254,6 +347,7 @@ export function bringUpToDate(
   // once per directory; a folder that is no repository, or a git that cannot
   // answer, tracks nothing, which is what this did before it asked.
   const settingsHeld: string[] = [];
+  const allowed: string[] = [];
   const hooks =
     projectDir === null
       ? []
@@ -264,9 +358,14 @@ export function bringUpToDate(
           mergeCarrickHooks,
           trackedPaths(projectDir, SETTINGS_FILES) ?? new Set(),
           settingsHeld,
+          allowed,
         );
   if (hooks.length > 0) {
     lines.push(`Carrick brought its hook entries in ${hooks.join(", ")} up to date for ${running}.`);
+  }
+  if (allowed.length > 0) {
+    const named = listed(allowed.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))));
+    lines.push(`Carrick allowed its read-only MCP tools in ${named}, so headless runs (\`claude -p\`) can call them.`);
   }
   const rootTracked = trackedPaths(workspace, [...SKILL_ROOTS, AGENTS_FILE, CLAUDE_FILE]) ?? new Set();
   const rootHeld: string[] = [];
@@ -275,6 +374,27 @@ export function bringUpToDate(
     const roots = [...new Set(skills.map((file) => path.dirname(path.dirname(file))))];
     lines.push(`Carrick brought its task skills in ${roots.join(", ")} up to date for ${running}.`);
   }
+  const notAdded: string[] = [];
+  const fresh = addNewSkills(workspace, rootTracked, notAdded);
+  const skillPhrase = (files: string[]): { names: string[]; roots: string[]; noun: string } => {
+    const names = [...new Set(files.map((file) => path.basename(path.dirname(file))))];
+    return {
+      names,
+      roots: [...new Set(files.map((file) => path.dirname(path.dirname(file))))],
+      noun: names.length === 1 ? "skill" : "skills",
+    };
+  };
+  if (fresh.length > 0) {
+    const { names, roots, noun } = skillPhrase(fresh);
+    lines.push(`Carrick added its new task ${noun} ${listed(names)} to ${roots.join(", ")} for ${running}.`);
+  }
+  if (notAdded.length > 0) {
+    const { names, roots, noun } = skillPhrase(notAdded);
+    held.push(...notAdded);
+    lines.push(
+      `Carrick did not add its new task ${noun} ${listed(names)} to ${roots.join(", ")} because git tracks its other skills there. Run \`carrick init\`, then commit the change in its own pull request.`,
+    );
+  }
   const written = [
     updateAgentsSection(workspace, log, rootTracked, rootHeld),
     updateClaudeSection(workspace, rootTracked, rootHeld),
@@ -282,15 +402,25 @@ export function bringUpToDate(
   if (written.length > 0) {
     lines.push(`Carrick brought its rules section in ${written.join(" and ")} up to date for ${running}.`);
   }
+  // A held settings file whose committed version holds none of our entries is an
+  // older version's uncommitted edit: nothing to commit, and `carrick init` puts
+  // it back (carrick#4881).
+  const ours = (file: string): boolean => projectDir !== null && !committedHooksAreOurs(projectDir, file);
+  const stray = settingsHeld.filter(ours);
   const skipped = [
-    ...settingsHeld.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))),
+    ...settingsHeld.filter((file) => !ours(file)).map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))),
     ...rootHeld,
   ];
-  held.push(...skipped);
-  if (skipped.length > 0) {
-    const named = skipped.length === 1 ? skipped[0]! : `${skipped.slice(0, -1).join(", ")} and ${skipped.at(-1)}`;
+  held.push(...stray.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))), ...skipped);
+  if (stray.length > 0) {
+    const named = listed(stray.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))));
     lines.push(
-      `Carrick did not update ${named} because git tracks them here. Run \`carrick init\`, then commit the change in its own pull request.`,
+      `An older Carrick version added hooks to ${named}, which git tracks. Run \`carrick init\` to move them to a file git ignores. Do not commit them.`,
+    );
+  }
+  if (skipped.length > 0) {
+    lines.push(
+      `Carrick did not update ${listed(skipped)} because git tracks them here. Run \`carrick init\`, then commit the change in its own pull request.`,
     );
   }
   // The recorded version is what the mismatch line compares. Move it only when

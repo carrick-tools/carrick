@@ -11,7 +11,7 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CLAUDE_LAUNCHER_CALL } from "../src/init/launcher.ts";
+import { CLAUDE_LAUNCHER_CALL, writeLauncher } from "../src/init/launcher.ts";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
@@ -23,9 +23,12 @@ import {
 } from "../src/init/repos.ts";
 import {
   carrickHooks,
+  installedCarrickHooks,
   mergeCarrickHooks,
   removeCarrickHooks,
 } from "../src/init/settings.ts";
+import { bringUpToDate } from "../src/init/self-update.ts";
+import { currentVersion } from "../src/update.ts";
 import {
   absentRepos,
   installCommands,
@@ -47,7 +50,7 @@ import { inspectTaskSkills, removeTaskSkills, taskSkillPaths, taskSkillWarnings,
 import { checkTaskSkills } from "../src/init/doctor.ts";
 import { writeIfChanged } from "../src/init/files.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
-import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
+import { CODEX_HOOKS_FILE, writeCodexHooks } from "../src/init/codex.ts";
 import { TEMPLATE_PATHS } from "../src/templates.ts";
 import {
   BEAT_MS,
@@ -431,7 +434,7 @@ test("the hook entries land beside everything else the settings file holds", () 
   );
   const merged = mergeCarrickHooks(existing);
   const written = JSON.parse(merged.body);
-  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
+  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)", "mcp__carrick"] });
   assert.equal(written.hooks.PreToolUse.length, 1);
   // The user's own session-start script survives, with ours after it.
   assert.equal(written.hooks.SessionStart.length, 2);
@@ -482,7 +485,7 @@ test("init replaces the scaffold's session-start entry and keeps its nudges and 
   );
   const merged = mergeCarrickHooks(scaffolded);
   const written = JSON.parse(merged.body);
-  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
+  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)", "mcp__carrick"] });
   assert.deepEqual(
     written.hooks.SessionStart.map((group: { hooks: Array<{ command: string }> }) => group.hooks[0]!.command),
     [`${CLAUDE_LAUNCHER_CALL} hook session-start`],
@@ -1212,7 +1215,12 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
         // Which build wrote the files below, so a hook running an older
         // `carrick` than this one says so (carrick#1372).
         path.join(".carrick", "cli-version"),
-        path.join(".claude", "settings.json"),
+        // Which skills this install was given, so a session start adds only
+        // the ones new to it (carrick#1333).
+        path.join(".carrick", "task-skills-written.json"),
+        // Kept out of git in a repo of its own, so no shared settings file
+        // is written (carrick#4881).
+        path.join(".claude", "settings.local.json"),
         // The launcher every entry calls, whatever PATH holds (carrick#4759).
         path.join(".claude", "carrick-hook.sh"),
         // The same hooks, for the other host (carrick#1335).
@@ -1228,12 +1236,12 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
       true,
     );
 
-    // And the set is ignored where it has to be: all git can see in the tree
-    // after a first run is the three agent directories, which hold the settings,
-    // the Codex hooks and the skills and are meant to be committed.
+    // And the set is hidden where it has to be: all git can see in the tree
+    // after a first run is the check section in AGENTS.md; the settings, the
+    // Codex hooks and the skills are named in the clone's exclude file.
     assert.equal(
       execFileSync("git", ["-C", fixture.repo, "status", "--porcelain"], { encoding: "utf8" }),
-      "?? .agents/\n?? .claude/\n?? .codex/\n?? AGENTS.md\n",
+      "?? AGENTS.md\n",
     );
 
     // This workspace read reports no services, so the run names the index
@@ -2143,25 +2151,25 @@ test("an editor file is written only for an editor found here, or one somebody n
   // every writer merges, and a list of folders read as though it replaced
   // them (carrick#1512).
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, folder: null, home: "/home/dev" }),
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, codex: false, folder: null, home: "/home/dev" }),
     "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
   );
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: false, folder: null, home: "/home/dev" }),
+    writesLine({ workspaceFile: false, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: false, codex: false, folder: null, home: "/home/dev" }),
     "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to ~/.cursor/mcp.json",
   );
   assert.equal(
-    writesLine({ workspaceFile: true, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: true, folder: "~/shop", home: "/home/dev" }),
+    writesLine({ workspaceFile: true, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: true, codex: false, folder: "~/shop", home: "/home/dev" }),
     `Add Carrick's hooks and skills to .claude/, .agents/ and .codex/ in ~/shop and in each repo, create .carrick/ and ${WORKSPACE_FILE}, and add Carrick's MCP server to Claude Code and ~/.cursor/mcp.json`,
   );
   // A folder run writes into each repo too, so the line says where
   // (carrick#1512, option A as ruled).
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, folder: "~/shop", home: "/home/dev" }),
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, codex: false, folder: "~/shop", home: "/home/dev" }),
     "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/ in ~/shop and in each repo, create .carrick/, and add Carrick's MCP server to Claude Code",
   );
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: false, folder: null, home: "/home/dev" }),
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: false, codex: false, folder: null, home: "/home/dev" }),
     "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, and create .carrick/",
   );
 });
@@ -2893,5 +2901,293 @@ test("removing task skills deletes nothing through a link out of the harness fol
     assert.ok(deleted.some((p) => p.startsWith(".agents")));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A team's repo: the folder init runs in is the top of its own git repository,
+// and git has to keep reading as the team left it (carrick#4881). Every case
+// asserts `git status --porcelain`, the way a developer meets the change.
+const TEAM_HOOK = { type: "command", command: "npx prettier --write" };
+const TEAM_SETTINGS = `${JSON.stringify({ permissions: { allow: ["Bash(npm test)"] }, hooks: { PostToolUse: [{ matcher: "Write", hooks: [TEAM_HOOK] }] } }, null, 2)}\n`;
+const TEAM_CODEX = `${JSON.stringify({ hooks: { PostToolUse: [{ matcher: "apply_patch", hooks: [TEAM_HOOK] }] } }, null, 2)}\n`;
+const TEAM_SKILL = "---\nname: team-skill\n---\nThe team's own skill.\n";
+
+// No global or system git config, and no per-user ignore file, so a laptop that
+// ignores `.claude/settings.local.json` globally reads the same as CI.
+const HERMETIC_GIT: NodeJS.ProcessEnv = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "carrick-no-git-config-")),
+};
+
+function gitIn(repo: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], {
+    encoding: "utf8",
+    env: { ...process.env, ...HERMETIC_GIT },
+  });
+}
+
+/** The porcelain, one line per entry, in the order git prints it. */
+function porcelain(repo: string): string {
+  return gitIn(repo, "status", "--porcelain", "--untracked-files=all");
+}
+
+/** Commit a repo shaped like a team's: its own rules files, hooks and skills. */
+function commitTeamRepo(repo: string, files: { codex?: boolean; settings?: string | null; bare?: boolean } = {}): void {
+  const put = (relative: string, body: string): void => {
+    fs.mkdirSync(path.dirname(path.join(repo, relative)), { recursive: true });
+    fs.writeFileSync(path.join(repo, relative), body);
+  };
+  if (files.bare !== true) {
+    put("AGENTS.md", "# Team rules\n\nRun the tests.\n");
+    put("CLAUDE.md", "@AGENTS.md\n");
+    if (files.settings !== null) put(path.join(".claude", "settings.json"), files.settings ?? TEAM_SETTINGS);
+    if (files.codex !== false) put(CODEX_HOOKS_FILE, TEAM_CODEX);
+    put(path.join(".claude", "skills", "team-skill", "SKILL.md"), TEAM_SKILL);
+    put(path.join(".agents", "skills", "team-skill", "SKILL.md"), TEAM_SKILL);
+  } else {
+    put("package.json", "{}\n");
+  }
+  gitIn(repo, "add", "-A");
+  gitIn(repo, "commit", "-q", "-m", "team");
+}
+
+function runCarrick(fixture: { repo: string; env: NodeJS.ProcessEnv }, ...args: string[]): { status: number | null; stdout: string; stderr: string } {
+  return spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), ...args], {
+    cwd: fixture.repo,
+    env: { ...fixture.env, ...HERMETIC_GIT },
+    encoding: "utf8",
+  });
+}
+
+function runInit(fixture: { repo: string; env: NodeJS.ProcessEnv }): string {
+  const result = runCarrick(fixture, "init", "--yes", fixture.repo);
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout;
+}
+
+/** What git shows after a first init in a team's repo that tracks its Codex hooks. */
+const TEAM_PORCELAIN = " M .codex/hooks.json\n M AGENTS.md\n M CLAUDE.md\n";
+const TEAM_PORCELAIN_NO_CODEX = " M AGENTS.md\n M CLAUDE.md\n";
+const LOCAL_FILE = path.join(".claude", "settings.local.json");
+const LAUNCHERS = [path.join(".claude", "carrick-hook.sh"), path.join(".codex", "carrick-hook.sh")];
+
+function excludeBlock(repo: string): string[] {
+  const file = path.join(repo, ".git", "info", "exclude");
+  return fs.readFileSync(file, "utf8").split("\n").filter((line) => line.startsWith("/")).map((line) => line.slice(1).split("/").join(path.sep));
+}
+
+test("a first init in a team's repo leaves git showing only the rules files and the tracked Codex hooks", posixNativeFixture, () => {
+  for (const codex of [true, false]) {
+    const fixture = executableInitFixture("payments");
+    try {
+      commitTeamRepo(fixture.repo, { codex });
+      runInit(fixture);
+      assert.equal(porcelain(fixture.repo), codex ? TEAM_PORCELAIN : TEAM_PORCELAIN_NO_CODEX);
+      // Claude Code's entries are in the personal file, and the shared one is the team's.
+      assert.equal(fs.readFileSync(path.join(fixture.repo, ".claude", "settings.json"), "utf8"), TEAM_SETTINGS);
+      assert.ok(installedCarrickHooksIn(path.join(fixture.repo, LOCAL_FILE)) > 0);
+      // Every file init wrote is named in the exclude block.
+      const named = excludeBlock(fixture.repo);
+      for (const written of [LOCAL_FILE, ...LAUNCHERS, ...taskSkillPaths(), ...(codex ? [] : [CODEX_HOOKS_FILE])]) {
+        assert.ok(named.includes(written), `${written} is named in .git/info/exclude`);
+      }
+      assert.equal(named.includes(CODEX_HOOKS_FILE), !codex);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+function installedCarrickHooksIn(file: string): number {
+  return installedCarrickHooks(fs.readFileSync(file, "utf8")).length;
+}
+
+/** The 0.3.164 state: our entries in the shared files, an untracked launcher and skills, no exclude block. */
+function oldInstall(repo: string): void {
+  const shared = path.join(repo, ".claude", "settings.json");
+  fs.writeFileSync(shared, mergeCarrickHooks(fs.readFileSync(shared, "utf8")).body);
+  writeLauncher(path.join(repo, ".claude"));
+  writeCodexHooks(repo);
+  writeTaskSkills(repo, { slug: "payments" });
+}
+
+test("init in a repo an older version set up takes Carrick out of the shared settings file and hides the rest", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    oldInstall(fixture.repo);
+    assert.notEqual(porcelain(fixture.repo), TEAM_PORCELAIN);
+    runInit(fixture);
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+    assert.equal(
+      fs.readFileSync(path.join(fixture.repo, ".claude", "settings.json"), "utf8"),
+      gitIn(fixture.repo, "show", "HEAD:.claude/settings.json"),
+    );
+    assert.ok(installedCarrickHooksIn(path.join(fixture.repo, LOCAL_FILE)) > 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a repo that never held a settings file loses the one an older version made", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo, { settings: null });
+    fs.mkdirSync(path.join(fixture.repo, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(fixture.repo, ".claude", "settings.json"), mergeCarrickHooks(null).body);
+    runInit(fixture);
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".claude", "settings.json")), false);
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("hooks the team committed are left, with the launcher they call hidden and none of ours added beside them", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    const committed = mergeCarrickHooks(TEAM_SETTINGS).body;
+    commitTeamRepo(fixture.repo, { settings: committed });
+    const stdout = runInit(fixture);
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+    assert.equal(fs.readFileSync(path.join(fixture.repo, ".claude", "settings.json"), "utf8"), committed);
+    const local = path.join(fixture.repo, LOCAL_FILE);
+    assert.ok(!fs.existsSync(local) || installedCarrickHooksIn(local) === 0);
+    assert.ok(fs.existsSync(path.join(fixture.repo, LAUNCHERS[0]!)));
+    assert.ok(excludeBlock(fixture.repo).includes(LAUNCHERS[0]!));
+    assert.match(stdout, /Carrick's hooks are committed in \.claude\/settings\.json, so init left them unchanged and added no second set\./);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a session start rewrites older local entries and git still shows the same files", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    runInit(fixture);
+    const local = path.join(fixture.repo, LOCAL_FILE);
+    const older = JSON.parse(mergeCarrickHooks(null, "carrick").body);
+    for (const groups of Object.values(older.hooks) as { hooks: { command: string; timeout?: number }[] }[][]) {
+      for (const group of groups) for (const entry of group.hooks) if (/hook post-edit/.test(entry.command)) entry.timeout = 10;
+    }
+    fs.writeFileSync(local, `${JSON.stringify(older, null, 2)}\n`);
+    const before = porcelain(fixture.repo);
+    const lines = bringUpToDate(fixture.repo, fixture.repo, currentVersion()!);
+    assert.ok(lines.some((line) => /brought its hook entries/.test(line)), lines.join("\n"));
+    assert.deepEqual(JSON.parse(fs.readFileSync(local, "utf8")).hooks.PostToolUse.at(-1).hooks[0].timeout !== 10, true);
+    assert.equal(porcelain(fixture.repo), before);
+    assert.equal(before, TEAM_PORCELAIN);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a settings file that is not JSON is named and the skills and launchers are still written", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    fs.writeFileSync(path.join(fixture.repo, LOCAL_FILE), "{not json");
+    const result = runCarrick(fixture, "init", "--yes", fixture.repo);
+    assert.match(result.stdout + result.stderr, /Could not configure Carrick hooks: .*Fix \.claude\/settings\.local\.json and run carrick init again\./);
+    assert.equal(fs.readFileSync(path.join(fixture.repo, LOCAL_FILE), "utf8"), "{not json");
+    const named = excludeBlock(fixture.repo);
+    for (const written of [...LAUNCHERS, ...taskSkillPaths()]) {
+      assert.ok(fs.existsSync(path.join(fixture.repo, written)), written);
+      assert.ok(named.includes(written), `${written} is named in .git/info/exclude`);
+    }
+    assert.ok(!named.includes(LOCAL_FILE));
+    // The broken file was the user's own and untracked before init, so it stays visible.
+    assert.equal(porcelain(fixture.repo), `${TEAM_PORCELAIN}?? .claude/settings.local.json\n`);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("remove after a first init in a team's repo leaves git clean and the team's files as committed", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    runInit(fixture);
+    const result = runCarrick(fixture, "remove", fixture.repo, "--confirm", path.basename(fixture.repo));
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.equal(porcelain(fixture.repo), "");
+    assert.doesNotMatch(fs.readFileSync(path.join(fixture.repo, ".git", "info", "exclude"), "utf8"), /carrick init/);
+    for (const team of [".claude/settings.json", ".codex/hooks.json", "AGENTS.md", "CLAUDE.md"]) {
+      assert.equal(fs.readFileSync(path.join(fixture.repo, team), "utf8"), gitIn(fixture.repo, "show", `HEAD:${team}`), team);
+    }
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a repo with none of the team's agent files shows only the new AGENTS.md", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo, { bare: true });
+    runInit(fixture);
+    assert.equal(porcelain(fixture.repo), "?? AGENTS.md\n");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("two clones that each ran init stay as they were after one pulls the other's commit", posixNativeFixture, () => {
+  const first = executableInitFixture("payments");
+  const second = executableInitFixture("payments");
+  try {
+    const remote = path.join(first.root, "remote.git");
+    execFileSync("git", ["init", "-q", "--bare", remote]);
+    for (const clone of [first, second]) {
+      gitIn(clone.repo, "remote", "add", "shared", remote);
+    }
+    commitTeamRepo(first.repo);
+    gitIn(first.repo, "push", "-q", "shared", "HEAD:refs/heads/main");
+    gitIn(second.repo, "fetch", "-q", "shared");
+    gitIn(second.repo, "checkout", "-q", "-B", "main", "shared/main");
+    runInit(first);
+    runInit(second);
+    assert.equal(porcelain(first.repo), TEAM_PORCELAIN);
+    assert.equal(porcelain(second.repo), TEAM_PORCELAIN);
+    // One developer commits an unrelated file and the other pulls it.
+    fs.writeFileSync(path.join(first.repo, "notes.md"), "notes\n");
+    gitIn(first.repo, "add", "notes.md");
+    gitIn(first.repo, "commit", "-q", "-m", "notes");
+    gitIn(first.repo, "push", "-q", "shared", "HEAD:refs/heads/main");
+    gitIn(second.repo, "pull", "-q", "--ff-only", "shared", "main");
+    assert.equal(porcelain(first.repo), TEAM_PORCELAIN);
+    assert.equal(porcelain(second.repo), TEAM_PORCELAIN);
+  } finally {
+    first.cleanup();
+    second.cleanup();
+  }
+});
+
+test("init in a team's repo writes the allow entry into the personal file only, and git shows the same files", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    runInit(fixture);
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+    const local = JSON.parse(fs.readFileSync(path.join(fixture.repo, LOCAL_FILE), "utf8"));
+    assert.deepEqual(local.permissions, { allow: ["mcp__carrick"] });
+    assert.equal(fs.readFileSync(path.join(fixture.repo, ".claude", "settings.json"), "utf8"), TEAM_SETTINGS);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("moving an older install's hooks out of the shared file keeps an allow entry the team committed", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    const team = `${JSON.stringify({ permissions: { allow: ["mcp__carrick", "Bash(npm test)"] }, hooks: JSON.parse(TEAM_SETTINGS).hooks }, null, 2)}\n`;
+    commitTeamRepo(fixture.repo, { settings: team });
+    oldInstall(fixture.repo);
+    runInit(fixture);
+    assert.equal(fs.readFileSync(path.join(fixture.repo, ".claude", "settings.json"), "utf8"), team);
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+  } finally {
+    fixture.cleanup();
   }
 });

@@ -30,6 +30,43 @@ export interface Engine {
   close(): Promise<void>;
 }
 
+/** Sends of one file in one pull before it gives up on a fresh answer (a stale answer was followed by a fresh one 3 of 3 times). */
+const PULL_SENDS = 3;
+
+/** A pull that never got a report for the text it sent. */
+export class StalePull extends Error {
+  override name = "StalePull";
+}
+
+/**
+ * The line appended to a TypeScript file's text: its error names the version
+ * sent, so a report shows which text it answers. A block, so no name reaches a
+ * script's global scope.
+ */
+function marker(version: number): string {
+  return `\n{ const __carrick_rev: "r${version}" = "r${version}_"; }`;
+}
+
+/** TypeScript source, not a declaration file (an initializer there is another error) or JavaScript. */
+function marks(file: string): boolean {
+  return /\.(ts|tsx|mts|cts)$/.test(file) && !/\.d(\.[^./\\]+)?\.[cm]?ts$/.test(file);
+}
+
+/**
+ * The caller's view of a marked report: the marker's own diagnostics dropped,
+ * and any other diagnostic that lies past the caller's text (an end-of-file
+ * syntax error) moved to that text's end. Positions inside the text never move.
+ */
+function unmarked(items: Diag[], text: string, version: number): Diag[] {
+  const lines = text.split("\n");
+  const end = { line: lines.length - 1, character: lines[lines.length - 1]!.length };
+  const past = (p: { line: number; character: number }): boolean => p.line > end.line || (p.line === end.line && p.character > end.character);
+  const clamp = (p: { line: number; character: number }): { line: number; character: number } => (past(p) ? { ...end } : p);
+  return items
+    .filter((d) => !(d.range.start.line > end.line && (d.message.includes("__carrick_rev") || d.message.includes(`"r${version}`))))
+    .map((d) => (past(d.range.start) || past(d.range.end) ? { ...d, range: { start: clamp(d.range.start), end: clamp(d.range.end) } } : d));
+}
+
 type Pending = { resolve: (message: LspMessage) => void; reject: (error: Error) => void };
 
 export class Ts7Lsp implements Engine {
@@ -37,6 +74,8 @@ export class Ts7Lsp implements Engine {
   private readonly framer = new Framer();
   private readonly pending = new Map<number, Pending>();
   private readonly versions = new Map<string, number>();
+  /** Each file's text as the caller set it, without the marker. */
+  private readonly texts = new Map<string, string>();
   private readonly cwd: string;
   private nextId = 1;
   private exited = false;
@@ -126,42 +165,61 @@ export class Ts7Lsp implements Engine {
   }
 
   set(file: string, text: string): void {
+    this.texts.set(file, text);
+    void this.ready.then(() => this.send(file, text)).catch(() => undefined);
+  }
+
+  /** Send `text` as `file`'s next version, marked when the file can hold the marker; the version sent. */
+  private send(file: string, text: string): number {
     const uri = pathToFileURL(file).toString();
     const version = (this.versions.get(file) ?? 0) + 1;
     this.versions.set(file, version);
-    const message =
+    const sent = marks(file) ? text + marker(version) : text;
+    this.write(
       version === 1
-        ? {
-            method: "textDocument/didOpen",
-            params: { textDocument: { uri, languageId: "typescript", version, text } },
-          }
-        : {
-            method: "textDocument/didChange",
-            params: { textDocument: { uri, version }, contentChanges: [{ text }] },
-          };
-    void this.ready.then(() => this.write(message)).catch(() => undefined);
+        ? { method: "textDocument/didOpen", params: { textDocument: { uri, languageId: "typescript", version, text: sent } } }
+        : { method: "textDocument/didChange", params: { textDocument: { uri, version }, contentChanges: [{ text: sent }] } },
+    );
+    return version;
   }
 
+  /**
+   * After an idle spell the language server can answer a pull with the report
+   * of the text it last pulled, not the text just sent. So every marked file is
+   * sent again here under a new version, and its report counts only when it
+   * holds that version's marker error; a report without it is sent and pulled
+   * again, at most `PULL_SENDS` sends in all, and then the pull rejects. A
+   * file never `set`, or one that cannot hold the marker, is pulled once as it
+   * stands. One request per file per send: a fresh answer costs no round trip.
+   */
   async pull(files: string[]): Promise<Map<string, Diag[]>> {
     await this.ready;
-    const answers = await Promise.all(
-      files.map((file) =>
-        this.request("textDocument/diagnostic", {
-          textDocument: { uri: pathToFileURL(file).toString() },
-        }),
-      ),
-    );
     const out = new Map<string, Diag[]>();
-    files.forEach((file, i) => {
-      const answer = answers[i]!;
-      if (answer.error) throw new Error(`diagnostic request failed: ${answer.error.message}`);
-      const result = answer.result as { kind?: string; items?: Diag[] } | null;
-      // Anything but a full report is not "no diagnostics": it is no answer.
-      if (result?.kind !== "full") {
-        throw new Error(`diagnostic answer for ${file} is not a full report (${result?.kind ?? "null"})`);
-      }
-      out.set(file, result.items ?? []);
-    });
+    let todo = [...new Set(files)];
+    for (let sends = 0; todo.length > 0; sends++) {
+      if (sends === PULL_SENDS) throw new StalePull(`no answer for the text just sent to ${todo[0]} after ${PULL_SENDS} sends`);
+      const asked = todo.map((file) => {
+        const text = this.texts.get(file);
+        return { file, text, version: text !== undefined && marks(file) ? this.send(file, text) : null };
+      });
+      const answers = await Promise.all(
+        asked.map(({ file }) => this.request("textDocument/diagnostic", { textDocument: { uri: pathToFileURL(file).toString() } })),
+      );
+      todo = [];
+      asked.forEach(({ file, text, version }, i) => {
+        const answer = answers[i]!;
+        if (answer.error) throw new Error(`diagnostic request failed: ${answer.error.message}`);
+        const result = answer.result as { kind?: string; items?: Diag[] } | null;
+        // Anything but a full report is not "no diagnostics": it is no answer.
+        if (result?.kind !== "full") {
+          throw new Error(`diagnostic answer for ${file} is not a full report (${result?.kind ?? "null"})`);
+        }
+        const items = result.items ?? [];
+        if (version === null || text === undefined) out.set(file, items);
+        else if (items.some((d) => d.message.includes(`"r${version}_"`))) out.set(file, unmarked(items, text, version));
+        else todo.push(file);
+      });
+    }
     return out;
   }
 
