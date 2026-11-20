@@ -12073,33 +12073,200 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
     }
 
-    /// The split of `run_check` changes nothing: on the corpus-2 pair, the
-    /// outcomes `run_check` returns are the ones `judge_pairs` returns over
-    /// `build_check_pairs`, which is the call the matched-pair pass makes.
+    /// The split of `run_check` changes nothing. Seven pairs go through a
+    /// stand-in sidecar that answers by pair key: one with a producer that has
+    /// no surface (pre-verdict), a check that resolves, a check that leaves the
+    /// call to the retype and the retype that agrees, one that finds a
+    /// mismatch, and a same-service pair the check calls incompatible (held
+    /// back). The run is then repeated as a pull request run with main's
+    /// stored outcomes (settled pairs). What `run_check` returned for this
+    /// input on origin/main, and what the stand-in was asked, is recorded in
+    /// `tests/fixtures/run-check-pin/outcomes.txt` (the commit it came from is
+    /// in `SOURCE`); the branch returns the same. Record with
+    /// `RECORD_RUN_CHECK_PIN=1` on a checkout of the commit to pin against.
+    /// Not covered here: the real `check_v2` probe (the stand-in answers it);
+    /// the existing `run_check` tests over the real sidecar own that.
     #[test]
-    #[serial(v2_capture_sidecar)]
-    fn judge_pairs_is_what_run_check_runs() {
-        let Some((sidecar, _key, all_repo_data)) = corpus_pair() else {
-            return;
-        };
-        let from_run_check = run_check(&sidecar, &all_repo_data, &LocalConsumers::new(), None);
-        assert_eq!(from_run_check.len(), 1, "exactly one matched pair");
-
-        let data = with_route_graphs(&all_repo_data);
-        let pairs = super::build_check_pairs(&data);
-        let mut from_judge = judge_pairs(
-            &sidecar,
-            &judge_stubs(&data),
-            &pairs,
-            &LocalConsumers::new(),
-            std::time::Instant::now(),
+    fn run_check_returns_what_it_returned_before_the_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let log = root.join("asked.log");
+        let script = root.join("pin-sidecar.cjs");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+const fs = require('fs');
+const log = {log:?};
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  if (request.action === 'add_program_files') return write({{ request_id, status: 'success', added: request.files.length }});
+  if (request.action === 'check_v2') {{
+    for (const pair of request.pairs) fs.appendFileSync(log, 'check ' + pair.pair_key + '\n');
+    return write({{ request_id, status: 'success', result: {{
+      success: true, isolation: 'pnpm', install_ok: true, ts_version: '5.9.0',
+      verdicts: request.pairs.map((pair) => {{
+        const key = pair.pair_key;
+        const base = {{ pair_id: key, pair_key: key, gate: null }};
+        if (key.includes('S1')) return {{ ...base, bucket: 'incompatible', resolved: true, diagnostic: 'a field is missing' }};
+        if (key.includes('C10')) return {{ ...base, bucket: 'compatible', resolved: true }};
+        return {{ ...base, bucket: 'unverifiable', resolved: false,
+          unresolved_reason: "the consumer type is 'unknown'", unresolved_side: 'consumer' }};
+      }}) }} }});
+  }}
+  if (request.action === 'retype_check') {{
+    for (const item of request.items) fs.appendFileSync(log, 'retype ' + item.item_id + '\n');
+    return write({{ request_id, status: 'success',
+      outcomes: request.items.map((item) => item.item_id.includes('C9')
+        ? {{ item_id: item.item_id, outcome: 'mismatch',
+            diagnostics: [{{ line: 9, code: 2339, message: 'Property name does not exist' }}] }}
+        : {{ item_id: item.item_id, outcome: 'agrees', diagnostics: [] }}) }});
+  }}
+  write({{ request_id, status: 'error', errors: ['unexpected ' + request.action] }});
+}});
+"#
+            ),
         )
-        .outcomes;
-        from_judge.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+
+        let post = OperationKey::http("POST", "/p");
+        let consumer = |key: &OperationKey, alias: &str, line: u32, state: ManifestTypeState| {
+            let mut call = entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                alias,
+                "src/client.ts",
+                line,
+                state,
+            );
+            if state == ManifestTypeState::Explicit {
+                call.expanded_definition = Some("{ id: string; }".to_string());
+            }
+            call
+        };
+        let producer = |key: &OperationKey, alias: &str, file: &str| {
+            let mut route = entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                alias,
+                file,
+                3,
+                ManifestTypeState::Explicit,
+            );
+            route.expanded_definition = Some("{ id: string; }".to_string());
+            route
+        };
+        let own = OperationKey::http("GET", "/self");
+        let legacy = OperationKey::http("POST", "/ns");
+        let mut repos = settle_repos();
+        repos[0].type_manifest.as_mut().unwrap().extend([
+            producer(&own, "SelfRoute", "src/self.ts"),
+            consumer(&own, "S1", 20, ManifestTypeState::Unknown),
+        ]);
+        repos[1].type_manifest.as_mut().unwrap().extend([
+            consumer(&post, "C10", 10, ManifestTypeState::Explicit),
+            consumer(&legacy, "N1", 11, ManifestTypeState::Unknown),
+        ]);
+        let mut legacy_repo = repo(
+            "mono",
+            Some("legacy"),
+            vec![producer(&legacy, "NsRoute", "src/ns.ts")],
+            None,
+        );
+        legacy_repo.cache_version = Some(crate::engine::CACHE_VERSION);
+        legacy_repo.scanner_build = crate::cloud_storage::ScannerBuild::current();
+        repos.push(legacy_repo);
+
+        let call = |file: &str, line: u32| CallLocator {
+            file_path: root.join(file).to_string_lossy().into_owned(),
+            line_number: line,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("api.post('/p')".to_string()),
+            expression_line: Some(line),
+            prescreen: None,
+            prescreen_fresh_type: None,
+            prescreen_undefined_free: None,
+            procedure_path: None,
+        };
+        let local = LocalConsumers::from([
+            (
+                "web".to_string(),
+                LocalConsumer {
+                    root: root.clone(),
+                    tsconfig: None,
+                    calls: HashMap::from([
+                        ("C8".to_string(), call("src/client.ts", 8)),
+                        ("C9".to_string(), call("src/client.ts", 9)),
+                        ("N1".to_string(), call("src/client.ts", 11)),
+                    ]),
+                },
+            ),
+            (
+                "api".to_string(),
+                LocalConsumer {
+                    root: root.clone(),
+                    tsconfig: None,
+                    calls: HashMap::from([("S1".to_string(), call("src/self.ts", 20))]),
+                },
+            ),
+        ]);
+
+        let render = |label: &str, outcomes: &[PairCheckOutcome]| -> String {
+            let mut text = format!("== {label}: outcomes\n");
+            for outcome in outcomes {
+                text.push_str(&format!("{outcome:#?}\n"));
+            }
+            text.push_str(&format!("== {label}: asked\n"));
+            for line in asked(&log) {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            text
+        };
+        let main = run_check(&sidecar, &repos, &local, None);
+        let mut record = render("main run", &main);
+
+        let mut blobs = repos.clone();
+        crate::cloud_storage::attach_pair_outcomes(
+            &mut blobs,
+            &main,
+            "test",
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+        );
+        let reach = HashMap::from([(
+            "web".to_string(),
+            super::super::type_reach::ReachDecision::Partial {
+                reached: ["C9"].map(String::from).into(),
+                unreached: ["C8", "C10", "N1"].map(String::from).into(),
+            },
+        )]);
+        let settle = settle_from(&blobs, &["api", "legacy"], reach);
+        let pr = run_check(&sidecar, &repos, &local, Some(&settle));
+        record.push_str(&render("pull request run", &pr));
+        let record = record.replace(root.to_string_lossy().as_ref(), "<root>");
+
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run-check-pin");
+        if std::env::var_os("RECORD_RUN_CHECK_PIN").is_some() {
+            std::fs::create_dir_all(&fixture).unwrap();
+            std::fs::write(fixture.join("outcomes.txt"), &record).unwrap();
+            return;
+        }
+        let recorded = std::fs::read_to_string(fixture.join("outcomes.txt")).unwrap();
         assert_eq!(
-            format!("{from_judge:?}"),
-            format!("{from_run_check:?}"),
-            "judge_pairs over build_check_pairs is run_check"
+            record, recorded,
+            "run_check no longer returns what it returned"
         );
     }
 

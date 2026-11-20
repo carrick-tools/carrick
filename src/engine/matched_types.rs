@@ -45,6 +45,17 @@ const NOT_RECORDED: &str = "not_recorded";
 /// response before the caller reads it.
 pub(crate) const OWN_CODE_SKIP: &str = "the call goes through the repository's own code, which reshapes the response before the caller reads it; the pair at that code's request line is the one judged";
 
+/// Why a pair with both ends read has no verdict. Each is stated on the pair
+/// (`verdict_reason`); a pair with no verdict always carries one.
+pub(crate) const ENDS_NOT_READ: &str = "an end of the pair was not read, so there are no two types to judge; the end's reason says why";
+pub(crate) const PAIR_NOT_BUILT: &str =
+    "the pair could not be built from the two types that were read, so it was not judged";
+pub(crate) const JUDGE_COULD_NOT_START: &str =
+    "the judge's compiler process could not be started, so the pair was not judged";
+pub(crate) const JUDGE_NOT_READY: &str =
+    "the judge's compiler process did not become ready in time, so the pair was not judged";
+pub(crate) const JUDGE_NO_ANSWER: &str = "the judge returned no outcome for the pair";
+
 /// Extensions the compiler engine reads as source.
 const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
@@ -77,7 +88,9 @@ pub(crate) struct MatchedEnd {
     pub reason: Option<&'static str>,
     /// Caller only: whether the repository's own code the located call goes
     /// into hands back the parsed body. `Some(false)` types the caller and
-    /// skips the verdict. `None` and `Some(true)` are judged.
+    /// skips the verdict. `None` means there is no own code between the call
+    /// and the client (the call is the client's own), so the pair is judged,
+    /// as it is for `Some(true)`.
     pub hands_back_body: Option<bool>,
 }
 
@@ -128,8 +141,12 @@ pub(crate) struct MatchedPairTypes {
     pub pair_id: String,
     pub caller: MatchedEndTypes,
     pub server: MatchedEndTypes,
-    /// `None` when an end has no alias to judge.
+    /// The judge's verdict, or `None`: the pair was not judged, and
+    /// `verdict_reason` says why. A skipped pair (own code) is `Some` with
+    /// `skipped` set, never `None`.
     pub verdict: Option<MatchedVerdict>,
+    /// Why `verdict` is `None`; `None` exactly when `verdict` is `Some`.
+    pub verdict_reason: Option<&'static str>,
 }
 
 /// The word's own row in the one list, read at the point of use: a word the
@@ -193,7 +210,7 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
     if let Some(reason) = end.reason {
         return Plan::Stated(state(reason));
     }
-    if role == Role::Server && !is_compiler_source(&end.file) {
+    if !is_compiler_source(&end.file) {
         return Plan::Stated(state(NOT_TYPESCRIPT_SOURCE));
     }
     if role == Role::Caller && end.span.is_none() {
@@ -379,6 +396,26 @@ fn type_service(
     Ok(ServiceTypes { artifact, entries })
 }
 
+/// The stubs of the services that were typed, in service-id order: the order
+/// feeds the stub folder names (a repeated name is suffixed in the order it is
+/// met) and the judge's answer cache, so it must not depend on the map's.
+fn ordered_stubs<'a>(
+    typed: &'a HashMap<&'a str, Result<ServiceTypes, String>>,
+) -> Vec<JudgeStub<'a>> {
+    let mut stubs: Vec<JudgeStub<'a>> = typed
+        .iter()
+        .filter_map(|(service_id, types)| {
+            Some(JudgeStub {
+                service_id,
+                artifact: &types.as_ref().ok()?.artifact,
+                graphql_types: None,
+            })
+        })
+        .collect();
+    stubs.sort_by(|a, b| a.service_id.cmp(b.service_id));
+    stubs
+}
+
 /// The end's reading once its service's type stage has run.
 fn read_end(service: &str, alias: &str, entries: &[TypeManifestEntry]) -> MatchedEndTypes {
     let Some(entry) = entries.iter().find(|entry| entry.type_alias == alias) else {
@@ -418,9 +455,13 @@ fn stated(service: &str, alias: Option<&str>, reason: String) -> MatchedEndTypes
 
 /// Read both ends of every pair and judge the pairs whose ends are both read.
 ///
-/// Services run one at a time, in the order the pairs name them. A service not
-/// started once `ceiling` has passed gives every end it owns `budget_exhausted`.
-/// The result has one row per input pair, in input order.
+/// Services run one at a time, in the order the pairs name them. `ceiling` is
+/// checked before each service starts: a service not started once it has passed
+/// gives every end it owns `budget_exhausted`. It is not a bound on the whole
+/// run: a service that has started runs to its end, and the judge runs after
+/// the last service whatever the time.
+/// The result has one row per input pair, in input order. A row's `verdict` is
+/// `None` only with a `verdict_reason`.
 pub(crate) fn type_matched_pairs(
     sidecar_path: &Path,
     services: &[MatchedService],
@@ -504,6 +545,7 @@ pub(crate) fn type_matched_pairs(
             caller: read(caller_plan, &pair.caller.service),
             server: read(server_plan, &pair.server.service),
             verdict: None,
+            verdict_reason: Some(ENDS_NOT_READ),
         })
         .collect();
 
@@ -542,32 +584,33 @@ pub(crate) fn type_matched_pairs(
                 judged: false,
                 skipped: Some(OWN_CODE_SKIP),
             });
+            row.verdict_reason = None;
             continue;
         }
-        if let Some(built_pair) = type_compat_v2::build_matched_pair(
+        match type_compat_v2::build_matched_pair(
             &server.service,
             producer_entry,
             &caller.service,
             consumer_entry,
         ) {
-            row_of_key.insert(built_pair.spec.pair_key.clone(), index);
-            built.push(built_pair);
+            Some(built_pair) => {
+                row_of_key.insert(built_pair.spec.pair_key.clone(), index);
+                built.push(built_pair);
+            }
+            None => row.verdict_reason = Some(PAIR_NOT_BUILT),
         }
     }
+    // A pair that reached the judge and has no verdict says why not.
+    let set_reason = |reason: &'static str, rows: &mut [MatchedPairTypes]| {
+        for &index in row_of_key.values() {
+            rows[index].verdict_reason = Some(reason);
+        }
+    };
     if built.is_empty() {
         return rows;
     }
 
-    let stubs: Vec<JudgeStub<'_>> = typed
-        .iter()
-        .filter_map(|(service_id, types)| {
-            Some(JudgeStub {
-                service_id,
-                artifact: &types.as_ref().ok()?.artifact,
-                graphql_types: None,
-            })
-        })
-        .collect();
+    let stubs = ordered_stubs(&typed);
     let Some(first) = services.first() else {
         return rows;
     };
@@ -575,20 +618,24 @@ pub(crate) fn type_matched_pairs(
         Ok(sidecar) => sidecar,
         Err(e) => {
             warn!("matched pairs: the judge could not start: {e}");
+            set_reason(JUDGE_COULD_NOT_START, &mut rows);
             return rows;
         }
     };
     judge_sidecar.start_init(&first.root, first.tsconfig.as_deref());
     if let Err(e) = judge_sidecar.wait_ready(crate::services::type_sidecar::ready_budget()) {
         warn!("matched pairs: the judge was not ready: {e}");
+        set_reason(JUDGE_NOT_READY, &mut rows);
         return rows;
     }
+    set_reason(JUDGE_NO_ANSWER, &mut rows);
     let judged =
         type_compat_v2::judge_pairs(&judge_sidecar, &stubs, &built, &local_consumers, started);
     for outcome in judged.outcomes {
         let Some(&index) = row_of_key.get(&outcome.pair_key) else {
             continue;
         };
+        rows[index].verdict_reason = None;
         rows[index].verdict = Some(MatchedVerdict {
             bucket: outcome.bucket,
             gate: outcome.gate.clone(),
@@ -660,16 +707,45 @@ mod tests {
         }
     }
 
+    /// The rows of one run, in the order the pairs were given.
+    struct Run {
+        ids: Vec<String>,
+        by_id: HashMap<String, MatchedPairTypes>,
+        fixture_ids: Vec<String>,
+    }
+
+    impl std::ops::Index<&str> for Run {
+        type Output = MatchedPairTypes;
+        fn index(&self, id: &str) -> &MatchedPairTypes {
+            &self.by_id[id]
+        }
+    }
+
+    /// Whether the built sidecar is there. A local run without the build skips
+    /// the test; in CI a missing build is a failure, because a skip there
+    /// would make a green tick mean nothing (the convention of the
+    /// integration tests: `CI` set means the build must exist).
+    fn sidecar_built(sidecar_path: &Path) -> bool {
+        let built = sidecar_path.exists();
+        assert!(
+            built || std::env::var("CI").is_err(),
+            "the built sidecar is missing in CI, so these tests would silently not run \
+             (cd src/sidecar && npm run build)"
+        );
+        if !built {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        }
+        built
+    }
+
     /// Every pair of the fixture, read once and shared by the tests: the pass
     /// starts several compiler processes, so one run answers them all.
-    fn all_rows() -> Option<&'static HashMap<String, MatchedPairTypes>> {
-        static ROWS: std::sync::OnceLock<Option<HashMap<String, MatchedPairTypes>>> =
-            std::sync::OnceLock::new();
+    fn all_rows() -> Option<&'static Run> {
+        static ROWS: std::sync::OnceLock<Option<Run>> = std::sync::OnceLock::new();
         ROWS.get_or_init(|| {
             let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
-            if !sidecar_path.exists() {
-                eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            if !sidecar_built(&sidecar_path) {
                 return None;
             }
             let dir = tempfile::tempdir().unwrap();
@@ -717,11 +793,18 @@ mod tests {
                 .collect();
             let rows =
                 type_matched_pairs(&sidecar_path, &services, &pairs, Duration::from_secs(600));
-            Some(
-                rows.into_iter()
+            Some(Run {
+                ids: rows.iter().map(|row| row.pair_id.clone()).collect(),
+                fixture_ids: fixture
+                    .pairs
+                    .iter()
+                    .map(|pair| pair.pair_id.clone())
+                    .collect(),
+                by_id: rows
+                    .into_iter()
                     .map(|row| (row.pair_id.clone(), row))
                     .collect(),
-            )
+            })
         })
         .as_ref()
     }
@@ -789,6 +872,192 @@ mod tests {
             assert!(end.alias.is_none() && end.type_read.is_none());
         }
         assert!(row.verdict.is_none());
+    }
+
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn rows_come_back_in_input_order_and_a_missing_verdict_has_its_reason() {
+        let Some(rows) = all_rows() else { return };
+        assert_eq!(rows.ids, rows.fixture_ids);
+        for row in rows.by_id.values() {
+            assert_eq!(
+                row.verdict.is_none(),
+                row.verdict_reason.is_some(),
+                "{}: a verdict is missing only with its reason",
+                row.pair_id
+            );
+        }
+        assert_eq!(rows["sql_server"].verdict_reason, Some(ENDS_NOT_READ));
+        assert_eq!(rows["pubsub"].verdict_reason, Some(ENDS_NOT_READ));
+    }
+
+    fn stated_end(service: &str, file: &str, reason: Option<&'static str>) -> MatchedEnd {
+        MatchedEnd {
+            service: service.to_string(),
+            file: file.to_string(),
+            line: 1,
+            span: Some((0, 1)),
+            reason,
+            hands_back_body: None,
+        }
+    }
+
+    fn stated_pair(id: &str, caller: MatchedEnd, server: MatchedEnd) -> MatchedPair {
+        MatchedPair {
+            pair_id: id.to_string(),
+            verb: "GET".to_string(),
+            operation: "/x".to_string(),
+            http: true,
+            caller,
+            server,
+        }
+    }
+
+    /// Nothing in these pairs is asked of the compiler, so no sidecar is
+    /// needed: the path below is never spawned.
+    fn run_stated(pairs: &[MatchedPair]) -> Vec<MatchedPairTypes> {
+        type_matched_pairs(
+            Path::new("/nonexistent/sidecar/index.js"),
+            &[],
+            pairs,
+            Duration::from_secs(1),
+        )
+    }
+
+    #[test]
+    fn an_empty_pair_list_gives_an_empty_answer() {
+        assert!(run_stated(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_pair_naming_an_unknown_service_states_not_located() {
+        let rows = run_stated(&[stated_pair(
+            "p",
+            stated_end("nope", "a.ts", None),
+            stated_end("nowhere", "b.ts", None),
+        )]);
+        for end in [&rows[0].caller, &rows[0].server] {
+            assert_eq!(end.reason.as_deref(), Some("not_located"));
+            assert!(end.type_read.is_none() && end.alias.is_none());
+        }
+        assert!(rows[0].verdict.is_none());
+        assert_eq!(rows[0].verdict_reason, Some(ENDS_NOT_READ));
+    }
+
+    #[test]
+    fn a_declaration_file_server_end_and_a_caller_with_a_reason_state_theirs() {
+        let rows = run_stated(&[stated_pair(
+            "p",
+            stated_end("web", "a.ts", Some("several_sites_on_line")),
+            stated_end("api", "types/api.d.ts", None),
+        )]);
+        assert_eq!(
+            rows[0].caller.reason.as_deref(),
+            Some("several_sites_on_line")
+        );
+        assert_eq!(
+            rows[0].server.reason.as_deref(),
+            Some("not_typescript_source")
+        );
+        assert!(rows[0].verdict.is_none() && rows[0].verdict_reason.is_some());
+    }
+
+    #[test]
+    fn a_caller_in_a_file_that_is_not_source_states_not_typescript_source() {
+        let rows = run_stated(&[
+            stated_pair(
+                "sql",
+                stated_end("web", "db/001.sql", None),
+                stated_end("api", "b.ts", Some("not_located")),
+            ),
+            stated_pair(
+                "decl",
+                stated_end("web", "types/web.d.ts", None),
+                stated_end("api", "b.ts", Some("not_located")),
+            ),
+        ]);
+        for row in &rows {
+            assert_eq!(
+                row.caller.reason.as_deref(),
+                Some("not_typescript_source"),
+                "{}",
+                row.pair_id
+            );
+        }
+    }
+
+    #[test]
+    fn output_order_is_input_order() {
+        let ids = ["z", "a", "m", "b", "y"];
+        let pairs: Vec<MatchedPair> = ids
+            .iter()
+            .map(|id| {
+                stated_pair(
+                    id,
+                    stated_end("nope", "a.ts", None),
+                    stated_end("nope", "b.ts", None),
+                )
+            })
+            .collect();
+        let rows = run_stated(&pairs);
+        let got: Vec<&str> = rows.iter().map(|row| row.pair_id.as_str()).collect();
+        assert_eq!(got, ids);
+    }
+
+    #[test]
+    fn stub_inputs_are_the_same_on_every_run() {
+        use crate::cloud_storage::{CAPTURE_ARTIFACT_VERSION, CaptureStubArtifact};
+        // `a/b` and `a_b` sanitize to one folder name, so the order decides
+        // which gets the suffix.
+        let names = ["web", "a/b", "api", "a_b", "worker", "zeta", "alpha"];
+        let artifact = || CaptureStubArtifact {
+            artifact_version: CAPTURE_ARTIFACT_VERSION,
+            package_name: "@carrick/test".to_string(),
+            ts_version: "5.8.3".to_string(),
+            bare_checkout: true,
+            files: BTreeMap::new(),
+        };
+        let inputs = |order: &[&str]| -> Vec<(String, String)> {
+            let typed: HashMap<&str, Result<ServiceTypes, String>> = order
+                .iter()
+                .map(|name| {
+                    (
+                        *name,
+                        Ok(ServiceTypes {
+                            artifact: artifact(),
+                            entries: Vec::new(),
+                        }),
+                    )
+                })
+                .collect();
+            let dir = tempfile::tempdir().unwrap();
+            type_compat_v2::materialize_stubs(&ordered_stubs(&typed), dir.path())
+                .into_iter()
+                .map(|stub| {
+                    let folder = Path::new(&stub.stub_dir)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    (stub.service_name, folder)
+                })
+                .collect()
+        };
+        let first = inputs(&names);
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        assert_eq!(
+            first
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            sorted
+        );
+        for round in 0..40 {
+            let mut shuffled = names.to_vec();
+            shuffled.rotate_left(round % names.len());
+            assert_eq!(inputs(&shuffled), first, "round {round}");
+        }
     }
 
     #[test]
