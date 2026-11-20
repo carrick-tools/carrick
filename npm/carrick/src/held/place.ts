@@ -204,9 +204,13 @@ const POST_BODY = POST.indexOf("=> o") + 3;
  * The file with every placeable value wrapped. `wire` is `checkWire`'s text (it holds
  * `__carrick_Sent<S, E>`). `clean` states each
  * group's type; `twin` states it intersected with a property no value has, so
- * it must fail where the check can see the value at all.
+ * it must fail where the check can see the value at all. `wire` is `clean`
+ * with a scalar-form GraphQL check's callback reading the judge's wire line
+ * (`__carrick_GqlWire`) in place of its declared line: no field the record
+ * lacks or converts is read in the type the schema declares. Its body, spans
+ * and callbacks are `clean`'s; every other check keeps its `clean` text.
  */
-export function overlay(file: string, text: string, checks: CheckInput[], wire: string[], mode: "clean" | "twin"): Overlay {
+export function overlay(file: string, text: string, checks: CheckInput[], wire: string[], mode: "clean" | "twin" | "wire"): Overlay {
   const unplaced: Overlay["unplaced"] = [];
   const js = /\.(?:[mc]?js|jsx)$/.test(file);
   const bom = text.charCodeAt(0) === BOM ? 1 : 0;
@@ -231,7 +235,8 @@ export function overlay(file: string, text: string, checks: CheckInput[], wire: 
       } else if (form) {
         const leaf = form.leaf !== null;
         if (leaf) decls.push(`  type L${k} = ${form.leaf};`);
-        const sent = leaf ? `__carrick_GqlSentS<Awaited<V>, O${k}, L${k}>` : `__carrick_GqlSent<Awaited<V>, O${k}>`;
+        const scalar = mode === "wire" ? "__carrick_GqlWire" : "__carrick_GqlSentS";
+        const sent = leaf ? `${scalar}<Awaited<V>, O${k}, L${k}>` : `__carrick_GqlSent<Awaited<V>, O${k}>`;
         decls.push(`  function send${k}<V>(v: V, c: (o: ${sent}) => __carrick_GqlExpected<O${k}>): V;`);
       } else {
         decls.push(`  function send${k}<V>(v: V, c: (o: __carrick_Sent<V, O${k}>) => O${k}): V;`);

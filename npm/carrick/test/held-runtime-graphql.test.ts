@@ -14,6 +14,7 @@ import ts from "typescript";
 import type { ServiceEngine, ServiceInit } from "../src/held/daemon.ts";
 import type { Diag, Engine } from "../src/held/engine.ts";
 import { placedPath } from "../src/held/paths.ts";
+import type { SiteFinder } from "../src/held/place.ts";
 import { createRuntime } from "../src/held/runtime.ts";
 import { buildFacts, factsPath } from "../src/facts/store.ts";
 
@@ -31,7 +32,7 @@ const RESOLVERS_TEXT = [
 const HTTP_TEXT = "export const reply = () => ({ ok: true });\n";
 
 /** The engine's GraphQL answer, as S-G1 writes it, cut to what the fake compiler reads. */
-const GQL_LINES = ["type __carrick_GqlExpected<E> = E;", "type __carrick_GqlSent<S, E> = S;", "type __carrick_GqlSentS<S, E, R> = S;"];
+const GQL_LINES = ["type __carrick_GqlExpected<E> = E;", "type __carrick_GqlSent<S, E> = S;", "type __carrick_GqlSentS<S, E, R> = S;", "type __carrick_GqlWire<S, E, R> = S;"];
 const TYPES_DECL = "type __carrick_GqlTypes = {};";
 /** A table in the engine's shape; the fake engine refuses any field leaf that is not. */
 const TABLE = { Query: { fields: { order: { type: "Order" } } }, Order: { fields: { id: { non_null: { scalar: "ID" } }, total: { scalar: "Int" } } } };
@@ -68,7 +69,11 @@ const POST = ", (o) => o)";
  * A fake held compiler. Per check: a twin (its alias intersected with
  * `__carrick_never`) speaks at the check's start; a value holding `BROKEN`
  * speaks at the callback body, naming the alias, as the compiler does for a
- * GraphQL break (P8).
+ * GraphQL break (P8). A check whose own `send` line reads the judge's wire
+ * line (`__carrick_GqlWire<`) speaks at its callback on a value holding
+ * `CONVERTED` (an object field the record holds as a string, which the
+ * declared fill silences in the clean form), and at the file's start, outside
+ * every check, on one holding `OUTSIDE`.
  */
 class FakeCompiler implements Engine {
   readonly texts = new Map<string, string>();
@@ -89,8 +94,10 @@ class FakeCompiler implements Engine {
         const k = m[1]!;
         const post = text.indexOf(POST, m.index);
         const value = text.slice(m.index + m[0].length, post);
+        const wire = text.includes(`function send${k}<V>(v: V, c: (o: __carrick_GqlWire<`);
         if (new RegExp(`type O${k} = .*__carrick_never`).test(text)) diags.push({ range: at(m.index), code: 2322, message: `Type '{}' is not assignable to type 'O${k}'.` });
-        else if (value.includes("BROKEN")) diags.push({ range: at(post + POST.indexOf("=> o") + 3), code: 2322, message: `Type 'string' is not assignable to type 'O${k}'.` });
+        else if (value.includes("BROKEN") || (wire && value.includes("CONVERTED"))) diags.push({ range: at(post + POST.indexOf("=> o") + 3), code: 2322, message: `Type 'string' is not assignable to type 'O${k}'.` });
+        else if (wire && value.includes("OUTSIDE")) diags.push({ range: at(0), code: 2322, message: "Type 'string' is not assignable to type 'Resolvers'." });
       }
       out.set(file, diags);
     }
@@ -123,12 +130,12 @@ function contract(label: string, protocol: string, file: string, type: string, s
 }
 
 const ORDER = "{ order: { id: string; total: number } | null }";
-const rowsOf = (gql: boolean, orderType = ORDER): Wire[] => [
+const rowsOf = (gql: boolean, orderType = ORDER, resolvers = RESOLVERS_TEXT, orderValue = '{ id: "o1", total: 3 }'): Wire[] => [
   contract("GET /ok", "http", HTTP, "{ ok: boolean }", spanOf(HTTP_TEXT, "{ ok: true }")),
   ...(gql
     ? [
-        contract("QUERY order", "graphql", RESOLVERS, orderType, spanOf(RESOLVERS_TEXT, '{ id: "o1", total: 3 }'), { graphql_root: { type: "Query", field: "order" } }),
-        contract("MUTATION createOrder", "graphql", RESOLVERS, "{ createOrder: { id: string } }", spanOf(RESOLVERS_TEXT, '{ id: "o2" }'), { graphql_root: { type: "Mutation", field: "createOrder" } }),
+        contract("QUERY order", "graphql", RESOLVERS, orderType, spanOf(resolvers, orderValue), { graphql_root: { type: "Query", field: "order" } }),
+        contract("MUTATION createOrder", "graphql", RESOLVERS, "{ createOrder: { id: string } }", spanOf(resolvers, '{ id: "o2" }'), { graphql_root: { type: "Mutation", field: "createOrder" } }),
       ]
     : []),
 ];
@@ -145,13 +152,16 @@ type Rig = {
   facts: (rows: Wire[], table: unknown) => Promise<void>;
 };
 
-async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows: Wire[], table: unknown, startCompiler = true, extraEnv: Record<string, string> = {}): Promise<Rig | { placed: Rig["placed"]; asked: Rig["asked"] }> {
+/** The resolver file's text at the index commit, and the site finder (by default it never finds the value again). */
+type RigOptions = { resolvers?: string; site?: SiteFinder };
+
+async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows: Wire[], table: unknown, startCompiler = true, extraEnv: Record<string, string> = {}, options: RigOptions = {}): Promise<Rig | { placed: Rig["placed"]; asked: Rig["asked"] }> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-gql-runtime-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, "ws");
   const home = path.join(dir, "home");
   fs.mkdirSync(path.join(root, "src"), { recursive: true });
-  fs.writeFileSync(path.join(root, RESOLVERS), RESOLVERS_TEXT);
+  fs.writeFileSync(path.join(root, RESOLVERS), options.resolvers ?? RESOLVERS_TEXT);
   fs.writeFileSync(path.join(root, HTTP), HTTP_TEXT);
   git(root, "init", "-q");
   git(root, "add", "-A");
@@ -174,7 +184,7 @@ async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows:
   const init: ServiceInit = { repo: REPO, service: SERVICE, repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
   const runtime = createRuntime({
     root, home, entry, env: { ...process.env, FAKE_ENGINE_LOG: log, ...extraEnv },
-    site: async () => ({ reason: "value_edited" }),
+    site: options.site ?? (async () => ({ reason: "value_edited" })),
     makeEngine: () => {
       assert.ok(startCompiler, "no held compiler may start here");
       return compiler;
@@ -287,4 +297,77 @@ test("a GraphQL row whose root the engine was not asked about at start unarms th
   assert.deepEqual(summary(r.placed().unarmed), ["graphql MUTATION createOrder#0:graphql_table_changed", "graphql QUERY order#0:graphql_table_changed"]);
   assert.ok(!shadowText(r, RESOLVERS).includes("__C."), "no GraphQL check stays placed");
   assert.deepEqual(summary(r.placed().armed), ["http GET /ok#0"]);
+});
+
+// carrick#4940 (T-4940b): the declared fill reads an object field the record holds as a plain value as converted by a field
+// resolver, which Carrick does not read. Where the judge's wire line passed at the gate and fails after an edit while the clean
+// check is silent, the row is counted as not checked (`field_resolver_unread`) and says nothing; it stays armed and in the view.
+const ARMED_ALL = ["graphql MUTATION createOrder#0", "graphql QUERY order#0", "http GET /ok#0"];
+const SET_ASIDE = ["graphql QUERY order#0:field_resolver_unread"];
+const CONVERTED = RESOLVERS_TEXT.replace('"o1"', '"CONVERTED"');
+
+test("s1: the wire line speaks at the callback after an edit and the clean check is silent: not checked, field_resolver_unread, no line", async (t) => {
+  const r = (await rig(t, rowsOf(true), TABLE)) as Rig;
+  assert.deepEqual(summary(r.placed().armed), ARMED_ALL);
+  assert.deepEqual(await r.edit(RESOLVERS, CONVERTED), []);
+  assert.deepEqual(summary(r.placed().unarmed), SET_ASIDE);
+  assert.deepEqual(summary(r.placed().armed), ["graphql MUTATION createOrder#0", "http GET /ok#0"]);
+  assert.match(shadowText(r, RESOLVERS), /__C\.send\d+_0\(\{ id: "CONVERTED"/, "the check stays in the view");
+  assert.ok(!shadowText(r, RESOLVERS).includes("c: (o: __carrick_GqlWire<"), "the clean text is back in the engine");
+});
+
+test("s1-revert: the next edit restores the value and the row is checked again", async (t) => {
+  const r = (await rig(t, rowsOf(true), TABLE)) as Rig;
+  await r.edit(RESOLVERS, CONVERTED);
+  assert.deepEqual(summary(r.placed().unarmed), SET_ASIDE);
+  assert.deepEqual(await r.edit(RESOLVERS, RESOLVERS_TEXT), []);
+  assert.deepEqual(summary(r.placed().armed), ARMED_ALL);
+  assert.deepEqual(r.placed().unarmed, []);
+});
+
+test("s1-then-break: a set-aside check still states a break its clean check proves, and is checked again (D-4)", async (t) => {
+  const r = (await rig(t, rowsOf(true), TABLE)) as Rig;
+  await r.edit(RESOLVERS, CONVERTED);
+  const lines = await r.edit(RESOLVERS, RESOLVERS_TEXT.replace('"o1"', '"CONVERTED BROKEN"'));
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  assert.equal(lines[0]!["label"], "QUERY order");
+  assert.deepEqual(summary(r.placed().armed), ARMED_ALL, "the clean check spoke at this answer: not set aside");
+});
+
+test("s1-cross: an edit across the value's bounds, re-armed by the regate, is set aside at the same edit", async (t) => {
+  let asks = 0;
+  const site: SiteFinder = async (q) => {
+    asks += 1;
+    if (asks === 1) return { reason: "value_edited" };
+    const m = /\{ id: "[^"]*", total: 3 \}/.exec(q.newText);
+    return m === null ? { reason: "value_not_a_node" } : { start: m.index, end: m.index + m[0].length };
+  };
+  const r = (await rig(t, rowsOf(true), TABLE, true, {}, { site })) as Rig;
+  const crossed = RESOLVERS_TEXT.replace('({ id: "o1", total: 3 })', '({ id: "CONVERTED", total: 3 } as const)');
+  assert.deepEqual(await r.edit(RESOLVERS, crossed), []);
+  assert.ok(asks >= 2, "the move lost the value and the regate found it");
+  assert.deepEqual(summary(r.placed().unarmed), SET_ASIDE);
+});
+
+test("resid: a check whose wire line already speaks at the gate is never set aside (F2)", async (t) => {
+  const text = RESOLVERS_TEXT.replace('"o1"', '"CONVERTED-AT-INDEX"');
+  const r = (await rig(t, rowsOf(true, ORDER, text, '{ id: "CONVERTED-AT-INDEX", total: 3 }'), TABLE, true, {}, { resolvers: text })) as Rig;
+  assert.deepEqual(summary(r.placed().armed), ARMED_ALL);
+  assert.deepEqual(await r.edit(RESOLVERS, text.replace("total: 3", 'total: "CONVERTED"')), []);
+  assert.deepEqual(summary(r.placed().armed), ARMED_ALL);
+  assert.deepEqual(r.placed().unarmed, []);
+});
+
+test("n2: an edit adding a key the schema does not declare keeps the row armed and silent", async (t) => {
+  const r = (await rig(t, rowsOf(true), TABLE)) as Rig;
+  assert.deepEqual(await r.edit(RESOLVERS, RESOLVERS_TEXT.replace("total: 3", "total: 3, extra: 1")), []);
+  assert.deepEqual(summary(r.placed().armed), ARMED_ALL);
+  assert.deepEqual(r.placed().unarmed, []);
+});
+
+test("outside: a wire-line diagnostic outside the check's callback (the service's own error) sets nothing aside", async (t) => {
+  const r = (await rig(t, rowsOf(true), TABLE)) as Rig;
+  assert.deepEqual(await r.edit(RESOLVERS, RESOLVERS_TEXT.replace('"o1"', '"OUTSIDE"')), []);
+  assert.deepEqual(summary(r.placed().armed), ARMED_ALL);
+  assert.deepEqual(r.placed().unarmed, []);
 });
