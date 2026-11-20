@@ -7,3 +7,13 @@ export async function both(): Promise<void> {
   register(keep);
   await keep({ data: { body: "y" } });
 }
+
+function memo(run: () => unknown, deps: unknown[]): () => unknown {
+  void deps;
+  return run;
+}
+
+export function later(): () => unknown {
+  const again = useFn(saveNote);
+  return memo(() => again({ data: { body: "z" } }), [again]);
+}

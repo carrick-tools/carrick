@@ -870,6 +870,20 @@ fn consumer_identity(location: &str) -> (String, u32) {
     parse_file_location(location)
 }
 
+/// The key a wrong-verb risk names its producer by, and finds that
+/// producer's sources and matched state under: its method and full path,
+/// with no dispatch case (as before), and its procedure, so a procedure's
+/// key still meets [`producer_operation_key`]'s where the row has no case.
+/// A row with no procedure keys as before.
+fn mismatch_producer_key(endpoint: &crate::mount_graph::ResolvedEndpoint) -> String {
+    format!(
+        "{}:{}{}",
+        endpoint.method,
+        endpoint.full_path,
+        crate::mount_graph::procedure_suffix(endpoint.procedure.as_ref())
+    )
+}
+
 /// The key a producer row is matched, consumed and orphaned by: its method,
 /// full path, dispatch case (carrick#831) and procedure. The procedure is on
 /// it for the reason it is on the endpoint merge key
@@ -2842,7 +2856,7 @@ impl Analyzer {
                 continue;
             }
             producer_sources_by_key
-                .entry(format!("{}:{}", endpoint.method, endpoint.full_path))
+                .entry(mismatch_producer_key(endpoint))
                 .or_default()
                 .push(endpoint.resolution_source);
         }
@@ -3273,7 +3287,7 @@ impl Analyzer {
                         for endpoint in path_matches {
                             candidate.producers.push((
                                 endpoint.method.to_uppercase(),
-                                format!("{}:{}", endpoint.method, endpoint.full_path),
+                                mismatch_producer_key(endpoint),
                                 endpoint.full_path.clone(),
                             ));
                         }
@@ -7316,6 +7330,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(producer_operation_key(&plain), "GET:/users/:id");
+        assert_eq!(mismatch_producer_key(&plain), "GET:/users/:id");
         let dispatch = Dispatch {
             location: DispatchLocation::Body,
             field: "action".to_string(),
@@ -7331,6 +7346,7 @@ mod tests {
             producer_operation_key(&cased),
             format!("POST:/types{}", Dispatch::key_suffix(Some(&dispatch)))
         );
+        assert_eq!(mismatch_producer_key(&cased), "POST:/types");
     }
 
     /// carrick#831: nine operations behind one route are nine operations.

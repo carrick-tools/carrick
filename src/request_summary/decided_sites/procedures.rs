@@ -582,9 +582,8 @@ impl Pass<'_, '_> {
         discovered: &[super::DiscoverySite],
         bindings: &Bindings,
     ) {
-        if bindings.declared.is_empty() {
-            return;
-        }
+        // Read with an empty set too: a wrapper's call whose function is no
+        // procedure of the set is a plain call in place, never a question.
         let wrapper = |end: &LabelledEnd| {
             end.member.is_none()
                 && end.procedure.is_none()
@@ -687,6 +686,9 @@ impl Pass<'_, '_> {
         }
         // A direct call of a procedure's variable: any call of this
         // service's own files whose callee is a bare name.
+        if bindings.declared.is_empty() {
+            return;
+        }
         let decided: HashSet<(String, u32, u32)> = out
             .sites
             .iter()

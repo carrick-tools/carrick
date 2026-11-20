@@ -506,6 +506,8 @@ fn each_call_of_a_procedure_states_one_request_row() {
         rows,
         vec![
             at("direct.ts", 4, "GET", "listNotes"),
+            // Called inside a callback the alias is also handed beside.
+            at("handed.ts", 18, "POST", "saveNote"),
             at("handed.ts", 8, "POST", "saveNote"),
             at("page.tsx", 6, "POST", "saveNote"),
         ],
@@ -546,8 +548,9 @@ fn the_calls_pair_with_their_procedures_in_one_service() {
             "declared http|GET| <- declared http|GET|".to_string(),
             "declared http|POST| <- declared http|POST|".to_string(),
             "declared http|POST| <- declared http|POST|".to_string(),
+            "declared http|POST| <- declared http|POST|".to_string(),
         ],
-        "one pair per call: direct.ts, handed.ts, page.tsx"
+        "one pair per call: direct.ts, handed.ts twice, page.tsx"
     );
     let report = &declared()[0].stdout;
     let unconsumed: Vec<&str> = report
@@ -614,8 +617,39 @@ fn a_call_of_a_procedure_with_an_unread_method_is_saved_not_guessed() {
     assert_eq!(
         saved,
         vec![
+            "services/declared/src/handed.ts:18 unread".to_string(),
             "services/declared/src/handed.ts:8 unread".to_string(),
             "services/declared/src/page.tsx:6 unread".to_string(),
+        ]
+    );
+}
+
+/// A service whose procedure set is empty (the re-exported maker, whose
+/// definitions state nothing until carrick#4882): a wrapper's call of a
+/// function declared in the repository that is no procedure of the set is
+/// a plain call in place: no row, and no site saved or asked by this pass.
+/// The saves left are the other readers' own, as before this pass: the
+/// callback reader's `missed_inside` at the call written inside the
+/// function handed to `memo`, and the value reader's `value_callee` at the
+/// direct call. A row at those lines replaces each in the declared service.
+#[test]
+fn a_wrapper_of_no_procedure_of_the_set_states_nothing() {
+    let scan = scans(&cassette("library-claims.json"), 1).remove(0);
+    assert_eq!(call_rows(&scan, "reexport"), Vec::<String>::new());
+    let mut saved = Vec::new();
+    for file in [
+        "src/page.tsx",
+        "src/handed.ts",
+        "src/value.ts",
+        "src/direct.ts",
+    ] {
+        saved.extend(unread_in(&scan, "reexport", file));
+    }
+    assert_eq!(
+        saved,
+        vec![
+            "services/reexport/src/handed.ts:18 \"missed_inside\"".to_string(),
+            "services/reexport/src/direct.ts:4 \"value_callee\"".to_string(),
         ]
     );
 }
