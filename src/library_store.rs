@@ -903,6 +903,43 @@ fn installed(name: &str, install: &Install<'_>) -> Option<Installed> {
         })
 }
 
+/// The dependencies each of `packages` states in its installed manifest
+/// (`dependencies`, `peerDependencies` and `optionalDependencies`, as the
+/// compiler engine's `declaredDependencies` reads them), by package name,
+/// read from the copy the service resolves ([`installed`], carrick#4878). A
+/// package with
+/// no readable installed manifest is absent: nothing is known of what it
+/// can re-export.
+pub fn installed_dependencies(
+    packages: &BTreeSet<String>,
+    service_root: &Path,
+    repo_root: &Path,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let install = Install {
+        service_root,
+        repo_root,
+        home: None,
+        yarn_registry_env: None,
+        npm_registry_env: None,
+        bun_registry_env: None,
+        xdg_config_home: None,
+    };
+    packages
+        .iter()
+        .filter_map(|name| {
+            let copy = installed(name, &install)?;
+            let text = std::fs::read_to_string(copy.dir.join("package.json")).ok()?;
+            let manifest: Value = serde_json::from_str(&text).ok()?;
+            let names = ["dependencies", "peerDependencies", "optionalDependencies"]
+                .into_iter()
+                .filter_map(|list| manifest.get(list)?.as_object())
+                .flat_map(|deps| deps.keys().cloned())
+                .collect();
+            Some((name.clone(), names))
+        })
+        .collect()
+}
+
 /// The directory whose install a linked copy belongs to. A workspace member
 /// installed by the root's install holds `node_modules/<name>` as a link into
 /// the root's store (`<R>/node_modules/.pnpm/<key>/node_modules/<name>`, or a
@@ -2603,6 +2640,32 @@ mod tests {
             repo_root: repo,
             ..install_at(repo)
         }
+    }
+
+    /// carrick#4878: the three dependency lists the compiler engine reads,
+    /// an empty set for a manifest with none, nothing for a package with no
+    /// installed copy.
+    #[test]
+    fn installed_dependencies_read_each_installed_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("node_modules/kit/package.json"),
+            r#"{"name":"kit","version":"1.0.0","dependencies":{"core":"1"},
+                "peerDependencies":{"peer":"1"},"optionalDependencies":{"extra":"1"},
+                "devDependencies":{"dev":"1"}}"#,
+        );
+        install_package(dir.path(), "bare", "1.0.0");
+        let packages: BTreeSet<String> = ["kit", "bare", "gone"].map(String::from).into();
+        let got = installed_dependencies(&packages, dir.path(), dir.path());
+        let want: BTreeMap<String, BTreeSet<String>> = [
+            ("bare".to_string(), BTreeSet::new()),
+            (
+                "kit".to_string(),
+                ["core", "extra", "peer"].map(String::from).into(),
+            ),
+        ]
+        .into();
+        assert_eq!(got, want);
     }
 
     #[test]

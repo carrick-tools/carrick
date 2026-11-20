@@ -1,0 +1,33 @@
+{
+  "library_claims": [
+    {
+      "package": "hub-kit",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "hub-kit",
+          "export": "defineFn",
+          "role": "in_process_bus",
+          "side": null,
+          "classifier": "fixture-classifier",
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "handler",
+              "of": "instance:()",
+              "name": { "arg": 0 },
+              "payload": { "arg": 1 },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
