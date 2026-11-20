@@ -1117,3 +1117,168 @@ fn a_deno_app_without_deno_is_left_out_and_the_rest_is_read() {
         );
     }
 }
+
+/// A Deno workspace root with two members, and a package-manager workspace
+/// root one level below it that no root list names: `apps/web` holds clients
+/// under its own `pnpm-workspace.yaml`.
+fn deno_root_with_nested_pnpm(root: &Path, nested_patterns: &str) {
+    write(
+        root,
+        "deno.jsonc",
+        "{ \"workspace\": [\"./apps/api\", \"./packages/a\"] }",
+    );
+    for member in ["apps/api", "packages/a"] {
+        write(
+            root,
+            &format!("{member}/deno.json"),
+            r#"{"exports":"./mod.ts"}"#,
+        );
+        write(root, &format!("{member}/mod.ts"), "export const x = 1;\n");
+    }
+    write(root, "apps/web/package.json", r#"{"name":"web"}"#);
+    write(root, "apps/web/pnpm-workspace.yaml", nested_patterns);
+    for client in ["x", "y"] {
+        nested_client(root, &format!("apps/web/clients/{client}"));
+    }
+}
+
+fn nested_client(root: &Path, directory: &str) {
+    write(root, &format!("{directory}/package.json"), "{}");
+    write(
+        root,
+        &format!("{directory}/index.ts"),
+        "export const c = 1;\n",
+    );
+}
+
+fn directories(derived: &carrick::service_derivation::ServiceDerivation) -> Vec<String> {
+    let mut directories: Vec<String> = derived
+        .services
+        .iter()
+        .map(|s| s.directory.clone().unwrap_or_else(|| ".".into()))
+        .collect();
+    directories.sort();
+    directories
+}
+
+#[test]
+fn a_workspace_nested_below_the_root_adds_its_members_as_services() {
+    let dir = tempfile::tempdir().unwrap();
+    deno_root_with_nested_pnpm(dir.path(), "packages:\n  - 'clients/*'\n");
+    let derived = resolve(dir.path()).unwrap();
+    assert_eq!(
+        directories(&derived),
+        [
+            "apps/api",
+            "apps/web/clients/x",
+            "apps/web/clients/y",
+            "packages/a"
+        ]
+    );
+    assert!(
+        derived.reason.contains("pnpm workspaces in apps/web"),
+        "{}",
+        derived.reason
+    );
+}
+
+#[test]
+fn a_nested_root_in_a_skipped_folder_or_inside_a_member_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    deno_root_with_nested_pnpm(root, "packages:\n  - 'nothing/*'\n");
+    for folder in ["node_modules/pkg", ".hidden", "apps/api"] {
+        write(
+            root,
+            &format!("{folder}/pnpm-workspace.yaml"),
+            "packages:\n  - 'clients/*'\n",
+        );
+        nested_client(root, &format!("{folder}/clients/z"));
+    }
+    let derived = resolve(root).unwrap();
+    assert_eq!(directories(&derived), ["apps/api", "packages/a"]);
+}
+
+#[test]
+fn a_negated_pattern_in_a_nested_file_leaves_that_member_out() {
+    let dir = tempfile::tempdir().unwrap();
+    deno_root_with_nested_pnpm(dir.path(), "packages:\n  - 'clients/*'\n  - '!clients/y'\n");
+    let derived = resolve(dir.path()).unwrap();
+    assert_eq!(
+        directories(&derived),
+        ["apps/api", "apps/web/clients/x", "packages/a"]
+    );
+}
+
+#[test]
+fn a_root_npm_workspace_and_a_nested_pnpm_root_both_contribute() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"workspaces":["packages/*"]}"#);
+    nested_client(root, "packages/a");
+    write(root, "apps/web/package.json", r#"{"name":"web"}"#);
+    write(
+        root,
+        "apps/web/pnpm-workspace.yaml",
+        "packages:\n  - 'clients/*'\n",
+    );
+    nested_client(root, "apps/web/clients/x");
+    let derived = resolve(root).unwrap();
+    assert_eq!(directories(&derived), ["apps/web/clients/x", "packages/a"]);
+}
+
+#[test]
+fn a_nested_workspace_file_that_does_not_parse_is_skipped_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    deno_root_with_nested_pnpm(dir.path(), "packages: 42");
+    let derived = resolve(dir.path()).unwrap();
+    assert_eq!(directories(&derived), ["apps/api", "packages/a"]);
+    assert_eq!(derived.skipped_patterns.len(), 1);
+    assert!(
+        derived.skipped_patterns[0]
+            .pattern
+            .contains("apps/web/pnpm-workspace.yaml"),
+        "{:?}",
+        derived.skipped_patterns
+    );
+}
+
+#[test]
+fn a_nested_pattern_matching_nothing_is_skipped_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    deno_root_with_nested_pnpm(root, "packages:\n  - 'missing/*'\n");
+    let derived = resolve(root).unwrap();
+    assert_eq!(directories(&derived), ["apps/api", "packages/a"]);
+    assert_eq!(derived.skipped_patterns.len(), 1);
+    assert!(
+        derived.skipped_patterns[0].pattern.contains("missing/*"),
+        "{:?}",
+        derived.skipped_patterns
+    );
+}
+
+#[test]
+fn a_nested_root_above_a_root_member_leaves_that_member_as_the_root_derived_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "deno.jsonc", "{ \"workspace\": [\"./apps/api\"] }");
+    write(
+        root,
+        "apps/api/deno.json",
+        r#"{"name":"@scope/api","exports":"./mod.ts"}"#,
+    );
+    write(root, "apps/api/mod.ts", "export const x = 1;\n");
+    write(root, "apps/api/package.json", r#"{"name":"api-node"}"#);
+    // A package-manager root above the member, whose glob also holds it.
+    write(root, "apps/package.json", r#"{"workspaces":["*"]}"#);
+    nested_client(root, "apps/web");
+    let derived = resolve(root).unwrap();
+    let api = derived
+        .services
+        .iter()
+        .find(|s| s.directory.as_deref() == Some("apps/api"))
+        .expect("apps/api is a service");
+    assert_eq!(api.service_name.as_deref(), Some("@scope/api"));
+    assert!(directories(&derived).contains(&"apps/web".to_string()));
+}
