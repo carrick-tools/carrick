@@ -66,7 +66,13 @@ so in its own numbers.
 
 ## Where they are written
 
-`carrick init` writes both harnesses' copies, with identical bytes:
+`carrick init` writes identical copies for each coding agent found on the
+machine: `.claude/skills` for Claude Code and `.agents/skills` for Codex. An
+agent is found if its command is on `PATH` or its settings folder exists
+(`$CLAUDE_CONFIG_DIR` or `~/.claude`, `$CODEX_HOME` or `~/.codex`). If neither
+is found, `init` writes both. Existing files for an undetected agent are kept up
+to date, but none is created. A folder inside another repository always gets
+both, because those files are the team's.
 
 ```
 .claude/skills/<name>/SKILL.md
@@ -86,6 +92,8 @@ such repository:
   when git does not track it.
 - Every path init writes is listed in a marked block at the top of
   `.git/info/exclude`. The block is written before any of the files it names.
+- The block also holds the line `__carrick_surface_*`, which keeps a running
+  check's temporary files out of `git status`.
 
 `carrick remove` reads the block back and removes exactly those files and
 entries, then the block, which leaves the exclude file as it was
@@ -95,12 +103,15 @@ or one below the top of a repository, keeps the earlier layout. Its hooks go in
 
 Init does not hide a path git already tracks:
 
-- When the committed `.claude/settings.json` holds Carrick's hook entries,
-  init leaves the file as it is. It adds no second set to
-  `.claude/settings.local.json`, so the hooks do not run twice.
-- When `.codex/hooks.json` is tracked, init adds Carrick's entries to it, and
-  git shows the file as changed. Codex reads hooks only from that file and from
-  `$CODEX_HOME/hooks.json`, so it has no file per clone.
+- When a committed `.claude/settings.json` has Carrick's hook entries, `init`
+  updates them in place, and git shows the file as changed to commit. It adds no
+  second set to `.claude/settings.local.json`, so the hooks do not run twice.
+  Committed hook launchers and task skills are also updated in place. A new
+  skill beside committed ones is written where git shows it.
+- When `.codex/hooks.json` is tracked and the machine has Codex, init adds
+  Carrick's entries to it, and git shows the file as changed. Codex reads hooks
+  only from that file and from `$CODEX_HOME/hooks.json`, so it has no file per
+  clone.
 - The Carrick rules section is written as before, in `AGENTS.md` and in a
   `CLAUDE.md` the repository already has, and git shows those files as changed.
   Whether the section stays is under review.
