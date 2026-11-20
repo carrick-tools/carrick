@@ -1,0 +1,142 @@
+{
+  "pairs": [
+    {
+      "pair_id": "typed_ok",
+      "protocol": "http",
+      "verb": "GET",
+      "operation": "/w/:id",
+      "caller": {
+        "service": "web",
+        "file": "apps/web/src/client.ts",
+        "line": 21,
+        "span": [
+          501,
+          529
+        ],
+        "span_text": "(await fetch('/w/1')).json()",
+        "hands_back_body": null,
+        "reason": null
+      },
+      "server": {
+        "service": "api",
+        "file": "apps/api/src/server.ts",
+        "line": 6
+      }
+    },
+    {
+      "pair_id": "mismatch",
+      "protocol": "http",
+      "verb": "GET",
+      "operation": "/w/:id",
+      "caller": {
+        "service": "web",
+        "file": "apps/web/src/client.ts",
+        "line": 26,
+        "span": [
+          643,
+          671
+        ],
+        "span_text": "(await fetch('/w/2')).json()",
+        "hands_back_body": null,
+        "reason": null
+      },
+      "server": {
+        "service": "api",
+        "file": "apps/api/src/server.ts",
+        "line": 6
+      }
+    },
+    {
+      "pair_id": "untyped_generic",
+      "protocol": "http",
+      "verb": "GET",
+      "operation": "/w/:id",
+      "caller": {
+        "service": "web",
+        "file": "apps/web/src/client.ts",
+        "line": 31,
+        "span": [
+          764,
+          779
+        ],
+        "span_text": "getJson('/w/3')",
+        "hands_back_body": true,
+        "reason": null
+      },
+      "server": {
+        "service": "api",
+        "file": "apps/api/src/server.ts",
+        "line": 6
+      }
+    },
+    {
+      "pair_id": "own_wrapper",
+      "protocol": "http",
+      "verb": "GET",
+      "operation": "/list",
+      "caller": {
+        "service": "web",
+        "file": "apps/web/src/client.ts",
+        "line": 16,
+        "span": [
+          360,
+          371
+        ],
+        "span_text": "listItems()",
+        "hands_back_body": false,
+        "reason": null
+      },
+      "server": {
+        "service": "api",
+        "file": "apps/api/src/server.ts",
+        "line": 16
+      }
+    },
+    {
+      "pair_id": "sql_server",
+      "protocol": "http",
+      "verb": "GET",
+      "operation": "/sql/:id",
+      "caller": {
+        "service": "web",
+        "file": "apps/web/src/client.ts",
+        "line": 36,
+        "span": [
+          905,
+          935
+        ],
+        "span_text": "(await fetch('/sql/1')).json()",
+        "hands_back_body": null,
+        "reason": null
+      },
+      "server": {
+        "service": "api",
+        "file": "db/001.sql",
+        "line": 1
+      }
+    },
+    {
+      "pair_id": "pubsub",
+      "protocol": "pubsub",
+      "verb": "PUBLISH",
+      "operation": "widget.created",
+      "caller": {
+        "service": "web",
+        "file": "apps/web/src/client.ts",
+        "line": 41,
+        "span": [
+          995,
+          1038
+        ],
+        "span_text": "bus.publish('widget.created', { id: 'w1' })",
+        "hands_back_body": null,
+        "reason": null
+      },
+      "server": {
+        "service": "api",
+        "file": "apps/api/src/server.ts",
+        "line": 6
+      }
+    }
+  ]
+}

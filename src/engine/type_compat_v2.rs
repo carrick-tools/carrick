@@ -2218,6 +2218,36 @@ fn procedure_pair(
     })
 }
 
+/// Build the pair the matched-pair pass names, from the two manifest entries
+/// it captured. Both services carry a capture surface by construction; nothing
+/// else about the pairing is decided here.
+pub(crate) fn build_matched_pair(
+    producer_service: &str,
+    producer: &TypeManifestEntry,
+    consumer_service: &str,
+    consumer: &TypeManifestEntry,
+) -> Option<BuiltPair> {
+    let producer_side = ServiceEntry {
+        service_id: producer_service,
+        has_surface: true,
+        types_degraded: None,
+        entry: producer,
+        name_scope: None,
+        procedure: false,
+        graphql_types: None,
+    };
+    let consumer_side = ServiceEntry {
+        service_id: consumer_service,
+        has_surface: true,
+        types_degraded: None,
+        entry: consumer,
+        name_scope: None,
+        procedure: false,
+        graphql_types: None,
+    };
+    build_pair(&producer_side, &consumer_side)
+}
+
 fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltPair> {
     let (pseudo_method, identity) = join_identity(&producer.entry.key)?;
     let protocol = probe_protocol(&producer.entry.key);
@@ -2403,23 +2433,11 @@ fn no_request_body_pre_verdict(
 /// return the check inputs. Stub dir names are keyed on the sanitized
 /// service id (collisions suffixed) so two services of one monorepo can
 /// never clobber each other's stub.
-pub(crate) fn materialize_stubs(
-    all_repo_data: &[CloudRepoData],
-    dest_root: &Path,
-) -> Vec<CheckStubInput> {
+pub(crate) fn materialize_stubs(stubs: &[JudgeStub<'_>], dest_root: &Path) -> Vec<CheckStubInput> {
     let mut used: HashMap<String, usize> = HashMap::new();
-    let mut stubs = Vec::new();
-    for repo in all_repo_data {
-        let Some(artifact) = repo.capture_stub.as_ref() else {
-            continue;
-        };
-        if artifact.artifact_version != CAPTURE_ARTIFACT_VERSION {
-            continue;
-        }
-        let service_id = repo
-            .service_name
-            .as_deref()
-            .unwrap_or(repo.repo_name.as_str());
+    let mut inputs = Vec::new();
+    for stub in stubs {
+        let service_id = stub.service_id;
         let base = service_id.replace(['/', '\\'], "_");
         let dir_name = match used.entry(base.clone()) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -2433,17 +2451,17 @@ pub(crate) fn materialize_stubs(
             }
         };
         let dest = dest_root.join(dir_name);
-        if let Err(e) = artifact.materialize(&dest) {
+        if let Err(e) = stub.artifact.materialize(&dest) {
             warn!("failed to materialize stub for {}: {}", service_id, e);
             continue;
         }
-        stubs.push(CheckStubInput {
+        inputs.push(CheckStubInput {
             service_name: service_id.to_string(),
             stub_dir: dest.to_string_lossy().into_owned(),
-            graphql_types: repo.graphql_types.clone(),
+            graphql_types: stub.graphql_types.cloned(),
         });
     }
-    stubs
+    inputs
 }
 
 /// The folder one `check --changed` keeps its finished judge answers in. The
@@ -2772,6 +2790,99 @@ pub(crate) fn run_check(
         None => all_pairs,
     };
 
+    let Judged {
+        mut outcomes,
+        mut unresolved_sides,
+    } = judge_pairs(
+        sidecar,
+        &judge_stubs(all_repo_data),
+        &pairs,
+        local_consumers,
+        run_started,
+    );
+    if !verify_keys.is_empty() {
+        let (judged_again, kept): (Vec<_>, Vec<_>) = outcomes
+            .into_iter()
+            .partition(|outcome| verify_keys.contains(&outcome.pair_key));
+        outcomes = kept;
+        log_join_settle_differences(&settled, &judged_again);
+        let (verified, unsettled): (Vec<_>, Vec<_>) = pairs
+            .into_iter()
+            .partition(|pair| verify_keys.contains(&pair.spec.pair_key));
+        pairs = unsettled;
+        settled_pairs = verified;
+        unresolved_sides.retain(|key, _| !verify_keys.contains(key));
+    }
+    let settled_keys: HashSet<String> = settled.iter().map(|o| o.pair_key.clone()).collect();
+    outcomes.append(&mut settled);
+
+    // Deterministic order for every downstream consumer.
+    outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
+    record_pair_verdicts(
+        &outcomes,
+        pairs.iter().chain(&settled_pairs),
+        local_consumers,
+        &unresolved_sides,
+        &settled_keys,
+    );
+    log_unresolved_pairs(
+        &outcomes,
+        pairs.iter().chain(&settled_pairs),
+        local_consumers,
+    );
+    outcomes
+}
+
+/// One service's capture stub, as the judge reads it: the fields
+/// [`materialize_stubs`] writes into the check workspace. A scan's services
+/// map onto it from their repo data ([`judge_stubs`]); the matched-pair pass
+/// builds it from the stubs it captured itself.
+pub(crate) struct JudgeStub<'a> {
+    pub service_id: &'a str,
+    pub artifact: &'a CaptureStubArtifact,
+    pub graphql_types: Option<&'a crate::graphql::GraphqlTypes>,
+}
+
+/// What [`judge_pairs`] decided: one outcome per pair that reached it, and
+/// which side's type left each unresolved verdict unresolved.
+pub(crate) struct Judged {
+    pub outcomes: Vec<PairCheckOutcome>,
+    pub unresolved_sides: HashMap<String, VerdictSide>,
+}
+
+/// The stubs a scan's judge reads: every artifact-carrying service whose
+/// artifact is the current version, in repo order.
+pub(crate) fn judge_stubs(all_repo_data: &[CloudRepoData]) -> Vec<JudgeStub<'_>> {
+    all_repo_data
+        .iter()
+        .filter_map(|repo| {
+            let artifact = repo.capture_stub.as_ref()?;
+            (artifact.artifact_version == CAPTURE_ARTIFACT_VERSION).then(|| JudgeStub {
+                service_id: repo
+                    .service_name
+                    .as_deref()
+                    .unwrap_or(repo.repo_name.as_str()),
+                artifact,
+                graphql_types: repo.graphql_types.as_ref(),
+            })
+        })
+        .collect()
+}
+
+/// The one judge: pairs with a pre-set verdict never reach the sidecar, the
+/// rest go through `check_v2` over `stubs`, then the retype of the consumer
+/// calls `local_consumers` holds, then the post-passes (unstated modes, the
+/// spent unwidened reading, same-service mismatches). `run_check` and the
+/// matched-pair pass both end here, so there is one answer to "is this a
+/// break". `run_started` is when the caller began, for the pre-judge timing
+/// line.
+pub(crate) fn judge_pairs(
+    sidecar: &TypeSidecar,
+    stubs: &[JudgeStub<'_>],
+    pairs: &[BuiltPair],
+    local_consumers: &LocalConsumers,
+    run_started: std::time::Instant,
+) -> Judged {
     let mut outcomes: Vec<PairCheckOutcome> = Vec::new();
     // Which side's type left a pair unresolved, as the check returned it: the
     // outcome does not carry it, the run's record of the pair does.
@@ -2780,7 +2891,7 @@ pub(crate) fn run_check(
     // retype check can judge from the consumer's own code (carrick#1491).
     let mut consumer_blamed: HashSet<String> = HashSet::new();
     let mut probing: Vec<&BuiltPair> = Vec::new();
-    for pair in &pairs {
+    for pair in pairs {
         if pair.pre_verdict_side == Some(VerdictSide::Consumer) {
             consumer_blamed.insert(pair.spec.pair_key.clone());
         }
@@ -2803,7 +2914,7 @@ pub(crate) fn run_check(
         let workspace_parent = std::env::temp_dir().join(unique);
         let before_stubs = run_started.elapsed().as_millis() as u64;
         let stubs_started = std::time::Instant::now();
-        let stubs = materialize_stubs(all_repo_data, &workspace_parent);
+        let stubs = materialize_stubs(stubs, &workspace_parent);
         let before = PreJudgeMs {
             build_and_hash: before_stubs,
             stubs: stubs_started.elapsed().as_millis() as u64,
@@ -2949,51 +3060,24 @@ pub(crate) fn run_check(
     let retype_started = std::time::Instant::now();
     let procedure_judged = retype_consumer_calls(
         sidecar,
-        &pairs,
+        pairs,
         &consumer_blamed,
         local_consumers,
         &mut outcomes,
     );
     let retype_ms = retype_started.elapsed().as_millis() as u64;
     let passes_started = std::time::Instant::now();
-    abstain_on_unstated_modes(&pairs, &mut outcomes);
-    abstain_on_unwidened_out_of_budget(&pairs, &mut outcomes);
+    abstain_on_unstated_modes(pairs, &mut outcomes);
+    abstain_on_unwidened_out_of_budget(pairs, &mut outcomes);
     hold_back_same_service_mismatches(&mut outcomes, &procedure_judged);
     info!(
         "v2 check after-judge timing: retype {retype_ms} ms, post-passes {} ms",
         passes_started.elapsed().as_millis()
     );
-    if !verify_keys.is_empty() {
-        let (judged_again, kept): (Vec<_>, Vec<_>) = outcomes
-            .into_iter()
-            .partition(|outcome| verify_keys.contains(&outcome.pair_key));
-        outcomes = kept;
-        log_join_settle_differences(&settled, &judged_again);
-        let (verified, unsettled): (Vec<_>, Vec<_>) = pairs
-            .into_iter()
-            .partition(|pair| verify_keys.contains(&pair.spec.pair_key));
-        pairs = unsettled;
-        settled_pairs = verified;
-        unresolved_sides.retain(|key, _| !verify_keys.contains(key));
+    Judged {
+        outcomes,
+        unresolved_sides,
     }
-    let settled_keys: HashSet<String> = settled.iter().map(|o| o.pair_key.clone()).collect();
-    outcomes.append(&mut settled);
-
-    // Deterministic order for every downstream consumer.
-    outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
-    record_pair_verdicts(
-        &outcomes,
-        pairs.iter().chain(&settled_pairs),
-        local_consumers,
-        &unresolved_sides,
-        &settled_keys,
-    );
-    log_unresolved_pairs(
-        &outcomes,
-        pairs.iter().chain(&settled_pairs),
-        local_consumers,
-    );
-    outcomes
 }
 
 /// The gate a mismatch against a response whose case the call does not
@@ -7903,7 +7987,7 @@ mod tests {
             let mut pairs = build_check_pairs(&repos);
             assert_eq!(pairs.len(), 1);
             let dir = tempfile::tempdir().unwrap();
-            let stubs = materialize_stubs(&repos, dir.path());
+            let stubs = materialize_stubs(&judge_stubs(&repos), dir.path());
             let api_stub = stubs.iter().find(|s| s.service_name == "api").unwrap();
             (pairs.remove(0), serde_json::to_value(api_stub).unwrap())
         };
@@ -8827,7 +8911,7 @@ mod tests {
     #[test]
     fn every_listed_reason_decides_as_the_list_says() {
         let list: BTreeMap<String, serde_json::Value> = serde_json::from_str(TYPE_REASONS).unwrap();
-        assert_eq!(list.len(), 20, "{:?}", list.keys());
+        assert_eq!(list.len(), 23, "{:?}", list.keys());
         for (reason, row) in &list {
             let decided = row["decided"].as_str().unwrap();
             for kind in [InferKind::CallResult, InferKind::ResponseBody] {
@@ -11986,6 +12070,36 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             flat(&outcomes),
             flat(&outcomes_again),
             "check outcomes must be byte-stable across runs"
+        );
+    }
+
+    /// The split of `run_check` changes nothing: on the corpus-2 pair, the
+    /// outcomes `run_check` returns are the ones `judge_pairs` returns over
+    /// `build_check_pairs`, which is the call the matched-pair pass makes.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn judge_pairs_is_what_run_check_runs() {
+        let Some((sidecar, _key, all_repo_data)) = corpus_pair() else {
+            return;
+        };
+        let from_run_check = run_check(&sidecar, &all_repo_data, &LocalConsumers::new(), None);
+        assert_eq!(from_run_check.len(), 1, "exactly one matched pair");
+
+        let data = with_route_graphs(&all_repo_data);
+        let pairs = super::build_check_pairs(&data);
+        let mut from_judge = judge_pairs(
+            &sidecar,
+            &judge_stubs(&data),
+            &pairs,
+            &LocalConsumers::new(),
+            std::time::Instant::now(),
+        )
+        .outcomes;
+        from_judge.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
+        assert_eq!(
+            format!("{from_judge:?}"),
+            format!("{from_run_check:?}"),
+            "judge_pairs over build_check_pairs is run_check"
         );
     }
 
