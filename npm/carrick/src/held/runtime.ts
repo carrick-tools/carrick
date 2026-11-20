@@ -21,8 +21,8 @@ import path from "node:path";
 import ts from "typescript";
 import { diffAgainst, textAtCommit } from "../facts/diff.ts";
 import { contractKey } from "../facts/lines.ts";
-import { commitsOf, indexedCommit } from "../facts/peers.ts";
-import { factsPath, openFacts, type ContractRow, type GraphqlTypeTable } from "../facts/store.ts";
+import { commitsOf, indexedCommit, localCheckouts } from "../facts/peers.ts";
+import { factsPath, openFacts, type ContractGroup, type ContractRow, type GraphqlTypeTable } from "../facts/store.ts";
 import { createLogger } from "../log.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit, ServiceRuntime, StartResult } from "./daemon.ts";
 import { StalePull, Ts7Lsp, type Diag as LspDiag, type Engine } from "./engine.ts";
@@ -67,6 +67,8 @@ export type RuntimeDeps = {
   graphqlTypes?: (repo: string, service: string) => Promise<GraphqlTypeTable | null>;
   /** Each repo's index commit, as the fact file's header names it. Default: the fact file's. */
   commits?: () => Promise<Record<string, string> | null>;
+  /** Where each repo is checked out here, as the fact file's `repos` table names it (the places of a line are named in their own repo). Default: the fact file's. */
+  repoPaths?: () => Promise<Record<string, string>>;
   /** Changes when the rows may have: the fact file's size and mtime by default. */
   stamp?: () => string;
   /** The held compiler over a shadow's `w` directory. */
@@ -220,7 +222,7 @@ class HeldService implements ServiceEngine {
   private readonly engineId = `${process.pid}-${Date.now()}`;
 
   private readonly init: ServiceInit;
-  private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
+  private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "repoPaths" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
   private readonly engine: Engine;
   private readonly w: string;
   private readonly wire: string[];
@@ -230,7 +232,7 @@ class HeldService implements ServiceEngine {
 
   constructor(
     init: ServiceInit,
-    deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv },
+    deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "repoPaths" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv },
     engine: Engine,
     w: string,
     ownFiles: string[],
@@ -292,10 +294,12 @@ class HeldService implements ServiceEngine {
   }
 
   private commits: Record<string, string> | null = null;
+  private repoPaths: Record<string, string> = {};
 
   /** D6: place every position of every file on the current text and arm what passes. `onlyNew`: leave decided checks alone. */
   async gate(onlyNew: boolean): Promise<void> {
     this.commits = await this.deps.commits();
+    this.repoPaths = await this.deps.repoPaths();
     for (const rel of this.byFile.keys()) await this.gateFile(rel, onlyNew);
     for (const rel of this.byFile.keys()) this.setView(rel);
     for (const rel of [...this.views.keys()]) if (!this.byFile.has(rel)) this.views.delete(rel);
@@ -666,6 +670,7 @@ class HeldService implements ServiceEngine {
           row_path: path.join(this.init.repo_path, row.file),
           places: row.groups[g]!.places.map((p) => ({ service: p.service, file: p.file, line: p.line })),
           expected: row.groups[g]!.type,
+          ...this.otherSide(row.groups[g]!),
           // A consumer line names its protocol (the sentence's other side) and its call's line (part 2's join, HM4 D2).
           ...(isMessage(row) ? { side: "consumer" as const, protocol: row.protocol, call_line: callLineOf(entry) } : {}),
           run: spoke.get(key)!.run,
@@ -674,6 +679,25 @@ class HeldService implements ServiceEngine {
       }
     }
     return { lines: out, spoke };
+  }
+
+  /**
+   * The copy of the other side a line's check read (T2 P2.1, P2.2): the commit of
+   * main the fact file names for the places' repo (the first place that has one),
+   * and the files that hold it, absolute: each place's file and the group's home
+   * file, both named in the place's repo. A repo with no checkout here names no file.
+   */
+  private otherSide(group: ContractGroup): { main_commit: string | null; named_files: string[] } {
+    const checkouts = localCheckouts(new Map(Object.entries(this.repoPaths)));
+    const top = (repo: string): string | null => checkouts.place(repo, { repo: this.init.repo, top: this.init.repo_path })?.top ?? null;
+    const files = group.places.flatMap((p) => {
+      const base = top(p.repo);
+      return base === null ? [] : [path.join(base, p.file)];
+    });
+    const homeBase = !group.home || group.places.length === 0 ? null : top(group.places[0]!.repo);
+    if (group.home && homeBase !== null) files.push(path.join(homeBase, group.home.file));
+    const main = group.places.map((p) => indexedCommit(this.commits, p.repo)).find((commit) => commit !== null) ?? null;
+    return { main_commit: main, named_files: [...new Set(files)] };
   }
 
   /** The twin pass, restored in a `finally`; then files that lost a check's place, then rows the fact file added or changed. */
@@ -721,6 +745,7 @@ class HeldService implements ServiceEngine {
     const pending = [...this.regate];
     this.regate.clear();
     this.commits = await this.deps.commits();
+    this.repoPaths = await this.deps.repoPaths();
     for (const [rel, ids] of pending) {
       await this.gateFile(rel, false, ids);
       this.setView(rel);
@@ -769,6 +794,16 @@ async function factCommits(root: string): Promise<Record<string, string> | null>
   }
 }
 
+async function factRepoPaths(root: string): Promise<Record<string, string>> {
+  const store = await openFacts(root);
+  if (store === null) return {};
+  try {
+    return Object.fromEntries(store.repos.map((entry) => [entry.repo, entry.path]));
+  } finally {
+    store.close();
+  }
+}
+
 async function factRows(root: string): Promise<ContractRow[]> {
   const store = await openFacts(root);
   if (store === null) return [];
@@ -801,6 +836,7 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
     rows: options.rows ?? (() => factRows(options.root)),
     stamp: options.stamp ?? (() => factStamp(options.root)),
     commits: options.commits ?? (() => factCommits(options.root)),
+    repoPaths: options.repoPaths ?? (() => factRepoPaths(options.root)),
     graphqlTypes: options.graphqlTypes ?? ((repo: string, service: string) => factTable(options.root, repo, service)),
     env,
   };

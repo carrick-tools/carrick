@@ -158,6 +158,7 @@ function consumerRow(
     const held = items.get(key);
     if (held) {
       held.counterparts = [...(held.counterparts ?? []), ...counterparts];
+      absorbNamed(held, line);
       return;
     }
     items.set(key, {
@@ -180,6 +181,7 @@ function consumerRow(
   const held = moved.get(key);
   if (held) {
     held.counterparts.push(...places);
+    absorbNamed(held, line);
     return;
   }
   moved.set(key, {
@@ -207,11 +209,22 @@ export function engineOfRun(run: string): string {
   return at < 0 ? "" : run.slice(0, at);
 }
 
-/** A row's marks from its line: the run it belongs to, and `standing` when it is not this edit's. */
-const marks = (line: HeldLine): { run?: string; standing?: boolean } => ({
+/**
+ * A row's marks from its line: the run it belongs to, `standing` when it is not
+ * this edit's, and the copy of the other side the check read (T2): main's commit
+ * and the files that hold it.
+ */
+const marks = (line: HeldLine): { run?: string; standing?: boolean; main_commit: string | null; named_files: string[] } => ({
   ...(line.run === undefined ? {} : { run: line.run }),
   ...(line.standing ? { standing: true } : {}),
+  main_commit: line.main_commit,
+  named_files: [...line.named_files],
 });
+
+/** A row named by a second group: the second group's files join the first's. */
+function absorbNamed(held: { named_files?: string[] }, line: HeldLine): void {
+  held.named_files = [...new Set([...(held.named_files ?? []), ...line.named_files])];
+}
 
 /** The entry an early answer is for: the edited file, absolute, and the workspace it was queued in. */
 export type EarlyFor = { file: string; root: string };
@@ -246,6 +259,7 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
       const held = items.get(line.label);
       if (held) {
         held.counterparts = [...(held.counterparts ?? []), ...counterparts];
+        absorbNamed(held, line);
         continue;
       }
       items.set(line.label, {
@@ -267,6 +281,7 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
     const held = moved.get(key);
     if (held) {
       held.counterparts.push(...places);
+      absorbNamed(held, line);
       continue;
     }
     moved.set(key, {

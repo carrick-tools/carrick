@@ -1186,6 +1186,8 @@ function zzBreak(file: string, over: Partial<HeldLine> = {}): HeldLine {
     row_path: file,
     places: [{ service: "order-service", file: "src/clients/users.ts", line: 4 }],
     expected: "{ id: string }",
+    main_commit: null,
+    named_files: [],
     run: "e1.1",
     ...over,
   };

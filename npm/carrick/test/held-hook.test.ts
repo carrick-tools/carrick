@@ -115,6 +115,8 @@ const broken = (over: Partial<HeldLine> = {}, ws?: Ws): HeldLine => ({
   row_path: ws ? ws.at("api/src/tasks.ts") : "/w/api/src/tasks.ts",
   places: [{ service: "ext", file: "src/view4.ts", line: 4 }],
   expected: A,
+  main_commit: null,
+  named_files: [],
   ...over,
 });
 

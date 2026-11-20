@@ -341,6 +341,8 @@ test("an emitter break is a call item at the emit's line, through earlyResult", 
       counterparts: [{ role: "producer", service: "listener", file: "src/listen.ts", line: 3 }],
       stated: true,
       run: lines[0]!["run"],
+      main_commit: lines[0]!["main_commit"],
+      named_files: [path.join(r.root, "src/listen.ts")],
     },
   ]);
 });
@@ -394,6 +396,8 @@ test("a type edit in another file gives a moved call row at the emit", async (t)
       not_judged_before: false,
       stated: true,
       run: lines[0]!["run"],
+      main_commit: lines[0]!["main_commit"],
+      named_files: [path.join(r.root, "src/listen.ts")],
     },
   ]);
 });
@@ -407,7 +411,7 @@ test("a socket emit line is not printed when the engine gave no message rules", 
 
 test("a consumer line with no call line is not printed (part 2 could not join it)", () => {
   const root = fs.realpathSync(os.tmpdir());
-  const line = { row_key: "k", group: 0, label: EVENT, consumer: "listener", file: ORDERS, line: 6, message: "Type 'string' is not assignable to type '{ id: number; }'.", row_file: ORDERS, row_line: 6, row_path: path.join(root, ORDERS), places: [{ service: "listener", file: "src/listen.ts", line: 3 }], expected: ORDER_UPDATE, side: "consumer" as const, protocol: "socket" };
+  const line = { row_key: "k", group: 0, label: EVENT, consumer: "listener", file: ORDERS, line: 6, message: "Type 'string' is not assignable to type '{ id: number; }'.", row_file: ORDERS, row_line: 6, row_path: path.join(root, ORDERS), places: [{ service: "listener", file: "src/listen.ts", line: 3 }], expected: ORDER_UPDATE, main_commit: null, named_files: [], side: "consumer" as const, protocol: "socket" };
   for (const call_line of [undefined, null]) assert.deepEqual(earlyResult({ file: path.join(root, ORDERS), root }, [{ ...line, call_line }]).items, [], String(call_line));
   assert.equal(earlyResult({ file: path.join(root, ORDERS), root }, [{ ...line, call_line: 6 }]).items?.length, 1);
 });

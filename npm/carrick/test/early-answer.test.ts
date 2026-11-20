@@ -18,7 +18,7 @@ import { commitRepos } from "./facts-repos.ts";
 import { context, lineOf } from "./facts-helpers.ts";
 import type { Ws } from "./facts-helpers.ts";
 import { buildFacts, factsPath } from "../src/facts/store.ts";
-import { sessionsDir } from "../src/hook/reuse.ts";
+import { recordEdit, sessionsDir } from "../src/hook/reuse.ts";
 import { readTimings } from "../src/hook/timings.ts";
 import { stopAnswers } from "../src/hook/stop-wait.ts";
 import { heldDir, socketPath } from "../src/held/paths.ts";
@@ -118,6 +118,8 @@ const broken = (ws: Ws, over: Partial<HeldLine> = {}): HeldLine => ({
   row_path: ws.at("api/src/tasks.ts"),
   places: [{ service: "ext", file: "src/view4.ts", line: 4 }],
   expected: A,
+  main_commit: COMMIT,
+  named_files: [ws.at("ext/src/view4.ts")],
   ...over,
 });
 
@@ -449,6 +451,8 @@ test("10: a dispatch row's early item carries the label's parts, so its item lab
       row_path: file,
       places: [{ service: "web", file: "src/pay.ts", line: 2 }],
       expected: "{ ok: boolean }",
+      main_commit: null,
+      named_files: [],
     },
   ]);
   const item = result.items![0]!;
@@ -754,6 +758,8 @@ const gqlLine = (root: string, file: string, over: Partial<HeldLine> = {}): Held
   row_line: 6,
   row_path: path.join(root, file),
   places: [{ service: "web", file: "src/order.ts", line: 4 }],
+  main_commit: null,
+  named_files: [],
   expected: "{ order: { id: string; } | null; }",
   ...over,
 });
@@ -939,6 +945,8 @@ const emitAt = (ws: Ws, line: number, over: Partial<HeldLine> = {}): HeldLine =>
   row_line: line,
   row_path: ws.at("api/src/tasks.ts"),
   places: [{ service: "listener", file: "src/listen.ts", line: 3 }],
+  main_commit: null,
+  named_files: [],
   expected: "{ id: number }",
   side: "consumer",
   protocol: "socket",
@@ -986,4 +994,120 @@ test("T1: the differ record counts an entry's own breaks, not the standing ones"
   const ws = { root, home: root, at: (rel: string) => path.join(root, rel) } as Ws;
   const early = earlyResult({ file: ws.at("api/src/other.ts"), root }, [run1(ws, { standing: true })]);
   assert.deepEqual(heldRecord(compareEarly(early, undefined)), { held: "none", held_rows: { differ: 0, part3_only: 0, part2_only: 0, same: 0 } });
+});
+
+// T2 (carrick#4742, R3; the compiler half of carrick#4720): an early line says which copy of the other side it read.
+const SHORT = COMMIT.slice(0, 7);
+const COPY = `read from main at ${SHORT}`;
+const HOME_CLAUSE = "changed ext/src/types.ts in this session; the check used main's copy of it";
+const PLACE_CLAUSE = "changed ext/src/view4.ts in this session; the check used main's copy of it";
+
+/** The session edited `rel` of the workspace at `at` (a hook records this before it prints). */
+const editedBy = (ws: Ws, session: string, rel: string, at: number): void => recordEdit(session, ws.root, at, ws.home, [ws.at(rel)]);
+
+test("T2: every early line says which commit of main its other side was read from, whether or not the session edited anything", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)]);
+  const first = context((await edit(ws, "t2a", part2(ws, []))).stdout);
+  assert.ok(first.includes(COPY), first);
+  assert.ok(!first.includes("in this session"), first);
+  await settled(ws, "t2a");
+  const kept = JSON.parse(fs.readFileSync(path.join(sessionsDir(ws.home), names(ws, "t2a").find((n) => n.endsWith(".early.json"))!), "utf8")) as { result: CheckResult };
+  assert.equal(kept.result.items?.[0]?.main_commit, COMMIT, "every early row carries the commit");
+});
+
+test("T2: a named place file the session edited before the line printed is said to have been read from main", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)]);
+  editedBy(ws, "t2b", "ext/src/view4.ts", Date.now() - 5000);
+  const first = context((await edit(ws, "t2b", part2(ws, []))).stdout);
+  assert.ok(first.includes(COPY), first);
+  assert.ok(first.includes(PLACE_CLAUSE), first);
+});
+
+test("T2: the file that declares the caller's type counts as named", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws, { named_files: [ws.at("ext/src/view4.ts"), ws.at("ext/src/types.ts")] })]);
+  editedBy(ws, "t2c", "ext/src/types.ts", Date.now() - 5000);
+  const first = context((await edit(ws, "t2c", part2(ws, []))).stdout);
+  assert.ok(first.includes(HOME_CLAUSE), first);
+  assert.ok(!first.includes("view4.ts in this session"), first);
+});
+
+test("T2: a named file edited after the line printed, or a file no row names, adds no session clause", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)]);
+  editedBy(ws, "t2d", "ext/src/view4.ts", Date.now() + 60_000);
+  editedBy(ws, "t2d", "ext/src/unrelated.ts", Date.now() - 5000);
+  const first = context((await edit(ws, "t2d", part2(ws, []))).stdout);
+  assert.ok(first.includes(COPY), first);
+  assert.ok(!first.includes("in this session"), first);
+});
+
+test("T2: an early row on a route in another file agreed before the edit, never 'in the index', and says its copy", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [otherFile(ws)]);
+  editedBy(ws, "t2e", "ext/src/view4.ts", Date.now() - 5000);
+  const first = context((await edit(ws, "t2e", part2(ws, []))).stdout);
+  const moved = first.split("\n").find((line) => line.includes("route GET /others"))!;
+  assert.ok(moved.includes("agreed before the edit and now reads type_mismatch"), first);
+  assert.ok(!first.includes("agreed in the index"), first);
+  assert.ok(first.includes(COPY), first);
+});
+
+test("T2: Stop's print of an early break the session was not told says its copy", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)], 900);
+  const first = await edit(ws, "t2g", { ...part2(ws, []), CARRICK_FAKE_FULL_DELAY_MS: "3000" });
+  assert.equal(statesBreak([context(first.stdout)]), 0, first.stdout);
+  await until(() => names(ws, "t2g").some((n) => n.endsWith(".early.json")));
+  const stop = stopAnswers("t2g", { home: ws.home, ensure: () => false }).lines.join("\n");
+  assert.ok(stop.includes(COPY), stop);
+  forgetQueue(ws);
+});
+
+test("T2: a types-only file the session edited through the hook is recorded, so the session clause names it", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws, { named_files: [ws.at("ext/src/view4.ts"), ws.at("ext/src/types.ts")] })]);
+  fs.mkdirSync(ws.at("ext/src"), { recursive: true });
+  const types = ws.at("ext/src/types.ts");
+  fs.writeFileSync(types, "export type Task = { id: string };\n");
+  await runHook("post-edit.ts", {
+    payload: {
+      hook_event_name: "PostToolUse",
+      tool_name: "Edit",
+      session_id: "t2h",
+      cwd: ws.root,
+      tool_input: { file_path: types, old_string: "x", new_string: "" },
+      tool_response: { structuredPatch: [{ oldStart: 1, oldLines: 0, newLines: 0, newStart: 1, lines: ["+export type Task = { id: string };"] }] },
+    },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...ON }),
+  });
+  const first = context((await edit(ws, "t2h", part2(ws, []))).stdout);
+  assert.ok(first.includes(HOME_CLAUSE), first);
+});
+
+test("T2: an early moved row printed at a later carrier reads the same, after 'your earlier edit'", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [otherFile(ws)], 900);
+  const first = await edit(ws, "t2i", { ...part2(ws, []), CARRICK_FAKE_FULL_DELAY_MS: "3000" });
+  assert.ok(!context(first.stdout).includes("GET /others"), first.stdout);
+  await until(() => names(ws, "t2i").some((n) => n.endsWith(".early.json")));
+  const next = await carrier(ws, "t2i");
+  assert.ok(next.includes("after your earlier edit to it"), next);
+  assert.ok(next.includes("agreed before the edit and now reads type_mismatch"), next);
+  assert.ok(next.includes(COPY), next);
+  forgetQueue(ws);
+});
+
+test("T2: a row two groups name carries both groups' files", async () => {
+  const { earlyResult } = await import("../src/held/early.ts");
+  const root = fs.realpathSync(os.tmpdir());
+  const file = path.join(root, "svc", "src", "events.ts");
+  const line = (named: string): HeldLine => ({
+    row_key: "k", group: 0, label: "GET /events", consumer: "web", file: "src/events.ts", line: 9, message: "Type 'number' is not assignable to type 'O3_0'.",
+    row_file: "src/events.ts", row_line: 7, row_path: file, places: [{ service: "web", file: "src/pay.ts", line: 2 }], expected: "{ ok: boolean }", main_commit: COMMIT, named_files: [named],
+  });
+  const result = earlyResult({ file, root }, [line("/w/a.ts"), line("/w/b.ts")]);
+  assert.deepEqual(result.items?.[0]?.named_files, ["/w/a.ts", "/w/b.ts"]);
 });
