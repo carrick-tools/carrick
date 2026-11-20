@@ -1,0 +1,348 @@
+{
+  "schema": "carrick.matched/1",
+  "repo": "example-org/widgets",
+  "commit": "2222222222222222222222222222222222222222",
+  "run": {
+    "id": "run-0001",
+    "mode": "full",
+    "base_commit": null,
+    "model": "model-under-test",
+    "brief_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "started_at": "2026-11-20T10:00:00Z",
+    "finished_at": "2026-11-20T10:03:00Z"
+  },
+  "pairs": [
+    {
+      "id": "9386be3ab357cb38",
+      "caller": {
+        "file": "apps/web/src/client.ts",
+        "line": 21,
+        "line_sha256": "dc3afc42fc2a139618c371dd0871e1c98aa938a1b6e7b38673f057ba3db6bc24"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/w/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null,
+      "sides": {
+        "caller_expects": {
+          "model": {
+            "text": "{ id: string; total: number }",
+            "evidence": {
+              "file": "apps/web/src/client.ts",
+              "line": 21
+            }
+          }
+        }
+      },
+      "verdicts": {
+        "model": {
+          "grade": "agree"
+        }
+      }
+    },
+    {
+      "id": "d57580073ce238c7",
+      "caller": {
+        "file": "apps/web/src/client.ts",
+        "line": 26,
+        "line_sha256": "0429c417edf5e89719712e0380f000dad2f77410d7dcfc4e86a542e750222dea"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/w/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "a181623518180442",
+      "caller": {
+        "file": "apps/web/src/client.ts",
+        "line": 31,
+        "line_sha256": "95150b233f270f4bb144c7932888f9a73aacfeb4fb94a366aa54b7b70c191fb8"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/w/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "9ffa35ad41d7d919",
+      "caller": {
+        "file": "apps/web/src/client.ts",
+        "line": 16,
+        "line_sha256": "8226e9587b5c679690dd5617a95e3562ff625e151263c76b113c59766d7c2ff1"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 16,
+        "line_sha256": "966cd41dd1541b3d7da7f347269fe33b68669a89e79d1a79434be7e4e39ee0eb"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/list"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "cfa1ca07825f4930",
+      "caller": {
+        "file": "apps/web/src/client.ts",
+        "line": 36,
+        "line_sha256": "9b6c957cb9fa8566588356c027dd33466e2b500d329d01c2992080625c1131b1"
+      },
+      "server": {
+        "file": "db/001.sql",
+        "line": 1,
+        "line_sha256": "1a534133bfdc2ff680559a583de3ace806b43827237df1192b657cda976c35a6"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/sql/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "404ce7584c6764a0",
+      "caller": {
+        "file": "apps/web/src/client.ts",
+        "line": 41,
+        "line_sha256": "61990feda681568ced2bfe2e0eb010469b3641a54848dda73b54f7c3e35839a1"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "topic",
+        "method": "PUBSUB",
+        "name": "widget.created"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "47c85c1a09ea4829",
+      "caller": {
+        "file": "apps/web/src/pass.ts",
+        "line": 2,
+        "line_sha256": "bc0c87e7880014de473fda1bbefa951718e98c2f73ac3658eddee82cf2ba9727"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/w/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "aa7958d882d62b3d",
+      "caller": {
+        "file": "apps/web/src/pass.ts",
+        "line": 16,
+        "line_sha256": "2cd78fb48f2073498c2c579b9085067caecfa41212c248463358df7f0f24496c"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/w/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "b952af8bf73fe2f2",
+      "caller": {
+        "file": "apps/web/src/pass.ts",
+        "line": 21,
+        "line_sha256": "ca7afddfaacb3a6d69d7d10ede4ece25059fd18a420dfedb52b8f548fd872136"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/w/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "a1abadd430148740",
+      "caller": {
+        "file": "apps/web/src/pass.ts",
+        "line": 21,
+        "line_sha256": "ca7afddfaacb3a6d69d7d10ede4ece25059fd18a420dfedb52b8f548fd872136"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 16,
+        "line_sha256": "966cd41dd1541b3d7da7f347269fe33b68669a89e79d1a79434be7e4e39ee0eb"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/list"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "faed747174e80bf7",
+      "caller": {
+        "file": "apps/web/src/pass.ts",
+        "line": 25,
+        "line_sha256": "4bd726a0bf890ff76955b641704cb572cdd29b5f4a3c12d61f53fa3186dc5f90"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/w/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "26279eb9dd9aa068",
+      "caller": {
+        "file": "apps/web/src/pass.ts",
+        "line": 29,
+        "line_sha256": "0479ab9fef17a299eeeff6b8d06739ae2c6b8b46ff9db1f349ad64ff96b71862"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "function",
+        "method": "POST",
+        "name": "widget"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "e3d910bf9a6fb0f9",
+      "caller": {
+        "file": "apps/web/src/pass.ts",
+        "line": 34,
+        "line_sha256": "b8cc399cd90b35cd0d6b60da157b85e50f952b091f08ab77ac5bb7cc9daf9eb4"
+      },
+      "server": {
+        "file": "apps/api/src/schema.ts",
+        "line": 1,
+        "line_sha256": "5864bfb66bf2d986a86c25dd315b14c34de98640fbdf8ab9320ab3a169d6a4c7"
+      },
+      "operation": {
+        "kind": "table",
+        "method": "SELECT",
+        "name": "stock"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "37f99cd91f9d981b",
+      "caller": {
+        "file": "apps/web/src/pass.ts",
+        "line": 39,
+        "line_sha256": "a360d9cae38139e5f52b5ad700812822f3476e19fb0c7141fbe4bc24dfdf6f4d"
+      },
+      "server": {
+        "file": "db/001.sql",
+        "line": 1,
+        "line_sha256": "1a534133bfdc2ff680559a583de3ace806b43827237df1192b657cda976c35a6"
+      },
+      "operation": {
+        "kind": "database_function",
+        "method": "POST",
+        "name": "widget_by_id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    },
+    {
+      "id": "8ff45c391e1fdd07",
+      "caller": {
+        "file": "apps/web/src/gone.ts",
+        "line": 3,
+        "line_sha256": "283bb9deef02e6843abfb538efa1eca70801bd8a701c3f98191e123496339247"
+      },
+      "server": {
+        "file": "apps/api/src/server.ts",
+        "line": 6,
+        "line_sha256": "3ea48e946485671116e0f14646f2d8bd62fb2f4c5b6302180544907988333b3e"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/w/:id"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null
+    }
+  ],
+  "dropped": {}
+}

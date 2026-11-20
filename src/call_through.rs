@@ -1772,21 +1772,7 @@ impl Settled {
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     let mut graph = ReachGraph::of(services.iter().map(|service| &*service.data));
     let sites: Vec<&CallThroughSites> = services.iter().map(|service| service.sites).collect();
-    graph.side_calls = sites
-        .iter()
-        .flat_map(|sites| sites.side_calls.iter())
-        .map(|(key, side)| (key.clone(), side.clone()))
-        .collect();
-    graph.shapes = sites
-        .iter()
-        .flat_map(|sites| sites.return_shapes.iter())
-        .map(|(definition, shape)| (definition.clone(), *shape))
-        .collect();
-    graph.written = sites
-        .iter()
-        .flat_map(|sites| sites.written.iter())
-        .map(|(definition, segments)| (definition.clone(), segments.clone()))
-        .collect();
+    graph.read_facts(&sites);
     let owners = file_owners(services.iter().map(|service| &*service.data));
     let siblings = SiblingLines::of(services.iter().map(|service| &*service.data));
     let mut decider = Decider::new(&graph, &sites);
@@ -3366,6 +3352,25 @@ impl ReachGraph {
         graph
     }
 
+    /// Take every service's side calls, return shapes and written segments.
+    fn read_facts(&mut self, sites: &[&CallThroughSites]) {
+        self.side_calls = sites
+            .iter()
+            .flat_map(|sites| sites.side_calls.iter())
+            .map(|(key, side)| (key.clone(), side.clone()))
+            .collect();
+        self.shapes = sites
+            .iter()
+            .flat_map(|sites| sites.return_shapes.iter())
+            .map(|(definition, shape)| (definition.clone(), *shape))
+            .collect();
+        self.written = sites
+            .iter()
+            .flat_map(|sites| sites.written.iter())
+            .map(|(definition, segments)| (definition.clone(), segments.clone()))
+            .collect();
+    }
+
     /// Collect the requests written in `start` and in the definitions it
     /// reaches within [`MAX_EDGE_DEPTH`] call edges, and the rows no fact
     /// states there, each with whether it was reached only through a side
@@ -4103,6 +4108,75 @@ fn apply(
         types_unknown,
         request_dropped,
     })
+}
+
+/// Whether a function of the repository's own code hands back the parsed
+/// body of the request it makes, read off the scan's stored blobs: the one
+/// rule the scan applies to a wrapper's callers
+/// ([`ReachGraph::hands_back_parse`]), for a reader that holds a call's
+/// declaration and no scan (the engine's pass over model-found pairs,
+/// [`crate::matched_pass`]).
+pub(crate) struct OwnCode {
+    graph: ReachGraph,
+    /// Each definition's first and last line, by repository-relative file.
+    extents: HashMap<String, Vec<(u32, u32)>>,
+}
+
+impl OwnCode {
+    /// Every service's definitions and stored facts, as [`settle`] reads them.
+    pub(crate) fn of(services: &[CloudRepoData]) -> Self {
+        let mut graph = ReachGraph::of(services.iter());
+        let sites: Vec<CallThroughSites> = services
+            .iter()
+            .filter_map(|data| data.call_through.as_ref().map(StoredCallThrough::sites))
+            .collect();
+        graph.read_facts(&sites.iter().collect::<Vec<_>>());
+        let mut extents: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+        for definition in services
+            .iter()
+            .flat_map(|data| data.function_definitions.values())
+            .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
+        {
+            extents
+                .entry(definition.file_path.to_string_lossy().into_owned())
+                .or_default()
+                .push((
+                    definition.line_number,
+                    definition.end_line.max(definition.line_number),
+                ));
+        }
+        Self { graph, extents }
+    }
+
+    /// Whether the definition declared at `file:line` hands back a parsed
+    /// body. The definition is the one opening on that line, else the
+    /// innermost one holding it (a declaration's line can sit inside the
+    /// function's own lines). `false` for a definition no blob indexes: the
+    /// body is not proven.
+    pub(crate) fn hands_back_parse(&self, file: &str, line: u32) -> bool {
+        let exact = DefinitionSite {
+            file: file.to_string(),
+            line,
+        };
+        if self.graph.calls.contains_key(&exact) {
+            return self.graph.hands_back_parse(&exact);
+        }
+        let Some(first) = self
+            .extents
+            .get(file)
+            .into_iter()
+            .flatten()
+            .filter(|(first, last)| *first <= line && line <= *last)
+            .min_by_key(|(first, last)| last - first)
+            .map(|(first, _)| *first)
+        else {
+            return false;
+        };
+        self.graph.hands_back_parse(&DefinitionSite {
+            file: file.to_string(),
+            line: first,
+        })
+    }
 }
 
 /// Whether a captured type says nothing: the compiler could not state it, or
