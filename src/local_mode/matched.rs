@@ -225,7 +225,7 @@ mod tests {
     /// (`lambdas/_shared/matched_answer.contract.json`); either side changing
     /// fails a test in its own repo.
     const CONTRACT_SHA256: &str =
-        "27d34716c589d3bc1edb5d42d0fa721f2c048e3b81c735f9140c4fc932beaa1b";
+        "f6f0f89bfafe85410d635a7c257365f6e9ca70847d58d669cee54674775279df";
     const VECTORS_SHA256: &str = "b52de553c88080a7563df5b3541e83be5ffd2124141e657ec9be6e6a283147f8";
 
     fn sha(text: &str) -> String {
