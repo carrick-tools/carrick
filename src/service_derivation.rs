@@ -429,72 +429,11 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     if !sources.is_empty() {
         let globs = WorkspaceGlobs::compile(&sources)?;
         let mut seen = vec![false; globs.positive.len()];
-        let walker = walkdir::WalkDir::new(&root)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|entry| {
-                entry.depth() == 0
-                    || !entry.file_type().is_dir()
-                    || entry.file_name().to_str().is_some_and(|name| {
-                        !name.starts_with('.')
-                            && !MANIFEST_SKIP_DIRS.contains(&name)
-                            && !["target", "out", "coverage"].contains(&name)
-                    })
-                    // A checkout of its own inside the repository is no
-                    // member of this workspace: a linked worktree holds a
-                    // copy of every member (carrick#1902).
-                    && crate::file_finder::git_boundary(entry).is_none()
-            });
-        let mut deno_configs: Vec<PathBuf> = Vec::new();
-        for entry in walker {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry.file_type().is_file()
-                && (entry.file_name() == "deno.json" || entry.file_name() == "deno.jsonc")
-            {
-                deno_configs.push(entry.path().to_path_buf());
-                continue;
-            }
-            if !entry.file_type().is_file() || entry.file_name() != "package.json" {
-                continue;
-            }
-            let directory = entry.path().parent().expect("manifest parent");
-            let relative = directory.strip_prefix(&root).map_err(|e| e.to_string())?;
-            let relative = if relative.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                relative
-            };
-            let mut matched = false;
-            for index in globs.matching(relative) {
-                seen[index] = true;
-                matched = true;
-            }
-            if matched && !globs.excludes(relative) {
-                members.insert(directory.to_path_buf(), entry.path().to_path_buf());
-            }
-        }
-        for manifest in deno_apps_under_globs(&root, &globs, &members, &deno_configs, &mut seen)? {
-            let directory = manifest.parent().expect("manifest parent").to_path_buf();
-            members.entry(directory).or_insert(manifest);
-            glob_deno_members = true;
-        }
-        for ((raw, _), seen) in globs.positive.iter().zip(seen) {
-            // A folder emptied or optional in a real monorepo: nothing to
-            // propose for it, which is not a reason to refuse the rest.
-            if !seen
-                && !skipped_patterns
-                    .iter()
-                    .any(|skipped| skipped.pattern == *raw)
-            {
-                skipped_patterns.push(SkippedPattern {
-                    pattern: raw.clone(),
-                    reason: "matches no package".into(),
-                });
-            }
-        }
+        glob_deno_members = glob_members(&root, &globs, &mut members, &mut seen)?;
+        skip_unmatched(&globs, &seen, "", &mut skipped_patterns);
     }
     let deno = deno_workspace_manifest_paths(&root).map_err(|e| e.to_string())?;
-    let has_deno = !deno.is_empty() || glob_deno_members;
+    let mut has_deno = !deno.is_empty() || glob_deno_members;
     if has_deno {
         reasons.push("Deno manifests".into());
         for manifest in deno {
@@ -509,6 +448,15 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 continue;
             }
             members.entry(directory).or_insert(manifest);
+        }
+    }
+    // The root's own workspace is known: read the workspace roots below it.
+    if !sources.is_empty() || members.keys().any(|directory| *directory != root) {
+        let nested_deno =
+            nested_workspace_members(&root, &mut members, &mut skipped_patterns, &mut reasons);
+        if nested_deno && !has_deno {
+            has_deno = true;
+            reasons.push("Deno manifests".into());
         }
     }
     let without_source = leave_out_members_without_source(&root, &mut members);
@@ -617,6 +565,189 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         without_source,
         skipped_patterns,
     })
+}
+
+/// Whether a walk for workspace members enters `entry`: not a dependency,
+/// build or dot folder, and not a checkout of its own inside the repository
+/// (a linked worktree holds a copy of every member, carrick#1902).
+fn walks_into(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() == 0
+        || !entry.file_type().is_dir()
+        || entry.file_name().to_str().is_some_and(|name| {
+            !name.starts_with('.')
+                && !MANIFEST_SKIP_DIRS.contains(&name)
+                && !["target", "out", "coverage"].contains(&name)
+        }) && crate::file_finder::git_boundary(entry).is_none()
+}
+
+/// Add to `members` every directory under `base` that `globs` (relative to
+/// `base`) holds and that has a `package.json`, plus the Deno apps the globs
+/// hold ([`deno_apps_under_globs`]). Marks each pattern that matched in
+/// `seen`; true when a Deno app was added.
+fn glob_members(
+    base: &Path,
+    globs: &WorkspaceGlobs,
+    members: &mut BTreeMap<PathBuf, PathBuf>,
+    seen: &mut [bool],
+) -> Result<bool, String> {
+    let walker = walkdir::WalkDir::new(base)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(walks_into);
+    let mut deno_configs: Vec<PathBuf> = Vec::new();
+    for entry in walker {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_type().is_file()
+            && (entry.file_name() == "deno.json" || entry.file_name() == "deno.jsonc")
+        {
+            deno_configs.push(entry.path().to_path_buf());
+            continue;
+        }
+        if !entry.file_type().is_file() || entry.file_name() != "package.json" {
+            continue;
+        }
+        let directory = entry.path().parent().expect("manifest parent");
+        let relative = directory.strip_prefix(base).map_err(|e| e.to_string())?;
+        let relative = if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        };
+        let mut matched = false;
+        for index in globs.matching(relative) {
+            seen[index] = true;
+            matched = true;
+        }
+        if matched && !globs.excludes(relative) {
+            members.insert(directory.to_path_buf(), entry.path().to_path_buf());
+        }
+    }
+    let mut glob_deno = false;
+    for manifest in deno_apps_under_globs(base, globs, members, &deno_configs, seen)? {
+        let directory = manifest.parent().expect("manifest parent").to_path_buf();
+        members.entry(directory).or_insert(manifest);
+        glob_deno = true;
+    }
+    Ok(glob_deno)
+}
+
+/// Name each pattern of `globs` that matched nothing in `skipped`. A folder
+/// emptied or optional in a real monorepo has nothing to propose, which is no
+/// reason to refuse the rest. `prefix` is the directory (with its `/`) of a
+/// nested file, or empty for the root's.
+fn skip_unmatched(
+    globs: &WorkspaceGlobs,
+    seen: &[bool],
+    prefix: &str,
+    skipped: &mut Vec<SkippedPattern>,
+) {
+    for ((raw, _), seen) in globs.positive.iter().zip(seen) {
+        let pattern = format!("{prefix}{}", raw.trim_start_matches("./"));
+        if !seen && !skipped.iter().any(|skipped| skipped.pattern == pattern) {
+            skipped.push(SkippedPattern {
+                pattern,
+                reason: "matches no package".into(),
+            });
+        }
+    }
+}
+
+/// The members of the workspace roots that sit below the repo root (a
+/// directory with its own `pnpm-workspace.yaml`, or a `package.json` with
+/// `workspaces`), which no list at the root names. Returns true when one of
+/// them added a Deno app.
+///
+/// Not read: a root at or inside a member already found (the root's own, or
+/// one a nested root added just before), one in a skipped or dot folder, and
+/// one across a git boundary. A nested root is a service only when its own
+/// patterns hold it, as the repo root is. A nested file that does not parse,
+/// and a nested pattern that matches nothing, are skipped patterns and never
+/// an error: a first index that works without them must not fail for them.
+fn nested_workspace_members(
+    root: &Path,
+    members: &mut BTreeMap<PathBuf, PathBuf>,
+    skipped: &mut Vec<SkippedPattern>,
+    reasons: &mut Vec<String>,
+) -> bool {
+    let inside_member = |members: &BTreeMap<PathBuf, PathBuf>, directory: &Path| {
+        members
+            .keys()
+            .any(|member| member != root && directory.starts_with(member))
+    };
+    let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
+    let walker = walkdir::WalkDir::new(root)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            walks_into(entry)
+                && !(entry.depth() > 0
+                    && entry.file_type().is_dir()
+                    && inside_member(members, entry.path()))
+        });
+    for entry in walker.flatten() {
+        let directory = entry.path().parent().expect("file parent");
+        if !entry.file_type().is_file() || directory == root {
+            continue;
+        }
+        let declares = match entry.file_name().to_str() {
+            Some("pnpm-workspace.yaml") => true,
+            Some("package.json") => std::fs::read_to_string(entry.path())
+                .is_ok_and(|text| text.contains("\"workspaces\"")),
+            _ => false,
+        };
+        if declares {
+            candidates.insert(directory.to_path_buf());
+        }
+    }
+    let mut deno = false;
+    for directory in candidates {
+        if inside_member(members, &directory) {
+            continue;
+        }
+        let relative = directory
+            .strip_prefix(root)
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let unreadable = |file: &str| SkippedPattern {
+            pattern: format!("{relative}/{file}"),
+            reason: "is not a workspace file Carrick can read".into(),
+        };
+        let sources = match workspace_patterns(&directory) {
+            Ok(sources) if !sources.is_empty() => sources,
+            Ok(_) => continue,
+            Err(error) => {
+                let file = if error.contains("pnpm-workspace.yaml") {
+                    "pnpm-workspace.yaml"
+                } else {
+                    "package.json"
+                };
+                skipped.push(unreadable(file));
+                continue;
+            }
+        };
+        let Ok(globs) = WorkspaceGlobs::compile(&sources) else {
+            skipped.push(unreadable("pnpm-workspace.yaml"));
+            continue;
+        };
+        let mut seen = vec![false; globs.positive.len()];
+        let before = members.len();
+        match glob_members(&directory, &globs, members, &mut seen) {
+            Ok(found_deno) => deno |= found_deno,
+            Err(_) => {
+                skipped.push(unreadable("pnpm-workspace.yaml"));
+                continue;
+            }
+        }
+        skip_unmatched(&globs, &seen, &format!("{relative}/"), skipped);
+        if members.len() > before {
+            reasons.extend(
+                sources
+                    .iter()
+                    .map(|(name, _)| format!("{name} in {relative}")),
+            );
+        }
+    }
+    deno
 }
 
 /// The Deno apps a Node workspace glob holds without a `package.json`
