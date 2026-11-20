@@ -7,10 +7,12 @@
 //! locates nothing: the caller of this module hands in each end's span, and
 //! says which pairs go through the repository's own code.
 //!
-//! Only HTTP pairs are read, and only their response sides (the caller's
-//! result and the server's response body). A pair of any other protocol
-//! states `protocol_not_read` at both ends; a model-found type for such an end
-//! is not this module's.
+//! The caller of this module says which pairs are of a kind the pass asks
+//! about (`MatchedPair::asked`); only those are read, and only their response
+//! sides (the caller's result and, where the server end is asked, its
+//! response body). Every other pair, whatever its protocol, states
+//! `protocol_not_read` at both ends; a model-found type for such an end is
+//! not this module's.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -65,7 +67,8 @@ pub(crate) struct MatchedService {
     pub service_id: String,
     /// The root the compiler program of this service is initialised at.
     pub root: PathBuf,
-    /// The repository root every pair path is relative to.
+    /// The repository root every pair path is relative to, and the scan root
+    /// the compiler engine is given, as the scan gives it.
     pub scan_root: PathBuf,
     pub tsconfig: Option<String>,
     pub extraction_config: Option<ExtractionConfig>,
@@ -98,9 +101,11 @@ pub(crate) struct MatchedPair {
     pub pair_id: String,
     pub verb: String,
     pub operation: String,
-    /// Whether the pair is an HTTP pair. Any other pair states
+    /// Whether the pair's kind is one the pass asks about. The caller of
+    /// this module decides which kinds those are, and states a reason on an
+    /// end it does not want asked. A pair that is not asked states
     /// `protocol_not_read` at both ends.
-    pub http: bool,
+    pub asked: bool,
     pub caller: MatchedEnd,
     pub server: MatchedEnd,
 }
@@ -204,7 +209,7 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
         Role::Caller => &pair.caller,
         Role::Server => &pair.server,
     };
-    if !pair.http {
+    if !pair.asked {
         return Plan::Stated(state(PROTOCOL_NOT_READ));
     }
     if let Some(reason) = end.reason {
@@ -232,7 +237,10 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
         ManifestTypeKind::Response,
         Some(&site_id),
     );
-    let absolute = absolute_path(&service.scan_root, &end.file);
+    let Some(absolute) = repo_file(&service.scan_root, &end.file) else {
+        return Plan::Stated(state(NOT_LOCATED));
+    };
+    let absolute = absolute.to_string_lossy().into_owned();
     let infer = InferRequestItem {
         member: None,
         result: None,
@@ -292,13 +300,33 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
     }))
 }
 
-fn absolute_path(scan_root: &Path, file: &str) -> String {
-    let joined = scan_root.join(file);
-    joined
-        .canonicalize()
-        .unwrap_or(joined)
-        .to_string_lossy()
-        .into_owned()
+/// The file a pair names, as its absolute path inside the repository, or
+/// `None` when the name could reach anything else. A pair's file names come
+/// from a record written outside this process, and whatever file is asked
+/// has its type text stored, so a name is read only when it is a plain
+/// repository-relative path (no absolute path, no backslash or NUL, and no
+/// empty, `.`, `..` or `.git` segment) whose real path, symlinks followed,
+/// is under the repository's real root and not under a `.git` folder. This
+/// is the one gate for a file name of the record: the pass's entry asks it
+/// too (`checked_path` in `matched_pass.rs`).
+pub(crate) fn repo_file(scan_root: &Path, file: &str) -> Option<PathBuf> {
+    let name = Path::new(file);
+    if name.is_absolute() || name.has_root() || file.contains(['\\', '\0']) {
+        return None;
+    }
+    if file
+        .split('/')
+        .any(|segment| matches!(segment, "" | "." | ".." | ".git"))
+    {
+        return None;
+    }
+    let root = scan_root.canonicalize().ok()?;
+    let path = root.join(name).canonicalize().ok()?;
+    let inside = path.strip_prefix(&root).ok()?;
+    if inside.components().any(|part| part.as_os_str() == ".git") {
+        return None;
+    }
+    Some(path)
 }
 
 /// What one service's type stage left: its capture stub and its entries, with
@@ -320,6 +348,10 @@ fn type_service(
     let mut entries: Vec<TypeManifestEntry> = asks.iter().map(|ask| ask.entry.clone()).collect();
 
     let sidecar = TypeSidecar::spawn(sidecar_path).map_err(|e| e.to_string())?;
+    // As the scan names it (`spawn_sidecar`, `main.rs`): the bound of the
+    // search for a tsconfig above a service that has none of its own, in this
+    // process's init and in the capture process it starts.
+    sidecar.set_scan_root(&service.scan_root);
     sidecar.start_init(&service.root, service.tsconfig.as_deref());
     sidecar
         .wait_ready(crate::services::type_sidecar::ready_budget())
@@ -421,14 +453,7 @@ fn read_end(service: &str, alias: &str, entries: &[TypeManifestEntry]) -> Matche
     let Some(entry) = entries.iter().find(|entry| entry.type_alias == alias) else {
         return stated(service, Some(alias), state(SITE_UNREADABLE));
     };
-    let cause = || {
-        entry
-            .any_provenance
-            .iter()
-            .find(|finding| finding.path.is_empty())
-            .map(|finding| finding.reason.clone())
-            .unwrap_or_else(|| state(NOT_RECORDED))
-    };
+    let cause = || nested_cause(&entry.any_provenance);
     match (&entry.resolved_definition, &entry.expanded_definition) {
         (Some(definition), Some(expanded)) => MatchedEndTypes {
             service: service.to_string(),
@@ -442,6 +467,23 @@ fn read_end(service: &str, alias: &str, entries: &[TypeManifestEntry]) -> Matche
         },
         _ => stated(service, Some(alias), cause()),
     }
+}
+
+/// The capture's word for why a read type is not wholly concrete: its cause
+/// at the type's own position; else the first position inside it whose top
+/// type the source does not declare itself (an import that did not resolve,
+/// say); else `declared`, when every top type inside it is one the source
+/// writes (a member declared `unknown`). `not_recorded` only when the capture
+/// recorded no position at all.
+fn nested_cause(findings: &[crate::services::type_sidecar::TypeProvenance]) -> String {
+    const DECLARED: &str = "declared";
+    findings
+        .iter()
+        .find(|finding| finding.path.is_empty())
+        .or_else(|| findings.iter().find(|finding| finding.reason != DECLARED))
+        .or_else(|| findings.first())
+        .map(|finding| finding.reason.clone())
+        .unwrap_or_else(|| state(NOT_RECORDED))
 }
 
 fn stated(service: &str, alias: Option<&str>, reason: String) -> MatchedEndTypes {
@@ -622,6 +664,9 @@ pub(crate) fn type_matched_pairs(
             return rows;
         }
     };
+    // The retype re-initialises this process at each consumer's root, so it
+    // carries the scan root as each service's own process did.
+    judge_sidecar.set_scan_root(&first.scan_root);
     judge_sidecar.start_init(&first.root, first.tsconfig.as_deref());
     if let Err(e) = judge_sidecar.wait_ready(crate::services::type_sidecar::ready_budget()) {
         warn!("matched pairs: the judge was not ready: {e}");
@@ -786,7 +831,7 @@ mod tests {
                     pair_id: pair.pair_id.clone(),
                     verb: pair.verb.clone(),
                     operation: pair.operation.clone(),
-                    http: pair.protocol == "http",
+                    asked: pair.protocol == "http",
                     caller: end_of(&pair.caller),
                     server: end_of(&pair.server),
                 })
@@ -907,7 +952,7 @@ mod tests {
             pair_id: id.to_string(),
             verb: "GET".to_string(),
             operation: "/x".to_string(),
-            http: true,
+            asked: true,
             caller,
             server,
         }
@@ -1058,6 +1103,226 @@ mod tests {
             shuffled.rotate_left(round % names.len());
             assert_eq!(inputs(&shuffled), first, "round {round}");
         }
+    }
+
+    /// The callers of `tests/fixtures/matched-pairs-nested`, read once: a
+    /// service with no tsconfig of its own, whose only tsconfig sits above it
+    /// with the `paths` alias its callers' import needs.
+    fn nested_rows() -> Option<&'static HashMap<String, MatchedPairTypes>> {
+        static ROWS: std::sync::OnceLock<Option<HashMap<String, MatchedPairTypes>>> =
+            std::sync::OnceLock::new();
+        ROWS.get_or_init(|| {
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+            if !sidecar_built(&sidecar_path) {
+                return None;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("matched-pairs-nested");
+            copy_tree(
+                &manifest_dir.join("tests/fixtures/matched-pairs-nested"),
+                &root,
+            );
+            let file = "apps/portal/ui/web/src/page.ts";
+            let source = std::fs::read_to_string(root.join(file)).unwrap();
+            let pair = |id: &str, call: &str, operation: &str| {
+                let start = source.find(call).expect("the fixture holds the call");
+                MatchedPair {
+                    pair_id: id.to_string(),
+                    verb: "GET".to_string(),
+                    operation: operation.to_string(),
+                    asked: true,
+                    caller: MatchedEnd {
+                        service: "web".to_string(),
+                        file: file.to_string(),
+                        line: source[..start].matches('\n').count() as u32 + 1,
+                        span: Some((start as u32, (start + call.len()) as u32)),
+                        reason: None,
+                        hands_back_body: None,
+                    },
+                    server: MatchedEnd {
+                        service: "web".to_string(),
+                        file: "apps/portal/shared/widgets.ts".to_string(),
+                        line: 1,
+                        span: None,
+                        reason: Some(NOT_LOCATED),
+                        hands_back_body: None,
+                    },
+                }
+            };
+            let pairs = [
+                pair("widget", "readWidget(id)", "/widgets/:id"),
+                pair("gadget", "readGadget(id)", "/gadgets/:id"),
+            ];
+            let services = [MatchedService {
+                service_id: "web".to_string(),
+                root: root.join("apps/portal/ui/web"),
+                scan_root: root.clone(),
+                tsconfig: None,
+                extraction_config: None,
+                server_claims: None,
+            }];
+            let rows =
+                type_matched_pairs(&sidecar_path, &services, &pairs, Duration::from_secs(600));
+            Some(
+                rows.into_iter()
+                    .map(|row| (row.pair_id.clone(), row))
+                    .collect(),
+            )
+        })
+        .as_ref()
+    }
+
+    /// The scan finds a tsconfig above a service because it names the scan
+    /// root (`set_scan_root`); the pass must too, or the import does not
+    /// resolve and the caller has no type.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_service_whose_tsconfig_sits_above_it_reads_its_caller_type() {
+        let Some(rows) = nested_rows() else { return };
+        let caller = &rows["widget"].caller;
+        assert_eq!(caller.reason, None, "{caller:?}");
+        let read = caller.type_read.as_ref().expect("the caller is typed");
+        assert!(
+            read.expanded.contains("label: string"),
+            "the type is the shared Widget: {read:?}"
+        );
+    }
+
+    /// A type with one member the source declares `unknown` is read, and the
+    /// reason beside it is the capture's word for that member, not a word
+    /// saying no cause was recorded.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_member_declared_unknown_keeps_the_type_and_states_the_captures_reason() {
+        let Some(rows) = nested_rows() else { return };
+        let caller = &rows["gadget"].caller;
+        let read = caller.type_read.as_ref().expect("the caller is typed");
+        assert!(read.expanded.contains("id: string"), "{read:?}");
+        assert_eq!(caller.reason.as_deref(), Some("declared"), "{caller:?}");
+    }
+
+    /// A repository with one source file, and a file outside it that a
+    /// symlink inside points at.
+    fn guarded_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(repo.join("apps/web/src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(repo.join("apps/web/src/a.ts"), "export const a = 1;\n").unwrap();
+        let secret = outside.join("secret.ts");
+        std::fs::write(&secret, "export const secret = 'kept out';\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, repo.join("apps/web/src/out.ts")).unwrap();
+        (dir, repo, secret)
+    }
+
+    /// The pair's caller names `file`; the result is that caller's reading.
+    /// The sidecar path does not exist, so an end that is asked reads
+    /// `site_unreadable` with an alias, and one that is refused reads
+    /// `not_located` with none.
+    fn caller_named(repo: &Path, file: &str) -> MatchedEndTypes {
+        let services = [MatchedService {
+            service_id: "web".to_string(),
+            root: repo.join("apps/web"),
+            scan_root: repo.to_path_buf(),
+            tsconfig: None,
+            extraction_config: None,
+            server_claims: None,
+        }];
+        let pair = stated_pair(
+            "p",
+            stated_end("web", file, None),
+            stated_end("web", "apps/web/src/a.ts", Some("not_located")),
+        );
+        type_matched_pairs(
+            Path::new("/nonexistent/sidecar/index.js"),
+            &services,
+            &[pair],
+            Duration::from_secs(1),
+        )
+        .remove(0)
+        .caller
+    }
+
+    fn assert_refused(end: &MatchedEndTypes, file: &str) {
+        assert_eq!(
+            end.reason.as_deref(),
+            Some("not_located"),
+            "{file}: {end:?}"
+        );
+        assert!(
+            end.alias.is_none() && end.type_read.is_none(),
+            "{file} was asked: {end:?}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_file_name_is_not_asked() {
+        let (_dir, repo, secret) = guarded_repo();
+        let file = secret.to_string_lossy().into_owned();
+        assert_refused(&caller_named(&repo, &file), &file);
+        // Absolute and inside the repository is still not a repository name.
+        let inside = repo
+            .join("apps/web/src/a.ts")
+            .to_string_lossy()
+            .into_owned();
+        assert_refused(&caller_named(&repo, &inside), &inside);
+    }
+
+    #[test]
+    fn a_file_name_with_a_parent_segment_is_not_asked() {
+        let (_dir, repo, _secret) = guarded_repo();
+        for file in [
+            "../outside/secret.ts",
+            "apps/web/../../outside/secret.ts",
+            "apps/web/../web/src/a.ts",
+            "./apps/web/src/a.ts",
+            "apps//web/src/a.ts",
+            ".git/hooks/a.ts",
+        ] {
+            assert_refused(&caller_named(&repo, file), file);
+        }
+        // The plain name of the same file is asked.
+        let asked = caller_named(&repo, "apps/web/src/a.ts");
+        assert!(asked.alias.is_some(), "{asked:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_repository_is_not_asked() {
+        let (_dir, repo, _secret) = guarded_repo();
+        assert_refused(
+            &caller_named(&repo, "apps/web/src/out.ts"),
+            "apps/web/src/out.ts",
+        );
+    }
+
+    #[test]
+    fn a_nested_top_type_the_source_does_not_declare_names_the_cause() {
+        let finding = |path: &str, reason: &str| crate::services::type_sidecar::TypeProvenance {
+            path: path.to_string(),
+            kind: "unknown".to_string(),
+            reason: reason.to_string(),
+            detail: None,
+        };
+        assert_eq!(nested_cause(&[]), "not_recorded");
+        assert_eq!(nested_cause(&[finding("meta", "declared")]), "declared");
+        assert_eq!(
+            nested_cause(&[
+                finding("meta", "declared"),
+                finding("owner", "unresolved_import")
+            ]),
+            "unresolved_import"
+        );
+        assert_eq!(
+            nested_cause(&[
+                finding("owner", "unresolved_import"),
+                finding("", "budget_exhausted")
+            ]),
+            "budget_exhausted"
+        );
     }
 
     #[test]

@@ -1,0 +1,3 @@
+{
+  "services": [{ "serviceName": "web", "directory": "apps/portal/ui/web" }]
+}
