@@ -768,10 +768,11 @@ function handleVerifyClientSemantics(
   request: SidecarRequest & { action: 'verify_client_semantics' }
 ): VerifyClientSemanticsResponse {
   try {
+    const verifiers = serviceVerifiers();
     const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} client-semantics claim(s) from ${fromDir}`);
     const { semantics, modules } = runInPrograms(
-      serviceVerifiers(),
+      verifiers,
       fromDir,
       request.checks.map(httpCheck),
       request.budget_ms ?? SEMANTICS_BUDGET_MS
