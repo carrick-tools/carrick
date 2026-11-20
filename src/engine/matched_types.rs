@@ -24,7 +24,8 @@ use super::type_compat_v2::{self, JudgeStub, LocalConsumer, LocalConsumers};
 use crate::cloud_storage::{
     ManifestRole, ManifestTypeKind, ManifestTypeState, TypeEvidence, TypeManifestEntry,
 };
-use crate::operation::OperationKey;
+use crate::graphql::{GraphqlRoot, GraphqlType, GraphqlTypes};
+use crate::operation::{GraphqlOperationKind, OperationKey};
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     CaptureAliasRecord, ExtractionConfig, InferKind, InferRequestItem, ServerClaims, VerdictBucket,
@@ -58,6 +59,12 @@ pub(crate) const JUDGE_NOT_READY: &str =
     "the judge's compiler process did not become ready in time, so the pair was not judged";
 pub(crate) const JUDGE_NO_ANSWER: &str = "the judge returned no outcome for the pair";
 
+/// Why a GraphQL pair whose ends were both read is not judged: judged without
+/// the producer's schema types, a built-in scalar leaf is compared in its JSON
+/// form, which reads a false mismatch (a resolver's `bigint` under a `String`
+/// field), so the pair is judged only when the types hold the root field.
+pub(crate) const GRAPHQL_NOT_JUDGED: &str = "the producer has no GraphQL schema types for this field, so the response was not judged: a field resolver can supply what the root resolver does not return";
+
 /// Extensions the compiler engine reads as source.
 const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
@@ -73,6 +80,11 @@ pub(crate) struct MatchedService {
     pub tsconfig: Option<String>,
     pub extraction_config: Option<ExtractionConfig>,
     pub server_claims: Option<ServerClaims>,
+    /// The service's GraphQL type table, as the scan stores it for the
+    /// service (`graphql::graphql_types`); `None` when it has none. A GraphQL
+    /// pair whose producer is this service is judged only when it holds the
+    /// pair's root field.
+    pub graphql_types: Option<GraphqlTypes>,
 }
 
 /// One end of a pair: the service that owns its file and where it sits.
@@ -97,10 +109,52 @@ pub(crate) struct MatchedEnd {
     pub hands_back_body: Option<bool>,
 }
 
+/// The protocol a pair is read as. `Http` (the default) keeps the asks and
+/// the key a route pair has always had.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum MatchedProtocol {
+    #[default]
+    Http,
+    Graphql(GraphqlPair),
+}
+
+/// A GraphQL field pair: the operation it names and where each end is read.
+/// The caller of this module locates both places, as the scan does (the
+/// resolver's span from `graphql_resolver_anchor`, the declared field type's
+/// span from the document reader); this module asks the compiler there and
+/// locates nothing. An end with no place is `not_located`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphqlPair {
+    pub kind: GraphqlOperationKind,
+    /// The root field the pair is about.
+    pub field: String,
+    /// The schema's root type for `kind` (renamed or not). The service's
+    /// type table does not say which type is a root, so the caller names it.
+    pub root_type: String,
+    /// Where the caller's result type is declared: the document's field
+    /// type, as the scan asks it (`Expression`).
+    pub caller: Option<ReadAt>,
+    /// Where the resolver function is: the scan's producer ask
+    /// (`FunctionReturn`).
+    pub server: Option<ReadAt>,
+}
+
+/// A place a GraphQL end is read at, in the file's own numbering: the
+/// compiler's UTF-16 offsets `[start, end)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadAt {
+    /// Path relative to the repository root; read only through [`repo_file`].
+    pub file: String,
+    /// 1-based.
+    pub line: u32,
+    pub span: (u32, u32),
+}
+
 pub(crate) struct MatchedPair {
     pub pair_id: String,
     pub verb: String,
     pub operation: String,
+    pub protocol: MatchedProtocol,
     /// Whether the pair's kind is one the pass asks about. The caller of
     /// this module decides which kinds those are, and states a reason on an
     /// end it does not want asked. A pair that is not asked states
@@ -201,7 +255,61 @@ enum Plan {
 }
 
 fn key_of(pair: &MatchedPair) -> OperationKey {
-    OperationKey::http(&pair.verb, &pair.operation)
+    match &pair.protocol {
+        MatchedProtocol::Http => OperationKey::http(&pair.verb, &pair.operation),
+        MatchedProtocol::Graphql(graphql) => {
+            OperationKey::graphql(graphql.kind, graphql.field.clone())
+        }
+    }
+}
+
+/// Where an end is read and with what ask: an HTTP end at its own line (a
+/// caller at its call's span, as `call_result`; a server by line, as
+/// `response_body`), a GraphQL end at the place its pair names (a caller's
+/// declared field type, as `expression`; a resolver, as `function_return`),
+/// the two asks the scan makes for a GraphQL field. `Err` is the reason the
+/// end is not asked.
+struct ReadPlace {
+    file: String,
+    line: u32,
+    span: Option<(u32, u32)>,
+    infer_kind: InferKind,
+}
+
+fn read_place(pair: &MatchedPair, role: Role, end: &MatchedEnd) -> Result<ReadPlace, String> {
+    if !is_compiler_source(&end.file) {
+        return Err(state(NOT_TYPESCRIPT_SOURCE));
+    }
+    match (&pair.protocol, role) {
+        (MatchedProtocol::Http, Role::Caller) => Ok(ReadPlace {
+            file: end.file.clone(),
+            line: end.line,
+            span: Some(end.span.ok_or_else(|| state(NOT_LOCATED))?),
+            infer_kind: InferKind::CallResult,
+        }),
+        (MatchedProtocol::Http, Role::Server) => Ok(ReadPlace {
+            file: end.file.clone(),
+            line: end.line,
+            span: None,
+            infer_kind: InferKind::ResponseBody,
+        }),
+        (MatchedProtocol::Graphql(graphql), role) => {
+            let (at, infer_kind) = match role {
+                Role::Caller => (&graphql.caller, InferKind::Expression),
+                Role::Server => (&graphql.server, InferKind::FunctionReturn),
+            };
+            let at = at.as_ref().ok_or_else(|| state(NOT_LOCATED))?;
+            if !is_compiler_source(&at.file) {
+                return Err(state(NOT_TYPESCRIPT_SOURCE));
+            }
+            Ok(ReadPlace {
+                file: at.file.clone(),
+                line: at.line,
+                span: Some(at.span),
+                infer_kind,
+            })
+        }
+    }
 }
 
 fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedService>) -> Plan {
@@ -215,21 +323,27 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
     if let Some(reason) = end.reason {
         return Plan::Stated(state(reason));
     }
-    if !is_compiler_source(&end.file) {
-        return Plan::Stated(state(NOT_TYPESCRIPT_SOURCE));
-    }
-    if role == Role::Caller && end.span.is_none() {
-        return Plan::Stated(state(NOT_LOCATED));
-    }
+    let place = match read_place(pair, role, end) {
+        Ok(place) => place,
+        Err(reason) => return Plan::Stated(reason),
+    };
     let Some(service) = services.get(end.service.as_str()) else {
         return Plan::Stated(state(NOT_LOCATED));
     };
     let key = key_of(pair);
     let scan_root = service.scan_root.to_string_lossy().into_owned();
-    let site_id = build_site_id(&end.file, end.line, &key, &scan_root);
-    let (manifest_role, infer_kind, span) = match role {
-        Role::Caller => (ManifestRole::Consumer, InferKind::CallResult, end.span),
-        Role::Server => (ManifestRole::Producer, InferKind::ResponseBody, None),
+    let site_id = build_site_id(&place.file, place.line, &key, &scan_root);
+    let manifest_role = match role {
+        Role::Caller => ManifestRole::Consumer,
+        Role::Server => ManifestRole::Producer,
+    };
+    let (infer_kind, span) = (place.infer_kind, place.span);
+    let graphql_root = match (&pair.protocol, role) {
+        (MatchedProtocol::Graphql(graphql), Role::Server) => Some(GraphqlRoot {
+            type_name: graphql.root_type.clone(),
+            field: graphql.field.clone(),
+        }),
+        _ => None,
     };
     let alias = build_manifest_type_alias_with_site_id(
         &key,
@@ -237,7 +351,7 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
         ManifestTypeKind::Response,
         Some(&site_id),
     );
-    let Some(absolute) = repo_file(&service.scan_root, &end.file) else {
+    let Some(absolute) = repo_file(&service.scan_root, &place.file) else {
         return Plan::Stated(state(NOT_LOCATED));
     };
     let absolute = absolute.to_string_lossy().into_owned();
@@ -245,7 +359,7 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
         member: None,
         result: None,
         file_path: absolute,
-        line_number: end.line,
+        line_number: place.line,
         span_start: span.map(|(start, _)| start),
         span_end: span.map(|(_, end)| end),
         expression_text: None,
@@ -264,17 +378,17 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
         role: manifest_role,
         type_kind: ManifestTypeKind::Response,
         type_alias: alias.clone(),
-        file_path: end.file.clone(),
-        line_number: end.line,
+        file_path: place.file.clone(),
+        line_number: place.line,
         is_explicit: false,
         type_state: ManifestTypeState::Unknown,
         evidence: TypeEvidence {
-            file_path: end.file.clone(),
+            file_path: place.file.clone(),
             span_start: span.map(|(start, _)| start),
             span_end: span.map(|(_, end)| end),
             expression_text: None,
             expression_line: None,
-            line_number: end.line,
+            line_number: place.line,
             infer_kind,
             is_explicit: false,
             type_state: ManifestTypeState::Unknown,
@@ -289,7 +403,7 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
-        graphql_root: None,
+        graphql_root,
         v1_before_demotion: None,
     };
     Plan::Ask(Box::new(Ask {
@@ -431,8 +545,12 @@ fn type_service(
 /// The stubs of the services that were typed, in service-id order: the order
 /// feeds the stub folder names (a repeated name is suffixed in the order it is
 /// met) and the judge's answer cache, so it must not depend on the map's.
+///
+/// Each stub carries its service's own schema types: the judge reads a GraphQL
+/// response's built-in scalar leaves in the scalar's form from them.
 fn ordered_stubs<'a>(
     typed: &'a HashMap<&'a str, Result<ServiceTypes, String>>,
+    services: &HashMap<&str, &'a MatchedService>,
 ) -> Vec<JudgeStub<'a>> {
     let mut stubs: Vec<JudgeStub<'a>> = typed
         .iter()
@@ -440,12 +558,23 @@ fn ordered_stubs<'a>(
             Some(JudgeStub {
                 service_id,
                 artifact: &types.as_ref().ok()?.artifact,
-                graphql_types: None,
+                graphql_types: services
+                    .get(service_id)
+                    .and_then(|service| service.graphql_types.as_ref()),
             })
         })
         .collect();
     stubs.sort_by(|a, b| a.service_id.cmp(b.service_id));
     stubs
+}
+
+/// Whether the producer's schema types hold the pair's root field: the root
+/// type is an object or interface of the table and declares the field.
+fn schema_holds_root(schema: Option<&GraphqlTypes>, graphql: &GraphqlPair) -> bool {
+    matches!(
+        schema.and_then(|types| types.get(&graphql.root_type)),
+        Some(GraphqlType::Fields(fields)) if fields.contains_key(&graphql.field)
+    )
 }
 
 /// The end's reading once its service's type stage has run.
@@ -629,11 +758,33 @@ pub(crate) fn type_matched_pairs(
             row.verdict_reason = None;
             continue;
         }
+        // A GraphQL pair is judged with the producer's schema types or not at
+        // all: both types are stored either way.
+        let schema = by_id
+            .get(server.service.as_str())
+            .and_then(|service| service.graphql_types.as_ref());
+        if let MatchedProtocol::Graphql(graphql) = &pair.protocol
+            && !schema_holds_root(schema, graphql)
+        {
+            row.verdict = Some(MatchedVerdict {
+                bucket: VerdictBucket::Unverifiable,
+                gate: None,
+                diagnostic: None,
+                resolved: false,
+                unresolved_reason: Some(GRAPHQL_NOT_JUDGED.to_string()),
+                unresolved_side: None,
+                judged: false,
+                skipped: Some(GRAPHQL_NOT_JUDGED),
+            });
+            row.verdict_reason = None;
+            continue;
+        }
         match type_compat_v2::build_matched_pair(
             &server.service,
             producer_entry,
             &caller.service,
             consumer_entry,
+            schema,
         ) {
             Some(built_pair) => {
                 row_of_key.insert(built_pair.spec.pair_key.clone(), index);
@@ -652,7 +803,7 @@ pub(crate) fn type_matched_pairs(
         return rows;
     }
 
-    let stubs = ordered_stubs(&typed);
+    let stubs = ordered_stubs(&typed, &by_id);
     let Some(first) = services.first() else {
         return rows;
     };
@@ -822,6 +973,7 @@ mod tests {
                     tsconfig: None,
                     extraction_config: None,
                     server_claims: None,
+                    graphql_types: None,
                 })
                 .collect();
             let pairs: Vec<MatchedPair> = fixture
@@ -831,6 +983,7 @@ mod tests {
                     pair_id: pair.pair_id.clone(),
                     verb: pair.verb.clone(),
                     operation: pair.operation.clone(),
+                    protocol: MatchedProtocol::Http,
                     asked: pair.protocol == "http",
                     caller: end_of(&pair.caller),
                     server: end_of(&pair.server),
@@ -952,6 +1105,7 @@ mod tests {
             pair_id: id.to_string(),
             verb: "GET".to_string(),
             operation: "/x".to_string(),
+            protocol: MatchedProtocol::Http,
             asked: true,
             caller,
             server,
@@ -1076,7 +1230,7 @@ mod tests {
                 })
                 .collect();
             let dir = tempfile::tempdir().unwrap();
-            type_compat_v2::materialize_stubs(&ordered_stubs(&typed), dir.path())
+            type_compat_v2::materialize_stubs(&ordered_stubs(&typed, &HashMap::new()), dir.path())
                 .into_iter()
                 .map(|stub| {
                     let folder = Path::new(&stub.stub_dir)
@@ -1131,6 +1285,7 @@ mod tests {
                     pair_id: id.to_string(),
                     verb: "GET".to_string(),
                     operation: operation.to_string(),
+                    protocol: MatchedProtocol::Http,
                     asked: true,
                     caller: MatchedEnd {
                         service: "web".to_string(),
@@ -1161,6 +1316,7 @@ mod tests {
                 tsconfig: None,
                 extraction_config: None,
                 server_claims: None,
+                graphql_types: None,
             }];
             let rows =
                 type_matched_pairs(&sidecar_path, &services, &pairs, Duration::from_secs(600));
@@ -1230,6 +1386,7 @@ mod tests {
             tsconfig: None,
             extraction_config: None,
             server_claims: None,
+            graphql_types: None,
         }];
         let pair = stated_pair(
             "p",
@@ -1297,6 +1454,447 @@ mod tests {
             &caller_named(&repo, "apps/web/src/out.ts"),
             "apps/web/src/out.ts",
         );
+    }
+
+    /// The GraphQL fixture: a schema-first service and a client that executes
+    /// typed documents, plus one route pair. Spans are found by text, except
+    /// the resolver's, which is the scan's own reader's (`resolver_anchor`).
+    struct GraphqlFixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        pairs: Vec<MatchedPair>,
+        schema: GraphqlTypes,
+    }
+
+    fn line_of(source: &str, offset: usize) -> u32 {
+        source[..offset].matches('\n').count() as u32 + 1
+    }
+
+    fn graphql_fixture() -> GraphqlFixture {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("matched-pairs-graphql");
+        copy_tree(
+            &manifest_dir.join("tests/fixtures/matched-pairs-graphql"),
+            &root,
+        );
+        let read = |file: &str| std::fs::read_to_string(root.join(file)).unwrap();
+
+        // The producer's schema types and root type names, as the scan reads
+        // them from its SDL.
+        let extraction = crate::graphql::extract_from_document_text(
+            &read("apps/api/src/schema.graphql"),
+            Path::new("apps/api/src/schema.graphql"),
+            1,
+        );
+        let schema = crate::graphql::graphql_types(&extraction.schema_types).unwrap();
+        let root_type = |kind: GraphqlOperationKind| -> String {
+            extraction
+                .schema_types
+                .roots
+                .iter()
+                .find(|(_, root_kind)| **root_kind == kind)
+                .map(|(name, _)| name.clone())
+                .unwrap()
+        };
+
+        // The declared field type of a document's result: the text after
+        // `property?: ` up to the end of its type statement.
+        let documents = "apps/web/src/documents.ts";
+        let documents_source = read(documents);
+        let field_type = |property: &str, document_type: &str| -> ReadAt {
+            let declared = documents_source
+                .find(&format!("export type {document_type} = {{"))
+                .unwrap();
+            let marker = format!("  {property}?: ");
+            let anchor = declared + documents_source[declared..].find(&marker).unwrap();
+            let start = anchor + marker.len();
+            let end = start + documents_source[start..].find(";\n};").unwrap();
+            ReadAt {
+                file: documents.to_string(),
+                line: line_of(&documents_source, anchor),
+                span: (start as u32, end as u32),
+            }
+        };
+
+        // The resolver function of the field declared at `field_text`.
+        let resolvers = "apps/api/src/graphql.ts";
+        let resolvers_source = read(resolvers);
+        let resolver = |field_text: &str| -> ReadAt {
+            let line = line_of(
+                &resolvers_source,
+                resolvers_source.find(field_text).unwrap(),
+            );
+            let crate::graphql_resolver_anchor::ResolverAnchor::Function { lo, hi } =
+                crate::graphql_resolver_anchor::resolver_anchor(
+                    Path::new(resolvers),
+                    &resolvers_source,
+                    line,
+                )
+            else {
+                panic!("the fixture's resolver is a function literal");
+            };
+            ReadAt {
+                file: resolvers.to_string(),
+                line,
+                span: (
+                    crate::utils::sidecar_position(&resolvers_source, lo),
+                    crate::utils::sidecar_position(&resolvers_source, hi),
+                ),
+            }
+        };
+
+        let widgets = "apps/web/src/widgets.ts";
+        let widgets_source = read(widgets);
+        let graphql_pair = |id: &str,
+                            kind: GraphqlOperationKind,
+                            field: &str,
+                            call: &str,
+                            caller: ReadAt,
+                            server: ReadAt| {
+            let call_line = line_of(&widgets_source, widgets_source.find(call).unwrap());
+            MatchedPair {
+                pair_id: id.to_string(),
+                // The record's own words: neither names the root field.
+                verb: "QUERY".to_string(),
+                operation: "SomeDocument".to_string(),
+                protocol: MatchedProtocol::Graphql(GraphqlPair {
+                    kind,
+                    field: field.to_string(),
+                    root_type: root_type(kind),
+                    caller: Some(caller),
+                    server: Some(server.clone()),
+                }),
+                asked: true,
+                caller: MatchedEnd {
+                    service: "web".to_string(),
+                    file: widgets.to_string(),
+                    line: call_line,
+                    span: None,
+                    reason: None,
+                    hands_back_body: None,
+                },
+                server: MatchedEnd {
+                    service: "api".to_string(),
+                    file: resolvers.to_string(),
+                    line: server.line,
+                    span: None,
+                    reason: None,
+                    hands_back_body: None,
+                },
+            }
+        };
+
+        let client = "apps/web/src/client.ts";
+        let client_source = read(client);
+        let call = "(await fetch('/g/1')).json()";
+        let start = client_source.find(call).unwrap();
+        let http = MatchedPair {
+            pair_id: "http_ok".to_string(),
+            verb: "GET".to_string(),
+            operation: "/g/:id".to_string(),
+            protocol: MatchedProtocol::Http,
+            asked: true,
+            caller: MatchedEnd {
+                service: "web".to_string(),
+                file: client.to_string(),
+                line: line_of(&client_source, start),
+                span: Some((start as u32, (start + call.len()) as u32)),
+                reason: None,
+                hands_back_body: None,
+            },
+            server: MatchedEnd {
+                service: "api".to_string(),
+                file: "apps/api/src/server.ts".to_string(),
+                line: 6,
+                span: None,
+                reason: None,
+                hands_back_body: None,
+            },
+        };
+        let query = GraphqlOperationKind::Query;
+        let pairs = vec![
+            graphql_pair(
+                "gql_ok",
+                query,
+                "widget",
+                "execute(WidgetDocument)",
+                field_type("widget", "WidgetQuery"),
+                resolver("widget: {"),
+            ),
+            graphql_pair(
+                "gql_mismatch",
+                GraphqlOperationKind::Mutation,
+                "renameWidget",
+                "execute(RenameWidgetDocument",
+                field_type("renameWidget", "RenameWidgetMutation"),
+                resolver("renameWidget: {"),
+            ),
+            graphql_pair(
+                "gql_declared",
+                query,
+                "widget",
+                "execute(WidgetWithMetaDocument)",
+                field_type("widget", "WidgetWithMetaQuery"),
+                resolver("widget: {"),
+            ),
+            http,
+        ];
+        GraphqlFixture {
+            _dir: dir,
+            root,
+            pairs,
+            schema,
+        }
+    }
+
+    /// One run of the GraphQL fixture's pairs (`only_http` keeps the route
+    /// pair alone), with the api service's schema types or none.
+    fn graphql_rows(
+        with_schema: bool,
+        only_http: bool,
+    ) -> Option<HashMap<String, MatchedPairTypes>> {
+        let sidecar_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+        if !sidecar_built(&sidecar_path) {
+            return None;
+        }
+        let fixture = graphql_fixture();
+        let services: Vec<MatchedService> = [("web", "apps/web"), ("api", "apps/api")]
+            .iter()
+            .map(|(name, directory)| MatchedService {
+                service_id: name.to_string(),
+                root: fixture.root.join(directory),
+                scan_root: fixture.root.clone(),
+                tsconfig: None,
+                extraction_config: None,
+                server_claims: None,
+                graphql_types: (with_schema && *name == "api").then(|| fixture.schema.clone()),
+            })
+            .collect();
+        let pairs: Vec<MatchedPair> = fixture
+            .pairs
+            .into_iter()
+            .filter(|pair| !only_http || pair.protocol == MatchedProtocol::Http)
+            .collect();
+        let rows = type_matched_pairs(&sidecar_path, &services, &pairs, Duration::from_secs(600));
+        Some(
+            rows.into_iter()
+                .map(|row| (row.pair_id.clone(), row))
+                .collect(),
+        )
+    }
+
+    fn graphql_with_schema() -> Option<&'static HashMap<String, MatchedPairTypes>> {
+        static ROWS: std::sync::OnceLock<Option<HashMap<String, MatchedPairTypes>>> =
+            std::sync::OnceLock::new();
+        ROWS.get_or_init(|| graphql_rows(true, false)).as_ref()
+    }
+
+    fn graphql_without_schema() -> Option<&'static HashMap<String, MatchedPairTypes>> {
+        static ROWS: std::sync::OnceLock<Option<HashMap<String, MatchedPairTypes>>> =
+            std::sync::OnceLock::new();
+        ROWS.get_or_init(|| graphql_rows(false, false)).as_ref()
+    }
+
+    /// Both ends of a field pair are read where the pair names them, and the
+    /// resolver's imported named type is resolved through to its members.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn graphql_pair_reads_the_resolver_and_the_declared_field() {
+        let Some(rows) = graphql_with_schema() else {
+            return;
+        };
+        let row = &rows["gql_ok"];
+        let server = row.server.type_read.as_ref().expect("the resolver is read");
+        assert!(
+            server.expanded.contains("total: number") && server.expanded.contains("name: string"),
+            "the imported Owner is resolved: {server:?}"
+        );
+        assert_eq!(row.server.reason, None, "{:?}", row.server);
+        let caller = row
+            .caller
+            .type_read
+            .as_ref()
+            .expect("the declared field is read");
+        assert!(caller.expanded.contains("total"), "{caller:?}");
+        assert_eq!(row.caller.reason, None, "{:?}", row.caller);
+        // A member the document declares `unknown` states the capture's word.
+        let declared = &rows["gql_declared"].caller;
+        assert!(declared.type_read.is_some(), "{declared:?}");
+        assert_eq!(declared.reason.as_deref(), Some("declared"), "{declared:?}");
+    }
+
+    /// With the producer's schema types the pair is judged: a resolver's
+    /// `number` under an `ID!` field reads as the client's `string`, and a
+    /// client that reads an `Int!` field as a `string` is a mismatch (what a
+    /// resolver leaves out or converts is the schema's to state, not the
+    /// resolver's).
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn graphql_pair_with_schema_types_is_judged() {
+        let Some(rows) = graphql_with_schema() else {
+            return;
+        };
+        let ok = rows["gql_ok"].verdict.as_ref().expect("judged");
+        assert_eq!(ok.bucket, VerdictBucket::Compatible, "{ok:?}");
+        assert!(ok.judged && ok.skipped.is_none(), "{ok:?}");
+        let bad = rows["gql_mismatch"].verdict.as_ref().expect("judged");
+        assert_eq!(bad.bucket, VerdictBucket::Incompatible, "{bad:?}");
+        assert!(
+            bad.diagnostic.as_deref().unwrap_or("").contains("total"),
+            "the diagnostic names the field: {bad:?}"
+        );
+    }
+
+    /// Without schema types both types are stored and the verdict is skipped
+    /// with its sentence (RC20): never a verdict from the JSON form.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn graphql_pair_without_schema_types_is_not_judged() {
+        let Some(rows) = graphql_without_schema() else {
+            return;
+        };
+        for id in ["gql_ok", "gql_mismatch"] {
+            let row = &rows[id];
+            assert!(row.caller.type_read.is_some(), "{id}: {:?}", row.caller);
+            assert!(row.server.type_read.is_some(), "{id}: {:?}", row.server);
+            let verdict = row.verdict.as_ref().expect("a stated skip");
+            assert_eq!(verdict.skipped, Some(GRAPHQL_NOT_JUDGED), "{id}");
+            assert!(!verdict.judged, "{id}");
+            assert_eq!(row.verdict_reason, None, "{id}");
+        }
+    }
+
+    /// The route pair in the run reads what it reads alone, with or without
+    /// the service's schema types: the GraphQL path never touches it.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn an_http_pair_beside_graphql_pairs_reads_what_it_read_before() {
+        let Some(alone) = graphql_rows(true, true) else {
+            return;
+        };
+        let (Some(with), Some(without)) = (graphql_with_schema(), graphql_without_schema()) else {
+            return;
+        };
+        let expected = &alone["http_ok"];
+        assert_eq!(
+            expected.verdict.as_ref().map(|verdict| verdict.bucket),
+            Some(VerdictBucket::Compatible),
+            "{expected:?}"
+        );
+        assert_eq!(&with["http_ok"], expected);
+        assert_eq!(&without["http_ok"], expected);
+    }
+
+    /// An end with no place states `not_located`; a place whose file fails
+    /// the one path gate is never asked.
+    #[test]
+    fn a_graphql_end_with_no_ask_or_an_ungated_file_is_not_located() {
+        let (_dir, repo, secret) = guarded_repo();
+        let services = [MatchedService {
+            service_id: "web".to_string(),
+            root: repo.join("apps/web"),
+            scan_root: repo.clone(),
+            tsconfig: None,
+            extraction_config: None,
+            server_claims: None,
+            graphql_types: None,
+        }];
+        let at = |file: &str| ReadAt {
+            file: file.to_string(),
+            line: 1,
+            span: (0, 1),
+        };
+        let pair = |id: &str, caller: Option<ReadAt>, server: Option<ReadAt>| {
+            let mut pair = stated_pair(
+                id,
+                stated_end("web", "apps/web/src/a.ts", None),
+                stated_end("web", "apps/web/src/a.ts", None),
+            );
+            pair.protocol = MatchedProtocol::Graphql(GraphqlPair {
+                kind: GraphqlOperationKind::Query,
+                field: "widget".to_string(),
+                root_type: "Query".to_string(),
+                caller,
+                server,
+            });
+            pair
+        };
+        let pairs = [
+            pair("none", None, None),
+            pair(
+                "ungated",
+                Some(at("../outside/secret.ts")),
+                Some(at(&secret.to_string_lossy())),
+            ),
+            pair("link", Some(at("apps/web/src/out.ts")), None),
+            pair("gated", Some(at("apps/web/src/a.ts")), None),
+        ];
+        let rows = type_matched_pairs(
+            Path::new("/nonexistent/sidecar/index.js"),
+            &services,
+            &pairs,
+            Duration::from_secs(1),
+        );
+        for (row, file) in rows.iter().take(2).zip(["none", "ungated"]) {
+            for end in [&row.caller, &row.server] {
+                assert_refused(end, file);
+            }
+        }
+        #[cfg(unix)]
+        assert_refused(&rows[2].caller, "apps/web/src/out.ts");
+        // A place that passes the gate is asked (the sidecar is absent, so it
+        // reads `site_unreadable`, with its alias).
+        assert!(rows[3].caller.alias.is_some(), "{:?}", rows[3].caller);
+        assert_refused(&rows[3].server, "a server with no place");
+    }
+
+    /// The schema types answer for a pair only when its root type declares
+    /// its field: a missing table, a root type the table lacks, a renamed
+    /// root and an absent field all leave it unjudged.
+    #[test]
+    fn schema_types_hold_a_root_field_only_when_the_root_type_declares_it() {
+        let pair = |root: &str, field: &str| GraphqlPair {
+            kind: GraphqlOperationKind::Query,
+            field: field.to_string(),
+            root_type: root.to_string(),
+            caller: None,
+            server: None,
+        };
+        let fields = |names: &[&str]| {
+            GraphqlType::Fields(
+                names
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.to_string(),
+                            crate::graphql::Leaf::Scalar("String".to_string()),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let table: GraphqlTypes = [
+            ("RootQuery".to_string(), fields(&["widget"])),
+            (
+                "Members".to_string(),
+                GraphqlType::Members(vec!["RootQuery".to_string()]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert!(schema_holds_root(
+            Some(&table),
+            &pair("RootQuery", "widget")
+        ));
+        assert!(!schema_holds_root(
+            Some(&table),
+            &pair("RootQuery", "gadget")
+        ));
+        assert!(!schema_holds_root(Some(&table), &pair("Query", "widget")));
+        assert!(!schema_holds_root(Some(&table), &pair("Members", "widget")));
+        assert!(!schema_holds_root(None, &pair("RootQuery", "widget")));
     }
 
     #[test]

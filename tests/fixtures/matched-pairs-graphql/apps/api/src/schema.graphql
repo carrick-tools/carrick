@@ -1,0 +1,17 @@
+type Query {
+  widget: Widget
+}
+
+type Mutation {
+  renameWidget(id: ID!, name: String!): Widget
+}
+
+type Widget {
+  id: ID!
+  total: Int!
+  owner: Owner
+}
+
+type Owner {
+  name: String!
+}

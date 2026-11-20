@@ -2226,6 +2226,7 @@ pub(crate) fn build_matched_pair(
     producer: &TypeManifestEntry,
     consumer_service: &str,
     consumer: &TypeManifestEntry,
+    producer_graphql_types: Option<&crate::graphql::GraphqlTypes>,
 ) -> Option<BuiltPair> {
     let producer_side = ServiceEntry {
         service_id: producer_service,
@@ -2234,7 +2235,7 @@ pub(crate) fn build_matched_pair(
         entry: producer,
         name_scope: None,
         procedure: false,
-        graphql_types: None,
+        graphql_types: producer_graphql_types,
     };
     let consumer_side = ServiceEntry {
         service_id: consumer_service,

@@ -68,8 +68,8 @@ use crate::call_through::OwnCode;
 use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
 use crate::engine::matched_types::{
-    MatchedEnd, MatchedEndTypes, MatchedPair, MatchedPairTypes, MatchedService, MatchedVerdict,
-    repo_file, type_matched_pairs,
+    MatchedEnd, MatchedEndTypes, MatchedPair, MatchedPairTypes, MatchedProtocol, MatchedService,
+    MatchedVerdict, repo_file, type_matched_pairs,
 };
 use crate::position_rows::{FileRows, Kind, POSITIONS_DIR, Row};
 use crate::services::type_sidecar::VerdictBucket;
@@ -1118,6 +1118,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
             pair_id: index.to_string(),
             verb: pair.method.clone(),
             operation: pair.name.clone(),
+            protocol: MatchedProtocol::default(),
             // A kind this build reads at at least one end (see [`reading_of`]).
             asked: kind != Reading::Neither,
             caller: MatchedEnd {
@@ -1150,6 +1151,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
                 .get(name)
                 .and_then(|stored| stored.blob.as_ref()?.cached_extraction_config.clone()),
             server_claims: None,
+            graphql_types: None,
         })
         .collect();
 
