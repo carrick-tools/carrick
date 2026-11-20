@@ -66,6 +66,8 @@ export interface WrapperReplyContext {
   readonly readsReplies: boolean;
   /** The labels' word on a call (`StatedParams.sendAt`). */
   sendAt(call: Node): ClaimSlot | 'setter' | undefined;
+  /** Whether a label names the assigned member a body set (`StatedParams.setsBody`). */
+  setsBody(target: Node): boolean;
   /** The symbol at the root of a member or call chain (`StatedParams.rootSymbol`). */
   rootSymbol(expression: Node): TsSymbol | undefined;
   /** A type that holds no value (`StatedParams.isNothing`). */
@@ -108,12 +110,24 @@ export function wrapperReplyVerdict(
   return replier ? { kind: 'runs', handler: replier } : UNREAD;
 }
 
-/** The one body the callee declares in the program, or undefined (a library, several bodies). */
-function bodyOfCallee(call: CallExpression): PlainFunctionBody | undefined {
-  let symbol = call.getExpression().getSymbol();
+/**
+ * The one body the callee runs, declared in the repo (not a library's
+ * declarations or installed code): a name's one body,
+ * or for a curried call (`withAuth(options)(fn)`) the one function literal
+ * the inner call's body returns. Undefined for a library or several bodies.
+ */
+function bodyOfCallee(call: CallExpression, depth = 0): PlainFunctionBody | undefined {
+  const callee = peelValueWrappers(call.getExpression());
+  if (Node.isCallExpression(callee)) {
+    const outer = depth < MAX_DEPTH ? bodyOfCallee(callee, depth + 1) : undefined;
+    return outer ? onlyReturnedFunction(outer) : undefined;
+  }
+  let symbol = callee.getSymbol();
   if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
   const body = functionBodyOf(symbol?.getDeclarations() ?? [], { methods: false });
-  return body && !body.getSourceFile().isDeclarationFile() ? body : undefined;
+  if (!body) return undefined;
+  const file = body.getSourceFile();
+  return file.isDeclarationFile() || file.isInNodeModules() ? undefined : body;
 }
 
 function parameterSymbol(
@@ -266,7 +280,7 @@ function parameterInside(symbol: TsSymbol | undefined, at: Node, outer: Node | u
   });
 }
 
-type RootTest = (root: TsSymbol | undefined, send: CallExpression) => boolean;
+type RootTest = (root: TsSymbol | undefined, send: Node) => boolean;
 
 /** Whether `send` is a send of its whole first argument on a receiver `rootOk` accepts. */
 function isSend(send: CallExpression, rootOk: RootTest, context: WrapperReplyContext): boolean {
@@ -276,6 +290,25 @@ function isSend(send: CallExpression, rootOk: RootTest, context: WrapperReplyCon
   if (!context.readsReplies) return true;
   const slot = context.sendAt(send);
   return typeof slot === 'object' && slot.arg === 0 && slot.key === undefined;
+}
+
+/** Whether `value` is the whole right side of an assignment to a reply member (`ctx.body = value`). */
+function isAssignedSend(value: Node, rootOk: RootTest, context: WrapperReplyContext): boolean {
+  const assignment = value.getParent();
+  if (
+    !assignment ||
+    !Node.isBinaryExpression(assignment) ||
+    assignment.getOperatorToken().getKind() !== SyntaxKind.EqualsToken ||
+    assignment.getRight() !== value
+  ) {
+    return false;
+  }
+  const target = assignment.getLeft();
+  if (!Node.isPropertyAccessExpression(target)) return false;
+  const statement = assignment.getParent();
+  if (!statement || !Node.isExpressionStatement(statement)) return false;
+  if (!rootOk(context.rootSymbol(target.getExpression()), assignment)) return false;
+  return !context.readsReplies || context.setsBody(target);
 }
 
 /** A read that only tests a value (`x !== undefined`, `!x`, `typeof x`, `if (x)`). */
@@ -302,9 +335,15 @@ function isInspection(use: Node): boolean {
  * handed on by `.then((x) => send(x))`, or bound to a `const` that is only
  * sent so and tested.
  */
-function sentUnchanged(value: Node, rootOk: RootTest, context: WrapperReplyContext): boolean {
+function sentUnchanged(
+  value: Node,
+  rootOk: RootTest,
+  context: WrapperReplyContext,
+  otherwiseKept: (use: Node) => boolean = () => false
+): boolean {
   const parent = value.getParent();
   if (!parent) return false;
+  if (isAssignedSend(value, rootOk, context)) return true;
   if (Node.isCallExpression(parent) && parent.getExpression() !== value) {
     return parent.getArguments()[0] === value && isSend(parent, rootOk, context);
   }
@@ -331,12 +370,12 @@ function sentUnchanged(value: Node, rootOk: RootTest, context: WrapperReplyConte
     const symbol = name.getSymbol();
     const scope = enclosingFunction(parent);
     if (!symbol || !scope) return false;
-    let sent = false;
+    let kept = false;
     for (const use of usesOf(scope, symbol, name)) {
-      if (sentUnchanged(use, rootOk, context)) sent = true;
+      if (sentUnchanged(use, rootOk, context, otherwiseKept) || otherwiseKept(use)) kept = true;
       else if (!isInspection(use)) return false;
     }
-    return sent;
+    return kept;
   }
   return false;
 }
@@ -356,6 +395,19 @@ function useKeepsResult(
   const parent = use.getParent();
   if (parent && Node.isCallExpression(parent) && parent.getExpression() === use) {
     return resultKept(parent, wrapper, context, depth);
+  }
+  // `fn.call(this, req, res)` and `fn.apply(this, args)` call the callback.
+  const invoked = parent?.getParent();
+  if (
+    parent &&
+    Node.isPropertyAccessExpression(parent) &&
+    parent.getExpression() === use &&
+    invoked &&
+    Node.isCallExpression(invoked) &&
+    invoked.getExpression() === parent
+  ) {
+    const member = defaultLibraryMember(invoked);
+    if (member === 'call' || member === 'apply') return resultKept(invoked, wrapper, context, depth);
   }
   const handedTo = handedAsArgument(use);
   if (!handedTo) return false;
@@ -399,7 +451,20 @@ function resultKept(
   context: WrapperReplyContext,
   depth: number
 ): boolean | 'unread' {
-  const top = climbKeptValue(callbackCall);
+  return valueKept(climbKeptValue(callbackCall), wrapper, context, depth);
+}
+
+/**
+ * Whether the wrapper keeps the callback's result, held at `top`, as it is:
+ * dropped, returned, sent unchanged, or bound to a `const` that is only so
+ * used and tested.
+ */
+function valueKept(
+  top: Node,
+  wrapper: PlainFunctionBody,
+  context: WrapperReplyContext,
+  depth: number
+): boolean | 'unread' {
   const parent = top.getParent();
   if (!parent) return false;
   if (Node.isExpressionStatement(parent) || Node.isVoidExpression(parent)) return true;
@@ -418,7 +483,18 @@ function resultKept(
       ? true
       : 'unread';
   }
-  return sentUnchanged(top, (root, send) => parameterInside(root, send, wrapper), context);
+  let thunkUnread = false;
+  const kept = sentUnchanged(
+    top,
+    (root, send) => parameterInside(root, send, wrapper),
+    context,
+    (use) => {
+      const verdict = valueKept(climbKeptValue(use), wrapper, context, depth);
+      if (verdict === 'unread') thunkUnread = true;
+      return verdict === true;
+    }
+  );
+  return thunkUnread ? 'unread' : kept;
 }
 
 /**
