@@ -9391,7 +9391,7 @@ fn traced_route_requests(
             // A procedure named by its binding is asked its own types
             // ([`procedure_binding_requests`]): its line names no response.
             if !is_producer_method(&method)
-                || !is_served_row_path(&row.full_path, row.procedure.as_ref())
+                || !is_typed_row_path(&row.full_path, row.procedure.as_ref())
                 || is_binding_row(row)
             {
                 return None;
@@ -9499,6 +9499,15 @@ struct TracedWrite {
     corrected: Vec<(usize, String)>,
     /// The rows written: the last `applied.added` of the graph.
     added: std::ops::Range<usize>,
+}
+
+/// Whether a producer row is given type entries and asks: a path with a
+/// leading `/` exactly as written (the test these entries always took, never
+/// [`crate::swc_scanner::is_producer_route_path`]'s trimmed reading), or a
+/// procedure named by its binding, which states no path (contract amendment
+/// 13, carrick#4909).
+fn is_typed_row_path(full_path: &str, procedure: Option<&carrick_match::ProcedureKey>) -> bool {
+    full_path.starts_with('/') || (procedure.is_some() && full_path.is_empty())
 }
 
 /// Whether the trace writes a row served at `full_path`: a path a route is
@@ -15015,7 +15024,7 @@ fn build_type_manifest_entries(
             continue;
         }
         let path = endpoint.full_path.clone();
-        if !is_served_row_path(&path, endpoint.procedure.as_ref()) {
+        if !is_typed_row_path(&path, endpoint.procedure.as_ref()) {
             continue;
         }
         let (file_path, line_number) = parse_file_location(&endpoint.file_location);
@@ -34047,6 +34056,64 @@ unfollowed_member_calls_total: 0,
         };
         assert!(is_served_row_path("", Some(&key)));
         assert!(!is_served_row_path("ping", Some(&key)));
+    }
+
+    /// carrick#4909: the type entries and the trace's asks take a path with a
+    /// leading `/` exactly as written, as before, plus a procedure row with no
+    /// path. A path the route rule trims into shape (a leading space or
+    /// backtick) is still given none, and a row with no path and no procedure
+    /// gets none.
+    #[test]
+    fn type_entries_take_a_written_leading_slash_or_a_pathless_procedure() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let key = carrick_match::ProcedureKey {
+            path: "saveNote".to_string(),
+            router: carrick_match::RouterId {
+                repo: "r".to_string(),
+                file: "src/a.ts".to_string(),
+                binding: String::new(),
+            },
+        };
+        let row = |line: u32, full_path: &str, procedure: Option<&carrick_match::ProcedureKey>| {
+            crate::mount_graph::ResolvedEndpoint {
+                procedure: procedure.cloned(),
+                ..traced_row(
+                    &format!("src/a.ts:{line}"),
+                    "POST",
+                    full_path,
+                    full_path,
+                    ResolutionSource::LibraryClaim,
+                )
+            }
+        };
+        let rows = vec![
+            row(1, "`/x", None),
+            row(2, " /x", None),
+            row(3, "/x", None),
+            row(4, "", Some(&key)),
+            row(5, "", None),
+        ];
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = rows.clone();
+        let mut entry_lines: Vec<u32> =
+            build_type_manifest_entries(&graph, &Config::default(), ".")
+                .iter()
+                .filter(|entry| entry.role == ManifestRole::Producer)
+                .map(|entry| entry.line_number)
+                .collect();
+        entry_lines.dedup();
+        assert_eq!(entry_lines, vec![3, 4]);
+        let mut ask_lines: Vec<u32> = traced_route_requests(&rows, ".")
+            .iter()
+            .map(|ask| ask.line_number)
+            .chain(
+                procedure_binding_requests(rows.iter(), &[], ".")
+                    .iter()
+                    .map(|ask| ask.line_number),
+            )
+            .collect();
+        ask_lines.sort();
+        assert_eq!(ask_lines, vec![3, 4]);
     }
 
     /// carrick#4071: each row the trace writes asks for its response, as a
