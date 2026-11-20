@@ -13,7 +13,8 @@ import { execFileSync } from "node:child_process";
 import { makeWorkspace } from "./helpers.ts";
 import { currentVersion } from "../src/update.ts";
 import { bringUpToDate } from "../src/init/self-update.ts";
-import { writeFolderCopy } from "../src/init/repo-copies.ts";
+import { excludeFile, writeFolderCopy } from "../src/init/repo-copies.ts";
+import { recordCliVersion } from "../src/init/outdated.ts";
 import { skillFile, SKILL_ROOTS, TASK_SKILLS, writeTaskSkills } from "../src/init/task-skills.ts";
 
 const running = currentVersion()!;
@@ -141,4 +142,30 @@ test("a root with no skill of ours gets nothing", (t) => {
     for (const root of SKILL_ROOTS) assert.equal(exists(workspace.root, skillFile(root, name)), false);
   }
   assert.deepEqual(lines, []);
+});
+
+test("a block an older version wrote gets the surface pattern once, silently", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  git(workspace.root, "init", "-q");
+  writeFolderCopy(workspace.root, { slug: "demo" });
+  const exclude = excludeFile(workspace.root)!;
+  const older = fs.readFileSync(exclude, "utf8").replace("__carrick_surface_*\n", "");
+  assert.notEqual(older, fs.readFileSync(exclude, "utf8"));
+  fs.writeFileSync(exclude, older);
+  recordCliVersion(workspace.root, "0.0.1");
+
+  const lines = bringUpToDate(workspace.root, null, running);
+
+  assert.ok(fs.readFileSync(exclude, "utf8").split("\n").includes("__carrick_surface_*"));
+  assert.ok(lines.every((line) => !/surface|exclude/i.test(line)), lines.join("\n"));
+
+  // Recorded equals running: the file is left alone.
+  recordCliVersion(workspace.root, running);
+  fs.writeFileSync(exclude, older);
+  const past = new Date(Date.now() - 60_000);
+  fs.utimesSync(exclude, past, past);
+  bringUpToDate(workspace.root, null, running);
+  assert.equal(fs.readFileSync(exclude, "utf8"), older);
+  assert.equal(fs.statSync(exclude).mtimeMs, past.getTime());
 });

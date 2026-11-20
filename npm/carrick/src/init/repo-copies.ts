@@ -67,6 +67,16 @@ import {
 export const EXCLUDE_BEGIN = "# Added by carrick init: Carrick's hooks and skills for this clone";
 export const EXCLUDE_END = "# End of carrick init lines";
 
+/**
+ * Lines the block holds besides the paths it records, so the temporary files a
+ * running check writes beside the code it reads stay out of `git status`:
+ * `__carrick_surface__.<pid>.<n>.ts` (the compiler engine's capture entry,
+ * `src/sidecar/src/capture/index.ts`) and `__carrick_surface_probe_<pid>_<n>.ts`
+ * (`src/sidecar/src/library-claims.ts`). Unanchored, because the files land at
+ * any depth. A mitigation for carrick#4031; the fix is carrick#2931.
+ */
+export const EXCLUDE_PATTERNS = ["__carrick_surface_*"];
+
 /** The personal Claude Code settings file, which is the one a repo copy uses. */
 export const LOCAL_SETTINGS = path.join(".claude", "settings.local.json");
 const CLAUDE_LAUNCHER = path.join(".claude", LAUNCHER_FILE);
@@ -109,7 +119,7 @@ export function withoutExcludeBlock(existing: string): { body: string; lines: st
   let end: number;
   if (close !== -1) end = close + 1;
   else {
-    const ours = new Set(repoCopyPaths().map(asPattern));
+    const ours = new Set([...repoCopyPaths().map(asPattern), ...EXCLUDE_PATTERNS]);
     end = start + 1;
     while (end < all.length && ours.has(bare(all[end]!))) end += 1;
   }
@@ -130,7 +140,7 @@ export function withoutExcludeBlock(existing: string): { body: string; lines: st
 export function withExcludeBlock(existing: string | null, relatives: string[]): string {
   const { body } = withoutExcludeBlock(existing ?? "");
   if (relatives.length === 0) return body;
-  return `${EXCLUDE_BEGIN}\n${relatives.map(asPattern).join("\n")}\n${EXCLUDE_END}\n${body}`;
+  return `${EXCLUDE_BEGIN}\n${[...relatives.map(asPattern), ...EXCLUDE_PATTERNS].join("\n")}\n${EXCLUDE_END}\n${body}`;
 }
 
 /**
