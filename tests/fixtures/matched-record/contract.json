@@ -1,0 +1,211 @@
+{
+  "schema": "carrick.matched/1",
+  "repo": "example-org/shop",
+  "commit": "1111111111111111111111111111111111111111",
+  "run": {
+    "id": "run-0001",
+    "mode": "changed_files",
+    "base_commit": "0000000000000000000000000000000000000001",
+    "model": "model-under-test",
+    "brief_sha256": "0dc5d38f11c971ec376e5712138d070330da677073d544d8b5b3f1c99e215572",
+    "started_at": "2026-11-20T10:00:00Z",
+    "finished_at": "2026-11-20T10:03:00Z"
+  },
+  "engine": {
+    "status": "partial",
+    "reason": "time_budget",
+    "ms": 9000,
+    "scanner_version": "0.0.0"
+  },
+  "pairs": [
+    {
+      "id": "94fe38591b62349e",
+      "caller": {
+        "file": "apps/web/src/lib/api.ts",
+        "line": 8,
+        "line_sha256": "0a14c327e7cf7b541e7277ce7ff6d79effdec91731f4b9035e939a19d4c7a676"
+      },
+      "server": {
+        "file": "apps/api/src/orders/orders.router.ts",
+        "line": 18,
+        "line_sha256": "22c4976a8ebaf98587a323685ed698fe56333456baad5f720b65ae6bc00f94e7"
+      },
+      "operation": {
+        "kind": "route",
+        "method": "GET",
+        "name": "/v1/orders"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null,
+      "sides": {
+        "caller_sends": {
+          "compiler": {
+            "reason": "no_body"
+          }
+        },
+        "caller_expects": {
+          "compiler": {
+            "text": "{ id: string; total: number }[]",
+            "evidence": {
+              "file": "apps/web/src/lib/api.ts",
+              "line": 8
+            }
+          },
+          "model": {
+            "text": "{ id: string; total: number }[]",
+            "evidence": {
+              "file": "apps/web/src/lib/api.ts",
+              "line": 7,
+              "end_line": 9
+            }
+          }
+        },
+        "server_reads": {
+          "compiler": {
+            "reason": "no_body"
+          }
+        },
+        "server_returns": {
+          "compiler": {
+            "text": "{ id: string; total: number }[]",
+            "evidence": {
+              "file": "apps/api/src/orders/orders.router.ts",
+              "line": 18
+            }
+          }
+        }
+      },
+      "verdicts": {
+        "compiler": {
+          "grade": "agree",
+          "compiler_verdict": "compatible"
+        },
+        "model": {
+          "grade": "agree"
+        }
+      },
+      "wrapper": {
+        "name": "getOrders",
+        "file": "apps/web/src/lib/api.ts",
+        "line": 7,
+        "callers": [
+          {
+            "file": "apps/web/src/orders/OrderBadge.tsx",
+            "line": 9
+          },
+          {
+            "file": "apps/web/src/orders/OrderList.tsx",
+            "line": 42
+          }
+        ],
+        "callers_total": 2
+      }
+    },
+    {
+      "id": "64cefa096691598b",
+      "caller": {
+        "file": "apps/web/src/stock/useStock.ts",
+        "line": 15,
+        "line_sha256": "a2ac6270cc389ee3452175fcf8753d84d50ac86d1bb5d192a6ef93da43a1d6e9"
+      },
+      "server": {
+        "file": "db/migrations/0003_stock.sql",
+        "line": 4,
+        "line_sha256": "9be8e80fc44cf53b2804e16b9c9142458474c24c9abac84aa0435e74f386c999"
+      },
+      "operation": {
+        "kind": "table",
+        "method": "SELECT",
+        "name": "stock_levels"
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null,
+      "sides": {
+        "caller_sends": {
+          "compiler": {
+            "reason": "no_body"
+          }
+        },
+        "caller_expects": {
+          "compiler": {
+            "text": "{ sku: string; qty: number }[]",
+            "evidence": {
+              "file": "apps/web/src/stock/useStock.ts",
+              "line": 15
+            }
+          }
+        },
+        "server_reads": {
+          "compiler": {
+            "reason": "server_not_typescript"
+          },
+          "model": {
+            "reason": "no_body"
+          }
+        },
+        "server_returns": {
+          "compiler": {
+            "reason": "server_not_typescript"
+          },
+          "model": {
+            "text": "{ sku: string; qty: number | null }[]",
+            "evidence": {
+              "file": "db/migrations/0003_stock.sql",
+              "line": 4,
+              "end_line": 7
+            }
+          }
+        }
+      },
+      "verdicts": {
+        "compiler": {
+          "grade": "cannot_tell",
+          "compiler_verdict": "unverifiable"
+        },
+        "model": {
+          "grade": "fails_at_run_time",
+          "detail": "qty can be null in the table; the caller types it number",
+          "evidence": [
+            {
+              "file": "db/migrations/0003_stock.sql",
+              "line": 6
+            },
+            {
+              "file": "apps/web/src/stock/useStock.ts",
+              "line": 15
+            }
+          ]
+        }
+      },
+      "wrapper": {
+        "reason": "not_in_wrapper"
+      }
+    },
+    {
+      "id": "01829f860cf590c2",
+      "caller": {
+        "file": "apps/api/src/orders/events.ts",
+        "line": 30,
+        "line_sha256": "b0a9ea1e927df99bbc8c42f7e517c42dfcf82efd8dcf7a2b509afd5079ba4988"
+      },
+      "server": {
+        "file": "apps/worker/src/handlers/orderPaid.ts",
+        "line": 12,
+        "line_sha256": "ddaf389a82c95b380333f2a98e91769373264cc7324cb2276ba07ae005aa593a"
+      },
+      "operation": {
+        "kind": "topic",
+        "method": "PUBSUB",
+        "name": "order-paid"
+      },
+      "basis": "symbol",
+      "model_confidence": "inferred",
+      "carried_from": "0000000000000000000000000000000000000001"
+    }
+  ],
+  "dropped": {
+    "server_line_missing": 1
+  }
+}
