@@ -1255,6 +1255,10 @@ pub struct FunctionDefinitionExtractor {
     current_class_collisions: HashSet<String>,
     /// Members whose AST accessibility prevents callers outside the class hierarchy.
     inaccessible_members: HashSet<String>,
+    /// Spans of callbacks already defined under the exported-object member a
+    /// wrapper call is the value of ([`Self::insert_wrapped_member`],
+    /// carrick#4083). `visit_call_expr` names no synthetic row for them.
+    member_callbacks: HashSet<swc_common::Span>,
 }
 
 impl FunctionDefinitionExtractor {
@@ -1273,6 +1277,7 @@ impl FunctionDefinitionExtractor {
             current_class: None,
             current_class_collisions: HashSet::new(),
             inaccessible_members: HashSet::new(),
+            member_callbacks: HashSet::new(),
         }
     }
 
@@ -1898,7 +1903,12 @@ impl FunctionDefinitionExtractor {
                         Expr::Ident(ident) => {
                             self.exported_names.insert(ident.sym.to_string());
                         }
-                        _ => {}
+                        // `{ list: wrap(async (req, res) => { … }) }`.
+                        value => {
+                            if let Expr::Call(call) = crate::swc_scanner::unwrap_expr(value) {
+                                self.insert_wrapped_member(name, call);
+                            }
+                        }
                     }
                 }
                 // `{ list, create }`: the shorthand form of the line above.
@@ -1907,6 +1917,65 @@ impl FunctionDefinitionExtractor {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Index the callback a wrapper call hands in as an exported object's
+    /// member, keyed `owner.member` (carrick#4083): `{ list: wrap(async (req,
+    /// res) => { … }) }` offers the same function as `{ list: async (req, res)
+    /// => { … } }`, wrapped, and the member's name is the name the module
+    /// gives it.
+    ///
+    /// Named for the wrapper instead ([`derive_handler_name`] reads the
+    /// callee), every member of such an object was `wrap_handler`, and the
+    /// first-wins guard in `visit_call_expr` kept one row per file: a
+    /// controller of twelve routes read as one function.
+    ///
+    /// Only a call with exactly one function literal among its arguments is
+    /// read; with two there is no saying which is the member's, and the call
+    /// keeps today's synthetic naming. The callback's span is recorded so
+    /// `visit_call_expr` names no second row for the same body. A local object
+    /// exported by a later statement is collected after the walk
+    /// ([`Self::collect_exported_local_objects`]), by which time that
+    /// synthetic row exists, so it is dropped here. A callback elsewhere in the
+    /// file that the dropped row's name kept out stays unnamed.
+    fn insert_wrapped_member(&mut self, name: String, call: &CallExpr) {
+        if !matches!(call.callee, Callee::Expr(_)) {
+            return;
+        }
+        let mut callbacks = call
+            .args
+            .iter()
+            .filter(|arg| matches!(&*arg.expr, Expr::Arrow(_) | Expr::Fn(_)));
+        let (Some(callback), None) = (callbacks.next(), callbacks.next()) else {
+            return;
+        };
+        let span = match &*callback.expr {
+            Expr::Arrow(arrow) => {
+                self.insert_arrow_definition(name, arrow);
+                arrow.span
+            }
+            Expr::Fn(fn_expr) => {
+                self.insert_method_definition(name, &fn_expr.function);
+                fn_expr.function.span
+            }
+            _ => return,
+        };
+        self.member_callbacks.insert(span);
+        let stale: Vec<String> = self
+            .synthetic_names
+            .iter()
+            .filter(|key| {
+                self.function_definitions
+                    .get(*key)
+                    .is_some_and(|def| def.node_type.span() == span)
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.synthetic_names.remove(&key);
+            self.function_definitions.remove(&key);
+            self.callee_refs.remove(&key);
         }
     }
 
@@ -2411,6 +2480,16 @@ impl Visit for FunctionDefinitionExtractor {
         if let Some((method_name, first_str_arg)) = extract_call_context(call) {
             // Look for function/arrow arguments (skip the first string arg)
             for arg in &call.args {
+                let callback_span = match &*arg.expr {
+                    Expr::Arrow(arrow) => arrow.span,
+                    Expr::Fn(fn_expr) => fn_expr.function.span,
+                    _ => continue,
+                };
+                // Already defined under the exported member it is the value
+                // of (`insert_wrapped_member`, carrick#4083).
+                if self.member_callbacks.contains(&callback_span) {
+                    continue;
+                }
                 match &*arg.expr {
                     Expr::Arrow(arrow) => {
                         let synthetic_name =
