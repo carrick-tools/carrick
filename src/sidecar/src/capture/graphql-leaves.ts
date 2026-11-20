@@ -28,6 +28,21 @@ export const GRAPHQL_SCALAR_SENT: Readonly<Record<string, 'string' | 'number' | 
     Boolean: 'boolean',
   });
 
+/**
+ * The type a built-in scalar's serializer rejects for every value of it
+ * (graphql-js 16): `Boolean` given a string, `ID` given a boolean. `String`,
+ * `Int` and `Float` have none: `Int` and `Float` accept numeric strings and
+ * `String` accepts numbers and booleans, so a type alone proves no break.
+ */
+export const GRAPHQL_SCALAR_REJECTS: Readonly<Record<string, 'string' | 'boolean' | 'never'>> =
+  Object.freeze({
+    String: 'never',
+    ID: 'boolean',
+    Int: 'never',
+    Float: 'never',
+    Boolean: 'string',
+  });
+
 /** The type a built-in scalar sends, or `undefined` for any other scalar. */
 export function graphqlScalarSent(name: string): 'string' | 'number' | 'boolean' | undefined {
   return Object.prototype.hasOwnProperty.call(GRAPHQL_SCALAR_SENT, name)

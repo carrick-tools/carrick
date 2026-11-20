@@ -99,8 +99,16 @@ const BILLING_TYPES: GraphqlTypes = {
       agreed: ref('Agreed'),
       node: ref('Node'),
       loan: ref('Loan'),
+      confirm: scalar('Boolean'),
+      flags: list(scalar('Boolean')),
+      token: scalar('ID'),
+      count: scalar('Int'),
+      ratio: scalar('Float'),
+      label: scalar('String'),
+      toggled: ref('Toggled'),
     },
   },
+  Toggled: { fields: { on: nn(scalar('Boolean')), ref: nn(scalar('ID')) } },
   Receipt: { fields: { id: nn(scalar('ID')), totalMinor: scalar('String'), at: nn(scalar('DateTime')) } },
   Reading: { fields: { id: nn(scalar('ID')), takenAt: nn(scalar('Float')) } },
   Stamp: { fields: { id: nn(scalar('ID')), at: nn(scalar('DateTime')) } },
@@ -168,6 +176,22 @@ const PAIRS: CheckPairSpec[] = [
   gql('leaf-cycle', 'Node_Sent', 'Node_Exp', 'node'),
   // A dangling type reference is read as #4275 reads it: the JSON form.
   gql('leaf-dangling', 'Loan_Sent', 'Loan_Exp', 'loan'),
+];
+
+const REJECT_PAIRS: CheckPairSpec[] = [
+  // (g) a root Boolean whose resolver sends a string: the serializer rejects it.
+  gql('rej-bool-string', 'Str_Sent', 'MaybeBool_Exp', 'confirm'),
+  // (h) the same values below an object type: a field resolver may convert them.
+  gql('rej-below-object', 'Toggled_Sent', 'Toggled_Exp', 'toggled'),
+  // (i) values every serializer of the root scalar accepts.
+  gql('rej-bool-number', 'Num_Sent', 'MaybeBool_Exp', 'confirm'),
+  gql('rej-int-string', 'Str_Sent', 'Num_Exp', 'count'),
+  gql('rej-float-string', 'Str_Sent', 'Num_Exp', 'ratio'),
+  gql('rej-string-bool', 'Bool_Sent', 'Str_Exp', 'label'),
+  gql('rej-string-date', 'Date_Sent', 'Str_Exp', 'label'),
+  // (j) a root list keeps the rule per element; a root ID rejects a boolean.
+  gql('rej-list', 'MixedList_Sent', 'BoolList_Exp', 'flags'),
+  gql('rej-id-bool', 'Bool_Sent', 'Str_Exp', 'token'),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -317,6 +341,78 @@ describe('check_v2 compares a GraphQL leaf in its scalar\'s sent type (carrick#4
   it('an enum leaf and an optional field keep their form', () => {
     assert.strictEqual(bucket('leaf-enum').bucket, 'compatible');
     assert.strictEqual(bucket('leaf-optional').bucket, 'compatible', JSON.stringify(bucket('leaf-optional')));
+  });
+});
+
+describe('a root scalar the server\'s serializer rejects is a break (carrick#4940)', () => {
+  let verdicts: Map<string, CheckVerdict>;
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-check-v2-gql-rejects-'));
+    writeStub(
+      root,
+      'billing',
+      [
+        'export type Str_Sent = string;',
+        'export type Num_Sent = number;',
+        'export type Bool_Sent = boolean;',
+        'export type Date_Sent = Date;',
+        'export type MixedList_Sent = (boolean | string)[];',
+        'export type Toggled_Sent = { on: string; ref: boolean };',
+      ].join('\n') + '\n'
+    );
+    writeStub(
+      root,
+      'desk',
+      [
+        'export type MaybeBool_Exp = boolean | null;',
+        'export type Num_Exp = number;',
+        'export type Str_Exp = string;',
+        'export type BoolList_Exp = (boolean | null)[];',
+        'export type Toggled_Exp = { on: boolean; ref: string };',
+      ].join('\n') + '\n'
+    );
+    const result = await runCheck({
+      stubs: [
+        { service_name: 'billing', stub_dir: path.join(root, 'billing'), graphql_types: BILLING_TYPES },
+        { service_name: 'desk', stub_dir: path.join(root, 'desk') },
+      ],
+      pairs: REJECT_PAIRS,
+    });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    verdicts = byKey(result.verdicts);
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const bucket = (key: string) => {
+    const v = verdicts.get(key);
+    assert.ok(v, `verdict for ${key}`);
+    return v;
+  };
+
+  it('(g) a string under a root Boolean is incompatible, naming the sent string and the expected type', () => {
+    const v = bucket('rej-bool-string');
+    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+    assert.match(v.diagnostic!, /string/);
+    assert.match(v.diagnostic!, /MaybeBool_Exp/);
+  });
+
+  it('(h) below an object type a field resolver may convert: compatible', () => {
+    assert.strictEqual(bucket('rej-below-object').bucket, 'compatible', JSON.stringify(bucket('rej-below-object')));
+  });
+
+  it('(i) values the serializer accepts stay compatible', () => {
+    for (const key of ['rej-bool-number', 'rej-int-string', 'rej-float-string', 'rej-string-bool', 'rej-string-date']) {
+      assert.strictEqual(bucket(key).bucket, 'compatible', `${key}: ${JSON.stringify(bucket(key))}`);
+    }
+  });
+
+  it('(j) a root Boolean list rejects a string element, and a root ID rejects a boolean', () => {
+    assert.strictEqual(bucket('rej-list').bucket, 'incompatible', JSON.stringify(bucket('rej-list')));
+    assert.strictEqual(bucket('rej-id-bool').bucket, 'incompatible', JSON.stringify(bucket('rej-id-bool')));
   });
 });
 

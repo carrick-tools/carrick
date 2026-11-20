@@ -262,13 +262,13 @@ describe('the declared line leaves other probes as they were (carrick#4726)', ()
     assert.strictEqual(sha(probe('order', null).source), main);
   });
 
-  it('(f) every line up to the wire assignment is main\'s; the declared line comes after it', () => {
+  it('(f) the lines up to the wire assignment are pinned (carrick#4940 moved them); the declared line comes after it', () => {
     const p = probe('order');
     const lines = p.source.split('\n');
-    assert.strictEqual(p.wireAssignmentLine, 47);
+    assert.strictEqual(p.wireAssignmentLine, 48);
     assert.strictEqual(
       sha(lines.slice(0, p.wireAssignmentLine).join('\n')),
-      'c2b40c5e6d1c8f376ca10abe3fb7fcf565eca21e3ea8f651cf83fd9826677560'
+      'f1d43d2c643384313432d2e12d5feb7e23203d0ad51d1ef45d94e1b22922df3a'
     );
     const { from, line } = declaredLines(p);
     assert.ok(from !== undefined && from > p.wireAssignmentLine!, `declared block from ${from}`);
