@@ -28,8 +28,8 @@ answers state no rows.
 
 | File | Line | Method | Why |
 |---|---|---|---|
-| src/checkout.ts | 4 | POST | the decode helper's `{ data }` states no verb |
-| src/refund-screen.ts | 4 | POST | the logger's `{ body }` states no verb |
-| src/profile-screen.ts | 4 | PUT | the form helper's `{ data }` states no verb |
-| src/search-screen.ts | 4 | GET | the helper's only request names no method and no payload |
+| src/checkout.ts | 4 | no row, saved unread | the decode helper's `{ data }` states no verb, and nothing in the code writes the model's path, so the model's row is withdrawn (carrick#4206) |
+| src/refund-screen.ts | 4 | no row, saved unread | the logger's `{ body }` states no verb; withdrawn as above |
+| src/profile-screen.ts | 4 | no row, saved unread | the form helper's `{ data }` states no verb; withdrawn as above |
+| src/search-screen.ts | 4 | GET | the helper's only request names no method and no payload; the helper writes `/v1/catalog`, so the row is kept |
 | src/upload-screen.ts | 4 | POST | the helper writes `method: "POST"` beside its payload |

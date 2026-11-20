@@ -209,11 +209,13 @@ fn a_call_whose_callee_sends_nothing_loses_the_models_row() {
 fn a_call_whose_callee_constructs_a_class_is_never_proven_silent() {
     // `startPolling` makes no call, and the `Poller` it constructs sends a
     // request from its constructor. Nothing here follows a construction, so
-    // the model's row stands as the model's.
+    // the call is never proven silent. It is not proven to send the model's
+    // `POST /types/check-or-upload` either: nothing in the code writes that
+    // path, so the model's row is withdrawn and the site saved unread
+    // (carrick#4206).
     let calls = calls();
     let rows = rows_at(&calls, "server.ts", 19);
-    assert_eq!(rows.len(), 1, "{rows:#?}");
-    assert_eq!(rows[0]["resolution_source"].as_str(), Some("model"));
+    assert!(rows.is_empty(), "{rows:#?}");
 }
 
 #[test]

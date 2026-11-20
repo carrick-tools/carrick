@@ -1,0 +1,111 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "target": "/v1/jobs/close",
+      "method": "POST",
+      "pattern_matched": "client.close(",
+      "call_expression_text": "client.close(path)",
+      "call_expression_line": 6,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:13",
+      "line_number": 13,
+      "target": "${base}/api/v1/accounts",
+      "method": "GET",
+      "pattern_matched": "send(",
+      "call_expression_text": "send(url, \"\")",
+      "call_expression_line": 13,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:20",
+      "line_number": 20,
+      "target": "${base}/api/v1/accounts/${id}",
+      "method": "GET",
+      "pattern_matched": "send(",
+      "call_expression_text": "send(url.toString(), \"\")",
+      "call_expression_line": 20,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:30",
+      "line_number": 30,
+      "target": "/api/v1/jobs/claim",
+      "method": "POST",
+      "pattern_matched": "jobs.claim(",
+      "call_expression_text": "jobs.claim(5)",
+      "call_expression_line": 30,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:31",
+      "line_number": 31,
+      "target": "/api/v1/jobs/close",
+      "method": "POST",
+      "pattern_matched": "jobs.release(",
+      "call_expression_text": "jobs.release(id)",
+      "call_expression_line": 31,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:32",
+      "line_number": 32,
+      "target": "/api/v1/jobs/ping",
+      "method": "GET",
+      "pattern_matched": "jobs.ping(",
+      "call_expression_text": "jobs.ping()",
+      "call_expression_line": 32,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:38",
+      "line_number": 38,
+      "target": "/livez",
+      "method": "GET",
+      "pattern_matched": "report(",
+      "call_expression_text": "report(await readHealth(port))",
+      "call_expression_line": 38,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:43",
+      "line_number": 43,
+      "target": "/report",
+      "method": "GET",
+      "pattern_matched": "report(",
+      "call_expression_text": "report(await readHealth(port))",
+      "call_expression_line": 43,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}
