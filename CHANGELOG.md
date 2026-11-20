@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.167](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.166...carrick-v0.3.167) (2026-11-20)
+
+
+### Bug Fixes
+
+* **discovery:** ask the verifier about a labelled member a re-exported class lands in ([#4882](https://github.com/carrick-tools/carrick/issues/4882)) ([66c768d](https://github.com/carrick-tools/carrick/commit/66c768da3aa8ebcb101f1b0a91932f4f801003b6))
+* **held:** an ask that finds no daemon starts one and says the check is starting ([#4939](https://github.com/carrick-tools/carrick/issues/4939)) ([#4942](https://github.com/carrick-tools/carrick/issues/4942)) ([d2db6c4](https://github.com/carrick-tools/carrick/commit/d2db6c47d79a68118734d21c5c3cd83c36ef971c))
+
 ## [0.3.166](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.165...carrick-v0.3.166) (2026-11-20)
 
 
