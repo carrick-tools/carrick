@@ -763,21 +763,21 @@ pub(crate) fn type_matched_pairs(
         let schema = by_id
             .get(server.service.as_str())
             .and_then(|service| service.graphql_types.as_ref());
-        if let MatchedProtocol::Graphql(graphql) = &pair.protocol {
-            if !schema_holds_root(schema, graphql) {
-                row.verdict = Some(MatchedVerdict {
-                    bucket: VerdictBucket::Unverifiable,
-                    gate: None,
-                    diagnostic: None,
-                    resolved: false,
-                    unresolved_reason: Some(GRAPHQL_NOT_JUDGED.to_string()),
-                    unresolved_side: None,
-                    judged: false,
-                    skipped: Some(GRAPHQL_NOT_JUDGED),
-                });
-                row.verdict_reason = None;
-                continue;
-            }
+        if let MatchedProtocol::Graphql(graphql) = &pair.protocol
+            && !schema_holds_root(schema, graphql)
+        {
+            row.verdict = Some(MatchedVerdict {
+                bucket: VerdictBucket::Unverifiable,
+                gate: None,
+                diagnostic: None,
+                resolved: false,
+                unresolved_reason: Some(GRAPHQL_NOT_JUDGED.to_string()),
+                unresolved_side: None,
+                judged: false,
+                skipped: Some(GRAPHQL_NOT_JUDGED),
+            });
+            row.verdict_reason = None;
+            continue;
         }
         match type_compat_v2::build_matched_pair(
             &server.service,
