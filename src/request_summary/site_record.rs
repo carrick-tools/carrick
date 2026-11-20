@@ -2172,6 +2172,7 @@ fn records_of(
     records
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record(
     sources: &mut Sources<'_>,
     resolver: &Resolver<'_>,
