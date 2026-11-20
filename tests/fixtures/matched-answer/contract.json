@@ -1,0 +1,164 @@
+{
+  "schema": "carrick.matched-answer/1",
+  "model_types": true,
+  "legend": "`matched_pairs` are call-to-server pairs a model placed by reading the code after the scan, for calls the scan did not pair. The compiler did not prove them. A matched pair never fails a pull request check and never changes a check_compatibility status; a type verdict on one is information only. Each row names both ends: read the server line before relying on it.",
+  "rows": [
+    {
+      "id": "01829f860cf590c2",
+      "repo": "example-org/shop",
+      "commit": "1111111111111111111111111111111111111111",
+      "source": "matched: model pair, not compiler-checked",
+      "kind": "topic",
+      "protocol": "pubsub",
+      "method": "PUBSUB",
+      "name": "order-paid",
+      "caller": {
+        "service": "api",
+        "file": "apps/api/src/orders/events.ts",
+        "line": 30
+      },
+      "server": {
+        "service": null,
+        "file": "apps/worker/src/handlers/orderPaid.ts",
+        "line": 12
+      },
+      "basis": "symbol",
+      "model_confidence": "inferred",
+      "carried_from": "0000000000000000000000000000000000000001",
+      "types": {
+        "caller_sends": {
+          "basis": "none",
+          "reason": "not_read"
+        },
+        "caller_expects": {
+          "basis": "none",
+          "reason": "not_read"
+        },
+        "server_reads": {
+          "basis": "none",
+          "reason": "not_read"
+        },
+        "server_returns": {
+          "basis": "none",
+          "reason": "not_read"
+        }
+      },
+      "verdict": null
+    },
+    {
+      "id": "94fe38591b62349e",
+      "repo": "example-org/shop",
+      "commit": "1111111111111111111111111111111111111111",
+      "source": "matched: model pair, not compiler-checked",
+      "kind": "route",
+      "protocol": "http",
+      "method": "GET",
+      "name": "/v1/orders",
+      "caller": {
+        "service": "web",
+        "file": "apps/web/src/lib/api.ts",
+        "line": 8
+      },
+      "server": {
+        "service": "api",
+        "file": "apps/api/src/orders/orders.router.ts",
+        "line": 18
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null,
+      "types": {
+        "caller_sends": {
+          "basis": "none",
+          "reason": "no_body"
+        },
+        "caller_expects": {
+          "basis": "compiler",
+          "text": "{ id: string; total: number }[]",
+          "evidence": "apps/web/src/lib/api.ts:8"
+        },
+        "server_reads": {
+          "basis": "none",
+          "reason": "no_body"
+        },
+        "server_returns": {
+          "basis": "compiler",
+          "text": "{ id: string; total: number }[]",
+          "evidence": "apps/api/src/orders/orders.router.ts:18"
+        }
+      },
+      "verdict": {
+        "source": "compiler",
+        "grade": "agree",
+        "compiler_verdict": "compatible"
+      },
+      "wrapper_callers_total": 2,
+      "wrapper_callers": [
+        "apps/web/src/orders/OrderBadge.tsx:9",
+        "apps/web/src/orders/OrderList.tsx:42"
+      ]
+    },
+    {
+      "id": "64cefa096691598b",
+      "repo": "example-org/shop",
+      "commit": "1111111111111111111111111111111111111111",
+      "source": "matched: model pair, not compiler-checked",
+      "kind": "table",
+      "method": "SELECT",
+      "name": "stock_levels",
+      "caller": {
+        "service": "web",
+        "file": "apps/web/src/stock/useStock.ts",
+        "line": 15
+      },
+      "server": {
+        "service": null,
+        "file": "db/migrations/0003_stock.sql",
+        "line": 4
+      },
+      "basis": "text",
+      "model_confidence": "stated",
+      "carried_from": null,
+      "types": {
+        "caller_sends": {
+          "basis": "none",
+          "reason": "no_body"
+        },
+        "caller_expects": {
+          "basis": "compiler",
+          "text": "{ sku: string; qty: number }[]",
+          "evidence": "apps/web/src/stock/useStock.ts:15"
+        },
+        "server_reads": {
+          "basis": "none",
+          "reason": "server_not_typescript"
+        },
+        "server_returns": {
+          "basis": "model",
+          "text": "{ sku: string; qty: number | null }[]",
+          "evidence": "db/migrations/0003_stock.sql:4-7"
+        }
+      },
+      "verdict": {
+        "source": "model",
+        "grade": "fails_at_run_time",
+        "detail": "qty can be null in the table; the caller types it number",
+        "compiler_typed_sides": [
+          "caller_expects"
+        ]
+      }
+    }
+  ],
+  "hidden": [],
+  "counts": {
+    "rows": 3,
+    "hidden": 0,
+    "by_kind": {
+      "route": 1,
+      "table": 1,
+      "topic": 1
+    },
+    "model_readings_held": 1,
+    "dropped_pairs": 0
+  }
+}

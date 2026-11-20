@@ -393,6 +393,14 @@ pub struct LocalIndex {
     pub hosted_source_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_checked_at: Option<String>,
+    /// The hosted answers of possible pairs a model found
+    /// (`carrick.matched-answer/1`, one per project), kept as the cloud
+    /// wrote them and read leniently by `matched.rs`. Folded in by
+    /// `carrick index` from the hosted snapshot, only rows whose repo this
+    /// machine holds at the row's commit. Absent on an index written before
+    /// they existed, so an existing `index.json` still reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched: Vec<serde_json::Value>,
     pub version: u32,
     pub scanner_version: String,
     /// The build of the scanner that wrote this index, as a release binary
@@ -649,6 +657,7 @@ mod tests {
             repos_excluded: Vec::new(),
             hosted_checked_at: None,
             hosted_source_key: None,
+            matched: Vec::new(),
             version: READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
             scanner_build: None,
@@ -664,6 +673,32 @@ mod tests {
         assert_eq!(tree, Tree::at(Path::new("/w/mono/packages/api")));
     }
 
+    /// An `index.json` written before the possible-pair answers existed still
+    /// reads, and an index with none writes no key.
+    #[test]
+    fn an_index_without_possible_pairs_reads_and_writes_no_key() {
+        let index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_checked_at: None,
+            hosted_source_key: None,
+            matched: Vec::new(),
+            version: READ_MODEL_VERSION,
+            scanner_version: "test".to_string(),
+            scanner_build: None,
+            indexed_at: "2026-09-06T00:00:00Z".to_string(),
+            repos: vec![repo("/w/api", "api")],
+            type_check: None,
+        };
+        let written = serde_json::to_value(&index).unwrap();
+        assert!(written.get("matched").is_none(), "{written}");
+        let read: LocalIndex = serde_json::from_value(written).expect("an older index reads");
+        assert!(read.matched.is_empty());
+    }
+
     #[test]
     fn a_file_outside_every_repo_resolves_to_nothing() {
         let index = LocalIndex {
@@ -674,6 +709,7 @@ mod tests {
             repos_excluded: Vec::new(),
             hosted_checked_at: None,
             hosted_source_key: None,
+            matched: Vec::new(),
             version: READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
             scanner_build: None,

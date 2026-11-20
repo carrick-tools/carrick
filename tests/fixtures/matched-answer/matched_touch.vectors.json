@@ -1,0 +1,20 @@
+{
+  "schema": "carrick.matched-touch-vectors/1",
+  "repo": "example-org/shop",
+  "vectors": [
+    {
+      "files": [
+        "apps/web/src/lib/api.ts"
+      ],
+      "ids": [
+        "94fe38591b62349e"
+      ]
+    },
+    {
+      "files": [
+        "README.md"
+      ],
+      "ids": []
+    }
+  ]
+}
