@@ -1145,6 +1145,10 @@ pub struct ClaimSlot {
     /// rule rather than the instance rule. `false` is no flag.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub handle: bool,
+    /// On a `bound: "binding"` op's `method_key` only (amendment 13): the
+    /// slot is on the maker's call, not the op's. `false` is no flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maker: bool,
 }
 
 impl ClaimSlot {
@@ -1253,6 +1257,9 @@ pub enum BoundName {
     /// The name of the class member the decorator is applied to
     /// (amendment 8): a decorate-form receive op.
     Decorated,
+    /// The variable that holds the op call's value, a procedure (amendment
+    /// 13): a receive op over rpc with a handler.
+    Binding,
 }
 
 /// One entry of a `first` name (amendment 8): a plain slot, or the

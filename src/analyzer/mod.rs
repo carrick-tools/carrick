@@ -870,6 +870,37 @@ fn consumer_identity(location: &str) -> (String, u32) {
     parse_file_location(location)
 }
 
+/// The key a wrong-verb risk names its producer by, and finds that
+/// producer's sources and matched state under: its method and full path,
+/// with no dispatch case (as before), and its procedure, so a procedure's
+/// key still meets [`producer_operation_key`]'s where the row has no case.
+/// A row with no procedure keys as before.
+fn mismatch_producer_key(endpoint: &crate::mount_graph::ResolvedEndpoint) -> String {
+    format!(
+        "{}:{}{}",
+        endpoint.method,
+        endpoint.full_path,
+        crate::mount_graph::procedure_suffix(endpoint.procedure.as_ref())
+    )
+}
+
+/// The key a producer row is matched, consumed and orphaned by: its method,
+/// full path, dispatch case (carrick#831) and procedure. The procedure is on
+/// it for the reason it is on the endpoint merge key
+/// ([`crate::mount_graph::procedure_suffix`]): procedures named by the
+/// variable that holds them (contract amendment 13) are all served at one
+/// `""` per method, and without it one paired procedure would mark every
+/// other of its method consumed. A row with no procedure keys as before.
+fn producer_operation_key(endpoint: &crate::mount_graph::ResolvedEndpoint) -> String {
+    format!(
+        "{}:{}{}{}",
+        endpoint.method,
+        endpoint.full_path,
+        crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref()),
+        crate::mount_graph::procedure_suffix(endpoint.procedure.as_ref())
+    )
+}
+
 /// How far the type layer got on one pair, read off the outcome's own
 /// `resolved` flag (carrick#734, cloud#599).
 ///
@@ -2825,7 +2856,7 @@ impl Analyzer {
                 continue;
             }
             producer_sources_by_key
-                .entry(format!("{}:{}", endpoint.method, endpoint.full_path))
+                .entry(mismatch_producer_key(endpoint))
                 .or_default()
                 .push(endpoint.resolution_source);
         }
@@ -2934,12 +2965,7 @@ impl Analyzer {
                 }
                 for winner in &pairing.winners {
                     let endpoint = &pool_endpoints[winner.producer];
-                    matched_endpoints.insert(format!(
-                        "{}:{}{}",
-                        endpoint.method,
-                        endpoint.full_path,
-                        crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
-                    ));
+                    matched_endpoints.insert(producer_operation_key(endpoint));
                     if let Some(edge) = Self::build_cross_repo_match(
                         call,
                         method,
@@ -3145,14 +3171,7 @@ impl Analyzer {
                     // so it is part of the consumed key: without it the nine
                     // operations behind one route are one verified endpoint,
                     // and eight of them read as consumed because a ninth was.
-                    let consumed_key = |endpoint: &crate::mount_graph::ResolvedEndpoint| {
-                        format!(
-                            "{}:{}{}",
-                            endpoint.method,
-                            endpoint.full_path,
-                            crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
-                        )
-                    };
+                    let consumed_key = producer_operation_key;
                     // `RouteCaseUnknown`: the call reaches a route that
                     // dispatches, and states no value its cases can be told
                     // apart by. The route exists, so this is never a missing
@@ -3268,7 +3287,7 @@ impl Analyzer {
                         for endpoint in path_matches {
                             candidate.producers.push((
                                 endpoint.method.to_uppercase(),
-                                format!("{}:{}", endpoint.method, endpoint.full_path),
+                                mismatch_producer_key(endpoint),
                                 endpoint.full_path.clone(),
                             ));
                         }
@@ -3381,15 +3400,10 @@ impl Analyzer {
             if endpoint.evidence == carrick_match::MatchEvidence::CallSite {
                 continue;
             }
-            // Same key the match loop inserted, dispatch case and all
-            // (carrick#831): eight unconsumed operations behind a route whose
-            // ninth is consumed are eight orphans, not silence.
-            let key = format!(
-                "{}:{}{}",
-                endpoint.method,
-                endpoint.full_path,
-                crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
-            );
+            // Same key the match loop inserted, dispatch case and procedure
+            // and all (carrick#831): eight unconsumed operations behind a
+            // route whose ninth is consumed are eight orphans, not silence.
+            let key = producer_operation_key(endpoint);
             if matched_endpoints.contains(&key) {
                 verified.push(
                     VerifiedEndpointEntry::new(
@@ -3400,8 +3414,9 @@ impl Analyzer {
                     .with_dispatch(endpoint.dispatch.clone()),
                 );
             } else if !method_mismatched_producers.contains(&key)
-                && !carrick_match::is_catch_all_path(&endpoint.full_path)
-                && carrick_match::path_literal_specificity(&endpoint.full_path) > 0
+                && (endpoint.procedure.is_some()
+                    || (!carrick_match::is_catch_all_path(&endpoint.full_path)
+                        && carrick_match::path_literal_specificity(&endpoint.full_path) > 0))
             {
                 // A producer already surfaced in a method-mismatch risk is
                 // neither verified nor re-reported as orphaned. Nor is a
@@ -3409,7 +3424,10 @@ impl Analyzer {
                 // literal segment at all (`/:slug`): those absorb calls by
                 // design (#381), so "no consumer matched" is not a meaningful
                 // observation — they are routing infrastructure, not an
-                // unconsumed contract.
+                // unconsumed contract. A procedure is paired by its key, never
+                // by its path, so it absorbs no call whatever path it is
+                // served at (`""` for one named by its binding, contract
+                // amendment 13): one nothing calls is an orphan.
                 findings.push(
                     Finding::orphaned_endpoint(
                         endpoint.method.clone(),
@@ -7243,6 +7261,92 @@ mod tests {
             })
             .collect();
         assert_eq!(marked, vec![("/dashboard", true), ("/api/orders", false)]);
+    }
+
+    /// Two procedures of one method served at the one path the code never
+    /// writes (contract amendment 13, carrick#4919): the call of one pairs
+    /// with it alone, and the other stays an orphan. Before the procedure was
+    /// on the matched key, both were `POST:` and the call marked both
+    /// consumed.
+    #[test]
+    fn two_procedures_at_one_empty_path_are_matched_one_at_a_time() {
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let key = |name: &str| carrick_match::ProcedureKey {
+            path: name.to_string(),
+            router: carrick_match::RouterId {
+                repo: "app".to_string(),
+                file: "src/notes.functions.ts".to_string(),
+                binding: String::new(),
+            },
+        };
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer.calls.push(ApiEndpointDetails {
+            key: OperationKey::http("POST", ""),
+            file_path: PathBuf::from("src/page.tsx:6"),
+            repo_name: Some("app".to_string()),
+            procedure: Some(key("saveNote")),
+            ..Default::default()
+        });
+        let mut mount_graph = MountGraph::new();
+        for (name, line) in [("saveNote", 5), ("removeNote", 12)] {
+            mount_graph.endpoints.push(ResolvedEndpoint {
+                method: "POST".to_string(),
+                path: String::new(),
+                full_path: String::new(),
+                owner: name.to_string(),
+                file_location: format!("src/notes.functions.ts:{line}"),
+                repo_name: Some("app".to_string()),
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
+                procedure: Some(key(name)),
+                ..Default::default()
+            });
+        }
+
+        let (findings, verified, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert_eq!(verified.len(), 1, "one pair: {verified:?}");
+        let orphaned: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| matches!(f, Finding::OrphanedEndpoint { .. }))
+            .collect();
+        assert_eq!(
+            orphaned.len(),
+            1,
+            "the procedure nothing calls stays an orphan: {findings:?}"
+        );
+    }
+
+    /// A producer row with no procedure keys exactly as before the
+    /// procedure joined the key: method, full path, dispatch case.
+    #[test]
+    fn a_row_with_no_procedure_keys_as_before() {
+        use crate::dispatch::{Dispatch, DispatchLocation};
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let plain = ResolvedEndpoint {
+            method: "GET".to_string(),
+            full_path: "/users/:id".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(producer_operation_key(&plain), "GET:/users/:id");
+        assert_eq!(mismatch_producer_key(&plain), "GET:/users/:id");
+        let dispatch = Dispatch {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            value: "store".to_string(),
+        };
+        let cased = ResolvedEndpoint {
+            method: "POST".to_string(),
+            full_path: "/types".to_string(),
+            dispatch: Some(dispatch.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            producer_operation_key(&cased),
+            format!("POST:/types{}", Dispatch::key_suffix(Some(&dispatch)))
+        );
+        assert_eq!(mismatch_producer_key(&cased), "POST:/types");
     }
 
     /// carrick#831: nine operations behind one route are nine operations.

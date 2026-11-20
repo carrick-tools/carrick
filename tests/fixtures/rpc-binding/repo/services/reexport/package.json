@@ -1,0 +1,8 @@
+{
+  "name": "rpc-binding-reexport",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/rpc": "^1.0.0"
+  }
+}

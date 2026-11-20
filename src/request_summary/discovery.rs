@@ -2063,6 +2063,67 @@ impl<'a> Walker<'a> {
         found
     }
 
+    /// `f(…)` where `const f = wrap(g)`: the instance a maker built, called
+    /// itself, when the store claims a call-form op with no member on that
+    /// instance and the maker names the instance by a function it is handed
+    /// (a make whose name slot is `ref: "function"`, amendment 7; contract
+    /// amendment 13 reads that function as a procedure). The instance is
+    /// read by the library-site reader, as for a member called on it
+    /// ([`Self::library_end`]'s instance branch), and the op is the claim's,
+    /// with no verdict read, as there. A make with any other name slot
+    /// states nothing here.
+    fn instance_called_end(&self, file: &Path, call: &CallIr) -> Option<SiteEnd> {
+        let site = self
+            .instances
+            .get(&(file, call.site.span_start, call.site.span_end))?;
+        if site.member.is_some() || !site.path.is_empty() {
+            return None;
+        }
+        let receivers = site.receiver_ids();
+        let invoke = Invoke {
+            file,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        specifier_keys(&site.specifier).into_iter().find_map(|key| {
+            let claims = self.labels.get(&key, &site.export)?;
+            let names_by_function = claims.claims.iter().any(|claim| {
+                matches!(
+                    claim,
+                    LibraryClaim::Make { name: Some(slot), .. }
+                        if slot.reference == Some(crate::services::type_sidecar::ClaimRef::Function)
+                )
+            });
+            if !names_by_function {
+                return None;
+            }
+            let op = claims.claims.iter().find_map(|claim| match claim {
+                LibraryClaim::Op {
+                    op,
+                    member: None,
+                    path,
+                    on,
+                    of,
+                    ..
+                } if claim.is_call_form()
+                    && path.is_empty()
+                    && of.is_some()
+                    && receivers
+                        .iter()
+                        .any(|receiver| applies(*on, of.as_deref(), receiver)) =>
+                {
+                    Some(*op)
+                }
+                _ => None,
+            })?;
+            Some(SiteEnd {
+                op: Some(op),
+                ..self.end_at(invoke, &key, &site.export, None, claims)
+            })
+        })
+    }
+
     /// The reason a call through a computed key on a library receiver
     /// (`app[k](…)`, carrick#4327) is saved with, when the store claims an
     /// op on that receiver: the key's own, as the text reader answers it.
@@ -2934,6 +2995,12 @@ impl<'a> Walker<'a> {
             && let Some((end, stop)) = self.untyped_procedure_end(file, call)
         {
             several = Some(stop);
+            found = Some((end, ReachedBy::Instance));
+        }
+        if found.is_none()
+            && !construction
+            && let Some(end) = self.instance_called_end(file, call)
+        {
             found = Some((end, ReachedBy::Instance));
         }
         if let Some((end, reached)) = found {

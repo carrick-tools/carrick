@@ -1,0 +1,9 @@
+{
+  "name": "rpc-binding-declared",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/rpc": "^1.0.0",
+    "@fixture/rpc-core": "^1.0.0"
+  }
+}
