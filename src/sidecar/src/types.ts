@@ -24,7 +24,9 @@ export type InferKind =
   | 'signature_return'  // Function return for the signature hint — NO Promise/wrapper unwrapping
   | 'function_param'    // Type of a single named parameter (explicit or contextually inferred)
   | 'receiver_type'     // Type of the RECEIVER of a member call (carrick#695)
-  | 'request_config';   // A request call's options literal: does it write the `member` that carries the body? (carrick#2674)
+  | 'request_config'    // A request call's options literal: does it write the `member` that carries the body? (carrick#2674)
+  | 'procedure_input'   // A procedure named by its binding: the `member` of parameter 0 of the variable's call signature (carrick#4909)
+  | 'procedure_output'; // A procedure named by its binding: the awaited return of the variable's call signature (carrick#4909)
 
 // ============================================================================
 // Extraction Config Types (Agent-Informed Payload Unwrapping)
@@ -713,6 +715,11 @@ export interface ClaimSlot extends SlotPosition {
    */
   handle?: boolean;
   /**
+   * On a `method_key` slot of a `bound: 'binding'` op only (amendment 13): the
+   * slot is on the maker's call, not the op's. `false` is no flag.
+   */
+  maker?: boolean;
+  /**
    * On a `handler` slot only (QW-1): the slot takes the function that runs,
    * or the path of a file that exports it (a string or the platform `URL`).
    * The file parts are dropped and the rest is judged by the handler rule.
@@ -764,10 +771,11 @@ export type OpNameSource = BoundName | NameParts | NameLiteral | NameFirst | Nam
  * the instance (`maker`), the one the scope member bound (`scope`), or the
  * key path the op's value sits under in a `collects` object (`key`, #2474
  * R6a), or the name of the class member a decorator is applied to
- * (`decorated`, amendment 8).
+ * (`decorated`, amendment 8), or the variable that holds the op call's
+ * value, a procedure (`binding`, amendment 13 of carrick#2434).
  */
 export interface BoundName {
-  bound: 'maker' | 'scope' | 'key' | 'path' | 'export' | 'subscribed' | 'decorated';
+  bound: 'maker' | 'scope' | 'key' | 'path' | 'export' | 'subscribed' | 'decorated' | 'binding';
   /** `path`: the property names walked on the receiver are joined by this (amendment 7). */
   join?: string;
   /** `subscribed`: the handler parameter that is handed the name. */
@@ -1162,7 +1170,11 @@ export interface InferRequestItem {
   alias?: string;
   /** Target parameter name for `function_param` inference. */
   param_name?: string;
-  /** The member of a request options literal that carries the body (`request_config`). */
+  /**
+   * The member of a request options literal that carries the body
+   * (`request_config`), or the key of a procedure's parameter 0 that carries
+   * what a caller sends (`procedure_input`, the label's `payload` key).
+   */
   member?: string;
   /**
    * carrick#2818: the library store's label for the call's result, naming the

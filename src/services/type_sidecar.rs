@@ -75,6 +75,13 @@ pub enum InferKind {
     /// method and no such property, and null otherwise. A null answer never
     /// anchors a body: it is not a request body inference.
     RequestConfig,
+    /// A procedure named by the variable that holds it (contract amendment
+    /// 13, carrick#4909): the key `member` names (the label's `payload`) of
+    /// parameter 0 of the variable's own call signature, read off the
+    /// declaration whose value starts on the line. What a caller sends.
+    ProcedureInput,
+    /// The same procedure's awaited return: what it sends back.
+    ProcedureOutput,
 }
 
 /// A rule for unwrapping machinery/wrapper types to extract payload types.
@@ -1145,6 +1152,10 @@ pub struct ClaimSlot {
     /// rule rather than the instance rule. `false` is no flag.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub handle: bool,
+    /// On a `bound: "binding"` op's `method_key` only (amendment 13): the
+    /// slot is on the maker's call, not the op's. `false` is no flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maker: bool,
 }
 
 impl ClaimSlot {
@@ -1253,6 +1264,9 @@ pub enum BoundName {
     /// The name of the class member the decorator is applied to
     /// (amendment 8): a decorate-form receive op.
     Decorated,
+    /// The variable that holds the op call's value, a procedure (amendment
+    /// 13): a receive op over rpc with a handler.
+    Binding,
 }
 
 /// One entry of a `first` name (amendment 8): a plain slot, or the
@@ -6633,6 +6647,8 @@ mod tests {
             InferKind::FunctionParam,
             InferKind::ReceiverType,
             InferKind::RequestConfig,
+            InferKind::ProcedureInput,
+            InferKind::ProcedureOutput,
         ];
         for kind in &infer_kinds {
             match kind {
@@ -6645,7 +6661,9 @@ mod tests {
                 | InferKind::SignatureReturn
                 | InferKind::FunctionParam
                 | InferKind::ReceiverType
-                | InferKind::RequestConfig => {}
+                | InferKind::RequestConfig
+                | InferKind::ProcedureInput
+                | InferKind::ProcedureOutput => {}
             }
         }
         let slot = || ClaimSlot {

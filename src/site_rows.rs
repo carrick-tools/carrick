@@ -319,6 +319,10 @@ pub struct TracedRoute {
     /// ([`crate::request_summary::decided_sites::router_holder`]). Empty for
     /// every other route.
     pub procedures: Vec<crate::request_summary::decided_sites::ProcedureAt>,
+    /// For a procedure named by its binding (contract amendment 13): the
+    /// key of its call's argument 0 that carries what a caller sends, the
+    /// op's `payload` (carrick#4909). `None` for every other route.
+    pub payload_key: Option<String>,
 }
 
 /// The route sites the receiver trace serves at a full path, and the rest
@@ -515,7 +519,13 @@ fn procedure_route(
         file: site.file.clone(),
         line: site.line,
         method: method.to_uppercase(),
-        path: crate::utils::join_prefix_and_path("/", &key_path),
+        // A procedure named by its binding (contract amendment 13) is served
+        // at a path the code never writes.
+        path: if procedure.binding {
+            String::new()
+        } else {
+            crate::utils::join_prefix_and_path("/", &key_path)
+        },
         full_paths: procedure.full_paths.clone(),
         addresses: std::collections::BTreeMap::new(),
         handler: site
@@ -525,6 +535,7 @@ fn procedure_route(
         owner: procedure.owner.clone(),
         corrects: false,
         procedures: procedure.at.clone(),
+        payload_key: procedure.payload_key.clone(),
     })
 }
 
@@ -664,6 +675,7 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<Vec<TracedRou
             full_paths.dedup();
             TracedRoute {
                 procedures: Vec::new(),
+                payload_key: None,
                 file: site.file.clone(),
                 line: site.line,
                 method: method.to_uppercase(),

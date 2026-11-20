@@ -9346,7 +9346,18 @@ fn apply_traced_routes(
     Vec<crate::services::type_sidecar::InferRequestItem>,
 ) {
     let mut write = write_traced_routes(mount_graph, traced, repo_path);
-    let asks = traced_route_requests(&mount_graph.endpoints[write.added.clone()], repo_path);
+    let mut asks = traced_route_requests(&mount_graph.endpoints[write.added.clone()], repo_path);
+    let replaced = write
+        .corrected
+        .iter()
+        .map(|(index, _)| &mount_graph.endpoints[*index]);
+    asks.extend(procedure_binding_requests(
+        mount_graph.endpoints[write.added.clone()]
+            .iter()
+            .chain(replaced),
+        traced,
+        repo_path,
+    ));
     if write.applied.added > 0 || write.applied.corrected > 0 || write.applied.replaced > 0 {
         write.applied.folded = FileOrchestrator::fold_documented_operations(mount_graph);
     }
@@ -9377,7 +9388,12 @@ fn traced_route_requests(
     rows.iter()
         .filter_map(|row| {
             let method = normalize_manifest_method(&row.method);
-            if !is_producer_method(&method) || !row.full_path.starts_with('/') {
+            // A procedure named by its binding is asked its own types
+            // ([`procedure_binding_requests`]): its line names no response.
+            if !is_producer_method(&method)
+                || !is_typed_row_path(&row.full_path, row.procedure.as_ref())
+                || is_binding_row(row)
+            {
                 return None;
             }
             let (file, line) = parse_file_location(&row.file_location);
@@ -9389,6 +9405,86 @@ fn traced_route_requests(
             ))
         })
         .collect()
+}
+
+/// Whether a producer row is a procedure named by the variable that holds
+/// it (contract amendment 13): keyed by its procedure, served at no path the
+/// code writes.
+fn is_binding_row(row: &crate::mount_graph::ResolvedEndpoint) -> bool {
+    row.procedure.is_some() && row.full_path.is_empty()
+}
+
+/// The type requests of each procedure row named by its binding (contract
+/// amendment 13, carrick#4909), written or replaced by the trace, keyed and
+/// sited as [`build_type_manifest_entries`] keys the row. Its request is
+/// what a caller sends: the key the op's `payload` names on argument 0 of
+/// the variable's own call signature, the validator's input (asked only
+/// where the label states that key). Its response is that signature's
+/// awaited return. Both are read off the declaration whose value starts on
+/// the row's line, which is all the locator these asks carry.
+fn procedure_binding_requests<'a>(
+    rows: impl Iterator<Item = &'a crate::mount_graph::ResolvedEndpoint>,
+    traced: &[crate::site_rows::TracedRoute],
+    repo_path: &str,
+) -> Vec<crate::services::type_sidecar::InferRequestItem> {
+    let root = Path::new(repo_path);
+    let repo_root = normalize_protocol_file(root);
+    let mut asks = Vec::new();
+    for row in rows.filter(|row| is_binding_row(row)) {
+        let method = normalize_manifest_method(&row.method);
+        if !is_producer_method(&method) {
+            continue;
+        }
+        let Some(procedure) = row.procedure.as_ref() else {
+            continue;
+        };
+        let (file, line) = parse_file_location(&row.file_location);
+        let key = OperationKey::http(&method, String::new());
+        let site_id = build_site_id(&file, line, &key, repo_path);
+        let file_abs = root.join(&file).to_string_lossy().into_owned();
+        let payload_key =
+            row_place(&row.file_location, &repo_root).and_then(|(_, relative, at)| {
+                traced
+                    .iter()
+                    .find(|route| {
+                        route.file == relative
+                            && route.line == at
+                            && route
+                                .procedures
+                                .iter()
+                                .any(|named| named.key_path == procedure.path)
+                    })
+                    .and_then(|route| route.payload_key.clone())
+            });
+        let ask = |kind: ManifestTypeKind, infer_kind: InferKind, member: Option<String>| {
+            crate::services::type_sidecar::InferRequestItem {
+                infer_kind,
+                member,
+                alias: Some(build_manifest_type_alias_with_site_id(
+                    &key,
+                    ManifestRole::Producer,
+                    kind,
+                    Some(&site_id),
+                )),
+                ..crate::agents::file_orchestrator::route_response_request(
+                    &file_abs, line, &key, &site_id,
+                )
+            }
+        };
+        if let Some(member) = payload_key {
+            asks.push(ask(
+                ManifestTypeKind::Request,
+                InferKind::ProcedureInput,
+                Some(member),
+            ));
+        }
+        asks.push(ask(
+            ManifestTypeKind::Response,
+            InferKind::ProcedureOutput,
+            None,
+        ));
+    }
+    asks
 }
 
 /// What [`write_traced_routes`] did, by the graph rows it touched: their
@@ -9403,6 +9499,26 @@ struct TracedWrite {
     corrected: Vec<(usize, String)>,
     /// The rows written: the last `applied.added` of the graph.
     added: std::ops::Range<usize>,
+}
+
+/// Whether a producer row is given type entries and asks: a path with a
+/// leading `/` exactly as written (the test these entries always took, never
+/// [`crate::swc_scanner::is_producer_route_path`]'s trimmed reading), or a
+/// procedure named by its binding, which states no path (contract amendment
+/// 13, carrick#4909).
+fn is_typed_row_path(full_path: &str, procedure: Option<&carrick_match::ProcedureKey>) -> bool {
+    full_path.starts_with('/') || (procedure.is_some() && full_path.is_empty())
+}
+
+/// Whether the trace writes a row served at `full_path`: a path a route is
+/// served at ([`crate::swc_scanner::is_producer_route_path`]), or for a
+/// procedure, also no path at all: a procedure named by the variable that
+/// holds it is served at a path the library chooses when the app is built
+/// (contract amendment 13), so its row is keyed by `procedure` and states
+/// `""`. Every row without a procedure reads the route rule alone.
+fn is_served_row_path(full_path: &str, procedure: Option<&carrick_match::ProcedureKey>) -> bool {
+    crate::swc_scanner::is_producer_route_path(full_path)
+        || (procedure.is_some() && full_path.is_empty())
 }
 
 /// A graph row's `file_location` as the file it names, that file relative
@@ -9707,7 +9823,11 @@ fn write_traced_routes(
                 if held {
                     continue;
                 }
-                if !crate::swc_scanner::is_producer_route_path(full_path) {
+                // A procedure the library serves at a path the code never
+                // writes (contract amendment 13) is keyed by its procedure,
+                // and states no path.
+                let procedure = procedure_at(route, full_path);
+                if !is_served_row_path(full_path, procedure.as_ref()) {
                     applied.refused += 1;
                     continue;
                 }
@@ -9720,7 +9840,7 @@ fn write_traced_routes(
                         handler_span: None,
                         handler_file: None,
                         address: route.addresses.get(full_path).cloned(),
-                        procedure: procedure_at(route, full_path),
+                        procedure,
                         ..template.clone()
                     },
                     // With no binding symbol there is no owner to write: the
@@ -9756,7 +9876,7 @@ fn write_traced_routes(
                         handler_span: None,
                         handler_file: None,
                         address: route.addresses.get(full_path).cloned(),
-                        procedure: procedure_at(route, full_path),
+                        procedure,
                     },
                 };
                 written.push(row);
@@ -14904,7 +15024,7 @@ fn build_type_manifest_entries(
             continue;
         }
         let path = endpoint.full_path.clone();
-        if !path.starts_with('/') {
+        if !is_typed_row_path(&path, endpoint.procedure.as_ref()) {
             continue;
         }
         let (file_path, line_number) = parse_file_location(&endpoint.file_location);
@@ -14912,6 +15032,10 @@ fn build_type_manifest_entries(
         let key = OperationKey::http(&method, path);
         let site_id = build_site_id(&file_path, line_number, &key, repo_root);
 
+        if is_binding_row(endpoint) {
+            add_procedure_binding_pair(&mut entries, key, &file_path, line_number, &site_id);
+            continue;
+        }
         add_manifest_pair(
             &mut entries,
             key,
@@ -15564,13 +15688,55 @@ fn add_manifest_pair(
             key.as_http().map(|(method, _)| method),
             Some("GET" | "HEAD" | "OPTIONS")
         );
+    let kinds: &[ManifestTypeKind] = if skip_request {
+        &[ManifestTypeKind::Response]
+    } else {
+        &[ManifestTypeKind::Request, ManifestTypeKind::Response]
+    };
+    let kinds = kinds
+        .iter()
+        .map(|&type_kind| (type_kind, infer_kind_for_manifest(role, type_kind)));
+    add_manifest_entries(entries, &key, role, file_path, line_number, site_id, kinds);
+}
 
-    for type_kind in [ManifestTypeKind::Request, ManifestTypeKind::Response] {
-        if skip_request && type_kind == ManifestTypeKind::Request {
-            continue;
-        }
-        let type_alias = build_manifest_type_alias_with_site_id(&key, role, type_kind, site_id);
-        let infer_kind = infer_kind_for_manifest(role, type_kind);
+/// The request and response entries of a procedure named by its binding
+/// (contract amendment 13, carrick#4909), whatever its method: its request
+/// is its call's argument, which a `GET` procedure takes as any other does,
+/// not an HTTP body. Asked by [`procedure_binding_requests`].
+fn add_procedure_binding_pair(
+    entries: &mut Vec<TypeManifestEntry>,
+    key: OperationKey,
+    file_path: &str,
+    line_number: u32,
+    site_id: &str,
+) {
+    let kinds = [
+        (ManifestTypeKind::Request, InferKind::ProcedureInput),
+        (ManifestTypeKind::Response, InferKind::ProcedureOutput),
+    ];
+    add_manifest_entries(
+        entries,
+        &key,
+        ManifestRole::Producer,
+        file_path,
+        line_number,
+        Some(site_id),
+        kinds.into_iter(),
+    );
+}
+
+/// One manifest entry per `(type kind, infer kind)`, unanswered, at one site.
+fn add_manifest_entries(
+    entries: &mut Vec<TypeManifestEntry>,
+    key: &OperationKey,
+    role: ManifestRole,
+    file_path: &str,
+    line_number: u32,
+    site_id: Option<&str>,
+    kinds: impl Iterator<Item = (ManifestTypeKind, InferKind)>,
+) {
+    for (type_kind, infer_kind) in kinds {
+        let type_alias = build_manifest_type_alias_with_site_id(key, role, type_kind, site_id);
         let evidence = crate::cloud_storage::TypeEvidence {
             file_path: file_path.to_string(),
             span_start: None,
@@ -33706,6 +33872,7 @@ unfollowed_member_calls_total: 0,
     ) -> crate::site_rows::TracedRoute {
         crate::site_rows::TracedRoute {
             procedures: Vec::new(),
+            payload_key: None,
             file: file.to_string(),
             line,
             method: method.to_string(),
@@ -33802,6 +33969,151 @@ unfollowed_member_calls_total: 0,
             ".",
         );
         assert_eq!(walked.endpoints[1].file_location, "./src/users.ts:8");
+    }
+
+    /// Contract amendment 13: a procedure named by its binding is served at
+    /// a path the code never writes, so its row states `""` and is written
+    /// keyed by its procedure, where no row stands at its line (one replaced
+    /// model row stands at the other). A route with no procedure and no path
+    /// is still refused, and the route rule itself is unchanged.
+    #[test]
+    fn a_procedure_served_at_no_path_is_written_and_a_route_with_none_is_not() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let bound = |line: u32, method: &str, name: &str| crate::site_rows::TracedRoute {
+            procedures: vec![crate::request_summary::decided_sites::ProcedureAt {
+                full_path: String::new(),
+                key_path: name.to_string(),
+                router_file: "src/notes.ts".to_string(),
+                router_binding: String::new(),
+            }],
+            owner: Some(name.to_string()),
+            handler: None,
+            corrects: false,
+            ..traced_route("src/notes.ts", line, method, "", &[""])
+        };
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![traced_row(
+            "src/notes.ts:5",
+            "POST",
+            "/saveNote",
+            "/saveNote",
+            ResolutionSource::Model,
+        )];
+        let (applied, _) = apply_traced_routes(
+            &mut graph,
+            &[
+                bound(3, "GET", "listNotes"),
+                bound(5, "POST", "saveNote"),
+                bound(10, "GET", "unused"),
+                traced_route("src/odd.ts", 4, "GET", "", &[""]),
+            ],
+            ".",
+        );
+        assert_eq!(
+            (applied.added, applied.replaced, applied.refused),
+            (2, 1, 1)
+        );
+        let rows: Vec<String> = graph
+            .endpoints
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} {} {:?} {:?} {}",
+                    row.file_location,
+                    row.method,
+                    row.full_path,
+                    row.path,
+                    row.procedure
+                        .as_ref()
+                        .map(|key| format!("{}#{}", key.path, key.router.binding))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                r#"src/notes.ts:5 POST "" "" saveNote#"#,
+                r#"src/notes.ts:3 GET "" "" listNotes#"#,
+                r#"src/notes.ts:10 GET "" "" unused#"#,
+            ]
+        );
+        // Every row without a procedure reads the route rule alone.
+        for path in ["", "ping", "GET", "/", "/users/:id", "`/orders/${id}`"] {
+            assert_eq!(
+                is_served_row_path(path, None),
+                crate::swc_scanner::is_producer_route_path(path),
+                "{path}"
+            );
+        }
+        let key = carrick_match::ProcedureKey {
+            path: "saveNote".to_string(),
+            router: carrick_match::RouterId {
+                repo: "r".to_string(),
+                file: "src/notes.ts".to_string(),
+                binding: String::new(),
+            },
+        };
+        assert!(is_served_row_path("", Some(&key)));
+        assert!(!is_served_row_path("ping", Some(&key)));
+    }
+
+    /// carrick#4909: the type entries and the trace's asks take a path with a
+    /// leading `/` exactly as written, as before, plus a procedure row with no
+    /// path. A path the route rule trims into shape (a leading space or
+    /// backtick) is still given none, and a row with no path and no procedure
+    /// gets none.
+    #[test]
+    fn type_entries_take_a_written_leading_slash_or_a_pathless_procedure() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let key = carrick_match::ProcedureKey {
+            path: "saveNote".to_string(),
+            router: carrick_match::RouterId {
+                repo: "r".to_string(),
+                file: "src/a.ts".to_string(),
+                binding: String::new(),
+            },
+        };
+        let row = |line: u32, full_path: &str, procedure: Option<&carrick_match::ProcedureKey>| {
+            crate::mount_graph::ResolvedEndpoint {
+                procedure: procedure.cloned(),
+                ..traced_row(
+                    &format!("src/a.ts:{line}"),
+                    "POST",
+                    full_path,
+                    full_path,
+                    ResolutionSource::LibraryClaim,
+                )
+            }
+        };
+        let rows = vec![
+            row(1, "`/x", None),
+            row(2, " /x", None),
+            row(3, "/x", None),
+            row(4, "", Some(&key)),
+            row(5, "", None),
+        ];
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = rows.clone();
+        let mut entry_lines: Vec<u32> =
+            build_type_manifest_entries(&graph, &Config::default(), ".")
+                .iter()
+                .filter(|entry| entry.role == ManifestRole::Producer)
+                .map(|entry| entry.line_number)
+                .collect();
+        entry_lines.dedup();
+        assert_eq!(entry_lines, vec![3, 4]);
+        let mut ask_lines: Vec<u32> = traced_route_requests(&rows, ".")
+            .iter()
+            .map(|ask| ask.line_number)
+            .chain(
+                procedure_binding_requests(rows.iter(), &[], ".")
+                    .iter()
+                    .map(|ask| ask.line_number),
+            )
+            .collect();
+        ask_lines.sort();
+        assert_eq!(ask_lines, vec![3, 4]);
     }
 
     /// carrick#4071: each row the trace writes asks for its response, as a

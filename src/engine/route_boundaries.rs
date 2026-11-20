@@ -99,6 +99,7 @@ pub(super) fn settle(
         });
         traced[index].push(TracedRoute {
             procedures: Vec::new(),
+            payload_key: None,
             file: resolved.file,
             line: resolved.line,
             method: resolved.method,

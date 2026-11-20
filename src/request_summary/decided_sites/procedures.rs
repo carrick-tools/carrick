@@ -69,6 +69,12 @@ use crate::request_summary::stop::Stop;
 pub struct ProcedureLabels {
     /// The ops named by their key (`bound: key`): package, export, member.
     keyed: Vec<(String, String, String)>,
+    /// The ops named by the variable that holds their call's value
+    /// (`bound: binding`, contract amendment 13): package, export, member.
+    bound: Vec<(String, String, String)>,
+    /// Of those, the key of argument 0 each states its call's body under
+    /// (the op's `payload`, carrick#4909): package, export, member, key.
+    payloads: Vec<(String, String, String, String)>,
     /// The verified router members.
     collects: Vec<CollectsLabel>,
     /// The verified members that merge the routers they are given.
@@ -215,22 +221,46 @@ impl ProcedureLabels {
                     LibraryClaim::Op {
                         member: Some(member),
                         name: Some(name),
+                        payload,
                         ..
                     } if matches!(
                         **name,
                         OpName::Bound {
-                            bound: BoundName::Key,
+                            bound: BoundName::Key | BoundName::Binding,
                             ..
                         }
                     ) =>
                     {
-                        let keyed = (
+                        let op = (
                             export.package.clone(),
                             export.export.clone(),
                             member.clone(),
                         );
-                        if !labels.keyed.contains(&keyed) {
-                            labels.keyed.push(keyed);
+                        let binding = matches!(
+                            **name,
+                            OpName::Bound {
+                                bound: BoundName::Binding,
+                                ..
+                            }
+                        );
+                        if let Some(key) = payload
+                            .as_ref()
+                            .filter(|slot| binding && slot.arg == 0)
+                            .and_then(|slot| slot.key.clone())
+                        {
+                            let (package, export, member) = op.clone();
+                            let stated = (package, export, member, key);
+                            if !labels.payloads.contains(&stated) {
+                                labels.payloads.push(stated);
+                            }
+                        }
+                        let list = if binding {
+                            &mut labels.bound
+                        } else {
+                            &mut labels.keyed
+                        };
+                        if !list.contains(&op) {
+                            list.push(op);
                         }
                     }
                     _ => {}
@@ -266,9 +296,32 @@ impl ProcedureLabels {
         labels
     }
 
-    /// Whether the labelled call `end` is a procedure op's.
+    /// Whether the labelled call `end` is a procedure op's named by its key.
     fn keyed(&self, end: &LabelledEnd) -> bool {
-        self.keyed.iter().any(|(package, export, member)| {
+        Self::is_of(&self.keyed, end)
+    }
+
+    /// Whether the labelled call `end` is a procedure op's named by the
+    /// variable that holds its value (contract amendment 13).
+    fn bound(&self, end: &LabelledEnd) -> bool {
+        Self::is_of(&self.bound, end)
+    }
+
+    /// The key of argument 0 a binding-named op `end` states its body
+    /// under, where its label states one.
+    fn bound_payload(&self, end: &LabelledEnd) -> Option<String> {
+        self.payloads
+            .iter()
+            .find(|(package, export, member, _)| {
+                *package == end.package
+                    && *export == end.export
+                    && end.member.as_deref() == Some(member.as_str())
+            })
+            .map(|(.., key)| key.clone())
+    }
+
+    fn is_of(ops: &[(String, String, String)], end: &LabelledEnd) -> bool {
+        ops.iter().any(|(package, export, member)| {
             *package == end.package
                 && *export == end.export
                 && end.member.as_deref() == Some(member.as_str())
@@ -310,6 +363,14 @@ pub struct Procedure {
     /// reason of the first adapter (in adapter order) that reached it and
     /// named no path. `None` where no adapter reached it (carrick#3688).
     pub stop: Option<Stop>,
+    /// Named by the variable that holds it (contract amendment 13): its one
+    /// full path is `""`, a path the library chooses and the code never
+    /// writes, and neither is its own path.
+    pub binding: bool,
+    /// For a binding-named procedure: the key of argument 0 its call
+    /// carries what a caller sends under (the op's `payload`, carrick#4909),
+    /// where its label states one.
+    pub payload_key: Option<String>,
 }
 
 /// Why an adapter's mount is unread: the key its count is kept under
@@ -411,6 +472,7 @@ impl Pass<'_, '_> {
     /// from the adapter calls among `discovered`.
     pub(super) fn run(&self, out: &mut Decided, discovered: &[super::DiscoverySite]) {
         self.graphql_mounts(out, discovered);
+        self.bound(out);
         let leaves: HashSet<(String, u32, u32)> = out
             .sites
             .iter()
@@ -536,6 +598,77 @@ impl Pass<'_, '_> {
             procedure.key_paths.dedup();
             procedure.at.sort();
             procedure.at.dedup();
+            site.procedure = Some(procedure);
+        }
+    }
+
+    /// Name every procedure an op named by its binding states (contract
+    /// amendment 13): the library serves it at a path it chooses when the
+    /// app is built, so no path is stated (`""`), and it is keyed by the
+    /// declaration that holds the op's call and the one around that
+    /// ([`super::router_holder::holder_of_call`]), in the call's own file. A
+    /// call no named declaration holds has no name the code writes: its
+    /// procedure is counted (`unread_key`) and never named.
+    ///
+    /// Two calls one declaration holds (an object of such calls under one
+    /// variable) would share one key: neither is named, and each is saved
+    /// with [`Stop::ProcedureRouterAmbiguous`].
+    fn bound(&self, out: &mut Decided) {
+        let keys: Vec<Option<Option<(String, String)>>> = out
+            .sites
+            .iter()
+            .map(|site| {
+                self.labels.bound(&site.end).then(|| {
+                    super::router_holder::holder_of_call(
+                        self.root,
+                        &site.file,
+                        (site.span_start, site.span_end),
+                    )
+                })
+            })
+            .collect();
+        let mut held: HashMap<(&str, &(String, String)), usize> = HashMap::new();
+        for (site, key) in out.sites.iter().zip(&keys) {
+            if let Some(Some(key)) = key {
+                *held.entry((site.file.as_str(), key)).or_default() += 1;
+            }
+        }
+        let shared: HashSet<(String, (String, String))> = held
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|((file, key), _)| (file.to_string(), key.clone()))
+            .collect();
+        for (site, key) in out.sites.iter_mut().zip(keys) {
+            let Some(key) = key else {
+                continue;
+            };
+            let mut procedure = Procedure {
+                binding: true,
+                payload_key: self.labels.bound_payload(&site.end),
+                ..Procedure::default()
+            };
+            match key {
+                Some(key) if shared.contains(&(site.file.clone(), key.clone())) => {
+                    procedure.unread.insert("unread_key".to_string(), 1);
+                    procedure.stop = Some(Stop::ProcedureRouterAmbiguous);
+                }
+                Some((key_path, router_binding)) => {
+                    // The row is registered on the variable that holds it.
+                    procedure.owner = Some(key_path.clone());
+                    procedure.full_paths.push(String::new());
+                    procedure.key_paths.push(key_path.clone());
+                    procedure.at.push(ProcedureAt {
+                        full_path: String::new(),
+                        key_path,
+                        router_file: site.file.clone(),
+                        router_binding,
+                    });
+                }
+                None => {
+                    procedure.unread.insert("unread_key".to_string(), 1);
+                    procedure.stop = Some(Stop::ProcedurePathUnread);
+                }
+            }
             site.procedure = Some(procedure);
         }
     }

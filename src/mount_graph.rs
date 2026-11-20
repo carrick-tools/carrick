@@ -433,6 +433,28 @@ pub fn procedure_suffix(procedure: Option<&carrick_match::ProcedureKey>) -> Stri
     }
 }
 
+/// The key [`MountGraph::merge_from_repos`] folds two producer rows by: repo,
+/// service, method, full path, dispatch case and procedure. The procedure is
+/// on it for the reason the dispatch case is (carrick#831): procedures named
+/// by the variable that holds them (contract amendment 13) are all served at
+/// one `""` per method, and without it every one of a service's `POST`
+/// procedures folds into one. A row with no procedure keys as before.
+pub(crate) fn endpoint_merge_key(
+    repo: &str,
+    service: Option<&str>,
+    endpoint: &ResolvedEndpoint,
+) -> String {
+    format!(
+        "{}:{}:{}:{}{}{}",
+        repo,
+        service.unwrap_or(""),
+        endpoint.method,
+        endpoint.full_path,
+        crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref()),
+        procedure_suffix(endpoint.procedure.as_ref())
+    )
+}
+
 impl MountGraph {
     pub fn new() -> Self {
         Self {
@@ -715,13 +737,10 @@ impl MountGraph {
                 // `(method, full_path)`, so without it eight of them are
                 // dropped here and one stands in for all of them.
                 for endpoint in &mount_graph.endpoints {
-                    let key = format!(
-                        "{}:{}:{}:{}{}",
-                        repo_data.repo_name,
-                        repo_data.service_name.as_deref().unwrap_or(""),
-                        endpoint.method,
-                        endpoint.full_path,
-                        crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
+                    let key = endpoint_merge_key(
+                        &repo_data.repo_name,
+                        repo_data.service_name.as_deref(),
+                        endpoint,
                     );
                     if seen_endpoints.insert(key) {
                         let mut tagged_endpoint = endpoint.clone();
@@ -1790,6 +1809,50 @@ mod tests {
             .collect();
         paths.sort_unstable();
         assert_eq!(paths, vec!["count", "shelf.list"]);
+    }
+
+    /// Procedures named by their binding (contract amendment 13) share one
+    /// `""` path per method: the merge keeps each, told apart by its
+    /// procedure, and still folds a row stated twice. A row with no
+    /// procedure keys exactly as before the procedure was on the key.
+    #[test]
+    fn the_merge_keeps_each_procedure_served_at_no_path() {
+        let row = |text: &str| -> ResolvedEndpoint { serde_json::from_str(text).unwrap() };
+        let procedure = |name: &str| {
+            row(&format!(
+                r#"{{"method":"POST","path":"","full_path":"","handler":null,"owner":"{name}","file_location":"src/notes.ts:5","middleware_chain":[],"procedure":{{"path":"{name}","router":{{"repo":"platform","file":"src/notes.ts","binding":""}}}}}}"#
+            ))
+        };
+        let plain = row(
+            r#"{"method":"GET","path":"/a","full_path":"/a","handler":null,"owner":"app","file_location":"src/a.ts:1","middleware_chain":[]}"#,
+        );
+        // Byte-identical to the key before the procedure joined it.
+        assert_eq!(
+            endpoint_merge_key("platform", Some("web"), &plain),
+            "platform:web:GET:/a"
+        );
+        assert_eq!(
+            endpoint_merge_key("platform", None, &plain),
+            "platform::GET:/a"
+        );
+        assert_eq!(
+            endpoint_merge_key("platform", Some("web"), &procedure("saveNote")),
+            "platform:web:POST:@platform:src/notes.ts#:saveNote"
+        );
+        let mut repo = cloud_repo_with_health("platform", Some("web"));
+        repo.mount_graph.as_mut().unwrap().endpoints.extend([
+            procedure("saveNote"),
+            procedure("archiveNote"),
+            procedure("saveNote"),
+        ]);
+        let merged = MountGraph::merge_from_repos(&[repo]);
+        let mut names: Vec<&str> = merged
+            .endpoints
+            .iter()
+            .filter_map(|row| row.procedure.as_ref().map(|key| key.path.as_str()))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["archiveNote", "saveNote"]);
     }
 
     /// A blob row written before `procedure` existed reads as no procedure,
