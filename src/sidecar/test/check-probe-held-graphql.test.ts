@@ -104,6 +104,12 @@ const CASES: Case[] = [
   { key: 'list-break', root: 'orders', sent: '{ id: string }[]', expected: '{ id: number }[]', bucket: 'incompatible' },
   { key: 'null-ok', root: 'order', sent: '{ id: string } | null', expected: '{ id: string } | null', bucket: 'compatible' },
   { key: 'null-break', root: 'order', sent: '{ id: string } | null', expected: '{ id: string }', bucket: 'incompatible' },
+  // carrick#4940: a root Boolean or ID the serializer rejects speaks; below an object, or where the serializer accepts, it does not.
+  { key: 'reject-root-bool', root: 'confirm', sent: 'string', expected: 'boolean | null', bucket: 'incompatible' },
+  { key: 'reject-root-id', root: 'tag', sent: 'boolean', expected: 'string', bucket: 'incompatible' },
+  { key: 'reject-below-object', root: 'order', sent: '{ id: boolean; pending: string }', expected: '{ id: string; pending: boolean }', bucket: 'compatible' },
+  { key: 'accept-root-bool-number', root: 'confirm', sent: 'number', expected: 'boolean | null', bucket: 'compatible' },
+  { key: 'accept-root-string-bool', root: 'note', sent: 'boolean', expected: 'string | null', bucket: 'compatible' },
   { key: 'field-not-in-sdl', root: 'order', sent: '{ id: string }', expected: '{ id: string; missing: string }', bucket: 'incompatible' },
   // carrick#4726: a field the record lacks or converts is read in the type the schema declares, by the judge and the held form alike.
   { key: 'rf-absent-label', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string | null }', bucket: 'compatible' },
@@ -140,7 +146,7 @@ function writeStub(dir: string, serviceName: string, surface: string): void {
 
 /** The held check of one pair: the engine's declarations, then the call a placed check would write. */
 function heldSource(c: Case): string {
-  const hg = heldGraphql(SHOP_TYPES, [{ type: 'Query', field: 'order' }, { type: 'Query', field: 'orders' }, { type: 'Query', field: 'orderPage' }]);
+  const hg = heldGraphql(SHOP_TYPES, [{ type: 'Query', field: 'order' }, { type: 'Query', field: 'orders' }, { type: 'Query', field: 'orderPage' }, { type: 'Query', field: 'confirm' }, { type: 'Query', field: 'tag' }, { type: 'Query', field: 'note' }]);
   const leaf = c.root === undefined ? undefined : hg.leaves[`Query.${c.root}`];
   const form = leaf === undefined ? '__carrick_GqlSent<Awaited<V>, E>' : '__carrick_GqlSentS<Awaited<V>, E, L>';
   return (

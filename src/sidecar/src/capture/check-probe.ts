@@ -41,6 +41,7 @@ import type {
   WireFormat,
 } from './api.js';
 import {
+  GRAPHQL_SCALAR_REJECTS,
   GRAPHQL_SCALAR_SENT,
   graphqlReachableFields,
   graphqlRootLeaf,
@@ -366,8 +367,13 @@ export function judgeTolerances(prefix: string): JudgeTolerances {
  *  - `any` and `unknown` stay what they are, so a top type is never laundered
  *    into a scalar; non-null is read through; `null` and `undefined` stay;
  *  - a list maps its elements; a non-array under a list keeps the JSON form;
- *  - a built-in scalar is the type it sends (`GRAPHQL_SCALAR_SENT`); any
- *    other scalar, an enum and a field the table does not name are JSON;
+ *  - a built-in scalar is the type it sends (`GRAPHQL_SCALAR_SENT`), except
+ *    at the root value (and a root list's elements, `Top`) where a value the
+ *    serializer rejects (`GRAPHQL_SCALAR_REJECTS`: a string under `Boolean`, a
+ *    boolean under `ID`) is kept as it is, so the comparison breaks. Below an
+ *    object type a field resolver the probe does not read may convert it, so
+ *    the rule stops there. Any other scalar, an enum and a field the table
+ *    does not name are JSON;
  *  - an object type the table holds maps each field through its own leaf;
  *    a type reference it does not hold (an undeclared scalar) is JSON.
  *
@@ -391,20 +397,24 @@ export function graphqlScalarDeclarations(
 /**
  * The leaf walk's declarations without the two table lines, namespaced by
  * `prefix` as `jsonWireDeclarations` is: `<p>GqlScalarSent`, `<p>GqlTypeOf`,
- * `<p>GqlFieldOf` and `<p>GqlLeafSent`. They read `<p>GqlTypes`, the service's
+ * `<p>GqlScalarRejects`, `<p>GqlFieldOf` and `<p>GqlLeafSent`. They read `<p>GqlTypes`, the service's
  * table, which the caller declares (once per file in the held check). The
- * probe's `GqlScalarSent` comes first, then the three walk lines.
+ * probe's `GqlScalarSent` comes first, then the four walk lines.
  */
 export function graphqlLeafWalkDeclarations(prefix: string): string[] {
   const p = prefix;
   const sent = Object.entries(GRAPHQL_SCALAR_SENT)
     .map(([name, type]) => `${name}: ${type}`)
     .join('; ');
+  const rejects = Object.entries(GRAPHQL_SCALAR_REJECTS)
+    .map(([name, type]) => `${name}: ${type}`)
+    .join('; ');
   return [
     `type ${p}GqlScalarSent = { ${sent} };`,
+    `type ${p}GqlScalarRejects = { ${rejects} };`,
     `type ${p}GqlTypeOf<F> = [F] extends [{ non_null: infer I }] ? ${p}GqlTypeOf<I> : [F] extends [{ type: infer T }] ? T : never;`,
     `type ${p}GqlFieldOf<T, K> = [T] extends [never] ? unknown : [T] extends [keyof ${p}GqlTypes] ? ([K] extends [keyof ${p}GqlTypes[T]] ? ${p}GqlTypes[T][K] : unknown) : unknown;`,
-    `type ${p}GqlLeafSent<C, F, D extends number = 15> = [D] extends [never] ? ${p}JsonWire<C> : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlLeafSent<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlLeafSent<C[K], I, ${p}GqlDepth[D]> } : ${p}JsonWire<C>) : [F] extends [{ scalar: infer N }] ? (N extends keyof ${p}GqlScalarSent ? ${p}GqlScalarSent[N] : ${p}JsonWire<C>) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? ${p}JsonWire<C> : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: ${p}GqlLeafSent<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> } : ${p}JsonWire<C>) : ${p}JsonWire<C>) : ${p}JsonWire<C>;`,
+    `type ${p}GqlLeafSent<C, F, D extends number = 15, Top extends boolean = true> = [D] extends [never] ? ${p}JsonWire<C> : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlLeafSent<C, I, D, Top> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlLeafSent<C[K], I, ${p}GqlDepth[D], Top> } : ${p}JsonWire<C>) : [F] extends [{ scalar: infer N }] ? (N extends keyof ${p}GqlScalarSent ? ([Top] extends [true] ? ([C] extends [${p}GqlScalarRejects[N & keyof ${p}GqlScalarRejects]] ? C : ${p}GqlScalarSent[N]) : ${p}GqlScalarSent[N]) : ${p}JsonWire<C>) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? ${p}JsonWire<C> : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: ${p}GqlLeafSent<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D], false> } : ${p}JsonWire<C>) : ${p}JsonWire<C>) : ${p}JsonWire<C>;`,
   ];
 }
 
