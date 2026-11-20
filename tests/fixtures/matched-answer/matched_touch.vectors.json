@@ -1,6 +1,6 @@
 {
   "schema": "carrick.matched-touch-vectors/1",
-  "repo": "example-org/shop",
+  "repo": "shop",
   "vectors": [
     {
       "files": [
