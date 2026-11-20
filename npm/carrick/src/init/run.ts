@@ -803,8 +803,8 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
             : `Could not configure Carrick hooks: ${refused.message}. Fix ${refused.file} and ${again()}.`,
         );
       }
-      if (copy.teamHooksLeft) {
-        out.say("Carrick's hooks are committed in .claude/settings.json, so init left them unchanged and added no second set.");
+      if (copy.teamHooksUpdated) {
+        out.say("Carrick updated its hooks in .claude/settings.json, which git tracks here. Commit the change in its own pull request.");
       }
       todo.push(...taskSkillWarnings(copy.skills));
       recordCliVersion(workspace, currentVersion());
