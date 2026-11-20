@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.171](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.170...carrick-v0.3.171) (2026-11-20)
+
+
+### Features
+
+* **check:** print possible pairs a model found for the changed files ([#4982](https://github.com/carrick-tools/carrick/issues/4982)) ([48181fb](https://github.com/carrick-tools/carrick/commit/48181fb7e04c5ffbab1caea0f83e191595b348b6))
+* **init:** set up only the coding agent this developer uses, and say what init writes, hides and allows ([#4984](https://github.com/carrick-tools/carrick/issues/4984)) ([e3da910](https://github.com/carrick-tools/carrick/commit/e3da91037efbaf96c249fe55ca8e8941c00b880d))
+* **npm:** edit-time fact lines show possible pairs a model found ([#4990](https://github.com/carrick-tools/carrick/issues/4990)) ([c496f79](https://github.com/carrick-tools/carrick/commit/c496f7968c2dd539c92c0b31947e897bc82e25de))
+* **scanner:** keep position rows for the cloud runner when it asks (L8) ([#5004](https://github.com/carrick-tools/carrick/issues/5004)) ([ec5c9e5](https://github.com/carrick-tools/carrick/commit/ec5c9e5eebfd6dfeb51a3f9059f39b50314ab067))
+* **scanner:** the engine pass over a model's pairs (__matched-pass) ([#4986](https://github.com/carrick-tools/carrick/issues/4986)) ([d46b627](https://github.com/carrick-tools/carrick/commit/d46b627557a4abd5a82c51c9d75045c85b7318a4))
+
+
+### Bug Fixes
+
+* **init:** a change in the index's counts alone never rewrites the rules section ([#4999](https://github.com/carrick-tools/carrick/issues/4999)) ([344d211](https://github.com/carrick-tools/carrick/commit/344d211a5a45cd078b9021aa600aab1f19831e66))
+* **init:** the exclude block keeps a running check's temporary files out of git status ([#4983](https://github.com/carrick-tools/carrick/issues/4983)) ([f85acde](https://github.com/carrick-tools/carrick/commit/f85acde9f3d0e7354cfa9b7aacb809fb8e44a9b5))
+* **sidecar:** the compiler engine's matched pass sets a service up as the scan does ([#5001](https://github.com/carrick-tools/carrick/issues/5001)) ([f71bf8e](https://github.com/carrick-tools/carrick/commit/f71bf8e6e681078bc9c375f2e15f90cdb91d9d04))
+
+
+### Documentation
+
+* **task-skills:** which agent's files init writes, the temp-file exclude line, and a team's committed files ([#4992](https://github.com/carrick-tools/carrick/issues/4992)) ([7367114](https://github.com/carrick-tools/carrick/commit/73671141a5b751030ba2de168b4e6765ff27a35d))
+
 ## [0.3.170](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.169...carrick-v0.3.170) (2026-11-20)
 
 
