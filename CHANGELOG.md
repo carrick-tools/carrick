@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.169](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.168...carrick-v0.3.169) (2026-11-20)
+
+
+### Bug Fixes
+
+* **visitor:** name a wrapped callback on an exported object for its member ([#4957](https://github.com/carrick-tools/carrick/issues/4957)) ([df177cb](https://github.com/carrick-tools/carrick/commit/df177cbe25a96038a91b7d52be24676cf550a266))
+
 ## [0.3.168](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.167...carrick-v0.3.168) (2026-11-20)
 
 
