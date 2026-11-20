@@ -61,14 +61,19 @@ definition's site):
 |---|---|
 | `page.tsx:6` | `POST ""` at the `save(` call, pairs `saveNote` |
 | `handed.ts:8` | `POST ""` at the `keep(` call, pairs `saveNote`: handing the alias on as well does not stop it |
+| `handed.ts:18` | `POST ""` at the `again(` call inside the function handed to `memo`, beside `[again]`, pairs `saveNote` |
 | `direct.ts:4` | `GET ""` at the `listNotes()` call, pairs `listNotes` |
 | `value.ts:9` | none: the alias is handed on and never called here; the `useFn(` call is saved `detached_unplaced` |
 | `control.ts` | none: a plain local function, no row and no saved site |
 
-The `useFn(` calls whose alias is called state no site of their own. Three
+The `useFn(` calls whose alias is called state no site of their own. Four
 pairs within the one service (two keys: `GET` and `POST`), one orphan
 (`unused`). Without the pass-through scopes `saveNote`'s method is unread,
-so its two calls are saved `unread`, never stated on a guessed method.
+so its three calls are saved `unread`, never stated on a guessed method.
+
+In `services/reexport` the procedure set is empty until carrick#4882, so
+its wrapper calls are plain calls in place: no row, and no site this pass
+saves or asks.
 Request types `{ body: string }` and `undefined`; response types
 `{ ok: boolean }` and `{ id: number }[]` (T1).
 
