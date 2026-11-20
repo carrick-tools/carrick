@@ -91,6 +91,7 @@ fn carrick(args: &[&std::ffi::OsStr]) -> Command {
         "ACTIONS_ID_TOKEN_REQUEST_URL",
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
         "CARRICK_LOCAL_STORAGE_DIR",
+        "CARRICK_RUNNER_ROWS_DIR",
     ] {
         cmd.env_remove(var);
     }
@@ -491,4 +492,226 @@ fn scan_blob_unchanged_by_matched_pass() {
         run.scan_stdout, run.rescan_stdout,
         "the scan's output moved"
     );
+}
+
+/// An uploading run as the cloud runner runs it (`--upload`, mock storage, no
+/// local store), optionally told where to keep its position rows. Returns the
+/// process output and the scratch folder's files (the model's request
+/// cassettes and the run's cache).
+fn upload_scan(
+    tree: &Path,
+    scratch: &Path,
+    rows_dir: Option<&Path>,
+) -> (Output, BTreeMap<PathBuf, Vec<u8>>) {
+    let cache = scratch.join("cache");
+    let cassettes = scratch.join("cassettes");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::create_dir_all(&cassettes).unwrap();
+    let mut cmd = carrick(&[tree.as_os_str(), "--upload".as_ref()]);
+    let tmp = scratch.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    cmd.env("CARRICK_CACHE_DIR", &cache)
+        .env("TMPDIR", &tmp)
+        .env("CARRICK_MOCK_ALL", "1")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        )
+        .env("CARRICK_SKIP_INTENTS", "1");
+    if let Some(dir) = rows_dir {
+        cmd.env("CARRICK_RUNNER_ROWS_DIR", dir);
+    }
+    let output = cmd.output().expect("spawn carrick");
+    assert!(
+        output.status.success(),
+        "upload scan failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output, snapshot(scratch))
+}
+
+fn tree_for_scan(dir: &Path) -> PathBuf {
+    let tree = dir.join("widgets");
+    copy_tree(&manifest_dir().join("tests/fixtures/matched-pairs"), &tree);
+    tree
+}
+
+fn rows_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    snapshot(&dir.join("positions"))
+}
+
+fn wrapper_of_first_pass_pair(store: Option<&Path>, tree: &Path, scratch: &Path) -> Value {
+    let record = tree.join("record.json");
+    let out = scratch.join("out.json");
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        "__matched-pass".as_ref(),
+        record.as_os_str(),
+        "--repo".as_ref(),
+        tree.as_os_str(),
+        "--out".as_ref(),
+        out.as_os_str(),
+    ];
+    if let Some(store) = store {
+        args.push("--store".as_ref());
+        args.push(store.as_os_str());
+    }
+    let output = carrick(&args).output().expect("spawn carrick");
+    assert!(
+        output.status.success(),
+        "pass failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    pair(&record, PASS, 2, "/w/:id")["wrapper"].clone()
+}
+
+/// L8: the runner's rows directory receives exactly the rows a local-store
+/// run writes, and the pass reads them from there.
+#[test]
+fn runner_rows_dir_gets_the_rows_a_local_store_run_writes() {
+    if !sidecar_built() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tree = tree_for_scan(dir.path());
+    let store = dir.path().join("store");
+    scan(&tree, &store, &dir.path().join("scan-local"));
+    let expected = rows_files(&store);
+    assert!(!expected.is_empty(), "the local store run wrote no rows");
+
+    let rows = dir.path().join("runner-rows");
+    std::fs::create_dir_all(&rows).unwrap();
+    upload_scan(&tree, &dir.path().join("scan-runner"), Some(&rows));
+    assert_eq!(rows_files(&rows), expected);
+    // Nothing but the rows directory's `positions/` is written there.
+    let top: Vec<_> = std::fs::read_dir(&rows)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(top, vec![std::ffi::OsString::from("positions")]);
+
+    // The pass reads them: the wrapper lists its callers where, with no
+    // rows, it said `rows_missing`.
+    let without = wrapper_of_first_pass_pair(None, &tree, dir.path());
+    assert_eq!(without, serde_json::json!({ "reason": "rows_missing" }));
+    let with = wrapper_of_first_pass_pair(Some(&rows), &tree, dir.path());
+    assert_eq!(with["name"], "apiGet", "{with:#}");
+    assert_eq!(with["callers_total"], 3, "{with:#}");
+}
+
+/// L8: without the variable an uploading run writes the same files and makes
+/// the same model requests as before the variable existed. The golden is the
+/// file list and request cassettes of a run on main before this change.
+#[test]
+fn without_the_variable_an_uploading_run_is_unchanged() {
+    if !sidecar_built() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tree = tree_for_scan(dir.path());
+    let (output, files) = upload_scan(&tree, &dir.path().join("scan"), None);
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The run's own paths, timings and memory figures vary; its words do not.
+    // The line that counts the model requests is kept exactly: it is the
+    // request log.
+    let scratch = dir.path().to_string_lossy().to_string();
+    let mut lines: Vec<String> = log
+        .replace(&scratch, "<dir>")
+        .lines()
+        .filter(|line| {
+            ![
+                "Phase progress",
+                "Walk ",
+                "Service ",
+                "Analyzed service",
+                "Type-reach",
+                "stamp",
+                "by memory",
+                "machine awake",
+            ]
+            .iter()
+            .any(|noise| line.contains(noise))
+        })
+        .map(|line| {
+            if line.contains("cloud request(s)") {
+                return line.to_string();
+            }
+            let mut out = String::new();
+            let mut in_number = false;
+            for c in line.chars() {
+                if c.is_ascii_digit() || (in_number && c == '.') {
+                    if !in_number {
+                        out.push('N');
+                    }
+                    in_number = true;
+                } else {
+                    in_number = false;
+                    out.push(c);
+                }
+            }
+            out
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+    let mut got = String::new();
+    for (path, bytes) in files.iter().chain(snapshot(&tree).iter()) {
+        got.push_str(&format!(
+            "{} {}\n",
+            path.display(),
+            carrick::position_rows::content_hash(bytes)
+        ));
+    }
+    got.push_str("--- log\n");
+    got.push_str(&lines.join("\n"));
+    let golden = manifest_dir().join("tests/fixtures/matched-pairs-runner-golden.txt");
+    if std::env::var_os("CARRICK_WRITE_GOLDEN").is_some() {
+        std::fs::write(&golden, &got).unwrap();
+        return;
+    }
+    assert_eq!(got, std::fs::read_to_string(&golden).unwrap());
+    // The log carries no word of the variable.
+    assert!(!log.contains("CARRICK_RUNNER_ROWS_DIR"), "{log}");
+}
+
+/// L8: a missing or unwritable directory is a logged warning, and the scan
+/// still succeeds.
+#[test]
+fn an_unusable_rows_dir_warns_and_never_fails_the_scan() {
+    if !sidecar_built() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let tree = tree_for_scan(dir.path());
+
+    let missing = dir.path().join("not-there");
+    let (output, _) = upload_scan(&tree, &dir.path().join("scan-a"), Some(&missing));
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(log.contains("not a directory"), "{log}");
+    assert!(!missing.exists());
+
+    let locked = dir.path().join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Running as root can write anyway; the warning is only owed when it can't.
+    let writable = std::fs::write(locked.join("probe"), b"").is_ok();
+    let (output, _) = upload_scan(&tree, &dir.path().join("scan-b"), Some(&locked));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !writable {
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(log.contains("were not kept"), "{log}");
+    }
 }

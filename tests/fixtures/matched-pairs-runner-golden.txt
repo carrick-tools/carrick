@@ -1,0 +1,73 @@
+apps/api/src/schema.ts 67cf6c856f461e8ce2283f0cad0ac09f5d870fd0a4cde7332ab8c5739d73a067
+apps/api/src/server.ts 449067d2d7edcc8439e00263987b3598eea70c5ca287f6e13a44c163d8d5238b
+apps/api/tsconfig.json 42e29a1ef3acf51c0adaabf652daa1b7b661eb2d9928a745e613d1e75143f72f
+apps/web/src/client.ts d320c418006541827045c3e24b8f186ab031b03f225992cd8bc4fb7e802ff54d
+apps/web/src/pass.ts 39321604ea70336f5bb5847891368a0209823d7bb0453066fccd50288badedca
+apps/web/tsconfig.json 42e29a1ef3acf51c0adaabf652daa1b7b661eb2d9928a745e613d1e75143f72f
+carrick.json 171cf6e4fb5999274b00a3218a32ac2f5115c450fd2e44fcb0756ef52fe8de72
+db/001.sql a3cb8384d4dbdda8a9cdb74f68cf343e594bd2e392e4da6d4ae9afcd35896ab3
+pairs.json d2768fa18d2d09e946d23164d3e087b120ba03f9c55bb981dcedae658941e68c
+record.json d48ba5bc079d70e2c266b4ed52dd61e41d922f179ec098f306fa1d21aa9cf30d
+--- log
+
+  N call site(s) Carrick could not read (e.g. apps/web/src/client.ts:N: it calls a member of an interface, and no implementation was found)
+  N call(s) with no resolved expected type (e.g. http|GET|/w/N (apps/web/src/client.ts:N))
+  N row(s) the model alone states (N joined a deterministic row)
+  types captured on a bare checkout: anything through a dependency is `any`
+## 🪢 Carrick · monorepo (N services)
+### Major version conflicts (N)
+#### express
+**Missing (N)**
+<!-- CARRICK_ISSUE_COUNT:N -->
+<!-- CARRICK_OUTPUT_END -->
+<!-- CARRICK_OUTPUT_START -->
+</details>
+<details>
+<summary><strong>Connectivity (N)</strong></summary>
+<summary><strong>Dependency conflicts (N)</strong></summary>
+> Missing endpoints have a consumer call but no producer.
+> N connectivity gaps and N dependency conflict across N repos.
+> Packages with different versions across services in the index.
+> [!WARNING]
+Analysis issued 18 cloud request(s): analyze-file 2, framework-detect 2, framework-guidance 12, library-claims 2
+Analyzing service api (N/N)
+Analyzing service web (N/N)
+Asked for the detection and guidance of N of N service(s) ahead of their analysis, N at a time, in Ns
+Discovered N file(s) under apps/api in Ns
+Discovered N file(s) under apps/web in Ns
+Indexed **N endpoints** and **N cross-service calls**.
+Model analysis: N of N files already analysed, N new.
+Model analysis: nothing here needs the model.
+Prescreened web's consumer calls: N of N abstain before any rewrite, N more when the producer's type is an object literal, N more when it has no top-level undefined, took Ns
+Resolved N services in widgets
+Using MockStorage
+What this scan could not classify
+api at an unknown commit: N file(s) sent to the analyzer
+web at an unknown commit: N file(s) sent to the analyzer
+| :--- | :--- | :--- |
+| Method | Path | Called from |
+| Repository | Version | Source |
+| `GET` | `/a` | `apps/web/src/pass.ts:N` |
+| `GET` | `/b` | `apps/web/src/pass.ts:N` |
+| `GET` | `/c` | `apps/web/src/pass.ts:N` |
+| `GET` | `/fn/resize` | `apps/web/src/pass.ts:N` |
+| `GET` | `/list` | `apps/web/src/client.ts:N` |
+| `GET` | `/sql/N` | `apps/web/src/client.ts:N` |
+| `GET` | `/w/N` | `apps/web/src/client.ts:N, apps/web/src/pass.ts:N, apps/web/src/pass.ts:N` |
+| `GET` | `/w/N` | `apps/web/src/client.ts:N` |
+| `repo-a` | `N` | `repo-a/package.json` |
+| `repo-b` | `N` | `repo-b/package.json` |
+▸ Analyzing repository...
+▸ Connecting to Carrick Cloud...
+▸ Downloading cross-repo data...
+▸ Running cross-repo analysis...
+▸ Starting compiler engine...
+▸ Uploading api (N/N)
+▸ Uploading results...
+▸ Uploading web (N/N)
+✓ Analyzed widgets (N service(s))
+✓ Connected to Carrick Cloud
+✓ Cross-repo analysis complete
+✓ Downloaded data from N repos
+✓ Sidecar ready
+✓ Uploaded results to Carrick Cloud
