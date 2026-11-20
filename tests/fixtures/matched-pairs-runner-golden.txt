@@ -36,7 +36,6 @@ Asked for the detection and guidance of N of N service(s) ahead of their analysi
 Discovered N file(s) under apps/api in Ns
 Discovered N file(s) under apps/web in Ns
 Indexed **N endpoints** and **N cross-service calls**.
-Keeping this machine awake until the scan finishes, for at most three hours. To let it sleep, pass --no-keep-awake or set CARRICK_NO_KEEP_AWAKE=N
 Model analysis: N of N files already analysed, N new.
 Model analysis: nothing here needs the model.
 Prescreened web's consumer calls: N of N abstain before any rewrite, N more when the producer's type is an object literal, N more when it has no top-level undefined, took Ns

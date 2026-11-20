@@ -631,6 +631,7 @@ fn without_the_variable_an_uploading_run_is_unchanged() {
                 "Type-reach",
                 "stamp",
                 "by memory",
+                "machine awake",
             ]
             .iter()
             .any(|noise| line.contains(noise))
