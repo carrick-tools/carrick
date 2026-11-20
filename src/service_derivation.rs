@@ -618,8 +618,12 @@ fn glob_members(
             seen[index] = true;
             matched = true;
         }
+        // A member already found keeps the manifest it was found by: a nested
+        // root above it never changes its service.
         if matched && !globs.excludes(relative) {
-            members.insert(directory.to_path_buf(), entry.path().to_path_buf());
+            members
+                .entry(directory.to_path_buf())
+                .or_insert_with(|| entry.path().to_path_buf());
         }
     }
     let mut glob_deno = false;

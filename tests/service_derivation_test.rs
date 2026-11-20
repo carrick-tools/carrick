@@ -1257,3 +1257,28 @@ fn a_nested_pattern_matching_nothing_is_skipped_not_refused() {
         derived.skipped_patterns
     );
 }
+
+#[test]
+fn a_nested_root_above_a_root_member_leaves_that_member_as_the_root_derived_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "deno.jsonc", "{ \"workspace\": [\"./apps/api\"] }");
+    write(
+        root,
+        "apps/api/deno.json",
+        r#"{"name":"@scope/api","exports":"./mod.ts"}"#,
+    );
+    write(root, "apps/api/mod.ts", "export const x = 1;\n");
+    write(root, "apps/api/package.json", r#"{"name":"api-node"}"#);
+    // A package-manager root above the member, whose glob also holds it.
+    write(root, "apps/package.json", r#"{"workspaces":["*"]}"#);
+    nested_client(root, "apps/web");
+    let derived = resolve(root).unwrap();
+    let api = derived
+        .services
+        .iter()
+        .find(|s| s.directory.as_deref() == Some("apps/api"))
+        .expect("apps/api is a service");
+    assert_eq!(api.service_name.as_deref(), Some("@scope/api"));
+    assert!(directories(&derived).contains(&"apps/web".to_string()));
+}
