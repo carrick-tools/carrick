@@ -721,6 +721,55 @@ struct ImplementationsResult {
     answers: Vec<ImplementationsAnswer>,
 }
 
+/// One `resource_keys` question: the keys found at each of `paths` in type
+/// argument `type_arg` of the make call spanning `start..end` in `file` (UTF-16
+/// code units, as a `call` position row gives). A general compiler read: it
+/// holds no library name, path template or domain word.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ResourceKeysQuery {
+    /// Absolute path of the file holding the make call.
+    pub file: String,
+    pub start: u32,
+    pub end: u32,
+    pub type_arg: u32,
+    /// Key paths to read, e.g. `["public", "Tables"]`.
+    pub paths: Vec<Vec<String>>,
+}
+
+/// One key read at a path, with its declaration (null for a key with none).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ResourceKey {
+    pub name: String,
+    pub decl_file: Option<String>,
+    pub decl_line: Option<u32>,
+}
+
+/// The keys at one asked path.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ResourceKeysPathAnswer {
+    /// The path as asked: where the keys were read.
+    pub path: Vec<String>,
+    pub keys: Vec<ResourceKey>,
+    /// `path_missing` when the type has no property at the path.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The answer to one [`ResourceKeysQuery`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ResourceKeysAnswer {
+    /// One entry per asked path, in order; empty when `reason` is set.
+    pub paths: Vec<ResourceKeysPathAnswer>,
+    /// `not_in_program`, `no_call`, `no_type_argument` or `checker_threw`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResourceKeysResult {
+    answers: Vec<ResourceKeysAnswer>,
+}
+
 /// Result of a `capture_v2` action (mirrors `CaptureStubResult`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaptureV2Result {
@@ -2084,6 +2133,12 @@ enum SidecarRequest {
         queries: Vec<ImplementationsQuery>,
         scan_root: String,
     },
+    #[serde(rename = "resource_keys")]
+    ResourceKeys {
+        request_id: String,
+        queries: Vec<ResourceKeysQuery>,
+        scan_root: String,
+    },
     #[serde(rename = "add_program_files")]
     AddProgramFiles {
         request_id: String,
@@ -2113,6 +2168,7 @@ impl SidecarRequest {
             SidecarRequest::RetypeCheck { items, .. } => items.len(),
             SidecarRequest::RetypePrescreen { items, .. } => items.len(),
             SidecarRequest::Implementations { queries, .. } => queries.len(),
+            SidecarRequest::ResourceKeys { queries, .. } => queries.len(),
             SidecarRequest::VerifyClientSemantics { checks, .. } => checks.len(),
             SidecarRequest::VerifyLibraryClaims { checks, .. } => checks.len(),
         }
@@ -4824,6 +4880,34 @@ impl TypeSidecar {
         Ok(result.answers)
     }
 
+    /// The keys at each query's paths of a make call's type argument, one
+    /// answer per query in order. Asked of the service's analysis process;
+    /// every file name in an answer is relative to `scan_root`.
+    pub fn resource_keys(
+        &self,
+        queries: &[ResourceKeysQuery],
+        scan_root: &Path,
+    ) -> Result<Vec<ResourceKeysAnswer>, SidecarError> {
+        self.ensure_ready()?;
+        let request_id = self.next_request_id();
+        let request = SidecarRequest::ResourceKeys {
+            request_id: request_id.clone(),
+            queries: queries.to_vec(),
+            scan_root: scan_root.to_string_lossy().into_owned(),
+        };
+        self.send_request(&request)?;
+        let value = self.operation_result(&request_id)?;
+        if value.get("status").and_then(|s| s.as_str()) != Some("success") {
+            return Err(SidecarError::ResourceKeysFailed(frame_errors(&value)));
+        }
+        let result: ResourceKeysResult =
+            serde_json::from_value(value.get("result").cloned().ok_or_else(|| {
+                SidecarError::ResourceKeysFailed("no result in the answer".to_string())
+            })?)
+            .map_err(|e| SidecarError::DeserializationError(e.to_string()))?;
+        Ok(result.answers)
+    }
+
     /// Names the sidecar build this process runs: a hash of every script
     /// file beside its entry. Part of the key a judge answer is kept under,
     /// so another build never reuses it.
@@ -5878,6 +5962,8 @@ pub enum SidecarError {
     PositionRowsFailed(String),
     /// The sidecar answered an implementations request with an error (carrick#2432)
     ImplementationsFailed(String),
+    /// The sidecar answered a resource_keys request with an error
+    ResourceKeysFailed(String),
     /// This process was signalled while the wait was on (carrick#1387).
     Interrupted(crate::shutdown::Interrupted),
 }
@@ -5944,7 +6030,8 @@ impl SidecarError {
             | SidecarError::ProgramFilesFailed(_)
             | SidecarError::ReachFailed(_)
             | SidecarError::PositionRowsFailed(_)
-            | SidecarError::ImplementationsFailed(_) => false,
+            | SidecarError::ImplementationsFailed(_)
+            | SidecarError::ResourceKeysFailed(_) => false,
             SidecarError::SpawnFailed(_)
             | SidecarError::InitFailed(_)
             | SidecarError::NotReady(_)
@@ -5974,6 +6061,9 @@ impl std::fmt::Display for SidecarError {
             SidecarError::PositionRowsFailed(e) => write!(f, "Position rows walk failed: {}", e),
             SidecarError::ImplementationsFailed(e) => {
                 write!(f, "Implementations request failed: {}", e)
+            }
+            SidecarError::ResourceKeysFailed(e) => {
+                write!(f, "Resource keys request failed: {}", e)
             }
             SidecarError::Interrupted(e) => write!(f, "{e}"),
         }
@@ -7414,6 +7504,69 @@ mod tests {
         assert_eq!(result.answers[0].reason, None);
         assert_eq!(result.answers[1].declaration, None);
         assert_eq!(result.answers[1].reason.as_deref(), Some("no_call"));
+    }
+
+    /// The `resource_keys` wire names must match the sidecar's
+    /// `ResourceKeysRequestSchema` and `ResourceKeysAnswer` exactly.
+    #[test]
+    fn resource_keys_wire_shape() {
+        let request = SidecarRequest::ResourceKeys {
+            request_id: "req-4".into(),
+            queries: vec![ResourceKeysQuery {
+                file: "/repo/src/client.ts".into(),
+                start: 90,
+                end: 130,
+                type_arg: 0,
+                paths: vec![vec!["public".into(), "Tables".into()]],
+            }],
+            scan_root: "/repo".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "action": "resource_keys",
+                "request_id": "req-4",
+                "queries": [{
+                    "file": "/repo/src/client.ts", "start": 90, "end": 130,
+                    "type_arg": 0, "paths": [["public", "Tables"]]
+                }],
+                "scan_root": "/repo"
+            })
+        );
+        assert_eq!(request.item_count(), 1);
+
+        let result: ResourceKeysResult = serde_json::from_value(serde_json::json!({
+            "answers": [
+                { "paths": [
+                    { "path": ["public", "Tables"], "keys": [
+                        { "name": "accounts", "decl_file": "src/types.ts", "decl_line": 4 },
+                        { "name": "mapped", "decl_file": null, "decl_line": null }
+                    ] },
+                    { "path": ["public", "Nope"], "keys": [], "reason": "path_missing" }
+                ] },
+                { "paths": [], "reason": "no_type_argument" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            result.answers[0].paths[0].keys[0],
+            ResourceKey {
+                name: "accounts".into(),
+                decl_file: Some("src/types.ts".into()),
+                decl_line: Some(4),
+            }
+        );
+        assert_eq!(result.answers[0].paths[0].keys[1].decl_file, None);
+        assert_eq!(result.answers[0].paths[0].reason, None);
+        assert_eq!(
+            result.answers[0].paths[1].reason.as_deref(),
+            Some("path_missing")
+        );
+        assert_eq!(
+            result.answers[1].reason.as_deref(),
+            Some("no_type_argument")
+        );
+        assert!(result.answers[1].paths.is_empty());
     }
 
     /// The `verify_client_semantics` wire names must match the sidecar's

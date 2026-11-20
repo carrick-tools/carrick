@@ -5692,6 +5692,32 @@ fn maker_base(
     env_or_unstated(reads)
 }
 
+/// The make claim of `export` for a maker call of `form` on `member` (`None`:
+/// the export itself). The one lookup [`base_slot`] and [`served_makers`]'s
+/// callers share.
+pub(crate) fn make_claim<'e>(
+    export: &'e crate::library_claims::ExportClaims,
+    form: super::MakerForm,
+    member: Option<&str>,
+) -> Option<&'e crate::services::type_sidecar::LibraryClaim> {
+    use crate::services::type_sidecar::{LibraryClaim, MakeForm};
+    export.claims.iter().find(|claim| match claim {
+        LibraryClaim::Make {
+            form: claimed,
+            member: claimed_member,
+            ..
+        } => {
+            claimed_member.as_deref() == member
+                && matches!(
+                    (claimed, form),
+                    (MakeForm::Call, super::MakerForm::Call)
+                        | (MakeForm::New, super::MakerForm::New)
+                )
+        }
+        _ => false,
+    })
+}
+
 /// The base slot the make claim of `export` names for a maker call of
 /// `form` on `member` (`None`: the export itself), where it names one. The
 /// one lookup [`maker_base`] and [`maker_base_env`] share.
@@ -5700,23 +5726,41 @@ fn base_slot<'e>(
     form: super::MakerForm,
     member: Option<&str>,
 ) -> Option<&'e crate::services::type_sidecar::ClaimSlot> {
-    use crate::services::type_sidecar::{LibraryClaim, MakeForm};
-    export.claims.iter().find_map(|claim| match claim {
-        LibraryClaim::Make {
-            form: claimed,
-            member: claimed_member,
-            base,
-            ..
-        } if claimed_member.as_deref() == member
-            && matches!(
-                (claimed, form),
-                (MakeForm::Call, super::MakerForm::Call) | (MakeForm::New, super::MakerForm::New)
-            ) =>
-        {
-            base.as_ref()
-        }
+    match make_claim(export, form, member)? {
+        crate::services::type_sidecar::LibraryClaim::Make { base, .. } => base.as_ref(),
         _ => None,
-    })
+    }
+}
+
+/// The maker calls as written (the export itself called or constructed, not a
+/// call a caller fills) of the `served` packages, each with the export's
+/// claims. The one filter [`served_base_vars`] and the type-resource rows
+/// ([`crate::type_resources`]) read makers through.
+pub fn served_makers<'a>(
+    library: &'a super::LibrarySites,
+    exports: &'a [crate::library_claims::ExportClaims],
+    served: &'a BTreeSet<String>,
+) -> impl Iterator<
+    Item = (
+        &'a super::LibrarySite,
+        &'a crate::library_claims::ExportClaims,
+    ),
+> + 'a {
+    library
+        .sites
+        .iter()
+        .filter(move |site| {
+            site.origin.is_none()
+                && site.receiver == super::SiteReceiver::Export
+                && site.path.is_empty()
+                && served.contains(site.package())
+        })
+        .filter_map(move |site| {
+            let export = exports
+                .iter()
+                .find(|export| export.package == site.package() && export.export == site.export)?;
+            Some((site, export))
+        })
 }
 
 /// One environment read a maker's base is: the read as the source writes it
@@ -5805,20 +5849,7 @@ pub fn served_base_vars(
         return learned;
     }
     let resolver = Resolver::new(inputs, siblings);
-    for site in &library.sites {
-        if site.origin.is_some()
-            || site.receiver != super::SiteReceiver::Export
-            || !site.path.is_empty()
-            || !served.contains(site.package())
-        {
-            continue;
-        }
-        let Some(export) = exports
-            .iter()
-            .find(|export| export.package == site.package() && export.export == site.export)
-        else {
-            continue;
-        };
+    for (site, export) in served_makers(library, exports, served) {
         if let Some(base) = maker_base_env(export, site, &resolver) {
             learned.entry(base.name).or_default().push((
                 site.package().to_string(),

@@ -1,0 +1,34 @@
+{
+  "library_claims": [
+    {
+      "package": "@supabase/supabase-js",
+      "version": "2.45.0",
+      "status": "answered",
+      "surface_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "exports": [
+        {
+          "specifier": "@supabase/supabase-js",
+          "export": "createClient",
+          "role": "http_client",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "base": {
+                "arg": 0
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

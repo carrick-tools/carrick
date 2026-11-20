@@ -469,6 +469,20 @@ export const ImplementationsRequestSchema = BaseRequestSchema.extend({
   scan_root: z.string().min(1, 'Scan root cannot be empty'),
 });
 
+export const ResourceKeysRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('resource_keys'),
+  queries: z.array(
+    z.object({
+      file: z.string().min(1, 'File path cannot be empty'),
+      start: z.number().int().nonnegative(),
+      end: z.number().int().nonnegative(),
+      type_arg: z.number().int().nonnegative(),
+      paths: z.array(z.array(z.string().min(1))),
+    })
+  ),
+  scan_root: z.string().min(1, 'Scan root cannot be empty'),
+});
+
 export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('resolve_definitions'),
   stub_dir: z.string().min(1, 'Stub dir cannot be empty'),
@@ -893,6 +907,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   AddProgramFilesRequestSchema,
   PositionRowsRequestSchema,
   ImplementationsRequestSchema,
+  ResourceKeysRequestSchema,
 ]);
 
 // ============================================================================

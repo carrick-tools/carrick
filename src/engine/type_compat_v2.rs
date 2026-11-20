@@ -4976,6 +4976,7 @@ mod tests {
             handler_span: None,
             handler_file: None,
             address: None,
+            resource: None,
         }
     }
 
@@ -10864,6 +10865,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             library_semantics: Vec::new(),
             inference: None,
             label_member: None,
+            resource: None,
         }
     }
 
@@ -11101,6 +11103,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             library_semantics: Vec::new(),
             inference: None,
             label_member: None,
+            resource: None,
         }
     }
 

@@ -501,6 +501,57 @@ export interface ImplementationsQuery {
   end: number;
 }
 
+/**
+ * The property keys found at key paths of a make call's type argument, with
+ * each key's declaration (a general compiler read: it holds no library name,
+ * no path template and no table word). One batch per service.
+ */
+export interface ResourceKeysRequest extends BaseRequest {
+  action: 'resource_keys';
+  queries: ResourceKeysQuery[];
+  /** The scanned repo's root: every file name in an answer is relative to it. */
+  scan_root: string;
+}
+
+export interface ResourceKeysQuery {
+  /** Absolute path of the file holding the make call. */
+  file: string;
+  /** The call's span (a `call` position row's), UTF-16 code units from the start of the file. */
+  start: number;
+  end: number;
+  /** Which type argument of the call to read, from 0. */
+  type_arg: number;
+  /** Key paths to read in that type, e.g. `["public", "Tables"]`. An empty path reads the type's own keys. */
+  paths: string[][];
+}
+
+/** Why a query reads no keys at all. */
+export type ResourceKeysReason = 'not_in_program' | 'no_call' | 'no_type_argument' | 'checker_threw';
+
+/** Why one path reads no keys: the type has no property at it. */
+export type ResourceKeysPathReason = 'path_missing';
+
+export interface ResourceKey {
+  name: string;
+  /** Repo-relative, as a position row's `decl_file`; null when the key has no declaration (a mapped key). */
+  decl_file: string | null;
+  decl_line: number | null;
+}
+
+export interface ResourceKeysPathAnswer {
+  /** The path as asked: where the keys were read. */
+  path: string[];
+  /** In declaration order. */
+  keys: ResourceKey[];
+  reason?: ResourceKeysPathReason;
+}
+
+export interface ResourceKeysAnswer {
+  /** One entry per asked path, in order; empty when `reason` is set. */
+  paths: ResourceKeysPathAnswer[];
+  reason?: ResourceKeysReason;
+}
+
 /** A declaration as a position row names one. */
 export interface NamedDeclaration {
   symbol: string | null;
@@ -1111,7 +1162,8 @@ export type SidecarRequest =
   | ReachRequest
   | AddProgramFilesRequest
   | PositionRowsRequest
-  | ImplementationsRequest;
+  | ImplementationsRequest
+  | ResourceKeysRequest;
 
 /**
  * Request for a specific symbol to be bundled
@@ -1353,6 +1405,12 @@ export interface HealthResponse extends BaseResponse {
  */
 export interface ShutdownResponse extends BaseResponse {
   status: 'success';
+}
+
+/** Response for resource_keys: one answer per query, in request order. */
+export interface ResourceKeysResponse extends BaseResponse {
+  result?: { answers: ResourceKeysAnswer[] };
+  errors?: string[];
 }
 
 /** Response for implementations: one answer per question, in request order. */
@@ -1824,6 +1882,7 @@ export type SidecarResponse =
   | AddProgramFilesResponse
   | PositionRowsResponse
   | ImplementationsResponse
+  | ResourceKeysResponse
   | ErrorResponse;
 
 /**

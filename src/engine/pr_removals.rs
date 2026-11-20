@@ -549,6 +549,7 @@ mod tests {
             library_semantics: Vec::new(),
             inference: None,
             label_member: None,
+            resource: None,
         }
     }
 
