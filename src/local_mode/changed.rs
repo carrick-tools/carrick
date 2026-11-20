@@ -473,7 +473,7 @@ fn matched_touching(
         out.extend(
             super::matched::touching(&rows, remote, files)
                 .into_iter()
-                .map(|row| super::matched::line(row, &path)),
+                .filter_map(|row| super::matched::line(row, &path)),
         );
     }
     out
@@ -1778,7 +1778,7 @@ const MAX_MATCHED_LISTED: usize = 10;
 
 /// What a possible pair's line says about itself, up to the commit its lines
 /// are read at (copy-pass, 2026-11-20).
-const MATCHED_NOTE: &str = "found by a model, not checked; lines as of";
+const MATCHED_NOTE: &str = "found by a model, not compiler-checked; lines as of";
 
 fn short_sha(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
@@ -1996,7 +1996,7 @@ impl ChangedOutput {
         let rest = self.matched.len() - shown;
         if rest > 0 {
             out.push_str(&format!(
-                "and {} found by a model: carrick check --changed --all lists {}\n",
+                "{} found by a model. List {} with carrick check --changed --all\n",
                 plural(rest, "more possible pair", "more possible pairs"),
                 if rest == 1 { "it" } else { "them" }
             ));
@@ -3461,7 +3461,7 @@ mod tests {
             one.lines().last().unwrap(),
             "possible  apps/web/src/lib/api1.ts:8  GET /v1/orders  ->  \
              apps/api/src/orders/orders.router.ts:18  \
-             (found by a model, not checked; lines as of 1111111)"
+             (found by a model, not compiler-checked; lines as of 1111111)"
         );
         output.matched = (0..13).map(pair).collect();
         let capped = output.render(false);
@@ -3471,7 +3471,7 @@ mod tests {
         );
         assert_eq!(
             capped.lines().last().unwrap(),
-            "and 3 more possible pairs found by a model: carrick check --changed --all lists them"
+            "3 more possible pairs found by a model. List them with carrick check --changed --all"
         );
         assert_eq!(
             output
@@ -3483,7 +3483,7 @@ mod tests {
         );
         output.matched = (0..11).map(pair).collect();
         assert!(output.render(false).ends_with(
-            "and 1 more possible pair found by a model: carrick check --changed --all lists it\n"
+            "1 more possible pair found by a model. List it with carrick check --changed --all\n"
         ));
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["matched"].as_array().unwrap().len(), 11);
