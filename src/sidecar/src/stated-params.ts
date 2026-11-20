@@ -448,7 +448,7 @@ export class StatedParams {
     return current;
   }
 
-  private isNothing(type: Type): boolean {
+  isNothing(type: Type): boolean {
     return type.isUndefined() || type.isNull() || (type.getFlags() & (ts.TypeFlags.Void | ts.TypeFlags.Never)) !== 0;
   }
 
@@ -813,7 +813,7 @@ export class StatedParams {
   }
 
   /** The symbol at the root of a member or call chain (`res.status(201)` is `res`). */
-  private rootSymbol(expression: Node): TsSymbol | undefined {
+  rootSymbol(expression: Node): TsSymbol | undefined {
     let node = expression;
     for (;;) {
       if (Node.isPropertyAccessExpression(node) || Node.isCallExpression(node) || Node.isParenthesizedExpression(node) || Node.isNonNullExpression(node)) {
