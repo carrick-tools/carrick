@@ -823,20 +823,21 @@ fn cut_utf16(text: &str, units: usize) -> String {
         .collect()
 }
 
-/// The compiler's reading of a response side.
+/// The compiler's reading of a response side. A type is stored as text when
+/// nothing is said beside it, or when the only top types inside it are ones
+/// the source writes (`declared`: a member typed `unknown`), since that is
+/// the type the source states. Any other reason beside a type leaves the side
+/// to that reason, so a model's reading can fill it.
 fn reading(end: &MatchedEndTypes, file: &str, line: u32) -> Value {
-    if let (Some(read), None) = (&end.type_read, &end.reason) {
+    if let Some(read) = &end.type_read {
         let text = read.expanded.trim();
         let concrete = !text.is_empty() && !matches!(text, "any" | "unknown");
-        if concrete && text.len() <= MAX_TYPE_TEXT_BYTES {
-            return json!({ "text": text, "evidence": { "file": file, "line": line } });
+        if concrete && matches!(end.reason.as_deref(), None | Some("declared")) {
+            if text.len() <= MAX_TYPE_TEXT_BYTES {
+                return json!({ "text": text, "evidence": { "file": file, "line": line } });
+            }
+            return json!({ "reason": "type_too_large" });
         }
-        let reason = if concrete {
-            "type_too_large"
-        } else {
-            "not_recorded"
-        };
-        return json!({ "reason": reason });
     }
     json!({ "reason": end.reason.clone().unwrap_or_else(|| "not_recorded".to_string()) })
 }
@@ -1480,6 +1481,30 @@ const i = client.get(
         assert_eq!(
             reading(&end_types(None, Some("not_typescript_source")), "a.ts", 3),
             json!({ "reason": "not_typescript_source" })
+        );
+    }
+
+    /// A type whose only top types inside are ones the source writes (a
+    /// member declared `unknown`) is the type the source states, so its text
+    /// is stored; any other reason beside a type leaves the side to it.
+    #[test]
+    fn a_type_the_source_declares_open_inside_is_stored() {
+        let text = "{ id: string; meta: unknown; }";
+        assert_eq!(
+            reading(&end_types(Some(text), Some("declared")), "a.ts", 3),
+            json!({ "text": text, "evidence": { "file": "a.ts", "line": 3 } })
+        );
+        assert_eq!(
+            reading(
+                &end_types(Some("{ id: Missing; }"), Some("unresolved_import")),
+                "a.ts",
+                3
+            ),
+            json!({ "reason": "unresolved_import" })
+        );
+        assert_eq!(
+            reading(&end_types(Some("unknown"), Some("declared")), "a.ts", 3),
+            json!({ "reason": "declared" })
         );
     }
 
