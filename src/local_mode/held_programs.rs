@@ -110,6 +110,7 @@ mod tests {
             repos_excluded: Vec::new(),
             hosted_checked_at: None,
             hosted_source_key: None,
+            matched: Vec::new(),
             version: READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
             scanner_build: None,

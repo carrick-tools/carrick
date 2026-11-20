@@ -617,6 +617,7 @@ fn run_generation(
     }
     index.type_check = Some(type_check_summary(&join, &uploaded_blobs, &positions));
     index.hosted_checked_at = hosted.checked_at();
+    index.matched = hosted.matched_answers();
     index.hosted_source_key = hosted.source_key();
     (index.hosted_identity, index.hosted_workspace) = hosted.identity();
     let scanned_blobs = read_blobs(blobs)?;
@@ -1983,6 +1984,7 @@ pub(super) fn build(
         repos_excluded: workspace.repos_excluded.clone(),
         hosted_checked_at: None,
         hosted_source_key: None,
+        matched: Vec::new(),
         version: READ_MODEL_VERSION,
         scanner_version: join.scanner_version.clone(),
         scanner_build: crate::cloud_storage::ScannerBuild::current(),

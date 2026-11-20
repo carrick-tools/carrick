@@ -98,6 +98,12 @@ pub struct ChangedOutput {
     /// (carrick#2911). The problems marked `other_build` rest on it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_scanner: Option<String>,
+    /// Possible pairs a model found that touch the changed files, from the
+    /// hosted index's one answer (`matched.rs`). Information only: never a
+    /// problem, never part of `failing`, `not_type_checked` or the exit code.
+    /// Absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched: Vec<super::matched::MatchedLine>,
 }
 
 /// One repo of the workspace, and what changed in it.
@@ -348,7 +354,8 @@ impl ChangedOutput {
     /// whose call is a built request (carrick#3470) does not count: matching
     /// its method and path is the check it can have.
     fn nothing_type_checked(&self) -> bool {
-        self.type_checked == 0 && self.not_type_checked.iter().any(|row| !row.descriptor)
+        self.type_checked == 0
+            && (self.not_type_checked.iter().any(|row| !row.descriptor) || !self.matched.is_empty())
     }
 
     /// Problems the index, written by another scanner build, cannot date.
@@ -434,7 +441,43 @@ fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
         elapsed_ms: 0,
         not_checked: Some(reason.into()),
         index_scanner: None,
+        matched: Vec::new(),
     }
+}
+
+/// The possible pairs the index holds that touch the changed files: the rows
+/// of its hosted answers whose repo is a changed repo (named by its remote)
+/// and whose caller or server file is among that repo's changed files.
+/// Nothing is read when the index holds no answer.
+fn matched_touching(
+    root: &Path,
+    workspace: &super::workspace::Workspace,
+    index: &LocalIndex,
+    changed: &Changed,
+) -> Vec<super::matched::MatchedLine> {
+    if index.matched.is_empty() {
+        return Vec::new();
+    }
+    let rows: Vec<super::matched::Row> = index
+        .matched
+        .iter()
+        .flat_map(super::matched::parse)
+        .collect();
+    let (remotes, _) = super::hosted::origins_of(workspace);
+    let mut out = Vec::new();
+    for (tree, files) in changed.values() {
+        let Some(remote) = remotes.get(&tree.repo) else {
+            continue;
+        };
+        let repo_path = tree.repo.to_string_lossy().to_string();
+        let path = |file: &str| shown(root, &repo_path, file);
+        out.extend(
+            super::matched::touching(&rows, remote, files)
+                .into_iter()
+                .map(|row| super::matched::line(row, &path)),
+        );
+    }
+    out
 }
 
 fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> ChangedOutput {
@@ -637,6 +680,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     output.outside_moved = judged.outside_moved;
     output.problems = judged.problems;
     output.unread = unread_in(&root, &rejoined.index, &wanted, &unmoved);
+    output.matched = matched_touching(&root, &workspace, &index, &changed);
     super::recheck::took("check/unread", began);
     output
 }
@@ -1730,6 +1774,17 @@ fn shown(root: &Path, repo_path: &str, file: &str) -> String {
     }
 }
 
+/// The most possible pairs `check --changed` lists without `--all`.
+const MAX_MATCHED_LISTED: usize = 10;
+
+/// What a possible pair's line says about itself, up to the commit its lines
+/// are read at (copy-pass, 2026-11-20).
+const MATCHED_NOTE: &str = "found by a model, not checked; lines as of";
+
+fn short_sha(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
 /// How long one reason may run on its line before it is cut.
 const MAX_REASON_CHARS: usize = 300;
 
@@ -1914,6 +1969,39 @@ impl ChangedOutput {
             ));
         }
         out.push_str(&self.skipped_lines());
+        out.push_str(&self.matched_lines(all));
+        out
+    }
+
+    /// The possible pairs a model found in the changed files, after every
+    /// other line. Information only: nothing here is read by `exit_code`.
+    /// Past [`MAX_MATCHED_LISTED`] the rest are counted, and `--all` lists them.
+    fn matched_lines(&self, all: bool) -> String {
+        let mut out = String::new();
+        let shown = if all {
+            self.matched.len()
+        } else {
+            self.matched.len().min(MAX_MATCHED_LISTED)
+        };
+        for pair in &self.matched[..shown] {
+            out.push_str(&format!(
+                "possible  {}  {} {}  ->  {}  ({} {})\n",
+                pair.caller,
+                pair.method,
+                pair.name,
+                pair.server,
+                MATCHED_NOTE,
+                short_sha(&pair.commit)
+            ));
+        }
+        let rest = self.matched.len() - shown;
+        if rest > 0 {
+            out.push_str(&format!(
+                "and {} found by a model: carrick check --changed --all lists {}\n",
+                plural(rest, "more possible pair", "more possible pairs"),
+                if rest == 1 { "it" } else { "them" }
+            ));
+        }
         out
     }
 
@@ -3234,5 +3322,171 @@ mod tests {
     fn a_compiler_message_is_one_line_and_cut() {
         assert_eq!(one_line("a\n  b\tc"), "a b c");
         assert!(one_line(&"x ".repeat(400)).chars().count() <= MAX_REASON_CHARS);
+    }
+
+    fn pair(n: usize) -> super::super::matched::MatchedLine {
+        super::super::matched::MatchedLine {
+            caller: format!("apps/web/src/lib/api{n}.ts:8"),
+            server: "apps/api/src/orders/orders.router.ts:18".to_string(),
+            kind: "route".to_string(),
+            method: "GET".to_string(),
+            name: "/v1/orders".to_string(),
+            types: serde_json::Value::Null,
+            commit: "1".repeat(40),
+        }
+    }
+
+    /// A possible pair is information: it never moves the exit code, whatever
+    /// the run otherwise holds (carrick: SD-4).
+    #[test]
+    fn possible_pairs_never_move_the_exit_code() {
+        let unchecked = NotTypeChecked {
+            file: "web/src/a.ts".to_string(),
+            line: Some(9),
+            role: "call".to_string(),
+            method: "GET".to_string(),
+            path: "/t".to_string(),
+            reason: "no verdict".to_string(),
+            descriptor: false,
+        };
+        let without = ChangedOutput {
+            calls: 1,
+            files: 1,
+            services: 2,
+            type_checked: 0,
+            not_type_checked: vec![unchecked],
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        let with = ChangedOutput {
+            matched: vec![pair(1), pair(2)],
+            ..without.clone()
+        };
+        assert_eq!(without.exit_code(), EXIT_NOTHING_COVERED);
+        assert_eq!(with.exit_code(), without.exit_code());
+        let clean = ChangedOutput {
+            calls: 1,
+            files: 1,
+            services: 2,
+            type_checked: 1,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        let clean_with = ChangedOutput {
+            matched: vec![pair(1)],
+            ..clean.clone()
+        };
+        assert_eq!(clean.exit_code(), 0);
+        assert_eq!(clean_with.exit_code(), 0);
+        // Nothing type-checked and no unchecked row: still only the pairs.
+        let empty = ChangedOutput {
+            type_checked: 0,
+            matched: vec![pair(1), pair(2)],
+            ..clean
+        };
+        assert_eq!(empty.exit_code(), 0);
+        // Nothing type-checked and no unchecked row: a possible pair is not
+        // one, so it must not turn this into "nothing covered".
+        let bare = ChangedOutput {
+            calls: 1,
+            files: 1,
+            services: 2,
+            type_checked: 0,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        let bare_with = ChangedOutput {
+            matched: vec![pair(1), pair(2)],
+            ..bare.clone()
+        };
+        assert_eq!(bare_with.exit_code(), bare.exit_code());
+    }
+
+    /// With no possible pair the text and the JSON are what they were.
+    #[test]
+    fn no_possible_pair_changes_no_byte() {
+        let base = ChangedOutput {
+            calls: 1,
+            files: 1,
+            services: 2,
+            type_checked: 1,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        assert_eq!(
+            base.render(false),
+            "carrick check: checked 0 routes and 1 call in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route\n"
+        );
+        assert!(!serde_json::to_string(&base).unwrap().contains("matched"));
+    }
+
+    /// Known gap (named in the SD-4 PR): the changed-file set `check --changed`
+    /// builds keeps scanned source only, so a change to a pair's non-source end
+    /// (a `.sql` file) never reaches the touch rule and its row does not show.
+    /// This pins that, so widening the filter is a deliberate change.
+    #[test]
+    fn a_changed_non_source_end_of_a_pair_is_not_in_the_changed_set() {
+        let root = std::path::Path::new("/w/shop");
+        assert!(crate::file_finder::is_scanned_source(
+            &root.join("apps/web/src/lib/api.ts"),
+            root
+        ));
+        assert!(!crate::file_finder::is_scanned_source(
+            &root.join("db/migrations/0003_stock.sql"),
+            root
+        ));
+    }
+
+    /// The lines come after every existing line, at most ten, then a count;
+    /// `--all` lists them all, and `--json` carries them.
+    #[test]
+    fn possible_pairs_print_after_everything_with_a_cap() {
+        let mut output = ChangedOutput {
+            calls: 1,
+            files: 1,
+            services: 2,
+            type_checked: 1,
+            not_checked: None,
+            matched: vec![pair(1)],
+            ..not_checked("/w", "")
+        };
+        let one = output.render(false);
+        assert!(
+            one.lines()
+                .next()
+                .unwrap()
+                .starts_with("carrick check: checked")
+        );
+        assert_eq!(
+            one.lines().last().unwrap(),
+            "possible  apps/web/src/lib/api1.ts:8  GET /v1/orders  ->  \
+             apps/api/src/orders/orders.router.ts:18  \
+             (found by a model, not checked; lines as of 1111111)"
+        );
+        output.matched = (0..13).map(pair).collect();
+        let capped = output.render(false);
+        assert_eq!(
+            capped.lines().filter(|l| l.starts_with("possible")).count(),
+            10
+        );
+        assert_eq!(
+            capped.lines().last().unwrap(),
+            "and 3 more possible pairs found by a model: carrick check --changed --all lists them"
+        );
+        assert_eq!(
+            output
+                .render(true)
+                .lines()
+                .filter(|l| l.starts_with("possible"))
+                .count(),
+            13
+        );
+        output.matched = (0..11).map(pair).collect();
+        assert!(output.render(false).ends_with(
+            "and 1 more possible pair found by a model: carrick check --changed --all lists it\n"
+        ));
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["matched"].as_array().unwrap().len(), 11);
     }
 }

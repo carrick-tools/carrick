@@ -50,6 +50,11 @@ struct HostedService {
     /// surfaces display and nothing ranks on.
     #[serde(default)]
     dirty: Option<bool>,
+    /// The hash of the Matched-pair record the cloud holds for this row, when
+    /// it holds one. Additive, and read as absent when it is anything but a
+    /// string ([`Resolution::parse`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    matched_sha256: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ResolvedRepo {
@@ -74,7 +79,22 @@ struct Resolution {
 }
 
 impl Resolution {
-    fn parse(value: serde_json::Value) -> Result<Self, String> {
+    fn parse(mut value: serde_json::Value) -> Result<Self, String> {
+        // A Matched-pair hash of any other type is no hash: it must never
+        // cost the whole response.
+        if let Some(repos) = value.get_mut("repos").and_then(|v| v.as_array_mut()) {
+            for repo in repos {
+                if let Some(services) = repo.get_mut("services").and_then(|v| v.as_array_mut()) {
+                    for service in services {
+                        if let Some(fields) = service.as_object_mut()
+                            && fields.get("matched_sha256").is_some_and(|v| !v.is_string())
+                        {
+                            fields.remove("matched_sha256");
+                        }
+                    }
+                }
+            }
+        }
         // Nullable is required on the wire; missing allowance must not erase
         // a server failure and masquerade as a successful read.
         if !value
@@ -233,6 +253,14 @@ struct Snapshot {
     /// "never compared": every project in it downloads once.
     #[serde(default)]
     stored_rows: BTreeMap<String, Vec<StoredRow>>,
+    /// Per project, the answer of possible pairs a model found
+    /// (`carrick.matched-answer/1`) as `get-cross-repo-data` gave it, kept
+    /// as the cloud wrote it and read leniently by `matched.rs`. Carried
+    /// with the project's blobs when they are reused or the download fails.
+    /// Absent on a snapshot written before the field existed, and when the
+    /// project has no record.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    matched: BTreeMap<String, serde_json::Value>,
 }
 
 /// The stored row a cached blob was downloaded as, in the same four fields a
@@ -251,6 +279,12 @@ struct StoredRow {
     service: String,
     hash: String,
     updated_at: Option<String>,
+    /// The hash of the Matched-pair record behind this row, when the cloud
+    /// holds one. A new record leaves `updated_at` alone, so this is what
+    /// moves and makes the project download again. Both sides read `None`
+    /// when no record is stored, so nothing extra downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    matched: Option<String>,
 }
 
 /// One project as `get-cross-repo-data` answered it: the blobs, and the stored
@@ -259,6 +293,9 @@ struct StoredRow {
 struct DownloadedProject {
     blobs: Vec<CloudRepoData>,
     rows: Vec<StoredRow>,
+    /// The body's top-level `matched`, whatever it holds. `None` when the
+    /// cloud sent none.
+    matched: Option<serde_json::Value>,
 }
 
 /// What one hosted read did about downloading, counted in LOCAL SERVICE ROWS —
@@ -444,13 +481,23 @@ impl Reader {
             /// (carrick#1673). It never costs the blob itself.
             #[serde(default, rename = "lastUpdated")]
             last_updated: Option<serde_json::Value>,
+            /// The hash of the entry's Matched-pair record. Read the way
+            /// `last_updated` is: anything but a string is no hash.
+            #[serde(default, rename = "matchedSha256")]
+            matched_sha256: Option<serde_json::Value>,
         }
         #[derive(Deserialize)]
         struct Response {
             repos: Vec<Entry>,
+            /// Possible pairs a model found, answered once and already
+            /// decided. Kept as written: it is read leniently later, and a
+            /// value that is not the answer is no rows, never a failed read.
+            #[serde(default)]
+            matched: Option<serde_json::Value>,
         }
         let response: Response =
             serde_json::from_value(value).map_err(|_| "Invalid hosted project schema")?;
+        let matched = response.matched;
         let mut blobs = Vec::with_capacity(response.repos.len());
         let mut rows = Vec::with_capacity(response.repos.len());
         for entry in response.repos {
@@ -469,10 +516,19 @@ impl Reader {
                     .as_ref()
                     .and_then(|at| at.as_str())
                     .map(str::to_string),
+                matched: entry
+                    .matched_sha256
+                    .as_ref()
+                    .and_then(|sha| sha.as_str())
+                    .map(str::to_string),
             });
             blobs.push(blob);
         }
-        Ok(DownloadedProject { blobs, rows })
+        Ok(DownloadedProject {
+            blobs,
+            rows,
+            matched,
+        })
     }
 
     async fn refresh(
@@ -544,6 +600,7 @@ impl Reader {
             .collect();
         let mut projects = BTreeMap::new();
         let mut stored_rows = BTreeMap::new();
+        let mut matched: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         let mut failure = None;
         let mut downloads = Downloads::default();
         for id in ids {
@@ -564,14 +621,20 @@ impl Reader {
                 && project_is_unchanged(&resolution, &id, cached, read_as, &requested)
             {
                 projects.insert(id.clone(), cached.clone());
-                stored_rows.insert(id, read_as.to_vec());
+                stored_rows.insert(id.clone(), read_as.to_vec());
+                if let Some(answer) = old.as_ref().and_then(|s| s.matched.get(&id)) {
+                    matched.insert(id, answer.clone());
+                }
                 downloads.reused += rows;
                 continue;
             }
             match self.project(credential, &id).await {
                 Ok(downloaded) => {
                     projects.insert(id.clone(), downloaded.blobs);
-                    stored_rows.insert(id, downloaded.rows);
+                    stored_rows.insert(id.clone(), downloaded.rows);
+                    if let Some(answer) = downloaded.matched {
+                        matched.insert(id, answer);
+                    }
                     downloads.fetched += rows;
                 }
                 Err(error) => {
@@ -579,7 +642,10 @@ impl Reader {
                     downloads.unread += rows;
                     if let Some((blobs, read_as)) = held {
                         projects.insert(id.clone(), blobs.clone());
-                        stored_rows.insert(id, read_as.to_vec());
+                        stored_rows.insert(id.clone(), read_as.to_vec());
+                        if let Some(answer) = old.as_ref().and_then(|s| s.matched.get(&id)) {
+                            matched.insert(id, answer.clone());
+                        }
                     }
                 }
             }
@@ -591,6 +657,7 @@ impl Reader {
                 resolution,
                 projects,
                 stored_rows,
+                matched,
             },
             failure,
             downloads,
@@ -861,6 +928,8 @@ fn rescanned_in_place(resolution: &Resolution, old: &Snapshot, name: &str) -> bo
             service: service.service.clone(),
             hash,
             updated_at: Some(updated_at),
+            // A new record at the same commit is no rescan of the blobs.
+            matched: None,
         });
     }
     named.sort();
@@ -871,6 +940,10 @@ fn rescanned_in_place(resolution: &Resolution, old: &Snapshot, name: &str) -> bo
         .flatten()
         .filter(|row| row.repo == basename)
         .cloned()
+        .map(|row| StoredRow {
+            matched: None,
+            ..row
+        })
         .collect();
     held.sort();
     !named.is_empty() && named != held
@@ -1714,6 +1787,7 @@ fn project_is_unchanged(
             service: service.service.clone(),
             hash,
             updated_at: Some(updated_at),
+            matched: service.matched_sha256.clone(),
         });
     }
     named.sort();
@@ -1895,6 +1969,30 @@ fn persist(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
 impl HostedInput {
     pub(super) fn checked_at(&self) -> Option<String> {
         self.snapshot.as_ref().map(|s| s.checked_at.clone())
+    }
+
+    /// The possible-pair answers of the snapshot, one per project that has
+    /// rows, each cut to the rows whose repo this snapshot holds at the row's
+    /// commit (so a repo held back at another commit shows none of its rows).
+    /// What `carrick index` copies into the index; `matched.rs` reads it.
+    pub(super) fn matched_answers(&self) -> Vec<serde_json::Value> {
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (id, answer) in &snapshot.matched {
+            let mut held: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+            for blob in snapshot.projects.get(id).into_iter().flatten() {
+                held.entry(blob.repo_name.to_ascii_lowercase())
+                    .or_default()
+                    .insert(blob.commit_hash.clone());
+            }
+            let kept = super::matched::retain_held(answer, &held);
+            if !super::matched::parse(&kept).is_empty() {
+                out.push(kept);
+            }
+        }
+        out
     }
 
     /// What this run did about downloading, for the build to print. `None`
@@ -2554,6 +2652,7 @@ mod tests {
                 service: service_of(blob),
                 hash: blob.commit_hash.clone(),
                 updated_at: Some(at.to_string()),
+                matched: None,
             })
             .collect()
     }
@@ -2596,6 +2695,7 @@ mod tests {
                 .map(|(id, blobs)| (id.clone(), read_as(blobs, STORED_AT)))
                 .collect(),
             projects,
+            matched: BTreeMap::new(),
         }
     }
 
@@ -2653,6 +2753,107 @@ mod tests {
             body,
             json!({"action":"get-cross-repo-data","project_id":"authorised-project"})
         );
+    }
+
+    /// A `matched` value that is not the answer, and a Matched-pair hash that
+    /// is not a string, never fail a project read; the blobs read as before.
+    #[tokio::test]
+    async fn a_garbage_matched_value_reads_the_project_and_holds_no_rows() {
+        let (url, request) = serve(
+            "200 OK",
+            "",
+            serde_json::to_vec(&json!({"repos":[
+                {"metadata": named_blob("api","api","abcdef"), "matchedSha256": 7}],
+                "matched": "not an answer"}))
+            .unwrap(),
+        );
+        let project = reader(url)
+            .project(&credential("test-secret"), "p")
+            .await
+            .unwrap();
+        request.join().unwrap();
+        assert_eq!(project.blobs.len(), 1);
+        assert_eq!(project.rows[0].matched, None);
+        let answer = project.matched.expect("kept as written");
+        assert!(super::super::matched::parse(&answer).is_empty());
+    }
+
+    /// With no record both sides read `None` and nothing downloads again; a
+    /// moved hash does, though `updated_at` did not move.
+    #[test]
+    fn a_moved_matched_hash_downloads_the_project_again() {
+        let resolution = |sha: Option<&str>| {
+            let mut metadata = json!({"schema":"carrick.resolve-repos/0",
+                "workspace":{"slug":"fixture","billing_tier":"free","installed":true},
+                "allowance_sentence":null,
+                "repos":[{"full_name":"example/api","connected":true,"project_id":"pa",
+                    "project_slug":"sa","services":[service_row("api","abcdef")]}],
+                "project_repos":[{"project_slug":"sa","repos":["example/api"]}]});
+            if let Some(sha) = sha {
+                metadata["repos"][0]["services"][0]["matched_sha256"] = json!(sha);
+            }
+            Resolution::parse(metadata).unwrap()
+        };
+        let cached = vec![named_blob("api", "api", "abcdef")];
+        let requested = std::collections::BTreeSet::from(["example/api".to_string()]);
+        let held = |sha: Option<&str>| {
+            let mut rows = read_as(&cached, STORED_AT);
+            rows[0].matched = sha.map(str::to_string);
+            rows
+        };
+        assert!(project_is_unchanged(
+            &resolution(None),
+            "pa",
+            &cached,
+            &held(None),
+            &requested
+        ));
+        assert!(project_is_unchanged(
+            &resolution(Some("aa")),
+            "pa",
+            &cached,
+            &held(Some("aa")),
+            &requested
+        ));
+        assert!(!project_is_unchanged(
+            &resolution(Some("bb")),
+            "pa",
+            &cached,
+            &held(Some("aa")),
+            &requested
+        ));
+        assert!(!project_is_unchanged(
+            &resolution(Some("aa")),
+            "pa",
+            &cached,
+            &held(None),
+            &requested
+        ));
+    }
+
+    /// A repo the snapshot holds at another commit shows none of its rows.
+    #[test]
+    fn the_snapshot_answers_only_rows_at_the_commit_it_holds() {
+        let answer = |commit: &str| {
+            json!({"schema":"carrick.matched-answer/1","rows":[{
+                "repo":"example/api","commit":commit,"kind":"route","method":"GET",
+                "name":"/a","caller":{"file":"a.ts","line":1},"server":{"file":"b.ts","line":2}}]})
+        };
+        let mut snapshot = snapshot(
+            resolution(),
+            BTreeMap::from([("p".to_string(), vec![blob()])]),
+        );
+        let input = |snapshot: &Snapshot| HostedInput {
+            snapshot: Some(snapshot.clone()),
+            ..Default::default()
+        };
+        assert!(input(&snapshot).matched_answers().is_empty());
+        snapshot.matched.insert("p".into(), answer("abcdef"));
+        assert_eq!(input(&snapshot).matched_answers().len(), 1);
+        snapshot.matched.insert("p".into(), answer("fedcba"));
+        assert!(input(&snapshot).matched_answers().is_empty());
+        snapshot.matched.insert("p".into(), json!(12));
+        assert!(input(&snapshot).matched_answers().is_empty());
     }
 
     /// A blob answered with no stored time, or with one that is not a string,
@@ -2837,6 +3038,7 @@ mod tests {
             resolution: Resolution::parse(resolution()).unwrap(),
             projects: BTreeMap::from([("p".into(), vec![blob()])]),
             stored_rows: BTreeMap::new(),
+            matched: BTreeMap::new(),
         };
         let (url, request) = serve("200 OK", "", serde_json::to_vec(&metadata).unwrap());
         let (new, failure, _) = reader(url)
@@ -3107,12 +3309,14 @@ mod tests {
                     service: "api".into(),
                     hash: "abcdef".into(),
                     updated_at: Some(later.into()),
+                    matched: None,
                 },
                 StoredRow {
                     repo: "api".into(),
                     service: "worker".into(),
                     hash: "fedcba".into(),
                     updated_at: Some(STORED_AT.into()),
+                    matched: None,
                 },
             ],
             "the rows the new blobs were answered as are what the next read compares"
@@ -3353,6 +3557,7 @@ mod tests {
                 resolution: Resolution::parse(metadata).unwrap(),
                 projects: BTreeMap::from([("p".into(), vec![blob()])]),
                 stored_rows: BTreeMap::new(),
+                matched: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -3382,6 +3587,7 @@ mod tests {
                 resolution: Resolution::parse(metadata).unwrap(),
                 projects: BTreeMap::from([("p".into(), vec![stored])]),
                 stored_rows: BTreeMap::new(),
+                matched: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(repo.to_path_buf(), "example/api".into())]),
@@ -3473,6 +3679,7 @@ mod tests {
                 resolution: Resolution::parse(resolution()).unwrap(),
                 projects: BTreeMap::new(),
                 stored_rows: BTreeMap::new(),
+                matched: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -3529,6 +3736,7 @@ mod tests {
                     vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
                 )]),
                 stored_rows: BTreeMap::new(),
+                matched: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -3570,6 +3778,7 @@ mod tests {
                     resolution: Resolution::parse(metadata).unwrap(),
                     projects: BTreeMap::from([("p".into(), vec![blob_from(version)])]),
                     stored_rows: BTreeMap::new(),
+                    matched: BTreeMap::new(),
                 }),
                 failure: None,
                 remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -3610,6 +3819,7 @@ mod tests {
                     vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
                 )]),
                 stored_rows: BTreeMap::new(),
+                matched: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -3650,6 +3860,7 @@ mod tests {
                 resolution: Resolution::parse(metadata).unwrap(),
                 projects: BTreeMap::from([("p".into(), vec![stored])]),
                 stored_rows: BTreeMap::new(),
+                matched: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(repo.to_path_buf(), "example/api".into())]),
@@ -3690,6 +3901,7 @@ mod tests {
                 resolution: Resolution::parse(metadata).unwrap(),
                 projects: BTreeMap::from([("p".into(), vec![stored])]),
                 stored_rows: BTreeMap::new(),
+                matched: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(repo.to_path_buf(), "example/api".into())]),
@@ -3725,6 +3937,7 @@ mod tests {
                     vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
                 )]),
                 stored_rows: BTreeMap::new(),
+                matched: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -3759,6 +3972,7 @@ mod tests {
                     resolution: Resolution::parse(resolution()).unwrap(),
                     projects: BTreeMap::new(),
                     stored_rows: BTreeMap::new(),
+                    matched: BTreeMap::new(),
                 }),
                 failure: None,
                 remotes,
@@ -4594,6 +4808,7 @@ mod tests {
                 service: "web".into(),
                 hash: t.web.1.clone(),
                 updated_at: Some(STORED_AT.into()),
+                matched: None,
             }]
         );
         assert_eq!(row_of("api")[0].updated_at.as_deref(), Some(MOVED_AT));
