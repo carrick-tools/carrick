@@ -9876,6 +9876,7 @@ export class TypeInferrer {
     return {
       readsReplies: stated.readsReplies,
       sendAt: (call) => stated.sendAt(call),
+      setsBody: (target) => stated.setsBody(target),
       rootSymbol: (expression) => stated.rootSymbol(expression),
       isNothing: (type) => stated.isNothing(type),
       awaited: (type) => this.unwrapPromiseType(type),

@@ -34,6 +34,7 @@ const PKG = 'reply-kit';
 const KIT = `export interface Reply<B = unknown> {
   statusCode: number;
   headersSent: boolean;
+  body: unknown;
   status(code: number): Reply<B>;
   json(body: B): Reply<B>;
   send(body?: B): Reply<B>;
@@ -134,6 +135,34 @@ function replyWith(res: Reply, body: unknown): void {
 
 export const kit = { serve };
 
+// Curried: the wrapper is the function another call returns.
+export const servedFor = (role: string) => <T>(fn: (req: Request) => Promise<T>): Handler =>
+  async (req, res) => {
+    res.json(await fn(req));
+  };
+
+// Calls the callback through the language library's call.
+export function viaCall<T>(fn: (req: Request) => Promise<T>): Handler {
+  return async (req, res) => {
+    res.json(await fn.call(undefined, req));
+  };
+}
+
+// Binds the callback's result to a const and returns it.
+export function held(fn: (req: Request, res: Reply) => Promise<void>): Handler {
+  return async (req, res) => {
+    const done = await fn(req, res);
+    return done;
+  };
+}
+
+// Sends the callback's result by assigning it to the reply's body member.
+export function assigned<T>(fn: (req: Request) => Promise<T>): Handler {
+  return async (req, res) => {
+    res.body = await fn(req);
+  };
+}
+
 // Hands the callback's result, unchanged, to a member no label names a send.
 export function traced<T>(fn: (req: Request) => Promise<T>): Handler {
   return async (req, res) => {
@@ -194,6 +223,10 @@ import {
   serve,
   statedEnvelope,
   traced,
+  servedFor,
+  viaCall,
+  held,
+  assigned,
 } from './wrap';
 
 const passThroughList = passThrough(async (req, res) => {
@@ -225,6 +258,12 @@ async function listAll(req: Request) {
 }
 const envelopedAll = envelope(listAll);
 const tracedList = traced(async (req) => listWidgets());
+const curriedList = servedFor('admin')(async (req) => listWidgets());
+const calledList = viaCall(async (req) => listWidgets());
+const heldList = held(async (req, res) => {
+  res.json(await listWidgets());
+});
+const assignedList = assigned(async (req) => listWidgets());
 const libVoidList = catchErrors(async (req, res) => {
   res.json(await listWidgets());
 });
@@ -255,6 +294,14 @@ app.get('/method-served', methodServedList);
 app.get('/all-enveloped', envelopedAll);
 app.get('/all', listAll);
 app.get('/traced', tracedList);
+app.get('/curried', curriedList);
+app.get('/called', calledList);
+app.get('/held', heldList);
+app.get('/assigned', assignedList);
+
+export function mount(router: typeof app): void {
+  router.get('/mounted', envelopedList);
+}
 `;
 
 const TSCONFIG = JSON.stringify({
@@ -297,6 +344,7 @@ const LABELS = [
   ),
   send('json'),
   send('send'),
+  check('reply', 'export', { kind: 'op', op: 'send', member: 'body', on: 'export', form: 'set', payload: { arg: 0 } }),
 ];
 
 interface Inferred {
@@ -353,7 +401,7 @@ describe('carrick#1969 T1: a wrapper is read through only where its code sends w
     shape: 'span' | 'line' = 'span',
     labels = true
   ): Promise<Inferred | undefined> => {
-    const start = source.search(new RegExp(`app\\.(get|post)\\('${route}'`));
+    const start = source.search(new RegExp(`(app|router)\\.(get|post)\\('${route}'`));
     assert.ok(start >= 0, `fixture registers ${route}`);
     const end = source.indexOf(');', start) + 1;
     const alias = `a${id}`;
@@ -382,7 +430,18 @@ describe('carrick#1969 T1: a wrapper is read through only where its code sends w
     inferred?.any_provenance?.find((p) => p.path === '')?.reason;
 
   describe('the callback stays the handler', () => {
-    for (const route of ['/pass-through', '/cast-catch', '/nested', '/identity', '/served', '/lib-void']) {
+    for (const route of [
+      '/pass-through',
+      '/cast-catch',
+      '/nested',
+      '/identity',
+      '/served',
+      '/lib-void',
+      '/curried',
+      '/called',
+      '/held',
+      '/assigned',
+    ]) {
       it(`${route}: the response is what the callback sends or returns`, async () => {
         assert.strictEqual(await text(route, 'response_body'), WIDGETS);
       });
@@ -423,6 +482,14 @@ describe('carrick#1969 T1: a wrapper is read through only where its code sends w
       assert.notStrictEqual(collapse(got?.type_string), WIDGETS);
       assert.strictEqual(got, undefined);
     });
+  });
+
+  it('a registration inside a function reads the wrapper`s reply too', async () => {
+    for (const shape of ['span', 'line'] as const) {
+      const got = await infer('/mounted', 'response_body', shape);
+      assert.strictEqual(collapse(got?.type_string), 'unknown', shape);
+      assert.strictEqual(reason(got), 'bound_by_callers', shape);
+    }
   });
 
   it('composed wrappers: the innermost wrapper that builds the reply decides', async () => {
