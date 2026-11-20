@@ -12,10 +12,10 @@ import net from "node:net";
 import path from "node:path";
 import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
-import { releaseLock, takeLock, touchLock } from "../hook/lock.ts";
+import { readJson, releaseLock, takeLock, touchLock } from "../hook/lock.ts";
 import { answerEarly, supersededEntry } from "../hook/rechecks.ts";
 import { heldBuildId } from "./build.ts";
-import { heldDir, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
+import { heldDir, helloPath, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
 import { readState, writeState, type NotChecked, type ServiceState } from "./state.ts";
 import { addSteps, tenth, type Steps } from "./steps.ts";
 import {
@@ -400,7 +400,7 @@ export class HeldDaemon {
         .filter((s) => s.status === "ready" && now - s.lastUsed >= EVICT_IDLE_MS)
         .sort((a, b) => a.lastUsed - b.lastUsed)[0];
       if (victim === undefined) return false;
-      await this.closeSlot(victim);
+      await this.closeSlot(victim, "evicted");
     }
   }
 
@@ -451,7 +451,8 @@ export class HeldDaemon {
     });
   }
 
-  private async closeSlot(slot: Slot): Promise<void> {
+  private async closeSlot(slot: Slot, reason: "idle" | "size" | "evicted" | "exit"): Promise<void> {
+    this.write({ at: new Date(this.now()).toISOString(), kind: "close", service: slot.init.service, reason });
     this.slots.delete(key(slot.init));
     removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
     if (this.slots.size === 0) this.emptySince = this.now();
@@ -471,7 +472,7 @@ export class HeldDaemon {
       const oversized = rss !== null && rss > ceiling;
       if (oversized) log(`closing ${slot.init.service} for size: ${Math.round(rss)} MB is above ${ceiling} MB (1.5 x ${slot.settledMb ?? "the floor"})`);
       if (now - slot.lastUsed >= ENGINE_IDLE_MS || oversized) {
-        await this.closeSlot(slot);
+        await this.closeSlot(slot, oversized ? "size" : "idle");
       } else if (holdsEntry && rss !== null) {
         this.entry(slot, rss);
       }
@@ -486,7 +487,7 @@ export class HeldDaemon {
 
   async close(): Promise<void> {
     this.closed = true;
-    for (const slot of [...this.slots.values()]) await this.closeSlot(slot);
+    for (const slot of [...this.slots.values()]) await this.closeSlot(slot, "exit");
   }
 
   private record(request: HeldRequest, state: HeldState, lines: number, ms: number, steps: Steps): void {
@@ -539,12 +540,15 @@ export async function serve(deps: DaemonDeps, options: ServeOptions = {}): Promi
   // The lock is ours, so a socket file left here belongs to a dead daemon.
   fs.rmSync(sock, { force: true });
   let retired = false;
+  let exitReason: "signal" | "idle" | "retired" | undefined;
   let leave: () => void = () => undefined;
   // A daemon of another build was told to exit: its socket and lock go at once,
   // so the replacement can take them, and only then does it reply and wind down.
   const retire = (): void => {
     if (retired) return;
     retired = true;
+    exitReason = "retired";
+    removeHelloFile();
     fs.rmSync(sock, { force: true });
     releaseLock(lock, process.pid);
   };
@@ -583,15 +587,25 @@ export async function serve(deps: DaemonDeps, options: ServeOptions = {}): Promi
     return false;
   }
   fs.chmodSync(sock, 0o600);
+  // Beside the lock: a client whose hello wait ran out tells a busy daemon of its own build from another.
+  const helloFile = helloPath(deps.root, deps.home);
+  const removeHelloFile = (): void => {
+    if (readJson<{ pid?: number }>(helloFile)?.pid === process.pid) fs.rmSync(helloFile, { force: true });
+  };
+  fs.writeFileSync(helloFile, `${JSON.stringify({ pid: process.pid, build_id: hello.build_id })}\n`, { mode: 0o600 });
   await new Promise<void>((resolve) => {
     const timer = setInterval(() => {
       if (retired) return;
       touchLock(lock, process.pid, now());
       void daemon.tick().then(() => {
-        if (daemon.wantsExit()) resolve();
+        if (daemon.wantsExit()) {
+          exitReason ??= "idle";
+          resolve();
+        }
       });
     }, options.tickMs ?? 10_000);
     const done = (): void => {
+      exitReason ??= options.signal?.aborted === true ? "signal" : "idle";
       clearInterval(timer);
       resolve();
     };
@@ -600,6 +614,8 @@ export async function serve(deps: DaemonDeps, options: ServeOptions = {}): Promi
     options.signal?.addEventListener("abort", done, { once: true });
   });
   server.close();
+  log(`daemon exiting: ${exitReason ?? "idle"}`);
+  removeHelloFile();
   // A retired daemon's socket and lock may be the replacement's by now.
   if (!retired) fs.rmSync(sock, { force: true });
   await daemon.close();

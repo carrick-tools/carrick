@@ -27,6 +27,11 @@ export function lockPath(root: string, home?: string): string {
   return path.join(heldDir(home), `${rootKey(root)}.lock`);
 }
 
+/** `{ pid, build_id }`, written once the daemon listens: a busy daemon of this build is told from another by it. */
+export function helloPath(root: string, home?: string): string {
+  return path.join(heldDir(home), `${rootKey(root)}.hello`);
+}
+
 /** A service name as one safe path segment (a hash keeps two names that sanitise alike apart). */
 function serviceSegment(service: string): string {
   const hash = createHash("sha256").update(service).digest("hex").slice(0, 6);

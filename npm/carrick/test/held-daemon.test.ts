@@ -256,6 +256,24 @@ test("an engine idle for 15 minutes closes; the daemon leaves 5 minutes later, o
   }
 });
 
+test("an engine closed for idle writes a close row to the held log", async () => {
+  const w = world(["api"]);
+  try {
+    w.release();
+    await w.daemon.handle(w.req(w.file("api")));
+    await settle();
+    w.clock.now += 16 * MIN;
+    await w.daemon.tick();
+    const rows = fs.readFileSync(logPath(w.root, w.home), "utf8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    const close = rows.find((r) => r["kind"] === "close");
+    assert.equal(close?.["reason"], "idle");
+    assert.equal(close?.["service"], "api");
+  } finally {
+    await w.daemon.close();
+    w.done();
+  }
+});
+
 test("over the memory budget answers capped, and the least recently used idle engine goes first", async () => {
   const w = world(["a", "b", "c"]);
   try {
