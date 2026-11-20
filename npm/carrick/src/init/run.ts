@@ -33,12 +33,12 @@ import {
   type WorkspaceProposal,
 } from "./repos.ts";
 import { reposUrl } from "./connect.ts";
+import { checkoutOf } from "../hook/worktree.ts";
 import { downloadHostedIndex, hostedReport, nativeRunner, STEP_LABEL } from "./hosted.ts";
 import { listProjects, projectLabel, SLUG, type Project } from "./projects.ts";
 import {
   committedHooksAreOurs,
   holdsOurs,
-  insideWorkTree,
   ownRepository,
   repoCopyPathsFor,
   trackedPaths,
@@ -659,7 +659,7 @@ async function planRun(input: {
   // A folder inside another repository's work tree holds the team's files, which
   // the team is asked to track: a per-machine choice there would change what the
   // team commits, so it gets both agents' files, as before.
-  const agents: CopyAgents = !hidden && insideWorkTree(workspace) ? BOTH_HARNESSES : harnesses;
+  const agents: CopyAgents = !hidden && checkoutOf(workspace) !== null ? BOTH_HARNESSES : harnesses;
   // One repo shows its copy in nothing git shows, unless git tracks a path this
   // run writes or the team's committed settings hold our entries (they are updated in place).
   const teamHooks = hidden && agents.claudeCode && committedHooksAreOurs(workspace, SHARED_SETTINGS);

@@ -170,11 +170,6 @@ export function git(repo: string, args: string[], timeoutMs = 5000, env?: NodeJS
   return result.stdout;
 }
 
-/** Whether this folder is inside a git work tree: its own repository's, or one above it. */
-export function insideWorkTree(folder: string): boolean {
-  return git(folder, ["rev-parse", "--is-inside-work-tree"])?.trim() === "true";
-}
-
 /** Whether this folder is the top of a git repository, not a folder inside one. */
 export function ownRepository(repo: string): boolean {
   const top = git(repo, ["rev-parse", "--show-toplevel"])?.trim();
