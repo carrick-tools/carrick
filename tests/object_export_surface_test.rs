@@ -29,6 +29,14 @@ fn function_definitions() -> serde_json::Map<String, serde_json::Value> {
 
 /// The function definitions of one isolated offline scan of `fixture`.
 fn function_definitions_of(fixture: &str) -> serde_json::Map<String, serde_json::Value> {
+    stored_blob(fixture)["function_definitions"]
+        .as_object()
+        .expect("the blob carries function definitions")
+        .clone()
+}
+
+/// The blob one isolated offline scan of `fixture` stores.
+fn stored_blob(fixture: &str) -> serde_json::Value {
     let cache = tempfile::tempdir().expect("temp cache dir");
     let cassettes = fixture_dir(fixture).join("__llm__");
 
@@ -55,11 +63,7 @@ fn function_definitions_of(fixture: &str) -> serde_json::Map<String, serde_json:
 
     let blob = find_blob(cache.path()).expect("the scan stored a blob");
     let text = std::fs::read_to_string(&blob).expect("read the stored blob");
-    let stored: serde_json::Value = serde_json::from_str(&text).expect("the blob is JSON");
-    stored["function_definitions"]
-        .as_object()
-        .expect("the blob carries function definitions")
-        .clone()
+    serde_json::from_str(&text).expect("the blob is JSON")
 }
 
 /// The stored blob, wherever the isolated cache put it.
@@ -330,4 +334,119 @@ fn a_member_call_through_the_import_reaches_the_definition() {
     .map(|(f, n, l)| (f.to_string(), n.to_string(), l))
     .collect();
     assert_eq!(calls, expected);
+}
+
+/// carrick#4083: a callback handed to a wrapper call as the value of an
+/// exported object's member (`list: wrap(async (req, res) => { … })`) is that
+/// member's function, keyed `owner.member` exactly as `list: async (req, res)
+/// => { … }` is. Named for the wrapper instead, every member of a controller
+/// read as one `wrap_handler` row, and the rest were never indexed.
+#[test]
+fn a_wrapped_callback_on_an_exported_object_is_named_for_its_member() {
+    let blob = stored_blob("wrapped-object-members");
+    let definitions: Vec<serde_json::Value> = blob["function_definitions"]
+        .as_object()
+        .expect("the blob carries function definitions")
+        .values()
+        .cloned()
+        .collect();
+
+    let members = [
+        // `export const widgetController = { … }`
+        (
+            "src/controllers/widgets.ts",
+            "widgetController.list",
+            7,
+            "listWidgets",
+        ),
+        (
+            "src/controllers/widgets.ts",
+            "widgetController.get",
+            10,
+            "findWidget",
+        ),
+        (
+            "src/controllers/widgets.ts",
+            "widgetController.create",
+            13,
+            "saveWidget",
+        ),
+        // `const gadgetController = { … }; export default gadgetController`,
+        // one member a function expression
+        (
+            "src/controllers/gadgets.ts",
+            "gadgetController.list",
+            7,
+            "listGadgets",
+        ),
+        (
+            "src/controllers/gadgets.ts",
+            "gadgetController.get",
+            10,
+            "findGadget",
+        ),
+        (
+            "src/controllers/gadgets.ts",
+            "gadgetController.remove",
+            13,
+            "removeGadget",
+        ),
+    ];
+    let helpers: Vec<&str> = members.iter().map(|(_, _, _, helper)| *helper).collect();
+
+    for (file, name, line, helper) in members {
+        let def = definition_in(&definitions, file, name);
+        assert_eq!(def["line_number"], line, "{file} {name}: {def:#?}");
+        assert_eq!(def["is_exported"], true, "{file} {name}: {def:#?}");
+        // Each row holds its own body, so the calls in it are its own.
+        let called: Vec<&str> = def["calls"]
+            .as_array()
+            .expect("calls")
+            .iter()
+            .filter_map(|call| call["name"].as_str())
+            .filter(|callee| helpers.contains(callee))
+            .collect();
+        assert_eq!(called, [helper], "{file} {name} calls: {def:#?}");
+    }
+
+    // Nothing else in a controller file: no row named for the wrapper beside
+    // the members, holding the same body a second time.
+    for file in ["src/controllers/widgets.ts", "src/controllers/gadgets.ts"] {
+        let mut in_file: Vec<&str> = definitions
+            .iter()
+            .filter(|d| d["file_path"] == file && d["name"] != "<module>")
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        in_file.sort();
+        let mut expected: Vec<&str> = members
+            .iter()
+            .filter(|(f, ..)| *f == file)
+            .map(|(_, name, ..)| *name)
+            .collect();
+        expected.sort();
+        assert_eq!(in_file, expected, "{file}: {:?}", located(&definitions));
+    }
+
+    // Each route's handler names one definition.
+    let endpoints = blob["endpoints"].as_array().expect("endpoints");
+    for (_, name, ..) in members {
+        let row = endpoints
+            .iter()
+            .find(|row| row["handler_name"] == name)
+            .unwrap_or_else(|| panic!("no route handled by {name}: {endpoints:#?}"));
+        let joined = definitions.iter().filter(|d| d["name"] == name).count();
+        assert_eq!(joined, 1, "{name} joins one definition: {row:#?}");
+    }
+
+    // The control: a callback handed straight to a route registration is still
+    // named for the route.
+    definition_in(&definitions, "src/routes.ts", "get_health_handler");
+
+    // The bound: `names: items.map((item) => item.name)` is a value computed
+    // with a callback, not a wrapped handler.
+    assert!(
+        find_in(&definitions, "src/store.ts", "catalog.names").is_none(),
+        "a method call's callback is not named for the member: {:?}",
+        located(&definitions)
+    );
 }
