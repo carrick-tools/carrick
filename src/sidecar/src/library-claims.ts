@@ -558,9 +558,10 @@ export function httpCheck(check: SemanticsCheck): LibraryCheck {
  * (carrick#4932), as `LibraryClaimsVerifier.run` judges them in one: a package
  * shipping twin declarations (`.d.mts`, `.d.cts`) resolves to the twin each
  * program's module resolution picks, and a call's position row names that
- * twin. The verdicts, their reasons and the modules are the first program's;
- * a check every program verifies names the declarations each of them reads,
- * each once. The later programs share what is left of `budgetMs`.
+ * twin. A check is verified where any program verifies it, naming the
+ * declarations every verifying program reads, each once; a check none
+ * verifies keeps the first program's verdict and reason. The modules are the
+ * first program's. The later programs share what is left of `budgetMs`.
  */
 export function runInPrograms(
   verifiers: readonly LibraryClaimsVerifier[],
@@ -578,7 +579,9 @@ export function runInPrograms(
     const other = verifier.run(fromDir, checks, left, scanRoot).semantics;
     result.semantics = result.semantics.map((verdict, i) => {
       const also = other[i];
-      if (verdict.verdict !== 'verified' || also?.verdict !== 'verified' || !also.declarations?.length) return verdict;
+      if (also?.verdict !== 'verified') return verdict;
+      if (verdict.verdict !== 'verified') return also;
+      if (!also.declarations?.length) return verdict;
       return { ...verdict, declarations: sortedDeclarations([...(verdict.declarations ?? []), ...also.declarations]) };
     });
   }

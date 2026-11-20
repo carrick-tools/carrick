@@ -4604,7 +4604,8 @@ impl TypeSidecar {
     ///
     /// `tsconfig` names another service's tsconfig: the checks are then judged
     /// in a probe-only program under its compiler options, not in this
-    /// service's own program (carrick#4472). `None` is the service's program.
+    /// service's own programs (carrick#4472). `None` judges them in each program
+    /// the service's files are typed under (carrick#4932).
     pub fn verify_library_claims(
         &self,
         from_dir: &Path,

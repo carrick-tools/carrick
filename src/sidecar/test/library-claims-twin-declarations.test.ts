@@ -54,7 +54,7 @@ interface Layout {
 }
 
 /** The post op's verdict and the call row of `app.post`, for one layout. */
-async function verdictAndRow(layout: Layout): Promise<{ verdict: Verdict; row: Row }> {
+async function verdictAndRow(layout: Layout): Promise<{ verdict: Verdict; row: Row; channel: Verdict }> {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-claims-twin-')));
   const store = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-claims-twin-rows-')));
   const client = new SidecarClient();
@@ -131,12 +131,20 @@ async function verdictAndRow(layout: Layout): Promise<{ verdict: Verdict; row: R
         checks: [
           check('m0', 'export', { kind: 'make', form: 'new', member: null }),
           check('post', 'instance:new', { kind: 'op', op: 'receive', member: 'post', name: { arg: 0 }, of: 'instance:new' }),
+          {
+            claim_id: 'channel',
+            package: 'lib:lib.dom.d.ts',
+            export: 'BroadcastChannel',
+            role: 'in_process_bus',
+            receiver: 'export',
+            claim: { kind: 'make', form: 'new', member: null, name: { arg: 0 } },
+          },
         ],
       },
       60_000
     );
     assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
-    return { verdict: response.verdicts![1], row: rows[0] };
+    return { verdict: response.verdicts![1], row: rows[0], channel: response.verdicts![2] };
   } finally {
     await client.stop();
     fs.rmSync(root, { recursive: true, force: true });
@@ -182,6 +190,16 @@ describe('verify_library_claims: twin .d.mts/.d.cts read as the service reads th
       { decl_file: twin('d.cts'), decl_line: row[5]! + 1 },
       { decl_file: twin('d.mts'), decl_line: row[5] },
     ]);
+  });
+
+  it('a claim only a later owner can read (its lib has the DOM, the first\'s has not) is verified', async () => {
+    const { channel } = await verdictAndRow({
+      pkg: {},
+      options: { ...bundler, lib: ['es2022'] },
+      solution: true,
+      tool: { ...bundler, lib: ['es2022', 'dom'] },
+    });
+    assert.strictEqual(channel.verdict, 'verified', JSON.stringify(channel));
   });
 
   it('a single `bundler` config, as before, names the .d.mts twin', async () => {
