@@ -195,7 +195,15 @@ impl Slots {
             if held(walked.service.as_deref()) {
                 continue;
             }
-            crate::position_rows::land(walked.rows.as_ref().map(Destination::path), to);
+            let landed =
+                crate::position_rows::land(walked.rows.as_ref().map(Destination::path), to);
+            if !landed && walked.rows.is_some() && crate::position_rows::is_runner_rows_path(to) {
+                warn!(
+                    "Position rows for service {} were not kept at {}",
+                    walked.label,
+                    to.display()
+                );
+            }
         }
     }
 

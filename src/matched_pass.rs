@@ -773,13 +773,20 @@ type Operation<'a> = (&'a str, &'a str, &'a str);
 
 /// A stored blob of one of the repository's services, with its rows file.
 struct Stored {
-    blob: CloudRepoData,
+    /// `None` for a service whose rows alone are in the store: the cloud
+    /// runner lands rows without blobs ([`crate::position_rows::RUNNER_ROWS_DIR_ENV`]).
+    blob: Option<CloudRepoData>,
     rows: PathBuf,
 }
 
 /// The blobs of `services` in `store`, matched by the repository's name
 /// (`owner/name` or `name`) and the service's.
-fn read_store(store: &Path, repo_name: &str, names: &[String]) -> HashMap<String, Stored> {
+fn read_store(
+    store: &Path,
+    repo_name: &str,
+    names: &[String],
+    service_names: &[Option<String>],
+) -> HashMap<String, Stored> {
     let short = repo_name.rsplit('/').next().unwrap_or(repo_name);
     let mut found = HashMap::new();
     let Ok(entries) = std::fs::read_dir(store) else {
@@ -807,7 +814,27 @@ fn read_store(store: &Path, repo_name: &str, names: &[String]) -> HashMap<String
         }
         let stem = crate::cloud_storage::blob_stem(&blob.repo_name, blob.service_name.as_deref());
         let rows = store.join(POSITIONS_DIR).join(format!("{stem}.jsonl.gz"));
-        found.insert(service, Stored { blob, rows });
+        found.insert(
+            service,
+            Stored {
+                blob: Some(blob),
+                rows,
+            },
+        );
+    }
+    // A service with rows and no blob (the cloud runner keeps rows only).
+    for (name, service_name) in names.iter().zip(service_names) {
+        if found.contains_key(name) {
+            continue;
+        }
+        for repo in [repo_name, short] {
+            let stem = crate::cloud_storage::blob_stem(repo, service_name.as_deref());
+            let rows = store.join(POSITIONS_DIR).join(format!("{stem}.jsonl.gz"));
+            if rows.exists() {
+                found.insert(name.clone(), Stored { blob: None, rows });
+                break;
+            }
+        }
     }
     found
 }
@@ -1026,22 +1053,34 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
 
     let stored = inputs
         .store
-        .map(|store| read_store(store, &repo_name, &names))
+        .map(|store| {
+            let service_names: Vec<Option<String>> =
+                services.iter().map(|s| s.service_name.clone()).collect();
+            read_store(store, &repo_name, &names, &service_names)
+        })
         .unwrap_or_default();
     let mut row_paths: Vec<PathBuf> = stored.values().map(|s| s.rows.clone()).collect();
     row_paths.sort();
     row_paths.retain(|path| path.exists());
     let rows = Rows::read(&root, &row_paths);
     let mut blobs: Vec<&Stored> = stored.values().collect();
-    blobs.sort_by(|a, b| a.blob.service_name.cmp(&b.blob.service_name));
-    let own = OwnCode::of(blobs.iter().map(|stored| &stored.blob));
+    blobs.retain(|stored| stored.blob.is_some());
+    blobs.sort_by(|a, b| {
+        let name = |s: &&Stored| s.blob.as_ref().and_then(|b| b.service_name.clone());
+        name(a).cmp(&name(b))
+    });
+    let own = OwnCode::of(blobs.iter().filter_map(|stored| stored.blob.as_ref()));
     // What each service was read with, for the runner's log: the pass runs
     // before any log sink, so it says so on stderr.
     for name in &names {
         let held = stored.get(name);
         crate::errln!(
             "carrick {COMMAND}: {name}: extraction config {}, rows {}",
-            if held.is_some_and(|s| s.blob.cached_extraction_config.is_some()) {
+            if held.is_some_and(|s| {
+                s.blob
+                    .as_ref()
+                    .is_some_and(|b| b.cached_extraction_config.is_some())
+            }) {
                 "stored"
             } else {
                 "absent"
@@ -1120,7 +1159,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
             tsconfig: service.tsconfig.clone(),
             extraction_config: stored
                 .get(name)
-                .and_then(|stored| stored.blob.cached_extraction_config.clone()),
+                .and_then(|stored| stored.blob.as_ref()?.cached_extraction_config.clone()),
             server_claims: None,
         })
         .collect();

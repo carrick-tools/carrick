@@ -354,15 +354,50 @@ impl Drop for Destination {
 /// a PR scan) leaves the local store untouched too, so its rows never land
 /// there (carrick#3283).
 pub fn destination(uploads: bool, repo_name: &str, service_name: Option<&str>) -> Destination {
+    let store = std::env::var_os(CACHE_DIR_ENV)
+        .map(PathBuf::from)
+        .filter(|_| uploads);
+    let runner = if store.is_none() && uploads {
+        runner_rows_dir()
+    } else {
+        None
+    };
     destination_from(
-        std::env::var_os(CACHE_DIR_ENV)
-            .map(PathBuf::from)
-            .filter(|_| uploads)
-            .as_deref(),
+        store.or(runner).as_deref(),
         &std::env::temp_dir(),
         repo_name,
         service_name,
     )
+}
+
+/// Internal: the cloud runner's directory for position rows. An uploading run
+/// with no local store lands each service's rows at
+/// `<dir>/positions/<stem>.jsonl.gz`, through the same [`land`] a local store
+/// uses, so `__matched-pass --store <dir>` reads them. Unset, nothing changes.
+pub const RUNNER_ROWS_DIR_ENV: &str = "CARRICK_RUNNER_ROWS_DIR";
+
+/// [`RUNNER_ROWS_DIR_ENV`]'s directory when it is set and exists; a set one
+/// that does not is one logged warning and no rows landed there.
+fn runner_rows_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os(RUNNER_ROWS_DIR_ENV).filter(|d| !d.is_empty())?);
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        tracing::warn!(
+            "{RUNNER_ROWS_DIR_ENV} names {}, which is not a directory: position rows are not kept",
+            dir.display()
+        );
+    }
+    None
+}
+
+/// Whether `to` sits under [`RUNNER_ROWS_DIR_ENV`]'s directory.
+pub fn is_runner_rows_path(to: &Path) -> bool {
+    std::env::var_os(RUNNER_ROWS_DIR_ENV)
+        .filter(|d| !d.is_empty())
+        .is_some_and(|d| to.starts_with(d))
 }
 
 /// [`destination`] over the settings it reads: the local store and the OS
