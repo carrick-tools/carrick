@@ -49,6 +49,9 @@ use swc_ecma_visit::VisitWith;
 mod answers_ahead;
 pub mod durability;
 pub mod fact_seam;
+// The entry that calls it lands with the matched-pair pass's next ticket.
+#[allow(dead_code)]
+pub(crate) mod matched_types;
 mod pair_settle;
 mod pr_removals;
 mod route_boundaries;

@@ -78,5 +78,17 @@
   "not_recorded": {
     "sentence": "the layer that produced it recorded no cause",
     "decided": "never"
+  },
+  "not_typescript_source": {
+    "sentence": "this end is not TypeScript or JavaScript source (a SQL file, a config file), so the compiler engine has no type to read here",
+    "decided": "always"
+  },
+  "several_sites_on_line": {
+    "sentence": "the line holds more than one call this pair could name, and nothing says which, so no type was read",
+    "decided": "never"
+  },
+  "protocol_not_read": {
+    "sentence": "the scan does not yet read the types of a model-found pair of this protocol",
+    "decided": "never"
   }
 }

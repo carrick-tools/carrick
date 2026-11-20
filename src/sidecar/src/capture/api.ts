@@ -298,6 +298,13 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    no type was read for it: no request located one, or the only locator was
  *    a line (carrick#3995) or a route's registration call that the handler
  *    gave no body read for (carrick#4079, carrick#4204).
+ *  - `not_typescript_source`: the end sits in a file the compiler engine does
+ *    not read (a SQL file, a config file, a declaration file), so no type was
+ *    asked for there. A decided word: there is no contract to state.
+ *  - `several_sites_on_line`: the line holds more than one call the pair could
+ *    name and nothing says which, so no type was read.
+ *  - `protocol_not_read`: the pair's protocol is one the scan does not yet read
+ *    types for on a model-found pair, so no type was asked for at either end.
  *  - `site_unreadable`: the scan located the site, but the compiler could not
  *    read a type at it (carrick#3995).
  *  - `unplaced_top_type`: the printed shape holds a top type at a member no

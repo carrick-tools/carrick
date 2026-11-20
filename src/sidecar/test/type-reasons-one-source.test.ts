@@ -31,12 +31,19 @@ function list(): Record<string, Entry> {
 describe('type-reasons.json is the one list', () => {
   it('holds every word, each with a sentence and one of three decided values', () => {
     const entries = list();
-    assert.equal(Object.keys(entries).length, 20);
+    assert.equal(Object.keys(entries).length, 23);
     for (const [word, entry] of Object.entries(entries)) {
       assert.match(word, /^[a-z_]+$/, word);
       assert.ok(entry.sentence.length > 0, `${word} has no sentence`);
       assert.ok(['always', 'at_call_result', 'never'].includes(entry.decided), `${word}: ${entry.decided}`);
     }
+  });
+
+  it('holds the three words the matched-pair pass states, with their decided values', () => {
+    const entries = list();
+    assert.equal(entries.not_typescript_source?.decided, 'always');
+    assert.equal(entries.several_sites_on_line?.decided, 'never');
+    assert.equal(entries.protocol_not_read?.decided, 'never');
   });
 
   it("the engine's decided set is the list's `always` words", () => {

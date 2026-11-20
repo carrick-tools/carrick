@@ -1,0 +1,5 @@
+tests/fixtures/run-check-pin/outcomes.txt is what `run_check` returned on origin/main
+2defa9673bfd2f51806a0965d08f49f86cec1572 (before `judge_pairs` was split out), for the
+input built by the test `run_check_returns_what_it_returned_before_the_split` in
+src/engine/type_compat_v2.rs. Recorded with RECORD_RUN_CHECK_PIN=1 on that commit
+plus the test. run_check was identical on the branch's merge base 783a205e3.
