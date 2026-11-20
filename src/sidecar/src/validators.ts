@@ -27,6 +27,8 @@ export const InferKindSchema = z.enum([
   'function_param',
   'receiver_type',
   'request_config',
+  'procedure_input',
+  'procedure_output',
 ]);
 
 // ============================================================================
@@ -179,12 +181,16 @@ export function validateInferRequestItem(item: InferRequestItem): string | null 
   // line, and the inferrer follows that line to the handler (`handlerAtLine`).
   // Worst case the line resolves nothing and the alias pads to `unknown` — the
   // same outcome rejection produced, but now the resolvable cases get through.
+  // A procedure named by its binding is read off the declaration whose value
+  // starts on the line (carrick#4909): the line is its whole locator.
   const lineOnlyOk =
     item.infer_kind === 'function_return' ||
     item.infer_kind === 'signature_return' ||
     item.infer_kind === 'function_param' ||
     item.infer_kind === 'response_body' ||
-    item.infer_kind === 'request_body';
+    item.infer_kind === 'request_body' ||
+    item.infer_kind === 'procedure_input' ||
+    item.infer_kind === 'procedure_output';
   if (!hasSpan && !hasText && !lineOnlyOk) {
     return 'at least one of (span_start + span_end) or expression_text is required';
   }

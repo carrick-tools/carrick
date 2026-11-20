@@ -328,6 +328,65 @@ fn each_definition_states_one_procedure_row() {
     );
 }
 
+/// The type entries `scan` states for `service`'s producer rows, as
+/// `line Kind METHOD "path" => definition` (the expanded definition, or `-`
+/// where none was published).
+fn producer_types(scan: &Scan, service: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    for blob in &scan.blobs {
+        if blob["service_name"].as_str() != Some(service) {
+            continue;
+        }
+        for entry in blob["type_manifest"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            if entry["role"].as_str() != Some("producer") {
+                continue;
+            }
+            entries.push(format!(
+                "{} {} {} {:?} => {}",
+                entry["line_number"],
+                entry["type_kind"].as_str().unwrap_or_default(),
+                entry["method"].as_str().unwrap_or_default(),
+                entry["path"].as_str().unwrap_or_default(),
+                entry["expanded_definition"]
+                    .as_str()
+                    .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_else(|| "-".to_string()),
+            ));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// carrick#4909 T1: each procedure row carries its request and response
+/// types, read off the variable's own call signature, on the cold scan and
+/// the incremental one alike. The request is what a caller sends (the
+/// label's `payload` key, `data`, of parameter 0: the validator's input),
+/// whatever the method; the response is the awaited return. The model's
+/// `POST /saveNote` row was replaced, and no entry of its stands.
+#[test]
+fn each_procedure_row_is_typed_from_its_call_signature() {
+    for (run, scan) in declared().iter().enumerate() {
+        let entries = producer_types(scan, "declared");
+        assert_eq!(
+            entries,
+            vec![
+                r#"10 request GET "" => undefined"#.to_string(),
+                r#"10 response GET "" => number"#.to_string(),
+                r#"3 request GET "" => undefined"#.to_string(),
+                r#"3 response GET "" => { id: number; }[]"#.to_string(),
+                r#"5 request POST "" => { body: string; }"#.to_string(),
+                r#"5 response POST "" => { ok: boolean; }"#.to_string(),
+            ],
+            "scan {run}: {entries:#?}"
+        );
+    }
+}
+
 /// The index's flat rows hold the same three procedures: none folds into
 /// another for sharing a method and the empty path.
 #[test]

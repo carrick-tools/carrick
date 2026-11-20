@@ -75,6 +75,13 @@ pub enum InferKind {
     /// method and no such property, and null otherwise. A null answer never
     /// anchors a body: it is not a request body inference.
     RequestConfig,
+    /// A procedure named by the variable that holds it (contract amendment
+    /// 13, carrick#4909): the key `member` names (the label's `payload`) of
+    /// parameter 0 of the variable's own call signature, read off the
+    /// declaration whose value starts on the line. What a caller sends.
+    ProcedureInput,
+    /// The same procedure's awaited return: what it sends back.
+    ProcedureOutput,
 }
 
 /// A rule for unwrapping machinery/wrapper types to extract payload types.
@@ -6640,6 +6647,8 @@ mod tests {
             InferKind::FunctionParam,
             InferKind::ReceiverType,
             InferKind::RequestConfig,
+            InferKind::ProcedureInput,
+            InferKind::ProcedureOutput,
         ];
         for kind in &infer_kinds {
             match kind {
@@ -6652,7 +6661,9 @@ mod tests {
                 | InferKind::SignatureReturn
                 | InferKind::FunctionParam
                 | InferKind::ReceiverType
-                | InferKind::RequestConfig => {}
+                | InferKind::RequestConfig
+                | InferKind::ProcedureInput
+                | InferKind::ProcedureOutput => {}
             }
         }
         let slot = || ClaimSlot {

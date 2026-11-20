@@ -3209,6 +3209,7 @@ fn every_route_the_trace_does_not_serve_is_counted_by_why() {
             owner: Some("items".to_string()),
             corrects: true,
             procedures: Vec::new(),
+            payload_key: None,
         }]
     );
     assert_eq!(
