@@ -426,7 +426,14 @@ export function bringUpToDate(
   // A block an older version wrote lacks the lines that hide a running check's
   // temporary files. Rebuilt once per new version; an up-to-date file is left
   // alone, and nothing is printed (carrick#4031).
-  if (recorded !== running) addToExcludeBlock(workspace, []);
+  if (recorded !== running) {
+    try {
+      addToExcludeBlock(workspace, []);
+    } catch {
+      // An exclude file that cannot be written costs only these lines: never
+      // the rest of this update, nor the version record below.
+    }
+  }
   // The recorded version is what the mismatch line compares. Move it only when
   // nothing of ours is still old: a Codex hook file we may not touch keeps the
   // "run carrick init" line honest.
