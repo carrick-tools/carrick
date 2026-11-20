@@ -4,6 +4,7 @@
 
 import fs from "node:fs";
 import net from "node:net";
+import path from "node:path";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { createLogger } from "../log.ts";
 import { lockHeld, readJson, releaseLock, takeLock, type Lock } from "../hook/lock.ts";
@@ -12,6 +13,7 @@ import { scriptBeside, startDetached } from "../hook/refresh.ts";
 import { backedOff } from "./backoff.ts";
 import { heldBuildId } from "./build.ts";
 import type { HeldAnswer, HeldHello, HeldRequest } from "./daemon.ts";
+import type { NotChecked } from "./state.ts";
 import { lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
 
 const log = createLogger("carrick-held-client");
@@ -196,8 +198,35 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
         if (settled) conn.end();
       }
     });
-    conn.on("error", () => finish(none("unavailable", started)));
-    conn.on("close", () => finish(none("unavailable", started)));
+    /**
+     * No daemon said hello: none listens (it left after its idle time,
+     * `daemon.ts` `wantsExit`, or it crashed), or one closed before its hello.
+     * One is started for the checkout (`ensureHeld`; the lock keeps it to one),
+     * so the check comes back at the next ask, not the next session (#4939).
+     * When this ask started it, the answer is `cold` with a note for the edit's
+     * line, naming the edited file because no daemon is there to name its
+     * service; otherwise (a daemon is starting or backed off) `unavailable`.
+     * An ask whose wait ran out first (`late`) still starts it.
+     */
+    const noDaemon = (): void => {
+      if (greeted || replacing) {
+        finish(none("unavailable", started));
+        return;
+      }
+      // Nothing is there to say hello, so the hello timeout must not take this
+      // for a silent daemon of another build and end the one started here.
+      replacing = true;
+      clearTimeout(helloTimer);
+      const startedOne = ensureHeld(root, { env, buildId, ...(options.home === undefined ? {} : { home: options.home }), ...(options.start === undefined ? {} : { start: options.start }) });
+      if (!startedOne) {
+        finish(none("unavailable", started));
+        return;
+      }
+      const notes: NotChecked[] = files.map((file) => ({ service: path.relative(root, file), state: "cold" }));
+      finish({ ...none("cold", started), not_checked: notes });
+    };
+    conn.on("error", noDaemon);
+    conn.on("close", noDaemon);
   });
 }
 

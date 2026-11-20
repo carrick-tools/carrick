@@ -45,9 +45,15 @@ async function runCase(t: test.TestContext, c: Case) {
   fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, started: new Date().toISOString(), touched: new Date().toISOString() }));
   const priorHome = process.env["HOME"];
   process.env["HOME"] = home;
+  // These cases are about the probe and the queue, not the compiler check: with
+  // it on, an edit that finds no daemon starts a real one (#4939).
+  const priorLines = process.env["CARRICK_COMPILER_LINES"];
+  process.env["CARRICK_COMPILER_LINES"] = "0";
   t.after(() => {
     if (priorHome === undefined) delete process.env["HOME"];
     else process.env["HOME"] = priorHome;
+    if (priorLines === undefined) delete process.env["CARRICK_COMPILER_LINES"];
+    else process.env["CARRICK_COMPILER_LINES"] = priorLines;
     fs.rmSync(base, { recursive: true, force: true });
   });
 
