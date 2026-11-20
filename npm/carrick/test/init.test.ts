@@ -23,8 +23,10 @@ import {
 } from "../src/init/repos.ts";
 import {
   carrickHooks,
+  holdsCarrickAllow,
   installedCarrickHooks,
   mergeCarrickHooks,
+  mergeHookSet,
   removeCarrickHooks,
 } from "../src/init/settings.ts";
 import { bringUpToDate } from "../src/init/self-update.ts";
@@ -47,7 +49,7 @@ import {
   type InitOptions,
   compilerCheckNote,
 } from "../src/init/run.ts";
-import { inspectTaskSkills, removeTaskSkills, taskSkillPaths, taskSkillWarnings, writeTaskSkills } from "../src/init/task-skills.ts";
+import { inspectTaskSkills, removeTaskSkills, renderTaskSkill, SKILL_ROOTS, stamped, taskSkillPaths, taskSkillWarnings, writeTaskSkills } from "../src/init/task-skills.ts";
 import { checkTaskSkills } from "../src/init/doctor.ts";
 import { writeIfChanged } from "../src/init/files.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
@@ -3057,7 +3059,122 @@ test("hooks the team committed are left, with the launcher they call hidden and 
     assert.ok(!fs.existsSync(local) || installedCarrickHooksIn(local) === 0);
     assert.ok(fs.existsSync(path.join(fixture.repo, LAUNCHERS[0]!)));
     assert.ok(excludeBlock(fixture.repo).includes(LAUNCHERS[0]!));
-    assert.match(stdout, /Carrick's hooks are committed in \.claude\/settings\.json, so init left them unchanged and added no second set\./);
+    assert.doesNotMatch(stdout, /Carrick updated its hooks|init left them unchanged/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#4898: a file the team committed is updated in place, so the "run
+// carrick init, then commit" lines a session start prints are true.
+const FOUR_SKILLS = ["carrick-impact", "carrick-reuse", "carrick-drift", "carrick-census"] as const;
+
+/** Commit four task skills per root, current or an older render of ours. */
+function commitSkills(repo: string, stale: boolean): void {
+  for (const root of SKILL_ROOTS) {
+    for (const name of FOUR_SKILLS) {
+      const file = path.join(repo, root, name, "SKILL.md");
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, stale ? stamped(`An older ${name}.\n`) : renderTaskSkill(name, { slug: "payments" }));
+    }
+  }
+  gitIn(repo, "add", "-A");
+  gitIn(repo, "commit", "-q", "-m", "skills");
+}
+
+const skillLines = (repo: string, names: readonly string[] = FOUR_SKILLS): string[] =>
+  porcelain(repo).split("\n").filter((line) => names.some((name) => line.includes(`/${name}/`)));
+
+test("a committed task skill of ours that is not current is rewritten in place, and a second init changes nothing more", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    commitSkills(fixture.repo, true);
+    runInit(fixture);
+    const expected = SKILL_ROOTS.flatMap((root) => FOUR_SKILLS.map((name) => ` M ${root.split(path.sep).join("/")}/${name}/SKILL.md`)).sort();
+    assert.deepEqual(skillLines(fixture.repo), expected);
+    runInit(fixture);
+    assert.deepEqual(skillLines(fixture.repo), expected);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a committed task skill that is current is left untouched", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    commitSkills(fixture.repo, false);
+    runInit(fixture);
+    assert.deepEqual(skillLines(fixture.repo), []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a task skill absent beside committed siblings is written visible, with no exclude line", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    commitSkills(fixture.repo, false);
+    runInit(fixture);
+    assert.deepEqual(skillLines(fixture.repo, ["carrick-audit"]), ["?? .agents/skills/carrick-audit/SKILL.md", "?? .claude/skills/carrick-audit/SKILL.md"]);
+    const named = excludeBlock(fixture.repo);
+    for (const root of SKILL_ROOTS) assert.ok(!named.includes(path.join(root, "carrick-audit", "SKILL.md")));
+    assert.ok(named.includes(LAUNCHERS[0]!));
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a committed settings file with our stale hooks gets the current ones in place and no allow entry", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    const current = mergeHookSet(TEAM_SETTINGS, carrickHooks(), true).body;
+    const older = JSON.parse(current);
+    for (const groups of Object.values(older.hooks) as { hooks: { command: string; timeout?: number }[] }[][]) {
+      for (const group of groups) for (const entry of group.hooks) if (/hook post-edit/.test(entry.command)) entry.timeout = 10;
+    }
+    commitTeamRepo(fixture.repo, { settings: `${JSON.stringify(older, null, 2)}\n` });
+    const stdout = runInit(fixture);
+    assert.equal(porcelain(fixture.repo), ` M .claude/settings.json\n${TEAM_PORCELAIN}`);
+    const written = fs.readFileSync(path.join(fixture.repo, ".claude", "settings.json"), "utf8");
+    assert.equal(written, current);
+    assert.ok(!holdsCarrickAllow(written));
+    const local = path.join(fixture.repo, LOCAL_FILE);
+    assert.ok(!fs.existsSync(local) || installedCarrickHooksIn(local) === 0);
+    assert.match(stdout, /Carrick updated its hooks in \.claude\/settings\.json, which git tracks here\. Commit the change in its own pull request\./);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a committed settings file with our current hooks stays clean and init says nothing about it", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo, { settings: mergeHookSet(TEAM_SETTINGS, carrickHooks(), true).body });
+    const stdout = runInit(fixture);
+    assert.equal(porcelain(fixture.repo), TEAM_PORCELAIN);
+    assert.doesNotMatch(stdout, /Carrick updated its hooks|init left them unchanged/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("the new-skill line a session start prints is true: init, commit, and the next session start is silent", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    commitTeamRepo(fixture.repo);
+    commitSkills(fixture.repo, false);
+    const first = bringUpToDate(fixture.repo, fixture.repo, currentVersion()!);
+    assert.ok(first.some((line) => /did not add its new task skill carrick-audit/.test(line)), first.join("\n"));
+    runInit(fixture);
+    gitIn(fixture.repo, "add", "-A");
+    gitIn(fixture.repo, "commit", "-q", "-m", "carrick");
+    // The commit init asked for holds the new skill in both roots.
+    const committed = gitIn(fixture.repo, "ls-files");
+    for (const root of SKILL_ROOTS) assert.ok(committed.includes(`${root.split(path.sep).join("/")}/carrick-audit/SKILL.md`), root);
+    assert.deepEqual(bringUpToDate(fixture.repo, fixture.repo, currentVersion()!), []);
   } finally {
     fixture.cleanup();
   }

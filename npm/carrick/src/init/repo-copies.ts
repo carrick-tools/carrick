@@ -42,6 +42,7 @@ import { LAUNCHER_FILE, launcherSource } from "./launcher.ts";
 import {
   holdsCarrickAllow,
   installedCarrickHooks,
+  carrickHooks,
   mergeCarrickHooks,
   mergeHookSet,
   removeCarrickHooks,
@@ -218,8 +219,8 @@ export type FolderCopy = {
   paths: string[];
   /** The Codex hooks file changed on this run: the first write is what asks the reader to trust it. */
   codexWritten: boolean;
-  /** The team's committed settings file already holds our entries and was left as it is. */
-  teamHooksLeft: boolean;
+  /** The team's committed settings file held our entries, and this run brought them up to date: a change for the team to commit. */
+  teamHooksUpdated: boolean;
   /** Skill paths left alone, as `writeTaskSkills` reports them. */
   skills: SkillOutcome[];
   /** Hooks files that are not JSON: neither written nor recorded, the rest still is. */
@@ -259,11 +260,22 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
   // of git, and the file it is put back to. Decided now, written last.
   let shared: { body: string } | { remove: true } | null = null;
   let teamHooksLeft = false;
+  let teamHooksUpdated = false;
 
   if (own) {
     const sharedFile = path.join(repo, SHARED_SETTINGS);
     const sharedBody = readOrNull(sharedFile);
     teamHooksLeft = committedHooksAreOurs(repo, SHARED_SETTINGS);
+    if (teamHooksLeft && sharedBody !== null) {
+      // The team committed our entries: they are brought up to date in that file
+      // (the hooks only; the allow entry is never added to a team's file), so the
+      // commit self-update asks for exists (carrick#4898).
+      const current = mergeHookSet(sharedBody, carrickHooks(), true).body;
+      if (!sameText(sharedBody, current)) {
+        shared = { body: current };
+        teamHooksUpdated = true;
+      }
+    }
     if (!teamHooksLeft && sharedBody !== null && holdsOurs(sharedBody)) {
       const head = tracked.has(SHARED_SETTINGS) ? committedText(repo, SHARED_SETTINGS) : null;
       // The removal takes out our allow entry too. One a team committed stays where
@@ -301,13 +313,25 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
       for (const name of TASK_SKILLS) skills.push({ path: skillFile(root, name), state: "linked", wrote: false, link });
       continue;
     }
+    // Where git tracks one of our skills in this root the team commits them, so
+    // init's changes there stay visible for the team to commit (carrick#4898).
+    const teamRoot =
+      own &&
+      TASK_SKILLS.some((name) => {
+        const relative = skillFile(root, name);
+        return tracked.has(relative) && skillState(readOrNull(path.join(repo, relative))) === "ours";
+      });
     for (const name of TASK_SKILLS) {
       const relative = skillFile(root, name);
-      if (tracked.has(relative)) continue;
+      const existing = readOrNull(path.join(repo, relative));
+      const state = skillState(existing);
+      if (tracked.has(relative)) {
+        if (own && state === "ours") writes.push({ relative, body: renderTaskSkill(name, scope), record: false });
+        continue;
+      }
       // A skill of somebody else's at one of these paths is theirs to track or
       // not, so it is neither written nor excluded.
-      const state = skillState(readOrNull(path.join(repo, relative)));
-      if (state === "absent" || state === "ours") writes.push({ relative, body: renderTaskSkill(name, scope), record: true });
+      if (state === "absent" || state === "ours") writes.push({ relative, body: renderTaskSkill(name, scope), record: !teamRoot });
       else skills.push({ path: relative, state, wrote: false });
     }
   }
@@ -328,7 +352,7 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
   return {
     paths: writes.filter((write) => write.record).map((write) => write.relative),
     codexWritten: changed.has(CODEX_HOOKS_FILE),
-    teamHooksLeft,
+    teamHooksUpdated,
     skills,
     refused,
   };
