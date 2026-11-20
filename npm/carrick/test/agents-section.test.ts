@@ -5,6 +5,7 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import {
   AGENTS_FILE,
@@ -14,6 +15,7 @@ import {
   removeAgentsSection,
   removeClaudeSection,
   renderCheckSection,
+  sameExceptCounts,
   withCheckSection,
   writeAgentsSection,
   writeClaudeSection,
@@ -208,6 +210,65 @@ test("remove takes the block out of CLAUDE.md and keeps the file, even where it 
     assert.equal(removeClaudeSection(dir), "section removed");
     assert.ok(fs.existsSync(claude));
     assert.equal(fs.readFileSync(claude, "utf8"), "");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A section that differs only in its counts phrase is current (carrick#4998).
+const OTHER_COUNTS = { repos: 1, services: 17 };
+
+function hermeticGit(repo: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", repo, "-c", "user.email=t@example.com", "-c", "user.name=t", ...args], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "carrick-no-git-config-")),
+    },
+  });
+}
+
+test("sameExceptCounts: other counts, no counts and a changed rule line", () => {
+  const a = renderCheckSection(SCOPE, { repos: 1, services: 13 });
+  const b = renderCheckSection(SCOPE, OTHER_COUNTS);
+  assert.notEqual(a, b);
+  assert.ok(sameExceptCounts(a, b));
+  assert.ok(sameExceptCounts(a, renderCheckSection(SCOPE, null)));
+  assert.ok(sameExceptCounts(renderCheckSection(SCOPE, null), b));
+  assert.ok(!sameExceptCounts(a, b.replace("1. Before you write", "1. First write")));
+  assert.ok(!sameExceptCounts(a, renderCheckSection({ slug: "other" }, OTHER_COUNTS)));
+});
+
+test("init leaves a tracked AGENTS.md and CLAUDE.md section that differs only in counts byte for byte", () => {
+  const { dir, file } = folder();
+  try {
+    const claude = path.join(dir, CLAUDE_FILE);
+    const held = `# Team\n\n${renderCheckSection(SCOPE, { repos: 1, services: 13 })}`;
+    fs.writeFileSync(file, held);
+    fs.writeFileSync(claude, held);
+    hermeticGit(dir, "init", "-q");
+    hermeticGit(dir, "add", ".");
+    hermeticGit(dir, "commit", "-q", "-m", "team");
+    assert.equal(writeAgentsSection(dir, SCOPE, OTHER_COUNTS), "unchanged");
+    assert.equal(writeClaudeSection(dir, SCOPE, OTHER_COUNTS), "unchanged");
+    assert.equal(fs.readFileSync(file, "utf8"), held);
+    assert.equal(fs.readFileSync(claude, "utf8"), held);
+    assert.equal(hermeticGit(dir, "status", "--porcelain"), "");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a section with a changed rule line is rewritten with today's counts, and a new one carries the counts", () => {
+  const { dir, file } = folder();
+  try {
+    const old = renderCheckSection(SCOPE, { repos: 1, services: 13 }).replace("1. Before you write", "1. First write");
+    fs.writeFileSync(file, old);
+    assert.equal(writeAgentsSection(dir, SCOPE, OTHER_COUNTS), "written");
+    assert.equal(fs.readFileSync(file, "utf8"), renderCheckSection(SCOPE, OTHER_COUNTS));
+    assert.equal(withCheckSection("# Team\n", renderCheckSection(SCOPE, OTHER_COUNTS)).includes("(one repository, 17 services)"), true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
