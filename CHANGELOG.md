@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.170](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.169...carrick-v0.3.170) (2026-11-20)
+
+
+### Bug Fixes
+
+* **derive:** a workspace nested below the repo root adds its members as services ([#4967](https://github.com/carrick-tools/carrick/issues/4967)) ([2defa96](https://github.com/carrick-tools/carrick/commit/2defa9673bfd2f51806a0965d08f49f86cec1572))
+
 ## [0.3.169](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.168...carrick-v0.3.169) (2026-11-20)
 
 
