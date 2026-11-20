@@ -69,7 +69,7 @@ use crate::cloud_storage::CloudRepoData;
 use crate::config::Config;
 use crate::engine::matched_types::{
     MatchedEnd, MatchedEndTypes, MatchedPair, MatchedPairTypes, MatchedService, MatchedVerdict,
-    type_matched_pairs,
+    repo_file, type_matched_pairs,
 };
 use crate::position_rows::{FileRows, Kind, POSITIONS_DIR, Row};
 use crate::services::type_sidecar::VerdictBucket;
@@ -150,21 +150,10 @@ pub(crate) enum Owner {
 /// a backslash, a NUL or a `.git` segment, or when the file it names, with
 /// every symlink followed, sits outside `root` or under a `.git` folder. A
 /// name that passes comes back as that canonical path. A refused or absent
-/// file is [`NOT_LOCATED`]: no new reason word.
+/// file is [`NOT_LOCATED`]: no new reason word. The rule itself is the type
+/// stage's [`repo_file`], so both ask one function.
 fn checked_path(root: &Path, file: &str) -> Result<PathBuf, &'static str> {
-    let odd_segment = file
-        .split('/')
-        .any(|segment| matches!(segment, "" | "." | ".." | ".git"));
-    if odd_segment || file.contains(['\\', '\0']) || Path::new(file).is_absolute() {
-        return Err(NOT_LOCATED);
-    }
-    let root = root.canonicalize().map_err(|_| NOT_LOCATED)?;
-    let canonical = root.join(file).canonicalize().map_err(|_| NOT_LOCATED)?;
-    let inside = canonical.strip_prefix(&root).map_err(|_| NOT_LOCATED)?;
-    if inside.components().any(|c| c.as_os_str() == ".git") {
-        return Err(NOT_LOCATED);
-    }
-    Ok(canonical)
+    repo_file(root, file).ok_or(NOT_LOCATED)
 }
 
 fn trim_dir(dir: &str) -> &str {

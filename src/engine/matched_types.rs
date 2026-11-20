@@ -304,23 +304,29 @@ fn plan_end(pair: &MatchedPair, role: Role, services: &HashMap<&str, &MatchedSer
 /// `None` when the name could reach anything else. A pair's file names come
 /// from a record written outside this process, and whatever file is asked
 /// has its type text stored, so a name is read only when it is a plain
-/// repository-relative path (no absolute path, and no empty, `.`, `..` or
-/// `.git` segment) whose real path, symlinks followed, is under the
-/// repository's real root.
+/// repository-relative path (no absolute path, no backslash or NUL, and no
+/// empty, `.`, `..` or `.git` segment) whose real path, symlinks followed,
+/// is under the repository's real root and not under a `.git` folder. This
+/// is the one gate for a file name of the record: the pass's entry asks it
+/// too (`checked_path` in `matched_pass.rs`).
 pub(crate) fn repo_file(scan_root: &Path, file: &str) -> Option<PathBuf> {
     let name = Path::new(file);
-    if file.is_empty() || name.is_absolute() || name.has_root() {
+    if name.is_absolute() || name.has_root() || file.contains(['\\', '\0']) {
         return None;
     }
     if file
-        .split(['/', '\\'])
+        .split('/')
         .any(|segment| matches!(segment, "" | "." | ".." | ".git"))
     {
         return None;
     }
     let root = scan_root.canonicalize().ok()?;
     let path = root.join(name).canonicalize().ok()?;
-    path.starts_with(&root).then_some(path)
+    let inside = path.strip_prefix(&root).ok()?;
+    if inside.components().any(|part| part.as_os_str() == ".git") {
+        return None;
+    }
+    Some(path)
 }
 
 /// What one service's type stage left: its capture stub and its entries, with
