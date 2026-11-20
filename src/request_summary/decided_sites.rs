@@ -292,6 +292,14 @@ pub struct SiteLabel {
     /// is unchanged.
     #[serde(skip)]
     pub name_scope: Option<crate::services::type_sidecar::NameScope>,
+    /// The op is met where a value a labelled call made is itself called,
+    /// never at the labelled call (contract amendment 13, carrick#4919): an
+    /// instance a maker named by a function built (`const f = wrap(g); f()`,
+    /// reached by the instance), or a procedure named by its binding (a call
+    /// of the variable that holds it, stated by the procedure pass alone).
+    /// Never sent: the label's wire shape is unchanged.
+    #[serde(skip)]
+    pub calls_value: bool,
 }
 
 /// The scope member an op is claimed on the result of (carrick#1678):
@@ -385,6 +393,7 @@ impl SiteLabel {
                         yields: op.yields,
                         name_scope: None,
                         name_at_maker: false,
+                        calls_value: false,
                     });
                 }
             }
@@ -415,6 +424,16 @@ impl SiteLabel {
                 .side
                 .filter(|_| !by_origin)
                 .and_then(|side| word(serde_json::to_value(side)));
+            // A make that names its instance by a function it is handed
+            // (`ref: "function"`, amendment 7): an op with no member on that
+            // instance is met where the instance is called.
+            let names_by_function = export.claims.iter().any(|claim| {
+                matches!(
+                    claim,
+                    LibraryClaim::Make { name: Some(slot), .. }
+                        if slot.reference == Some(crate::services::type_sidecar::ClaimRef::Function)
+                )
+            });
             for claim in &export.claims {
                 if let LibraryClaim::Make {
                     form,
@@ -446,6 +465,7 @@ impl SiteLabel {
                         yields: None,
                         name_scope: None,
                         name_at_maker: false,
+                        calls_value: false,
                     });
                     continue;
                 }
@@ -521,6 +541,7 @@ impl SiteLabel {
                             yields: None,
                             name_scope: None,
                             name_at_maker: false,
+                            calls_value: false,
                         });
                     }
                     continue;
@@ -586,7 +607,50 @@ impl SiteLabel {
                                 })
                             ),
                         }),
+                    calls_value: names_by_function
+                        && member.is_none()
+                        && of
+                            .as_deref()
+                            .is_some_and(|of| crate::library_claims::scope_step(of).is_none()),
                 });
+                // A procedure named by its binding (contract amendment 13):
+                // calling the variable that holds it is a call of the
+                // procedure, and `payload` is where that call carries its
+                // body. The call is a request, labelled from the op itself;
+                // it states no method of its own (its producer's is read
+                // once, at the producer's site) and is met only where the
+                // procedure pass finds a call of a variable in the run's
+                // procedure set.
+                if matches!(
+                    name.as_deref(),
+                    Some(OpName::Bound {
+                        bound: BoundName::Binding,
+                        ..
+                    })
+                ) {
+                    labels.push(SiteLabel {
+                        new: false,
+                        package: export.package.clone(),
+                        export: export.export.clone(),
+                        member: None,
+                        role: "http_client".to_string(),
+                        op: Some("request".to_string()),
+                        side: None,
+                        by_origin: false,
+                        name: None,
+                        name_at_maker: false,
+                        payload: payload.as_ref().map(slot),
+                        handler: None,
+                        method: None,
+                        reserved: Vec::new(),
+                        runs: None,
+                        request: None,
+                        yields: None,
+                        name_scope: None,
+                        scope: None,
+                        calls_value: true,
+                    });
+                }
             }
         }
         labels
@@ -906,6 +970,68 @@ pub struct DecidedSite {
 }
 
 impl DecidedSite {
+    /// A direct call of a procedure's variable (`listNotes()`, contract
+    /// amendment 13): the call at `placed`, as the request `label` (the
+    /// procedure's op read as its call, [`SiteLabel::calls_value`]) states
+    /// it, named by the procedure's key `at`. The call is the site: nothing
+    /// is walked to it.
+    pub(super) fn binding_call(
+        root: &Path,
+        placed: &Placed<'_>,
+        label: &SiteLabel,
+        at: super::discovery::ProcedureAt,
+    ) -> DecidedSite {
+        let file = relative(root, placed.file);
+        let (line, span_start, span_end) = (
+            placed.call.site.line,
+            placed.call.site.span_start,
+            placed.call.site.span_end,
+        );
+        let end = LabelledEnd {
+            package: label.package.clone(),
+            export: label.export.clone(),
+            member: None,
+            role: label.role.clone(),
+            op: label.op.clone(),
+            file: file.clone(),
+            line,
+            span_start,
+            span_end,
+            new: false,
+            scope: None,
+            procedure: Some(at.clone()),
+        };
+        DecidedSite {
+            file,
+            line,
+            span_start,
+            span_end,
+            end,
+            name: vec![Piece::Lit(at.path)],
+            key: None,
+            name_args: BTreeSet::new(),
+            name_at: None,
+            via: Vec::new(),
+            payload: label
+                .payload
+                .as_ref()
+                .and_then(|slot| payload_binding(root, std::slice::from_ref(placed), slot)),
+            payload_slot: None,
+            handler: None,
+            method: None,
+            receiver: None,
+            reached: None,
+            instances: Vec::new(),
+            composed: Vec::new(),
+            composed_trimmed: false,
+            procedure: None,
+            makes_end: false,
+            chain_handed_on: false,
+            deciding_callee: None,
+            hands_back: None,
+        }
+    }
+
     /// The name as text: every piece literal, or for HTTP a target the
     /// summaries would write (an opaque base before a literal path).
     pub fn name_text(&self) -> Option<String> {
@@ -4926,6 +5052,13 @@ fn decide(
             }
             continue;
         };
+        // An op met where a value a labelled call made is called
+        // ([`SiteLabel::calls_value`]): never at the labelled call itself
+        // (the maker call `wrap(g)` reached by its name). Only an instance's
+        // own call, reached by the instance, is its site here.
+        if label.calls_value && site.reached != Some(super::discovery::ReachedBy::Instance) {
+            continue;
+        }
         walk.label = Some(label);
         let Some(last) = calls.at_span(&root.join(&end.file), end.span_start, end.span_end) else {
             unplaced.push(format!("{}:{}", site.file, site.line));
@@ -6537,6 +6670,7 @@ pub(crate) mod tests {
                     yields: None,
                     name_scope: None,
                     name_at_maker: false,
+                    calls_value: false,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("post".into()),
@@ -6564,6 +6698,7 @@ pub(crate) mod tests {
                     name_scope: None,
                     // A name bound to the maker is read there (carrick#3527).
                     name_at_maker: true,
+                    calls_value: false,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("send".into()),
@@ -7580,6 +7715,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            calls_value: false,
             package: "@fixture/wire".into(),
             export: "connect".into(),
             member: Some(member.into()),
@@ -7605,6 +7741,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            calls_value: false,
             package: "lib:lib.dom.d.ts".into(),
             export: "fetch".into(),
             member: None,
@@ -7639,6 +7776,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            calls_value: false,
             package: "node:child_process".into(),
             export: "ChildProcess".into(),
             member: Some("send".into()),
@@ -8758,6 +8896,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            calls_value: false,
             package: "@fixture/http".into(),
             export: "default".into(),
             member: Some("get".into()),

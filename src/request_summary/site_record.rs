@@ -2104,23 +2104,72 @@ fn records_of(
     };
     let roles = roles_by_file(decided);
     let resolver = Resolver::new(inputs, siblings);
-    sites
-        .iter()
-        .enumerate()
-        .filter_map(|(index, site)| {
-            let label = SiteLabel::find(labels, &site.end)?;
-            record(
-                &mut sources,
-                &resolver,
-                inputs.positions.as_ref(),
-                root,
-                site,
-                (label, labels),
-                &roles,
-            )
-            .map(|record| (index, record))
-        })
-        .collect()
+    // A call of a procedure named by its binding (contract amendment 13)
+    // states its producer's wire method, read once at the producer's site:
+    // every other site is recorded first.
+    let calls_binding =
+        |site: &DecidedSite, label: &SiteLabel| label.calls_value && site.end.procedure.is_some();
+    let mut records: Vec<(usize, SiteRecord)> = Vec::new();
+    let mut calls: Vec<(usize, &DecidedSite, &SiteLabel)> = Vec::new();
+    for (index, site) in sites.iter().enumerate() {
+        let Some(label) = SiteLabel::find(labels, &site.end) else {
+            continue;
+        };
+        if calls_binding(site, label) {
+            calls.push((index, site, label));
+            continue;
+        }
+        if let Some(record) = record(
+            &mut sources,
+            &resolver,
+            inputs.positions.as_ref(),
+            root,
+            site,
+            (label, labels),
+            &roles,
+            None,
+        ) {
+            records.push((index, record));
+        }
+    }
+    let mut methods: HashMap<super::discovery::ProcedureAt, Option<String>> = HashMap::new();
+    for (index, record) in &records {
+        let Some(procedure) = sites[*index].procedure.as_ref().filter(|p| p.binding) else {
+            continue;
+        };
+        for at in &procedure.at {
+            methods.insert(
+                super::discovery::ProcedureAt {
+                    path: at.key_path.clone(),
+                    file: at.router_file.clone(),
+                    binding: at.router_binding.clone(),
+                },
+                record.state.forced.get(&Slot::Method).cloned(),
+            );
+        }
+    }
+    for (index, site, label) in calls {
+        let method = site
+            .end
+            .procedure
+            .as_ref()
+            .and_then(|at| methods.get(at).cloned())
+            .flatten();
+        if let Some(record) = record(
+            &mut sources,
+            &resolver,
+            inputs.positions.as_ref(),
+            root,
+            site,
+            (label, labels),
+            &roles,
+            Some(method),
+        ) {
+            records.push((index, record));
+        }
+    }
+    records.sort_by_key(|(index, _)| *index);
+    records
 }
 
 fn record(
@@ -2131,6 +2180,7 @@ fn record(
     site: &DecidedSite,
     (label, labels): (&SiteLabel, &[SiteLabel]),
     roles: &BTreeMap<String, BTreeSet<String>>,
+    producer_method: Option<Option<String>>,
 ) -> Option<SiteRecord> {
     let file = site.file.as_str();
     let call_line = {
@@ -2493,6 +2543,13 @@ fn record(
             _ => label_method(&method_label, site.method.as_ref())
                 .map(|method| BTreeSet::from([method])),
         };
+        // A call of a procedure named by its binding (contract amendment
+        // 13) is sent on the method its producer's site states: read there
+        // once, from the maker call, never guessed here.
+        let methods = match &producer_method {
+            Some(method) => method.clone().map(|method| BTreeSet::from([method])),
+            None => methods,
+        };
         // A procedure call's method is already a wire method here
         // ([`procedure_wire_label`], carrick#3186), like any HTTP call's.
         let methods: Vec<String> = methods
@@ -2514,11 +2571,14 @@ fn record(
                 // whose method sits on the maker call the instance walk did
                 // not reach: the site is saved unread, with the walk's own
                 // reason, never left as a counted route.
-                maker_method_unread = method_label.maker
+                // The same for a call of one whose producer's method is
+                // unstated: the call states no method of its own.
+                maker_method_unread = (method_label.maker
                     && site
                         .procedure
                         .as_ref()
-                        .is_some_and(|procedure| procedure.binding);
+                        .is_some_and(|procedure| procedure.binding))
+                    || producer_method.is_some();
                 decide(Slot::Method, Vec::new(), true, method_basis)
             }
         }

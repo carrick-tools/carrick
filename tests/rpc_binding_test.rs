@@ -57,6 +57,8 @@ fn copy_dir(src: &Path, dst: &Path) {
 struct Scan {
     blobs: Vec<serde_json::Value>,
     fallbacks: BTreeMap<String, serde_json::Value>,
+    /// What the scan printed: the report a person reads.
+    stdout: String,
 }
 
 /// The fixture's store answer `cassette`, as JSON.
@@ -69,6 +71,12 @@ fn cassette(name: &str) -> serde_json::Value {
 /// reader answers as the model's: every scan after the first takes the
 /// incremental path.
 fn scans(answer: &serde_json::Value, runs: usize) -> Vec<Scan> {
+    scans_with(answer, runs, false)
+}
+
+/// [`scans`]; with `json`, one scan that prints the analysis as JSON
+/// (`CARRICK_OUTPUT_JSON`, the eval projection) and stores no blob.
+fn scans_with(answer: &serde_json::Value, runs: usize, json: bool) -> Vec<Scan> {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir().join("repo"), &repo);
@@ -121,6 +129,9 @@ fn scans(answer: &serde_json::Value, runs: usize) -> Vec<Scan> {
     ] {
         cmd.env_remove(var);
     }
+    if json {
+        cmd.env("CARRICK_OUTPUT_JSON", "1");
+    }
     let mut out = Vec::new();
     for run in 0..runs {
         // A later scan reads the store back, so it finds the first's blob.
@@ -141,7 +152,7 @@ fn scans(answer: &serde_json::Value, runs: usize) -> Vec<Scan> {
                 blobs.push(serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap());
             }
         }
-        assert!(!blobs.is_empty(), "the scan stored a blob");
+        assert!(json || !blobs.is_empty(), "the scan stored a blob");
         // The runner keeps the last line each service states.
         let mut fallbacks = BTreeMap::new();
         for line in String::from_utf8_lossy(&output.stderr).lines() {
@@ -154,7 +165,11 @@ fn scans(answer: &serde_json::Value, runs: usize) -> Vec<Scan> {
                 fallbacks.insert(service.to_string(), line.clone());
             }
         }
-        out.push(Scan { blobs, fallbacks });
+        out.push(Scan {
+            blobs,
+            fallbacks,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        });
     }
     // Each later scan took the incremental path: its run log says so.
     let incremental = std::fs::read_dir(home.join(".carrick/logs/runs"))
@@ -372,7 +387,11 @@ fn a_chained_definition_reads_its_method_only_through_pass_through_members() {
             format!(r#"{NOTES}:5 POST "/saveNote" "/saveNote" model saveNote => -"#),
         ]
     );
-    let saved = unread_sites(scan, "declared", "unread");
+    // The definitions' own file (its callers' saves are the next test's).
+    let saved: Vec<String> = unread_sites(scan, "declared", "unread")
+        .into_iter()
+        .filter(|site| site.starts_with(&format!("{NOTES}:")))
+        .collect();
     assert_eq!(saved, vec![format!("{NOTES}:5 unread")], "{saved:#?}");
     // With the pass-through claims nothing there is unread.
     assert_eq!(
@@ -419,6 +438,196 @@ fn an_incremental_rescan_states_the_same_rows() {
     assert_eq!(
         producer_rows(&scans[1], "declared"),
         producer_rows(&scans[0], "declared")
+    );
+}
+
+/// The call rows `scan` states for `service`, as `file:line METHOD "path"
+/// source => key @ file#binding`.
+fn call_rows(scan: &Scan, service: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for blob in &scan.blobs {
+        if blob["service_name"].as_str() != Some(service) {
+            continue;
+        }
+        for row in blob["mount_graph"]["data_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let procedure = &row["procedure"];
+            rows.push(format!(
+                "{} {} {:?} {} => {} @ {}#{}",
+                row["file_location"].as_str().unwrap_or_default(),
+                row["method"].as_str().unwrap_or_default(),
+                row["target_url"].as_str().unwrap_or_default(),
+                row["resolution_source"].as_str().unwrap_or_default(),
+                procedure["path"].as_str().unwrap_or("-"),
+                procedure["router"]["file"].as_str().unwrap_or_default(),
+                procedure["router"]["binding"].as_str().unwrap_or_default(),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// The unread sites `scan` saves for `service` in `file` (a path suffix),
+/// as `file:line reason`.
+fn unread_in(scan: &Scan, service: &str, file: &str) -> Vec<String> {
+    let mut sites = Vec::new();
+    for blob in &scan.blobs {
+        if blob["service_name"].as_str() != Some(service) {
+            continue;
+        }
+        for site in blob["unread_sites"].as_array().cloned().unwrap_or_default() {
+            let at = site["file"].as_str().unwrap_or_default();
+            if at.ends_with(file) {
+                sites.push(format!("{at}:{} {}", site["line"], site["reason"]));
+            }
+        }
+    }
+    sites.sort();
+    sites
+}
+
+/// The answer key's consumer rows: each call of a procedure's variable,
+/// directly or through the wrapper's instance (called, or handed on and
+/// called), states one request row keyed by that procedure's own key, on
+/// the method its definition states, at the call. Nothing else is a row.
+#[test]
+fn each_call_of_a_procedure_states_one_request_row() {
+    let rows = call_rows(&declared()[0], "declared");
+    let at = |file: &str, line: u32, method: &str, name: &str| {
+        format!(
+            r#"services/declared/src/{file}:{line} {method} "" request_summary => {name} @ {NOTES}#"#
+        )
+    };
+    assert_eq!(
+        rows,
+        vec![
+            at("direct.ts", 4, "GET", "listNotes"),
+            at("handed.ts", 8, "POST", "saveNote"),
+            at("page.tsx", 6, "POST", "saveNote"),
+        ],
+        "{rows:#?}"
+    );
+}
+
+/// Each call pairs with its procedure in the one service (a pair whose
+/// two ends are one service, plan D12), and the procedure nothing calls
+/// (`unused`) is the one endpoint without a consumer.
+#[test]
+fn the_calls_pair_with_their_procedures_in_one_service() {
+    let scan = scans_with(&cassette("library-claims-declared.json"), 1, true).remove(0);
+    let printed = &scan.stdout;
+    let analysis: serde_json::Value =
+        serde_json::from_str(&printed[printed.find('{').expect("the JSON analysis")..])
+            .expect("the analysis is JSON");
+    let mut pairs: Vec<String> = analysis["cross_repo_matches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|pair| pair["consumer_repo"] == "declared" || pair["producer_repo"] == "declared")
+        .map(|pair| {
+            format!(
+                "{} {} <- {} {}",
+                pair["producer_repo"].as_str().unwrap_or_default(),
+                pair["producer_key"].as_str().unwrap_or_default(),
+                pair["consumer_repo"].as_str().unwrap_or_default(),
+                pair["consumer_key"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            "declared http|GET| <- declared http|GET|".to_string(),
+            "declared http|POST| <- declared http|POST|".to_string(),
+            "declared http|POST| <- declared http|POST|".to_string(),
+        ],
+        "one pair per call: direct.ts, handed.ts, page.tsx"
+    );
+    let report = &declared()[0].stdout;
+    let unconsumed: Vec<&str> = report
+        .lines()
+        .filter(|line| line.ends_with("| `declared` |"))
+        .collect();
+    assert_eq!(unconsumed, vec!["| `GET` | `` | `declared` |"], "{report}");
+}
+
+/// The wrapper's instance handed on and never called here (`value.ts`):
+/// nothing says where the procedure is called, so the maker call is saved
+/// with that reason. A maker call whose instance is called states no site
+/// of its own (the row is at the call), and a plain local function
+/// (`control.ts`) states nothing at all.
+#[test]
+fn a_wrapper_never_called_here_is_saved_and_a_plain_function_states_nothing() {
+    let scan = &declared()[0];
+    assert_eq!(
+        unread_in(scan, "declared", "src/value.ts"),
+        vec!["services/declared/src/value.ts:9 \"detached_unplaced\"".to_string()]
+    );
+    assert_eq!(
+        unread_in(scan, "declared", "src/page.tsx"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unread_in(scan, "declared", "src/handed.ts"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unread_in(scan, "declared", "src/direct.ts"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unread_in(scan, "declared", "src/control.ts"),
+        Vec::<String>::new()
+    );
+    assert!(
+        !call_rows(scan, "declared")
+            .iter()
+            .any(|row| row.contains("control.ts")),
+        "{:#?}",
+        call_rows(scan, "declared")
+    );
+}
+
+/// A call of a procedure whose definition states no method this scan reads
+/// (`saveNote` without the pass-through claims) states no row on a guessed
+/// method: each such call is saved `unread`, and the procedure whose method
+/// is read (`listNotes`) keeps its call's row.
+#[test]
+fn a_call_of_a_procedure_with_an_unread_method_is_saved_not_guessed() {
+    let scan = unchained();
+    assert_eq!(
+        call_rows(scan, "declared"),
+        vec![format!(
+            r#"services/declared/src/direct.ts:4 GET "" request_summary => listNotes @ {NOTES}#"#
+        )]
+    );
+    let saved: Vec<String> = unread_sites(scan, "declared", "unread")
+        .into_iter()
+        .filter(|site| !site.starts_with(&format!("{NOTES}:")))
+        .collect();
+    assert_eq!(
+        saved,
+        vec![
+            "services/declared/src/handed.ts:8 unread".to_string(),
+            "services/declared/src/page.tsx:6 unread".to_string(),
+        ]
+    );
+}
+
+/// The consumer rows ride no cache either: an incremental re-scan states
+/// the same ones.
+#[test]
+fn an_incremental_rescan_states_the_same_calls() {
+    let scans = declared();
+    assert_eq!(
+        call_rows(&scans[1], "declared"),
+        call_rows(&scans[0], "declared")
     );
 }
 

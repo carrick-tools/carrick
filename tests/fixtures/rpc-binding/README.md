@@ -50,29 +50,44 @@ and sits on the line its `defineFn(` call starts on.
 Three rows after the cross-service merge, not two: the merge key carries the
 procedure.
 
-## Consumer rows (S2, not yet asserted)
+## Consumer rows (S2), declared service
+
+Each call of a procedure's variable is a request row at the call, keyed by
+its procedure's own key (copied from the producer, never read again), with
+`path` `""` and the method its definition states (read once, at the
+definition's site):
 
 | File | Row |
 |---|---|
-| `page.tsx` | at the `save(` call, pairs `saveNote` |
-| `direct.ts` | at the `listNotes()` call, pairs `listNotes` |
-| `value.ts` | none: the alias is handed on and never called here; saved with a reason |
-| `control.ts` | none: a plain local function |
+| `page.tsx:6` | `POST ""` at the `save(` call, pairs `saveNote` |
+| `handed.ts:8` | `POST ""` at the `keep(` call, pairs `saveNote`: handing the alias on as well does not stop it |
+| `direct.ts:4` | `GET ""` at the `listNotes()` call, pairs `listNotes` |
+| `value.ts:9` | none: the alias is handed on and never called here; the `useFn(` call is saved `detached_unplaced` |
+| `control.ts` | none: a plain local function, no row and no saved site |
 
-Two pairs, one orphan (`unused`). Request types `{ body: string }` and
-`undefined`; response types `{ ok: boolean }` and `{ id: number }[]` (T1).
+The `useFn(` calls whose alias is called state no site of their own. Three
+pairs within the one service (two keys: `GET` and `POST`), one orphan
+(`unused`). Without the pass-through scopes `saveNote`'s method is unread,
+so its two calls are saved `unread`, never stated on a guessed method.
+Request types `{ body: string }` and `undefined`; response types
+`{ ok: boolean }` and `{ id: number }[]` (T1).
 
-## For S2
+The wrapper's request op (`useFn`, `member: null`, `name: { bound:
+"maker" }`) is read from the store's claim with no scanner verdict, as every
+op on an instance is today (carrick#4847): the direct verifier answers it
+`unchecked member_untyped`. When carrick#4847 requires a verdict, that op
+must verify, or the `page.tsx` and `handed.ts` rows stop.
 
-- The analyzer's matched and orphan keys carry no procedure: `analyzer/mod.rs`
-  keys a producer as `method:full_path` plus the dispatch case, where pairing
-  inserts its winners (`matched_endpoints`, about line 2941), in the consumed
-  key (about line 3153) and in the orphan lookup (about line 3391). Every
-  `POST ""` procedure of a service therefore shares one key: one paired
-  procedure marks the others consumed, and their orphans go unreported.
-  The procedure belongs on those keys, as `procedure_suffix` is on the
-  merge key (`mount_graph.rs` `endpoint_merge_key`).
-- The run's procedure set is the decided sites: read `DecidedSite.procedure`
-  where `binding` is true. Its `at` holds the key path, the file and the
-  router binding; the wire method is the site record's (the Method slot),
-  read once there.
+Gaps: a procedure defined in a sibling service is not read (the procedure
+set is this service's); its calls state nothing.
+
+## Where it is read
+
+- The procedure set is the decided sites `Pass::bound` keys
+  (`decided_sites/procedures.rs`); its calls are read against it by
+  `Pass::binding_calls`, matched on where the compiler declares the called
+  value and where `router_holder::holder_of_call` says the key's name is
+  written.
+- The analyzer keys a matched, consumed and orphaned producer with its
+  procedure (`analyzer/mod.rs` `producer_operation_key`), so one paired
+  `POST ""` procedure never marks another consumed.

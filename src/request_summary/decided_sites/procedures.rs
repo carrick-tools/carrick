@@ -62,6 +62,7 @@ use super::composed::{Mounts, compose};
 use super::instances::{InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex};
 use super::{Calls, Decided, LabelledEnd, SiteLabel, relative};
 use crate::position_rows::Kind;
+use crate::request_summary::discovery::ReachedBy;
 use crate::request_summary::stop::Stop;
 
 /// What the store labels for procedure routers, as this pass reads it.
@@ -430,12 +431,312 @@ struct Reached {
     stops: usize,
 }
 
+/// The service's procedures named by their binding (contract amendment 13),
+/// as [`Pass::bound`] keys them: the run's procedure set a call of one of
+/// their variables is read against ([`Pass::binding_calls`]).
+#[derive(Debug, Default)]
+pub(super) struct Bindings {
+    declared: Vec<Declared>,
+}
+
+/// One procedure of [`Bindings`].
+#[derive(Debug)]
+struct Declared {
+    /// Where the variable that holds it is declared: its repo-relative
+    /// file and the line its name is written on, where the compiler places
+    /// the declaration a call of that variable resolves to.
+    file: String,
+    line: u32,
+    /// The op's package (as the store keys it) and export.
+    package: String,
+    export: String,
+    /// Its key, as the producer row states it.
+    at: crate::request_summary::discovery::ProcedureAt,
+}
+
+/// What the value a call reads (its callee, or a maker's name slot) is
+/// declared as, against the run's procedure set.
+#[derive(Debug)]
+enum Declares<'b> {
+    /// A procedure of the set.
+    Procedure(&'b Declared),
+    /// A declaration of the repository that is no procedure of the set: a
+    /// plain local function, called in place (D5).
+    Plain,
+    /// The compiler names no declaration, or several, or one outside the
+    /// repository: the call is saved with this reason.
+    Stop(Stop),
+}
+
 impl Pass<'_, '_> {
+    /// What the value at `(lo, hi)` (discovery numbering) of `file` read as
+    /// `kind` is declared as ([`Declares`]).
+    fn declares<'b>(
+        &self,
+        bindings: &'b Bindings,
+        file: &Path,
+        span: (u32, u32),
+        kind: Kind,
+    ) -> Declares<'b> {
+        let (decl_file, decl_line) = match self.declaration(file, span, kind) {
+            Ok(declared) => declared,
+            Err(reason) => return Declares::Stop(reason),
+        };
+        match bindings
+            .declared
+            .iter()
+            .find(|declared| declared.file == decl_file && declared.line == decl_line)
+        {
+            Some(declared) => Declares::Procedure(declared),
+            None => Declares::Plain,
+        }
+    }
+
+    /// Where the compiler declares the value at `(lo, hi)` (discovery
+    /// numbering) of `file` read as `kind`: its repo-relative file and line,
+    /// or why there is no one such place in the repository.
+    fn declaration(
+        &self,
+        file: &Path,
+        (lo, hi): (u32, u32),
+        kind: Kind,
+    ) -> Result<(String, u32), Stop> {
+        let (Some(positions), Some(ir)) =
+            (self.inputs.positions.as_ref(), self.inputs.files.get(file))
+        else {
+            return Err(Stop::ProcedurePathUnread);
+        };
+        let (lo, hi) = (ir.swc_start(lo), ir.swc_start(hi));
+        let row = positions
+            .lookup(file, lo, hi, kind)
+            .map_err(|_| Stop::ProcedurePathUnread)?;
+        if positions
+            .union_declarations(file, lo, hi)
+            .is_ok_and(|declared| declared.len() > 1)
+        {
+            return Err(Stop::ProcedureRouterAmbiguous);
+        }
+        if !crate::request_summary::discovery::in_repo(row) {
+            return Err(Stop::ProcedureRouterOutsideRepo);
+        }
+        match (row.decl_file(), row.decl_line()) {
+            (Some(decl_file), Some(decl_line)) => Ok((decl_file.to_string(), decl_line)),
+            _ => Err(Stop::ProcedurePathUnread),
+        }
+    }
+
+    /// What the name slot of the maker call `made` (in `file`, repo-relative)
+    /// holds is declared as: the slot the store's make of `root`'s export
+    /// names its instance by.
+    fn maker_declares<'b>(
+        &self,
+        bindings: &'b Bindings,
+        file: &str,
+        made: (u32, u32),
+        (package, export, member, new): (&str, &str, Option<&str>, bool),
+    ) -> Declares<'b> {
+        let slot = self
+            .makers
+            .iter()
+            .find(|maker| {
+                maker.package == package
+                    && maker.export == export
+                    && maker.member.as_deref() == member
+                    && maker.new == new
+            })
+            .and_then(|maker| maker.name.as_ref());
+        let placed = self.calls.at_span(&self.root.join(file), made.0, made.1);
+        let (Some(slot), Some(placed)) = (slot, placed) else {
+            return Declares::Stop(Stop::Unread);
+        };
+        match (slot.key.as_ref(), placed.call.arg_spans.get(slot.arg)) {
+            (None, Some(&span)) => self.declares(bindings, placed.file, span, Kind::Ident),
+            _ => Declares::Stop(Stop::ProcedurePathUnread),
+        }
+    }
+
+    /// The calls of the procedures `bindings` holds (contract amendment 13,
+    /// carrick#4919), each a request row keyed by its procedure's own key
+    /// (the producer's, copied, never read again):
+    ///
+    /// - a call of an instance a maker named by a function it was handed
+    ///   (`const save = wrap(saveNote); save(…)`): the site the walk
+    ///   decided at the call, named by what the maker's name slot is
+    ///   declared as;
+    /// - a direct call of the variable (`listNotes()`): a call discovery
+    ///   reached no labelled call from, whose callee is declared as one,
+    ///   labelled from the procedure's op ([`SiteLabel::calls_value`]).
+    ///
+    /// A value declared in the repository that is no procedure of the set
+    /// is a plain local function called in place: no row and no saved site.
+    /// One the compiler declares nowhere, at several places, or outside the
+    /// repository is saved with that reason. A maker call whose instance no
+    /// call here is read of (handed on, never called) is saved
+    /// `detached_unplaced`: nothing says where the procedure is called.
+    ///
+    /// Read over this service's procedures only: a procedure a sibling
+    /// service defines is a gap (plan D12).
+    fn binding_calls(
+        &self,
+        out: &mut Decided,
+        discovered: &[super::DiscoverySite],
+        bindings: &Bindings,
+    ) {
+        if bindings.declared.is_empty() {
+            return;
+        }
+        let wrapper = |end: &LabelledEnd| {
+            end.member.is_none()
+                && end.procedure.is_none()
+                && SiteLabel::find(self.site_labels, end)
+                    .is_some_and(|label| label.calls_value && label.name_at_maker)
+        };
+        // Each maker call of an instance named by a function, by where the
+        // variable that holds it is declared: the one key rule
+        // ([`super::router_holder::holder_of_call`]) names it, so a call of
+        // that variable resolves to the same file and line.
+        let wraps: Vec<((String, u32), &super::DiscoverySite, &LabelledEnd)> = discovered
+            .iter()
+            .filter(|site| site.reached != Some(ReachedBy::Instance))
+            .filter_map(|site| {
+                let end = site.end.as_ref().filter(|end| wrapper(end))?;
+                let held = super::router_holder::holder_of_call(
+                    self.root,
+                    &site.file,
+                    (site.span_start, site.span_end),
+                )?;
+                Some(((site.file.clone(), held.line), site, end))
+            })
+            .collect();
+        // The calls of a maker's instance the walk decided, each named by
+        // what its maker call's name slot is declared as.
+        let mut kept = Vec::with_capacity(out.sites.len());
+        let mut made_read: HashSet<(String, u32, u32)> = HashSet::new();
+        for mut site in std::mem::take(&mut out.sites) {
+            if !wrapper(&site.end) {
+                kept.push(site);
+                continue;
+            }
+            let one = match self.calls.at_span(
+                &self.root.join(&site.file),
+                site.span_start,
+                site.span_end,
+            ) {
+                None => Declares::Stop(Stop::Unread),
+                Some(placed) => match self.declaration(
+                    placed.file,
+                    (placed.call.site.lo, placed.call.site.hi),
+                    Kind::Call,
+                ) {
+                    Err(reason) => Declares::Stop(reason),
+                    Ok(declared) => match wraps.iter().find(|(at, _, _)| *at == declared) {
+                        None => Declares::Stop(Stop::Unread),
+                        Some((_, wrap, end)) => {
+                            made_read.insert((wrap.file.clone(), wrap.span_start, wrap.span_end));
+                            self.maker_declares(
+                                bindings,
+                                &wrap.file,
+                                (wrap.span_start, wrap.span_end),
+                                (&end.package, &end.export, None, end.new),
+                            )
+                        }
+                    },
+                },
+            };
+            match one {
+                Declares::Procedure(declared) => {
+                    site.name = vec![super::super::Piece::Lit(declared.at.path.clone())];
+                    site.end.procedure = Some(declared.at.clone());
+                    kept.push(site);
+                }
+                Declares::Plain => {}
+                Declares::Stop(reason) => out.leads.push(super::DecidedLead {
+                    file: site.file.clone(),
+                    line: site.line,
+                    span_start: site.span_start,
+                    span_end: site.span_end,
+                    depth: 0,
+                    end: site.end.clone(),
+                    reason,
+                }),
+            }
+        }
+        out.sites = kept;
+        // A maker call whose instance no call here is read of.
+        for (_, wrap, end) in &wraps {
+            if made_read.contains(&(wrap.file.clone(), wrap.span_start, wrap.span_end)) {
+                continue;
+            }
+            let declares = self.maker_declares(
+                bindings,
+                &wrap.file,
+                (wrap.span_start, wrap.span_end),
+                (&end.package, &end.export, None, end.new),
+            );
+            if let Declares::Procedure(_) = declares {
+                out.leads.push(super::DecidedLead {
+                    file: wrap.file.clone(),
+                    line: wrap.line,
+                    span_start: wrap.span_start,
+                    span_end: wrap.span_end,
+                    depth: 0,
+                    end: (*end).clone(),
+                    reason: Stop::DetachedUnplaced,
+                });
+            }
+        }
+        // A direct call of a procedure's variable: any call of this
+        // service's own files whose callee is a bare name.
+        let decided: HashSet<(String, u32, u32)> = out
+            .sites
+            .iter()
+            .map(|site| (site.file.clone(), site.span_start, site.span_end))
+            .collect();
+        let mut direct: Vec<super::DecidedSite> = Vec::new();
+        for placed in self.calls.by_span.values() {
+            if placed.call.constructs
+                || placed.call.receiver_object.is_some()
+                || placed.call.callee.contains('.')
+            {
+                continue;
+            }
+            let file = relative(self.root, placed.file);
+            let span = (placed.call.site.span_start, placed.call.site.span_end);
+            if decided.contains(&(file.clone(), span.0, span.1)) {
+                continue;
+            }
+            let Declares::Procedure(declared) = self.declares(
+                bindings,
+                placed.file,
+                (placed.call.site.lo, placed.call.site.hi),
+                Kind::Call,
+            ) else {
+                continue;
+            };
+            let Some(label) = self.site_labels.iter().find(|label| {
+                label.calls_value
+                    && !label.name_at_maker
+                    && label.package == declared.package
+                    && label.export == declared.export
+            }) else {
+                continue;
+            };
+            direct.push(super::DecidedSite::binding_call(
+                self.root,
+                placed,
+                label,
+                declared.at.clone(),
+            ));
+        }
+        out.sites.extend(direct);
+    }
+
     /// Name every procedure route site of `out` (carrick#2474 R6c), read
     /// from the adapter calls among `discovered`.
     pub(super) fn run(&self, out: &mut Decided, discovered: &[super::DiscoverySite]) {
         self.graphql_mounts(out, discovered);
-        self.bound(out);
+        let bindings = self.bound(out);
+        self.binding_calls(out, discovered, &bindings);
         let leaves: HashSet<(String, u32, u32)> = out
             .sites
             .iter()
@@ -576,8 +877,8 @@ impl Pass<'_, '_> {
     /// Two calls one declaration holds (an object of such calls under one
     /// variable) would share one key: neither is named, and each is saved
     /// with [`Stop::ProcedureRouterAmbiguous`].
-    fn bound(&self, out: &mut Decided) {
-        let keys: Vec<Option<Option<(String, String)>>> = out
+    fn bound(&self, out: &mut Decided) -> Bindings {
+        let keys: Vec<Option<Option<super::router_holder::HeldCall>>> = out
             .sites
             .iter()
             .map(|site| {
@@ -590,17 +891,22 @@ impl Pass<'_, '_> {
                 })
             })
             .collect();
-        let mut held: HashMap<(&str, &(String, String)), usize> = HashMap::new();
+        let mut held: HashMap<(&str, &str, &str), usize> = HashMap::new();
         for (site, key) in out.sites.iter().zip(&keys) {
             if let Some(Some(key)) = key {
-                *held.entry((site.file.as_str(), key)).or_default() += 1;
+                *held
+                    .entry((site.file.as_str(), key.key.as_str(), key.binding.as_str()))
+                    .or_default() += 1;
             }
         }
-        let shared: HashSet<(String, (String, String))> = held
+        let shared: HashSet<(String, String, String)> = held
             .into_iter()
             .filter(|(_, count)| *count > 1)
-            .map(|((file, key), _)| (file.to_string(), key.clone()))
+            .map(|((file, key, binding), _)| {
+                (file.to_string(), key.to_string(), binding.to_string())
+            })
             .collect();
+        let mut bindings = Bindings::default();
         for (site, key) in out.sites.iter_mut().zip(keys) {
             let Some(key) = key else {
                 continue;
@@ -610,15 +916,36 @@ impl Pass<'_, '_> {
                 ..Procedure::default()
             };
             match key {
-                Some(key) if shared.contains(&(site.file.clone(), key.clone())) => {
+                Some(key)
+                    if shared.contains(&(
+                        site.file.clone(),
+                        key.key.clone(),
+                        key.binding.clone(),
+                    )) =>
+                {
                     procedure.unread.insert("unread_key".to_string(), 1);
                     procedure.stop = Some(Stop::ProcedureRouterAmbiguous);
                 }
-                Some((key_path, router_binding)) => {
+                Some(super::router_holder::HeldCall {
+                    key: key_path,
+                    binding: router_binding,
+                    line,
+                }) => {
                     // The row is registered on the variable that holds it.
                     procedure.owner = Some(key_path.clone());
                     procedure.full_paths.push(String::new());
                     procedure.key_paths.push(key_path.clone());
+                    bindings.declared.push(Declared {
+                        file: site.file.clone(),
+                        line,
+                        package: site.end.package.clone(),
+                        export: site.end.export.clone(),
+                        at: crate::request_summary::discovery::ProcedureAt {
+                            path: key_path.clone(),
+                            file: site.file.clone(),
+                            binding: router_binding.clone(),
+                        },
+                    });
                     procedure.at.push(ProcedureAt {
                         full_path: String::new(),
                         key_path,
@@ -633,6 +960,7 @@ impl Pass<'_, '_> {
             }
             site.procedure = Some(procedure);
         }
+        bindings
     }
 
     /// Write where each GraphQL server the store labels is mounted

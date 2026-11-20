@@ -59,8 +59,26 @@ pub(crate) fn holder_in(cm: &SourceMap, module: &Module, line: u32) -> Option<St
         found: None,
     };
     module.visit_with(&mut find);
-    find.found
-        .map(|enclosing| enclosing.last().cloned().unwrap_or_default())
+    find.found.map(|enclosing| {
+        enclosing
+            .last()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// The key of a procedure named by its binding ([`holder_of_call`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldCall {
+    /// The innermost named declaration around the op's call: the key path.
+    pub key: String,
+    /// The innermost named declaration around that one: the router binding
+    /// (`""` where none is).
+    pub binding: String,
+    /// The line (1-based) the key's declared name is written on: where the
+    /// compiler places the declaration a call of the procedure's variable
+    /// resolves to.
+    pub line: u32,
 }
 
 /// The key a procedure named by its binding is served under (contract
@@ -69,7 +87,7 @@ pub(crate) fn holder_in(cm: &SourceMap, module: &Module, line: u32) -> Option<St
 /// declaration around that one (`""` where none is). `None` when the file
 /// does not parse, no call has that span, or no named declaration holds it:
 /// the procedure has no name the code writes.
-pub fn holder_of_call(root: &Path, file: &str, span: (u32, u32)) -> Option<(String, String)> {
+pub fn holder_of_call(root: &Path, file: &str, span: (u32, u32)) -> Option<HeldCall> {
     let (cm, module) = parse(root, file)?;
     let mut find = Find {
         cm: &cm,
@@ -79,8 +97,12 @@ pub fn holder_of_call(root: &Path, file: &str, span: (u32, u32)) -> Option<(Stri
     };
     module.visit_with(&mut find);
     let mut enclosing = find.found?;
-    let key = enclosing.pop()?;
-    Some((key, enclosing.pop().unwrap_or_default()))
+    let (key, line) = enclosing.pop()?;
+    Some(HeldCall {
+        key,
+        binding: enclosing.pop().map(|(name, _)| name).unwrap_or_default(),
+        line,
+    })
 }
 
 /// What [`Find`] looks for.
@@ -94,14 +116,19 @@ enum Target {
 struct Find<'a> {
     cm: &'a SourceMap,
     target: Target,
-    /// The named declarations around the node being visited, outermost first.
-    enclosing: Vec<String>,
+    /// The named declarations around the node being visited, outermost
+    /// first, each with the line its name is written on.
+    enclosing: Vec<(String, u32)>,
     /// The named declarations around the target, outermost first.
-    found: Option<Vec<String>>,
+    found: Option<Vec<(String, u32)>>,
 }
 
 impl Find<'_> {
-    fn within(&mut self, name: Option<String>, visit: impl FnOnce(&mut Self)) {
+    fn line(&self, at: swc_common::BytePos) -> u32 {
+        self.cm.lookup_char_pos(at).line as u32
+    }
+
+    fn within(&mut self, name: Option<(String, u32)>, visit: impl FnOnce(&mut Self)) {
         match name {
             Some(name) => {
                 self.enclosing.push(name);
@@ -119,7 +146,9 @@ impl Visit for Find<'_> {
             return;
         }
         let name = match &declarator.name {
-            Pat::Ident(binding) => Some(binding.id.sym.to_string()),
+            Pat::Ident(binding) => {
+                Some((binding.id.sym.to_string(), self.line(binding.id.span.lo)))
+            }
             _ => None,
         };
         self.within(name, |this| declarator.visit_children_with(this));
@@ -129,7 +158,7 @@ impl Visit for Find<'_> {
         if self.found.is_some() {
             return;
         }
-        let name = Some(decl.ident.sym.to_string());
+        let name = Some((decl.ident.sym.to_string(), self.line(decl.ident.span.lo)));
         self.within(name, |this| decl.visit_children_with(this));
     }
 
@@ -137,7 +166,8 @@ impl Visit for Find<'_> {
         if self.found.is_some() {
             return;
         }
-        self.within(Some("default".to_string()), |this| {
+        let line = self.line(export.span.lo);
+        self.within(Some(("default".to_string(), line)), |this| {
             export.visit_children_with(this)
         });
     }
@@ -146,13 +176,12 @@ impl Visit for Find<'_> {
         if self.found.is_some() {
             return;
         }
+        let line = self.line(export.span.lo);
         let name = match &export.decl {
-            DefaultDecl::Fn(function) => Some(
-                function
-                    .ident
-                    .as_ref()
-                    .map_or_else(|| "default".to_string(), |ident| ident.sym.to_string()),
-            ),
+            DefaultDecl::Fn(function) => Some(function.ident.as_ref().map_or_else(
+                || ("default".to_string(), line),
+                |ident| (ident.sym.to_string(), self.line(ident.span.lo)),
+            )),
             _ => None,
         };
         self.within(name, |this| export.visit_children_with(this));
@@ -249,7 +278,20 @@ mod tests {
         // A file parsed on its own starts at SWC's position 1.
         let lo = source.find(call).unwrap() as u32 + 1;
         let hi = lo + call.len() as u32;
-        holder_of_call(dir.path(), "r.ts", (lo, hi))
+        holder_of_call(dir.path(), "r.ts", (lo, hi)).map(|held| (held.key, held.binding))
+    }
+
+    /// The line a key's declared name is written on, where a call of the
+    /// procedure's variable resolves to: not the line its call starts on.
+    #[test]
+    fn a_call_key_names_the_line_its_declaration_is_written_on() {
+        let call = "make().handler(() => 1)";
+        let source = format!("export const\n  later =\n  {call};\n");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("r.ts"), &source).unwrap();
+        let lo = source.find(call).unwrap() as u32 + 1;
+        let held = holder_of_call(dir.path(), "r.ts", (lo, lo + call.len() as u32)).unwrap();
+        assert_eq!((held.key.as_str(), held.line), ("later", 2));
     }
 
     /// Amendment 13: a procedure is keyed by the declaration that holds its
