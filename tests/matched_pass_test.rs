@@ -313,7 +313,7 @@ fn matched_pass_end_to_end() {
     assert_eq!(gone["wrapper"]["reason"], "not_located");
 
     // A deployed function: read at both ends and judged like a route.
-    let function = pair(out, PASS, 29, "widget");
+    let function = pair(out, PASS, 29, "resize");
     assert!(has_text(function, "caller_expects"), "{function:#}");
     assert!(has_text(function, "server_returns"), "{function:#}");
     assert_eq!(

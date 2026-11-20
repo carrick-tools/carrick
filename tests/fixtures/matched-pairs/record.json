@@ -274,7 +274,7 @@
       "operation": {
         "kind": "function",
         "method": "POST",
-        "name": "widget"
+        "name": "resize"
       },
       "basis": "text",
       "model_confidence": "stated",

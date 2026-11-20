@@ -46,6 +46,7 @@
 //!   a callee in the repository's own source is judged only when it hands
 //!   back the parsed body ([`crate::call_through::OwnCode`]).
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -81,7 +82,8 @@ pub const COMMAND: &str = "__matched-pass";
 
 /// How long the pass may run before a service not started yet is skipped
 /// (each of its ends says `budget_exhausted`): its share of the runner's
-/// window after the model step.
+/// window after the model step. The ceiling is checked only before each
+/// service starts, never during one: the runner applies the hard limit.
 pub const CEILING: Duration = Duration::from_secs(540);
 
 /// The record's word for a request side, which this build does not read.
@@ -101,6 +103,9 @@ const MAX_TYPE_TEXT_BYTES: usize = 16_384;
 const MAX_DETAIL_UNITS: usize = 500;
 const MAX_WRAPPER_CALLERS: usize = 200;
 
+/// The most pairs a record holds (the cloud refuses more).
+const MAX_PAIRS: usize = 5_000;
+
 /// Why a caller's verdict was skipped when the compiler's rows do not say
 /// where its call goes: the own-code sentence would claim more than is known.
 pub(crate) const CALLEE_NOT_READ: &str = "the compiler's rows do not say which function the call reaches, so whether it hands back the response unchanged is not known and the pair was not judged";
@@ -112,7 +117,7 @@ pub(crate) const SERVER_NOT_READ: &str = "the server end is a table or a databas
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reading {
     /// Both response sides are read and the pair is judged: a route, and a
-    /// call to a deployed function (HTTP underneath, a TypeScript handler).
+    /// call to a deployed function whose handler is TypeScript source.
     BothEnds,
     /// Only the caller's response side is read; the server end and the
     /// verdict are not: a table or a database function.
@@ -137,6 +142,29 @@ pub(crate) enum Owner {
     Directory,
     Include,
     Nearest,
+}
+
+/// The one gate every file name of the record passes before it is read,
+/// probed or handed to the type stage. The record is written by a model, so
+/// a name is refused when it is absolute, holds a `.`, `..` or empty segment,
+/// a backslash, a NUL or a `.git` segment, or when the file it names, with
+/// every symlink followed, sits outside `root` or under a `.git` folder. A
+/// name that passes comes back as that canonical path. A refused or absent
+/// file is [`NOT_LOCATED`]: no new reason word.
+fn checked_path(root: &Path, file: &str) -> Result<PathBuf, &'static str> {
+    let odd_segment = file
+        .split('/')
+        .any(|segment| matches!(segment, "" | "." | ".." | ".git"));
+    if odd_segment || file.contains(['\\', '\0']) || Path::new(file).is_absolute() {
+        return Err(NOT_LOCATED);
+    }
+    let root = root.canonicalize().map_err(|_| NOT_LOCATED)?;
+    let canonical = root.join(file).canonicalize().map_err(|_| NOT_LOCATED)?;
+    let inside = canonical.strip_prefix(&root).map_err(|_| NOT_LOCATED)?;
+    if inside.components().any(|c| c.as_os_str() == ".git") {
+        return Err(NOT_LOCATED);
+    }
+    Ok(canonical)
 }
 
 fn trim_dir(dir: &str) -> &str {
@@ -395,9 +423,19 @@ impl Visit for FileSites<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every file [`read_file_sites`] was asked to parse on this thread, for
+    /// the tests that prove a file is parsed once and nothing outside the
+    /// repository is opened.
+    static PARSED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
 /// A file's calls and functions, as the scanner's parser reads it. `None` for
 /// a file that does not parse.
 fn read_file_sites(path: &Path) -> Option<(Vec<Site>, Vec<Definition>)> {
+    #[cfg(test)]
+    PARSED.with(|parsed| parsed.borrow_mut().push(path.to_path_buf()));
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let module = crate::parser::parse_file(path, &cm, &handler)?;
@@ -480,9 +518,37 @@ pub(crate) struct Rows {
     files: HashMap<String, Vec<Row>>,
     /// Whether any rows file was read at all.
     any: bool,
+    /// The repository root the callers' files are read under.
+    root: PathBuf,
+    /// Built once: for each file the compiler declares a callee in, the
+    /// calls of it as `(declaration line, caller file, call start)`.
+    callers_by_declaration: HashMap<String, Vec<(u32, String, u32)>>,
+    /// Each caller file's text, read the first time a wrapper asks for it.
+    texts: RefCell<HashMap<String, Option<String>>>,
 }
 
 impl Rows {
+    fn new(root: &Path, files: HashMap<String, Vec<Row>>, any: bool) -> Self {
+        let mut callers_by_declaration: HashMap<String, Vec<(u32, String, u32)>> = HashMap::new();
+        for (caller, rows) in &files {
+            for row in rows.iter().filter(|row| row.kind() == Kind::Call) {
+                if let (Some(file), Some(line)) = (row.decl_file(), row.decl_line()) {
+                    callers_by_declaration
+                        .entry(file.to_string())
+                        .or_default()
+                        .push((line, caller.clone(), row.start()));
+                }
+            }
+        }
+        Self {
+            files,
+            any,
+            root: root.to_path_buf(),
+            callers_by_declaration,
+            texts: RefCell::new(HashMap::new()),
+        }
+    }
+
     fn read(repo: &Path, paths: &[PathBuf]) -> Self {
         let mut files: HashMap<String, Vec<Row>> = HashMap::new();
         let mut any = false;
@@ -496,15 +562,18 @@ impl Rows {
             };
             any = true;
             for FileRows { f, h, r, .. } in rows.files {
-                let fresh = std::fs::read(repo.join(&f)).is_ok_and(|bytes| {
-                    h.as_deref() == Some(crate::position_rows::content_hash(&bytes).as_str())
-                });
+                let fresh = checked_path(repo, &f)
+                    .ok()
+                    .and_then(|path| std::fs::read(path).ok())
+                    .is_some_and(|bytes| {
+                        h.as_deref() == Some(crate::position_rows::content_hash(&bytes).as_str())
+                    });
                 if fresh {
                     files.entry(f).or_default().extend(r);
                 }
             }
         }
-        Self { files, any }
+        Self::new(repo, files, any)
     }
 
     /// The `call` row at the UTF-16 span `start..end` of `file`.
@@ -517,26 +586,19 @@ impl Rows {
 
     /// The calls whose callee the compiler declares at `file` on one of
     /// `lines`: `(file, line)` of each, sorted, once each.
-    fn callers_of(&self, repo: &Path, file: &str, lines: &[u32]) -> Vec<(String, u32)> {
+    fn callers_of(&self, file: &str, lines: &[u32]) -> Vec<(String, u32)> {
         let mut found: BTreeSet<(String, u32)> = BTreeSet::new();
-        for (caller, rows) in &self.files {
-            let starts: Vec<u32> = rows
-                .iter()
-                .filter(|row| {
-                    row.kind() == Kind::Call
-                        && row.decl_file() == Some(file)
-                        && row.decl_line().is_some_and(|line| lines.contains(&line))
-                })
-                .map(Row::start)
-                .collect();
-            if starts.is_empty() {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(repo.join(caller)) else {
-                continue;
-            };
-            for start in starts {
-                found.insert((caller.clone(), line_of_utf16(&content, start)));
+        let Some(calls) = self.callers_by_declaration.get(file) else {
+            return Vec::new();
+        };
+        let mut texts = self.texts.borrow_mut();
+        for (_, caller, start) in calls.iter().filter(|(line, ..)| lines.contains(line)) {
+            let text = texts.entry(caller.clone()).or_insert_with(|| {
+                let path = checked_path(&self.root, caller).ok()?;
+                std::fs::read_to_string(path).ok()
+            });
+            if let Some(content) = text {
+                found.insert((caller.clone(), line_of_utf16(content, *start)));
             }
         }
         found.into_iter().collect()
@@ -641,7 +703,7 @@ fn read_caller(
         wrapper: json!({ "reason": reason }),
     };
     let file = parsed.entry(pair.caller_file.clone()).or_insert_with(|| {
-        let path = repo.join(&pair.caller_file);
+        let path = checked_path(repo, &pair.caller_file).ok()?;
         let content = std::fs::read_to_string(&path).ok()?;
         let (sites, definitions) = read_file_sites(&path)?;
         Some((content, sites, definitions))
@@ -666,7 +728,7 @@ fn read_caller(
         Some(definition) => {
             let mut lines = vec![definition.name_line, definition.start_line];
             lines.dedup();
-            let callers = rows.callers_of(repo, &pair.caller_file, &lines);
+            let callers = rows.callers_of(&pair.caller_file, &lines);
             json!({
                 "name": definition.name,
                 "file": pair.caller_file,
@@ -830,23 +892,41 @@ fn graded(judged: &MatchedVerdict) -> Value {
     verdict
 }
 
+/// The record's schema word, the only one this pass reads.
+const SCHEMA: &str = "carrick.matched/1";
+
+/// The four sides of a pair.
+const SIDES: [&str; 4] = [
+    "caller_expects",
+    "caller_sends",
+    "server_reads",
+    "server_returns",
+];
+
+/// Whether the pass may write into `pair`: it is an object, and `sides`, each
+/// side and `verdicts` are objects where present. Never replaces a value.
+fn writable(pair: &Value) -> bool {
+    let object_or_absent = |value: Option<&Value>| value.is_none_or(Value::is_object);
+    let sides = pair.get("sides");
+    pair.is_object()
+        && object_or_absent(sides)
+        && SIDES
+            .iter()
+            .all(|side| object_or_absent(sides.and_then(|sides| sides.get(*side))))
+        && object_or_absent(pair.get("verdicts"))
+}
+
 /// Put `value` at `pair.sides.<side>.compiler`, keeping whatever else the
-/// side holds (a model's reading).
+/// side holds (a model's reading). `pair` passed [`writable`].
 fn put_side(pair: &mut Map<String, Value>, side: &str, value: Value) {
     let sides = pair
         .entry("sides")
         .or_insert_with(|| Value::Object(Map::new()));
-    if !sides.is_object() {
-        *sides = Value::Object(Map::new());
-    }
     let slot = sides
         .as_object_mut()
         .expect("sides is an object")
         .entry(side)
         .or_insert_with(|| Value::Object(Map::new()));
-    if !slot.is_object() {
-        *slot = Value::Object(Map::new());
-    }
     slot.as_object_mut()
         .expect("the side is an object")
         .insert("compiler".to_string(), value);
@@ -856,13 +936,22 @@ fn put_verdict(pair: &mut Map<String, Value>, value: Value) {
     let verdicts = pair
         .entry("verdicts")
         .or_insert_with(|| Value::Object(Map::new()));
-    if !verdicts.is_object() {
-        *verdicts = Value::Object(Map::new());
-    }
     verdicts
         .as_object_mut()
         .expect("verdicts is an object")
         .insert("compiler".to_string(), value);
+}
+
+/// The reason a pair's server end is not asked, if any.
+fn server_reason(root: &Path, server_file: &str, kind: Reading) -> Option<&'static str> {
+    // A table's or database function's server end is never asked: a schema
+    // written in TypeScript is not a response body.
+    match kind {
+        Reading::CallerOnly if !is_compiler_source(server_file) => Some("not_typescript_source"),
+        Reading::CallerOnly => Some("protocol_not_read"),
+        _ if !checked_path(root, server_file).is_ok_and(|path| path.is_file()) => Some(NOT_LOCATED),
+        _ => None,
+    }
 }
 
 /// Where the pass finds what it reads.
@@ -882,18 +971,34 @@ pub struct Inputs<'a> {
 /// all (no `pairs` array); everything else is stated in the record.
 pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
     let started = Instant::now();
+    if record.get("schema").and_then(Value::as_str) != Some(SCHEMA) {
+        return Err(format!("the record's `schema` is not `{SCHEMA}`"));
+    }
     let repo_name = record
         .get("repo")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let pairs_in: Vec<Option<PairIn>> = record
+    let raw_pairs = record
         .get("pairs")
         .and_then(Value::as_array)
-        .ok_or("the record has no `pairs` array")?
+        .ok_or("the record has no `pairs` array")?;
+    if raw_pairs.len() > MAX_PAIRS {
+        return Err(format!(
+            "the record holds {} pairs, more than the {MAX_PAIRS} a record may hold",
+            raw_pairs.len()
+        ));
+    }
+    // A pair the pass cannot read, or one whose `sides`, a side or `verdicts`
+    // is not an object, is left exactly as it came and counted.
+    let pairs_in: Vec<Option<PairIn>> = raw_pairs
         .iter()
-        .map(pair_in)
+        .map(|pair| pair_in(pair).filter(|_| writable(pair)))
         .collect();
+    let skipped = pairs_in.iter().filter(|pair| pair.is_none()).count();
+    if skipped > 0 {
+        crate::errln!("carrick {COMMAND}: {skipped} pair(s) left untouched: not readable");
+    }
 
     let root = inputs
         .repo
@@ -977,23 +1082,15 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
         let (Some(pair), Some(caller)) = (pair, caller) else {
             continue;
         };
-        let server_present = root.join(&pair.server_file).is_file();
         let kind = reading_of(&pair.kind);
-        // A table's or database function's server end is never asked: a
-        // schema written in TypeScript is not a response body.
-        let server_reason = match kind {
-            Reading::CallerOnly if !is_compiler_source(&pair.server_file) => {
-                Some("not_typescript_source")
-            }
-            Reading::CallerOnly => Some("protocol_not_read"),
-            _ if !server_present => Some(NOT_LOCATED),
-            _ => None,
-        };
+        let server_reason = server_reason(&root, &pair.server_file, kind);
         indexes.push(index);
         matched.push(MatchedPair {
             pair_id: index.to_string(),
             verb: pair.method.clone(),
             operation: pair.name.clone(),
+            // The engine's field is named `http`; here it means "a kind this
+            // build reads at at least one end" (see [`reading_of`]).
             http: kind != Reading::Neither,
             caller: MatchedEnd {
                 service: repo.service_of(&pair.caller_file),
@@ -1163,7 +1260,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 /// written.
 pub fn run(args: &[String], sidecar: Option<&Path>) -> i32 {
     let usage = format!(
-        "usage: carrick {COMMAND} <record.json> --repo <dir> --out <file> [--store <dir>] [--ceiling-secs <n>]"
+        "usage: carrick {COMMAND} <record.json> --repo <dir> --out <file> [--store <dir>] [--ceiling-secs <n>]\n  --ceiling-secs: checked only before each service starts, not during one (the runner applies the hard limit)"
     );
     let args = match parse_args(args) {
         Ok(args) => args,
@@ -1192,7 +1289,8 @@ pub fn run(args: &[String], sidecar: Option<&Path>) -> i32 {
         crate::errln!("carrick {COMMAND}: {e}");
         return 1;
     }
-    let text = serde_json::to_string_pretty(&record).expect("a JSON value serializes");
+    // Compact: the cloud caps a record's size.
+    let text = serde_json::to_string(&record).expect("a JSON value serializes");
     if let Err(e) = std::fs::write(&args.out, text + "\n") {
         crate::errln!("carrick {COMMAND}: {}: {e}", args.out.display());
         return 1;
@@ -1506,10 +1604,7 @@ const i = client.get(
             method: "GET".to_string(),
             name: "/x".to_string(),
         };
-        let rows = Rows {
-            files: HashMap::new(),
-            any: false,
-        };
+        let rows = Rows::new(dir.path(), HashMap::new(), false);
         let read = read_caller(
             dir.path(),
             &pair,
@@ -1578,5 +1673,334 @@ await fetch('/top');
         assert_eq!(name_at(5), Some(("list".to_string(), 5)));
         assert_eq!(name_at(8), Some(("load".to_string(), 7)));
         assert_eq!(name_at(10), None);
+    }
+
+    // The record is written outside this process by a model: every path it
+    // names, the shape of its pairs and its size are checked here.
+
+    fn record_of(pairs: Vec<Value>) -> Value {
+        json!({
+            "schema": "carrick.matched/1",
+            "repo": "example-org/sample",
+            "commit": "0".repeat(40),
+            "run": { "id": "r1", "mode": "full", "note": ["kept"] },
+            "pairs": pairs,
+            "dropped": { "line_moved": 2 },
+            "unknown_top": { "keep": [1, 2, 3] },
+        })
+    }
+
+    fn route_pair(caller_file: &str, line: u32, server_file: &str) -> Value {
+        json!({
+            "id": format!("p{line}"),
+            "caller": { "file": caller_file, "line": line, "line_sha256": "x" },
+            "server": { "file": server_file, "line": 1, "line_sha256": "y" },
+            "operation": { "kind": "route", "method": "GET", "name": "/x" },
+            "basis": "text",
+            "model_confidence": "stated",
+            "carried_from": null,
+            "unknown_pair_field": { "keep": true },
+        })
+    }
+
+    fn annotate_offline(root: &Path, record: &mut Value) -> Result<(), String> {
+        PARSED.with(|parsed| parsed.borrow_mut().clear());
+        annotate(
+            record,
+            &Inputs {
+                repo: root,
+                store: None,
+                sidecar: None,
+                ceiling: CEILING,
+            },
+        )
+    }
+
+    fn parsed_files() -> Vec<PathBuf> {
+        PARSED.with(|parsed| parsed.borrow().clone())
+    }
+
+    /// A repository holding `a.ts` (one call on line 1) and, beside it, a
+    /// folder that is not part of it holding a file with a call.
+    fn sandbox() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(repo.join("a.ts"), "await fetch('/ok');\n").unwrap();
+        std::fs::write(outside.join("secret.ts"), "await fetch('/secret');\n").unwrap();
+        (dir, repo, outside)
+    }
+
+    /// One refused name beside one good pair: the refused end is not
+    /// located, nothing outside the root nor under `.git` is parsed, and the
+    /// good pair is still processed.
+    fn refuses(repo: &Path, bad: &str) {
+        let mut record = record_of(vec![
+            route_pair(bad, 1, "a.ts"),
+            route_pair("a.ts", 1, "a.ts"),
+        ]);
+        annotate_offline(repo, &mut record).unwrap();
+        assert_eq!(
+            record["pairs"][0]["wrapper"]["reason"], NOT_LOCATED,
+            "{bad}"
+        );
+        assert_eq!(
+            record["pairs"][1]["wrapper"]["reason"], ROWS_MISSING,
+            "the other pair is still read"
+        );
+        let root = repo.canonicalize().unwrap();
+        let parsed = parsed_files();
+        assert!(!parsed.is_empty(), "the good pair's file is parsed");
+        for path in parsed {
+            let path = path.canonicalize().unwrap_or(path);
+            assert!(path.starts_with(&root), "{} left the root", path.display());
+            assert!(
+                !path.components().any(|c| c.as_os_str() == ".git"),
+                "{} is under .git",
+                path.display()
+            );
+        }
+        // The server end, on a file that exists.
+        assert_eq!(
+            server_reason(repo, bad, Reading::BothEnds),
+            Some(NOT_LOCATED),
+            "{bad}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_name_is_refused_at_both_ends() {
+        let (_dir, repo, outside) = sandbox();
+        refuses(&repo, outside.join("secret.ts").to_str().unwrap());
+    }
+
+    #[test]
+    fn a_dot_dot_name_is_refused_at_both_ends() {
+        let (_dir, repo, _outside) = sandbox();
+        refuses(&repo, "../outside/secret.ts");
+        refuses(&repo, "sub/../a.ts");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_leaving_the_repository_is_refused_at_both_ends() {
+        let (dir, repo, outside) = sandbox();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.ts"), repo.join("file.ts")).unwrap();
+        refuses(&repo, "link/secret.ts");
+        refuses(&repo, "file.ts");
+        drop(dir);
+    }
+
+    #[test]
+    fn a_git_segment_is_refused_at_both_ends() {
+        let (_dir, repo, _outside) = sandbox();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/config"), "[core]\n").unwrap();
+        refuses(&repo, ".git/config");
+    }
+
+    #[test]
+    fn the_other_odd_names_are_refused() {
+        let (_dir, repo, _outside) = sandbox();
+        for bad in ["", "./a.ts", "a//b.ts", "a/.", "a\\b.ts", "a\0b.ts", "a/"] {
+            refuses(&repo, bad);
+        }
+    }
+
+    #[test]
+    fn a_name_inside_the_root_is_read() {
+        let (_dir, repo, _outside) = sandbox();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/b.ts"), "await fetch('/b');\n").unwrap();
+        let mut record = record_of(vec![route_pair("src/b.ts", 1, "a.ts")]);
+        annotate_offline(&repo, &mut record).unwrap();
+        assert_eq!(record["pairs"][0]["wrapper"]["reason"], ROWS_MISSING);
+        assert_eq!(server_reason(&repo, "a.ts", Reading::BothEnds), None);
+    }
+
+    #[test]
+    fn the_schema_must_be_the_matched_record_one() {
+        let (dir, repo, _outside) = sandbox();
+        for schema in [json!("carrick.matched/2"), Value::Null] {
+            let mut record = record_of(vec![route_pair("a.ts", 1, "a.ts")]);
+            record["schema"] = schema;
+            let before = record.clone();
+            let error = annotate_offline(&repo, &mut record).unwrap_err();
+            assert!(error.contains("carrick.matched/1"), "{error}");
+            assert_eq!(record, before, "a refused record is not touched");
+        }
+        // `run` writes nothing for it and exits non-zero.
+        let input = dir.path().join("in.json");
+        let out = dir.path().join("out.json");
+        let mut record = record_of(vec![]);
+        record["schema"] = json!("other/1");
+        std::fs::write(&input, record.to_string()).unwrap();
+        let args: Vec<String> = [
+            input.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(run(&args, None), 1);
+        assert!(!out.exists());
+    }
+
+    /// `value` with the four things the pass inserts taken out.
+    fn without_insertions(value: &Value) -> Value {
+        let mut value = value.clone();
+        value.as_object_mut().unwrap().remove("engine");
+        for pair in value["pairs"].as_array_mut().unwrap() {
+            let pair = pair.as_object_mut().unwrap();
+            pair.remove("wrapper");
+            if let Some(sides) = pair.get_mut("sides").and_then(Value::as_object_mut) {
+                for side in sides.values_mut() {
+                    if let Some(side) = side.as_object_mut() {
+                        side.remove("compiler");
+                    }
+                }
+            }
+            if let Some(verdicts) = pair.get_mut("verdicts").and_then(Value::as_object_mut) {
+                verdicts.remove("compiler");
+            }
+        }
+        value
+    }
+
+    #[test]
+    fn the_output_is_the_input_but_for_the_four_insertions() {
+        let (dir, repo, _outside) = sandbox();
+        let with_model = |line: u32| {
+            let mut pair = route_pair("a.ts", line, "a.ts");
+            pair["sides"] = json!({
+                "caller_expects": { "model": { "text": "T" }, "own_field": 1 },
+                "server_returns": { "model": { "text": "U" } },
+                "caller_sends": { "model": { "reason": "none" } },
+                "server_reads": { "model": { "reason": "none" } },
+            });
+            pair["verdicts"] = json!({ "model": { "grade": "agree" }, "own": 2 });
+            pair
+        };
+        let input = record_of(vec![with_model(2), with_model(1)]);
+        // A bogus engine path and no time: every end states
+        // `budget_exhausted` without a process started.
+        let path = dir.path().join("in.json");
+        let out = dir.path().join("out.json");
+        std::fs::write(&path, input.to_string()).unwrap();
+        let args: Vec<String> = [
+            path.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--ceiling-secs",
+            "0",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(run(&args, Some(Path::new("/nonexistent/engine.js"))), 0);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text.trim_end().lines().count(), 1, "compact JSON");
+        let output: Value = serde_json::from_str(&text).unwrap();
+        assert!(output["engine"].is_object());
+        assert!(output["pairs"][1]["sides"]["caller_expects"]["compiler"].is_object());
+        assert_eq!(without_insertions(&output), input);
+        assert_eq!(
+            output["pairs"][1]["sides"]["caller_expects"]["own_field"],
+            1
+        );
+    }
+
+    #[test]
+    fn a_pair_whose_parts_are_not_objects_is_left_untouched() {
+        let (_dir, repo, _outside) = sandbox();
+        let mut sides_array = route_pair("a.ts", 1, "a.ts");
+        sides_array["sides"] = json!([1, 2]);
+        let mut side_text = route_pair("a.ts", 1, "a.ts");
+        side_text["sides"] = json!({ "caller_expects": "text" });
+        let mut verdicts_null = route_pair("a.ts", 1, "a.ts");
+        verdicts_null["verdicts"] = Value::Null;
+        let good = route_pair("a.ts", 1, "a.ts");
+        let input = record_of(vec![
+            sides_array,
+            side_text,
+            verdicts_null,
+            json!("not a pair"),
+            good,
+        ]);
+        let mut record = input.clone();
+        annotate_offline(&repo, &mut record).unwrap();
+        for index in 0..4 {
+            assert_eq!(record["pairs"][index], input["pairs"][index], "{index}");
+        }
+        assert!(record["pairs"][4]["wrapper"].is_object());
+    }
+
+    #[test]
+    fn a_record_of_more_than_the_cap_is_refused() {
+        let (_dir, repo, _outside) = sandbox();
+        let pairs: Vec<Value> = (0..MAX_PAIRS + 1)
+            .map(|_| route_pair("a.ts", 1, "a.ts"))
+            .collect();
+        let mut record = record_of(pairs);
+        let error = annotate_offline(&repo, &mut record).unwrap_err();
+        assert!(error.contains("5000"), "{error}");
+        assert!(parsed_files().is_empty());
+    }
+
+    #[test]
+    fn without_an_engine_the_status_is_failed_engine_not_found() {
+        let (_dir, repo, _outside) = sandbox();
+        let mut record = record_of(vec![route_pair("a.ts", 1, "a.ts")]);
+        annotate_offline(&repo, &mut record).unwrap();
+        assert_eq!(record["engine"]["status"], "failed");
+        assert_eq!(record["engine"]["reason"], "engine_not_found");
+    }
+
+    #[test]
+    fn a_spent_ceiling_states_budget_exhausted_at_each_end() {
+        let (_dir, repo, _outside) = sandbox();
+        let mut record = record_of(vec![route_pair("a.ts", 1, "a.ts")]);
+        annotate(
+            &mut record,
+            &Inputs {
+                repo: &repo,
+                store: None,
+                sidecar: Some(Path::new("/nonexistent/engine.js")),
+                ceiling: Duration::ZERO,
+            },
+        )
+        .unwrap();
+        assert_eq!(record["engine"]["status"], "partial");
+        assert_eq!(record["engine"]["reason"], "budget_exhausted");
+        let pair = &record["pairs"][0];
+        assert_eq!(
+            pair["sides"]["caller_expects"]["compiler"]["reason"],
+            "budget_exhausted"
+        );
+        assert_eq!(
+            pair["sides"]["server_returns"]["compiler"]["reason"],
+            "budget_exhausted"
+        );
+    }
+
+    #[test]
+    fn many_pairs_on_one_file_parse_it_once() {
+        let (_dir, repo, _outside) = sandbox();
+        let source: String = (1..=300)
+            .map(|n| format!("await fetch('/p{n}');\n"))
+            .collect();
+        std::fs::write(repo.join("big.ts"), source).unwrap();
+        let pairs: Vec<Value> = (1..=300).map(|n| route_pair("big.ts", n, "a.ts")).collect();
+        let mut record = record_of(pairs);
+        annotate_offline(&repo, &mut record).unwrap();
+        let parsed = parsed_files();
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(record["pairs"][299]["wrapper"]["reason"], ROWS_MISSING);
     }
 }

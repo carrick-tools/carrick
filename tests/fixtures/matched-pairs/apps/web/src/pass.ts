@@ -26,21 +26,21 @@ export const options = {
 };
 
 export async function callFunction(): Promise<number> {
-  const w: { id: string; total: number } = await (await fetch('/functions/v1/widget')).json();
+  const w: { id: string; total: number } = await (await fetch('/fn/resize')).json();
   return w.total;
 }
 
 export async function readStock(): Promise<number> {
-  const rows: { sku: string; qty: number }[] = await db.from('stock').select();
+  const rows: { sku: string; qty: number }[] = await store.rows('stock').read();
   return rows.length;
 }
 
 export async function widgetById(): Promise<number> {
-  const rows: { id: string; total: number }[] = await db.rpc('widget_by_id');
+  const rows: { id: string; total: number }[] = await store.call('widget_by_id');
   return rows.length;
 }
 
-declare const db: {
-  from(table: string): { select(): Promise<{ sku: string; qty: number }[]> };
-  rpc(name: string): Promise<{ id: string; total: number }[]>;
+declare const store: {
+  rows(table: string): { read(): Promise<{ sku: string; qty: number }[]> };
+  call(name: string): Promise<{ id: string; total: number }[]>;
 };
