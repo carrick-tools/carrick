@@ -1931,16 +1931,22 @@ impl FunctionDefinitionExtractor {
     /// first-wins guard in `visit_call_expr` kept one row per file: a
     /// controller of twelve routes read as one function.
     ///
-    /// Only a call with exactly one function literal among its arguments is
-    /// read; with two there is no saying which is the member's, and the call
-    /// keeps today's synthetic naming. The callback's span is recorded so
+    /// Only a call of a bare name (`wrap(…)`) with exactly one function literal
+    /// among its arguments is read. With two there is no saying which is the
+    /// member's. A method call (`rows.map((r) => r.id)`, `z.string().refine(…)`)
+    /// is how a value is computed from a callback far more often than how a
+    /// handler is wrapped, and without types the scanner cannot tell the two
+    /// apart, so it keeps today's synthetic naming. The callback's span is recorded so
     /// `visit_call_expr` names no second row for the same body. A local object
     /// exported by a later statement is collected after the walk
     /// ([`Self::collect_exported_local_objects`]), by which time that
     /// synthetic row exists, so it is dropped here. A callback elsewhere in the
     /// file that the dropped row's name kept out stays unnamed.
     fn insert_wrapped_member(&mut self, name: String, call: &CallExpr) {
-        if !matches!(call.callee, Callee::Expr(_)) {
+        let Callee::Expr(callee) = &call.callee else {
+            return;
+        };
+        if !matches!(crate::swc_scanner::unwrap_expr(callee), Expr::Ident(_)) {
             return;
         }
         let mut callbacks = call

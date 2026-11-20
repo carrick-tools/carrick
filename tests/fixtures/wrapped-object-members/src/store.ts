@@ -29,3 +29,9 @@ export function findGadget(id: string): Item | undefined {
 export async function removeGadget(id: string): Promise<void> {
   items.splice(items.findIndex((item) => item.id === id), 1);
 }
+
+// The bound: a member computed by a method call that takes a callback is a
+// value, not a wrapped handler, and is not named for the member.
+export const catalog = {
+  names: items.map((item) => item.name),
+};

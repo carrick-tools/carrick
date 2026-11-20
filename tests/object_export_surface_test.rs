@@ -441,4 +441,12 @@ fn a_wrapped_callback_on_an_exported_object_is_named_for_its_member() {
     // The control: a callback handed straight to a route registration is still
     // named for the route.
     definition_in(&definitions, "src/routes.ts", "get_health_handler");
+
+    // The bound: `names: items.map((item) => item.name)` is a value computed
+    // with a callback, not a wrapped handler.
+    assert!(
+        find_in(&definitions, "src/store.ts", "catalog.names").is_none(),
+        "a method call's callback is not named for the member: {:?}",
+        located(&definitions)
+    );
 }
