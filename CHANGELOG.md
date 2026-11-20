@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.3.166](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.165...carrick-v0.3.166) (2026-11-20)
+
+
+### Features
+
+* **held:** show what the compiler check does not check ([#4897](https://github.com/carrick-tools/carrick/issues/4897)) ([ccc346f](https://github.com/carrick-tools/carrick/commit/ccc346f88bb6a21af2e34a04f834750f45ae2243))
+* **held:** the compiler check is on by default ([#4910](https://github.com/carrick-tools/carrick/issues/4910)) ([49fde03](https://github.com/carrick-tools/carrick/commit/49fde0343c1a602da53371ed831363b9003f3b5b))
+* **init:** a task skill new in a release reaches an existing install ([#4893](https://github.com/carrick-tools/carrick/issues/4893)) ([4e187ed](https://github.com/carrick-tools/carrick/commit/4e187edb487b372f0dad7e22197ad523bb044223))
+* **init:** allow Carrick's MCP tools in the settings file that holds its hooks ([#4899](https://github.com/carrick-tools/carrick/issues/4899)) ([b9a5521](https://github.com/carrick-tools/carrick/commit/b9a5521db9f51b72d6c9e956e93fb30fe48f74ff))
+* **init:** connect Codex to Carrick's MCP server with its own command ([#4901](https://github.com/carrick-tools/carrick/issues/4901)) ([cab49c8](https://github.com/carrick-tools/carrick/commit/cab49c8c9e96b6e24ce672e16e44fb97999b7bbc))
+* **init:** keep init's own files out of git in a single repo ([#4888](https://github.com/carrick-tools/carrick/issues/4888)) ([b78881e](https://github.com/carrick-tools/carrick/commit/b78881e43b5864c3453e9f313d668d42cc240716))
+
+
+### Bug Fixes
+
+* **held:** a caller type declared in a file the producer compiles is unarmed shared_home ([#4658](https://github.com/carrick-tools/carrick/issues/4658)) ([#4902](https://github.com/carrick-tools/carrick/issues/4902)) ([36ecfb4](https://github.com/carrick-tools/carrick/commit/36ecfb4bb99590f047d40f882b339111fdf5df50))
+* **held:** a compiler break is said once, as the edit's that caused it ([#4728](https://github.com/carrick-tools/carrick/issues/4728)) ([#4895](https://github.com/carrick-tools/carrick/issues/4895)) ([a884b84](https://github.com/carrick-tools/carrick/commit/a884b846bbdbdd6dc6ff70ba491a910c1b109cef)), closes [#4742](https://github.com/carrick-tools/carrick/issues/4742)
+* **held:** a service with no compiler gives back its memory slot ([#4889](https://github.com/carrick-tools/carrick/issues/4889)) ([717664c](https://github.com/carrick-tools/carrick/commit/717664c8cb056a1b38f0b1ea45feeb3d070b3c0d))
+* **held:** an early compiler line says which copy of the other side it read ([#4906](https://github.com/carrick-tools/carrick/issues/4906)) ([b2d2f82](https://github.com/carrick-tools/carrick/commit/b2d2f820a3d9597f510a2602432dee84c45c2fc6))
+* **held:** compiler memory rule (D8): budget a quarter of RAM, close above 1.5x settled size ([#4903](https://github.com/carrick-tools/carrick/issues/4903)) ([81ce7ce](https://github.com/carrick-tools/carrick/commit/81ce7ce23ad8307cf34aa606ba6bd446810cb87b))
+* **held:** use a held pull only when it answers the text just sent ([#4890](https://github.com/carrick-tools/carrick/issues/4890)) ([8c3b04e](https://github.com/carrick-tools/carrick/commit/8c3b04e2ffb96c06142374bfe65b836ca5599b5a)), closes [#4884](https://github.com/carrick-tools/carrick/issues/4884)
+* **hook:** Stop counts a stated early break once and never contradicts it ([#4904](https://github.com/carrick-tools/carrick/issues/4904)) ([d072186](https://github.com/carrick-tools/carrick/commit/d072186a549b88de9e34c699c72b7850c7024d4d))
+* **local:** a re-scan with no compiler engine says the check did not run ([#4875](https://github.com/carrick-tools/carrick/issues/4875)) ([9de530b](https://github.com/carrick-tools/carrick/commit/9de530ba1cee9f474b4fbfb93d324cb677a42678))
+* **skills:** the audit skill classes similar functions by what they read, signature and a quoted difference ([#4896](https://github.com/carrick-tools/carrick/issues/4896)) ([caf0ba5](https://github.com/carrick-tools/carrick/commit/caf0ba5492b32669b74bf784e90e5029ad7c57b5))
+* **skills:** the audit skill states its index, stops on an empty list and prices itself from a run ([#4887](https://github.com/carrick-tools/carrick/issues/4887)) ([8961910](https://github.com/carrick-tools/carrick/commit/8961910160054ed76aa57ab1a0941fc731c73755))
+
+
+### Documentation
+
+* **init:** what init hides from git, what it leaves to the team, and how new skills arrive ([#4905](https://github.com/carrick-tools/carrick/issues/4905)) ([ef54ee4](https://github.com/carrick-tools/carrick/commit/ef54ee44b34aa101fb1bf8b47daeb2003d302c3a))
+
 ## [0.3.165](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.164...carrick-v0.3.165) (2026-11-19)
 
 
