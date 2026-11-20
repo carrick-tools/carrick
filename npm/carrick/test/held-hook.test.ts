@@ -240,11 +240,23 @@ test("row 6: an answer after the wait is not printed by this hook, the hook is n
   assert.ok((row?.held_ms ?? 0) >= 40 && (row?.held_ms ?? 0) < 900, String(row?.held_ms));
 });
 
-test("no daemon at all: part 1 prints and the state is unavailable", async (t) => {
+test("no daemon at all (it left after its idle time): the edit starts one, part 1 prints, and the edit says once that the check is starting (#4939)", async (t) => {
   const ws = await workspace(t);
+  // The edits start real daemons for this workspace: end them, by the pids that name its own root.
+  t.after(() => {
+    const out = (() => { try { return execFileSync("pgrep", ["-f", ws.root], { encoding: "utf8" }); } catch { return ""; } })();
+    for (const pid of out.split("\n").map(Number).filter((p) => p > 0 && p !== process.pid)) {
+      try { process.kill(pid); } catch { /* already gone */ }
+    }
+  });
+  const STARTING = "Carrick: the compiler engine did not check this edit of api/src/tasks.ts: it is starting. `carrick doctor` lists what is not checked.";
   const said = context((await edit(ws, "h-none")).stdout);
   assert.ok(said.includes(PART1), said);
-  assert.equal(readTimings(ws.root).at(-1)?.held_state, "unavailable");
+  assert.ok(said.includes(STARTING), said);
+  assert.equal(readTimings(ws.root).at(-1)?.held_state, "cold");
+  // A second edit does not say the same line again in the same session.
+  const again = context((await edit(ws, "h-none")).stdout);
+  assert.ok(!again.includes(STARTING), again);
 });
 
 test("row 15: with the switch off the output is today's, byte for byte, even with a daemon listening", async (t) => {

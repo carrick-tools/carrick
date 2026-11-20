@@ -496,6 +496,29 @@ test("a second ensureHeld starts nothing; with the switch off, none starts", () 
   }
 });
 
+test("an ask that finds no daemon starts one and answers cold with a note naming the file; a second ask in the lock's window starts nothing (#4939)", async () => {
+  const w = world(["api"]);
+  try {
+    const started: string[][] = [];
+    const start = (_c: string, args: string[]) => void started.push(args);
+    const first = await askHeld(w.root, [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit", start });
+    assert.equal(first.state, "cold");
+    assert.deepEqual(first.not_checked, [{ service: path.join("api", "src", "a.ts"), state: "cold" }]);
+    assert.equal(started.length, 1);
+    assert.equal(started[0]!.at(-1), w.root);
+    // The lock this ask took is live: a second ask in its window starts nothing and says nothing.
+    const second = await askHeld(w.root, [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit", start });
+    assert.equal(second.state, "unavailable");
+    assert.equal(second.not_checked, undefined);
+    assert.equal(started.length, 1);
+    // Switch off: nothing is asked or started.
+    assert.equal((await askHeld(w.root, [w.file("api")], { env: { CARRICK_COMPILER_LINES: "0" }, home: w.home, session: "s", kind: "edit", start })).state, "off");
+    assert.equal(started.length, 1);
+  } finally {
+    w.done();
+  }
+});
+
 test("a daemon does not start when another live process holds the root's lock", async () => {
   const w = world(["api"]);
   try {
@@ -528,8 +551,11 @@ test("over the socket: none, cold, ready", async () => {
     const ready = await askHeld(w.root, [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit" });
     assert.equal(ready.state, "ready");
     assert.deepEqual(ready.lines, [LINE]);
-    // No daemon: unavailable, never a throw.
-    assert.equal((await askHeld(w.root + "-none", [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit" })).state, "unavailable");
+    // No daemon: one is started and the ask answers cold, never a throw.
+    const startedNone: string[][] = [];
+    const none2 = await askHeld(w.root + "-none", [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit", start: (_c, args) => void startedNone.push(args) });
+    assert.equal(none2.state, "cold");
+    assert.equal(startedNone.length, 1);
     // Switch off: no connection is tried.
     assert.equal((await askHeld(w.root, [w.file("api")], { env: { CARRICK_COMPILER_LINES: "0" }, home: w.home, session: "s", kind: "edit" })).state, "off");
   } finally {
