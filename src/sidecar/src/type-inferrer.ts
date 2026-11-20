@@ -31,6 +31,7 @@ import {
   type FunctionExpression,
   type MethodDeclaration,
   type CallExpression,
+  type PropertyAccessExpression,
   type ObjectLiteralExpression,
   type ParameterDeclaration,
   type ConditionalExpression,
@@ -1738,7 +1739,9 @@ export class TypeInferrer {
     const atLine = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
     if (!atLine) return request;
     const within = (inner: Node, outer: Node): boolean =>
-      inner.getPos() >= outer.getPos() && inner.getEnd() <= outer.getEnd();
+      inner.getSourceFile() === outer.getSourceFile() &&
+      inner.getPos() >= outer.getPos() &&
+      inner.getEnd() <= outer.getEnd();
     if (within(node, atLine.registration) || within(node, atLine.handler)) {
       return request;
     }
@@ -9720,6 +9723,12 @@ export class TypeInferrer {
     call: CallExpression
   ): FunctionLike | undefined {
     if (this.calledOnCollectionOrPromise(call)) return undefined;
+    // A call whose own result is a primitive is a value, never a registration
+    // (`JSON.stringify(body, this.replacer)`); one handed an inline function
+    // keeps its reading. The same check `registersHandlerAt` runs.
+    if (callResultIsPrimitive(call) && !call.getArguments().some((arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg))) {
+      return undefined;
+    }
     for (const arg of [...call.getArguments()].reverse()) {
       const handler = this.asHandlerFunction(arg);
       if (handler) {
@@ -9781,7 +9790,53 @@ export class TypeInferrer {
       }
     }
 
+    if (Node.isPropertyAccessExpression(expr)) return this.memberHandler(expr, followWrapperCalls);
+
     return undefined;
+  }
+
+  /**
+   * carrick#1969 T2: the function a member reference (`ctl.list`, `ns.list`,
+   * `instance.list`) names, by the compiler's symbol for the member, through
+   * an import alias. Each declaration reads as a handler by the shape it is:
+   * a method with a body, a property or class field holding a function
+   * literal, a wrapper call (through `functionWrappedBy`, so the wrapper's
+   * verdict is set), or a name; a shorthand property by its value; a function
+   * or variable declaration (a namespace export). A member with two
+   * different functions, or none, names no handler.
+   */
+  private memberHandler(access: PropertyAccessExpression, followWrapperCalls: boolean): FunctionLike | undefined {
+    let symbol = access.getNameNode().getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    const found = new Set<FunctionLike>();
+    for (const declaration of symbol?.getDeclarations() ?? []) {
+      const func = this.functionFromMemberDeclaration(declaration, followWrapperCalls);
+      if (func) found.add(func);
+    }
+    return found.size === 1 ? [...found][0] : undefined;
+  }
+
+  private functionFromMemberDeclaration(declaration: Node, followWrapperCalls: boolean): FunctionLike | undefined {
+    if (Node.isMethodDeclaration(declaration)) {
+      return declaration.getBody() ? this.resolvedDirectly(declaration) : undefined;
+    }
+    if (Node.isShorthandPropertyAssignment(declaration)) {
+      for (const valueDeclaration of declaration.getValueSymbol()?.getDeclarations() ?? []) {
+        const func = this.functionFromDeclaration(valueDeclaration, followWrapperCalls);
+        if (func) return func;
+      }
+      return undefined;
+    }
+    if (Node.isPropertyAssignment(declaration) || Node.isPropertyDeclaration(declaration)) {
+      const initializer = declaration.getInitializer();
+      if (!initializer) return undefined;
+      const direct = functionBodyOf([declaration]);
+      if (direct) return this.resolvedDirectly(direct);
+      const value = this.unwrapExpressionNode(initializer);
+      if (Node.isCallExpression(value)) return followWrapperCalls ? this.functionWrappedBy(value, 0) : undefined;
+      return this.asHandlerFunction(value, followWrapperCalls);
+    }
+    return this.functionFromDeclaration(declaration, followWrapperCalls);
   }
 
   /**

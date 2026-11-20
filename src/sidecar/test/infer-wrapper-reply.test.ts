@@ -513,10 +513,10 @@ describe('carrick#1969 T1: a wrapper is read through only where its code sends w
       assert.strictEqual(await infer('/lib-value', 'response_body'), undefined);
     });
 
-    // A wrapper called as a method is not followed to its body (carrick#1969
-    // T2 follows members), so its declared callback type decides.
-    it('a wrapper called as a method with a value callback leaves the route unread', async () => {
-      assert.strictEqual(await infer('/method-served', 'response_body'), undefined);
+    // A wrapper called as a method is read by its own code, through the
+    // member it names (carrick#1969 T2).
+    it('a wrapper called as a method with a value callback is read by its own code', async () => {
+      assert.strictEqual(await text('/method-served', 'response_body'), WIDGETS);
     });
   });
 

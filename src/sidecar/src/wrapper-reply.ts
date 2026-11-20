@@ -124,10 +124,32 @@ function bodyOfCallee(call: CallExpression, depth = 0): PlainFunctionBody | unde
   }
   let symbol = callee.getSymbol();
   if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
-  const body = functionBodyOf(symbol?.getDeclarations() ?? [], { methods: false });
+  const body = functionBodyOf(declarationsOfName(symbol?.getDeclarations() ?? []), { methods: false });
   if (!body) return undefined;
   const file = body.getSourceFile();
   return file.isDeclarationFile() || file.isInNodeModules() ? undefined : body;
+}
+
+/**
+ * A member that only names another binding (`{ serve }`, `{ run: serve }`)
+ * stands for that binding's declarations, so a wrapper called as a method
+ * (`kit.serve(fn)`) is read by the code it names (carrick#1969 T2).
+ */
+function declarationsOfName(declarations: readonly Node[], depth = 0): Node[] {
+  const out: Node[] = [];
+  for (const declaration of declarations) {
+    let named: TsSymbol | undefined;
+    if (Node.isShorthandPropertyAssignment(declaration)) named = declaration.getValueSymbol();
+    else if (Node.isPropertyAssignment(declaration)) {
+      const initializer = declaration.getInitializer();
+      const value = initializer ? peelValueWrappers(initializer) : undefined;
+      if (value && Node.isIdentifier(value)) named = value.getSymbol();
+    }
+    if (named?.isAlias()) named = named.getAliasedSymbol() ?? named;
+    if (named && depth < MAX_DEPTH) out.push(...declarationsOfName(named.getDeclarations(), depth + 1));
+    else out.push(declaration);
+  }
+  return out;
 }
 
 function parameterSymbol(
