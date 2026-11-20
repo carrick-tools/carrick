@@ -653,15 +653,20 @@ test("the whole command, on a workspace with exactly three findings", () => {
   // A `carrick` of the test's own on PATH, so what the hooks find does not depend on this machine.
   fs.writeFileSync(path.join(bin, "carrick"), "#!/bin/sh\nexit 0\n");
   fs.chmodSync(path.join(bin, "carrick"), 0o755);
+  // The fake scanner's interpreter, by itself: no other command of this
+  // machine's is on PATH, so a `codex` here does not make this a Codex machine.
+  fs.symlinkSync(process.execPath, path.join(bin, "node"));
   const run = spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "doctor", root], {
     encoding: "utf8",
     env: {
       ...process.env,
-      PATH: `${bin}${path.delimiter}${process.env["PATH"] ?? ""}`,
+      PATH: [bin, "/usr/bin", "/bin"].join(path.delimiter),
       HOME: home,
       USERPROFILE: home,
       XDG_CONFIG_HOME: path.join(home, ".config"),
       CLAUDE_CONFIG_DIR: path.join(home, ".claude-config"),
+      // No Codex settings folder either: this machine uses Claude Code only.
+      CODEX_HOME: path.join(home, ".codex"),
       APPDATA: path.join(home, "AppData"),
       CARRICK_BIN: path.join(packageRoot, "test", "fake-carrick.mjs"),
       CARRICK_FAKE_FIXTURE: fixture,
@@ -680,7 +685,8 @@ test("the whole command, on a workspace with exactly three findings", () => {
     `■ ${path.basename(root)}: service "api" includes "packages/shared", which is not a directory in this repo.`,
     `${path.basename(root)}: Carrick now scans this repo in its own cloud runners on every push, so .github/workflows/carrick.yml is no longer needed and only uses CI minutes. You can delete it.`,
     `◇ Agent hooks are installed here and run \`carrick\` on PATH (${path.join(bin, "carrick")}).`,
-    "▲ 10 of the 10 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
+    // Claude Code only: `.agents/skills` is Codex's, and holds nothing of ours.
+    "▲ 5 of the 5 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
     // Found with no ~/.claude at all: the command is the detection.
     "◇ MCP server connected for Claude Code.",
     "▲ api: api is connected and has no hosted index yet. Carrick builds it in the cloud, and `carrick refresh` downloads it once it is ready. (hosted state: no_index_yet)",
@@ -773,4 +779,44 @@ test("a workspace of two repos: the records sit under the workspace root and eac
   assert.match(lines.find((l) => l.startsWith("ledger:")) ?? "", /service "books": 1 of 1 rows are checked after an edit/);
   assert.ok(lines.every((l) => !l.includes("not started yet")), lines.join("\n"));
   assert.match(lines.find((l) => l.includes('service "loose"')) ?? "", new RegExp(`^${path.basename(root)}: .*starting`));
+});
+
+// T2a H6: doctor checks an agent's files where the agent is used on this
+// machine, or where its files of ours are here. The machine is stated.
+
+const CLAUDE_MACHINE = { claudeCode: true, codex: false, guessed: false };
+const CODEX_MACHINE = { claudeCode: false, codex: true, guessed: false };
+
+test("doctor says nothing about an agent this developer does not use, and names Codex's missing hooks where it is used", async () => {
+  const { checkCodexHooks } = await import("../src/init/doctor.ts");
+  const { writeCodexHooks, CODEX_HOOKS_FILE } = await import("../src/init/codex.ts");
+
+  // Claude Code only: no Codex line, and `.agents/skills` is not counted as missing.
+  const claude = workspace({ ".claude/settings.local.json": mergeCarrickHooks(null).body });
+  writeLauncher(path.join(claude, ".claude"));
+  writeTaskSkills(claude, { slug: "shop" }, [SKILL_ROOTS[0]!]);
+  assert.deepEqual(checkCodexHooks(claude, CLAUDE_MACHINE), []);
+  const skills = checkTaskSkills(inspectTaskSkills(claude), CLAUDE_MACHINE);
+  assert.equal(findingCount(skills), 0, texts(skills).join("\n"));
+  assert.doesNotMatch(texts(skills).join("\n"), /missing/);
+
+  // Codex only: no line about .claude settings.
+  const codex = workspace({});
+  writeCodexHooks(codex);
+  writeTaskSkills(codex, { slug: "shop" }, [SKILL_ROOTS[1]!]);
+  assert.deepEqual(checkHooks(codex, hookMachine(), false), []);
+  assert.equal(findingCount(checkTaskSkills(inspectTaskSkills(codex), CODEX_MACHINE)), 0);
+
+  // Codex used here, and no .codex/ in this workspace.
+  assert.deepEqual(texts(checkCodexHooks(claude, { claudeCode: true, codex: true, guessed: false })), [
+    `warn: Codex is installed on this machine, but ${CODEX_HOOKS_FILE} is missing, so Carrick's hooks do not run under Codex here. \`carrick init\` adds them.`,
+  ]);
+  // Neither found, so both guessed: no machine said Codex is installed.
+  assert.deepEqual(checkCodexHooks(claude, { claudeCode: true, codex: true, guessed: true }), []);
+
+  // A team's .codex/ without our entries, on a machine with no Codex: theirs, not this developer's.
+  const team = workspace({ [CODEX_HOOKS_FILE]: `${JSON.stringify({ hooks: { PostToolUse: [{ hooks: [{ type: "command", command: "npm run lint" }] }] } })}\n` });
+  assert.deepEqual(checkCodexHooks(team, CLAUDE_MACHINE), []);
+
+  for (const dir of [claude, codex, team]) fs.rmSync(dir, { recursive: true, force: true });
 });

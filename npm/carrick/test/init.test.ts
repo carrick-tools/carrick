@@ -41,7 +41,7 @@ import {
   writesLine,
   parseArgs,
   init,
-  initWith,
+  initWith as initOnMachine,
   namedButExcluded,
   chooseEditors,
   CLOUD_NEXT_TITLE,
@@ -77,6 +77,27 @@ import {
 } from "../src/init/output.ts";
 import { PassThrough, Writable } from "node:stream";
 import type { ResolvedRepos } from "../src/auth/read.ts";
+// A namespace, so a name this file reads that the source lacks fails its own tests, not the file's load.
+import * as mcp from "../src/init/mcp.ts";
+import * as run from "../src/init/run.ts";
+
+/**
+ * `initWith` on a machine that uses both agents, stated rather than read, so a
+ * laptop with one agent and a runner with none get the same run (H9).
+ */
+function initWith(argv: string[], out: InitOutput, interactive: boolean, harnesses: mcp.Harnesses = mcp.BOTH_HARNESSES): Promise<number> {
+  return initOnMachine(argv, out, interactive, { harnesses });
+}
+
+/**
+ * Codex's settings folder in a spawned run's fake home, so that run finds both
+ * agents (`claude` by the fake command on PATH) whatever this machine has.
+ */
+function codexHome(root: string): string {
+  const folder = path.join(root, "home", ".codex");
+  fs.mkdirSync(folder, { recursive: true });
+  return folder;
+}
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -348,6 +369,7 @@ globalThis.fetch = async (input, init) => {
       // A test that did not state one would edit the developer's own clients.
       HOME: path.join(root, "home"),
       USERPROFILE: path.join(root, "home"),
+      CODEX_HOME: codexHome(root),
       NODE_OPTIONS: `--import=${mockHttp}`,
       PATH: `${binDirectory}${path.delimiter}${process.env["PATH"] ?? ""}`,
     },
@@ -864,6 +886,7 @@ globalThis.fetch = async (input, init) => {
       XDG_CONFIG_HOME: path.join(root, "config"),
       HOME: path.join(root, "home"),
       USERPROFILE: path.join(root, "home"),
+      CODEX_HOME: codexHome(root),
       NODE_OPTIONS: `--import=${mockHttp}`,
       PATH: `${fakeClaude(root)}${path.delimiter}${process.env["PATH"] ?? ""}`,
     },
@@ -2272,6 +2295,10 @@ function cloudWorkspace(options: {
   readFromHosted?: string[];
   /** Editors with a configuration directory here, and whether each one's command answers. */
   editors?: Record<string, boolean>;
+  /** No `claude` command on PATH (T2a H5). */
+  noClaude?: boolean;
+  /** The folder of repos sits inside another repository's work tree (T2a H8). */
+  insideRepo?: boolean;
 }): {
   root: string;
   folder: string;
@@ -2283,6 +2310,7 @@ function cloudWorkspace(options: {
 } {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-cloud-")));
   const folder = path.join(root, "shop");
+  if (options.insideRepo === true) execFileSync("git", ["init", "-q", root]);
   const held = { ...options.repos };
   for (const name of Object.keys(held)) {
     const dir = path.join(folder, name);
@@ -2346,6 +2374,7 @@ process.stdout.write(JSON.stringify(inside.length > 0
 `);
   fs.chmodSync(native, 0o755);
   const bin = fakeClaude(root);
+  if (options.noClaude === true) fs.rmSync(path.join(bin, "claude"));
   // The fake scanner's interpreter, by itself.
   fs.symlinkSync(process.execPath, path.join(bin, "node"));
   const home = path.join(root, "home");
@@ -3331,4 +3360,145 @@ test("init says the compiler check is on, its memory budget and its off switch",
   assert.match(text, /^The compiler check is on by default\./);
   assert.match(text, /holds up to 4096 MB of memory across all checkouts/);
   assert.match(text, /CARRICK_COMPILER_LINES=0 in the "env" block of \.claude\/settings\.local\.json, or in the shell you start Claude Code from/);
+});
+
+// T2a: init writes files only for the coding agent this developer uses, and
+// its "Next:" list says what it writes, hides and allows.
+
+const CLAUDE_HERE: mcp.Harnesses = { claudeCode: true, codex: false, guessed: false };
+const CODEX_HERE: mcp.Harnesses = { claudeCode: false, codex: true, guessed: false };
+const T2A_SKILLS = (root: string): string[] => taskSkillPaths().filter((skill) => skill.startsWith(root));
+
+/** A run's printed text with the list wrapping undone, for a line that wraps. */
+function unwrapped(out: { lines: string[] }): string {
+  return out.lines.join("\n").replace(/\n {2,}/g, " ");
+}
+
+test("the Next list says what this run writes, hides, allows and adds to the rules files", () => {
+  const { nextLines } = run as unknown as { nextLines?: (options: Record<string, unknown>) => string[] };
+  assert.equal(typeof nextLines, "function", "run.ts exports nextLines");
+  const writes = (files: { claudeCode: boolean; codex: boolean }, folder: string | null = null): string =>
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, codex: false, folder, home: "/home/dev", files } as Parameters<typeof writesLine>[0]);
+  const hidden = "Keep these files out of git with .git/info/exclude";
+  const hiddenFolder = "Keep each repo's copy out of git with its .git/info/exclude";
+  const allow = (file: string): string => `Allow Carrick's read-only MCP tools in ${file} so headless \`claude -p\` runs can call them`;
+  const rules = "Add Carrick's rules section to AGENTS.md";
+  const guessed = "Set up both Claude Code and Codex, because neither was detected";
+
+  // Claude Code only, in one repo.
+  assert.deepEqual(
+    nextLines!({ writes: writes(CLAUDE_HERE), hidden: "repo", allowFile: ".claude/settings.local.json", claudeFile: false, guessed: false }),
+    [
+      "Add Carrick's hooks and skills to .claude/, create .carrick/, and add Carrick's MCP server to Claude Code",
+      hidden,
+      allow(".claude/settings.local.json"),
+      rules,
+    ],
+  );
+  // Codex only: no allow entry, which is Claude Code's.
+  assert.deepEqual(nextLines!({ writes: writes(CODEX_HERE), hidden: "repo", allowFile: null, claudeFile: false, guessed: false }), [
+    "Add Carrick's hooks and skills to .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
+    hidden,
+    rules,
+  ]);
+  // Both, in a folder of repos.
+  assert.deepEqual(
+    nextLines!({ writes: writes(mcp.BOTH_HARNESSES, "~/shop"), hidden: "folder", allowFile: ".claude/settings.json", claudeFile: false, guessed: false }),
+    [
+      "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/ in ~/shop and in each repo, create .carrick/, and add Carrick's MCP server to Claude Code",
+      hiddenFolder,
+      allow(".claude/settings.json"),
+      rules,
+    ],
+  );
+  // A repo with a CLAUDE.md gets the section there too; git tracking a path this run writes hides nothing.
+  assert.deepEqual(
+    nextLines!({ writes: writes(mcp.BOTH_HARNESSES), hidden: null, allowFile: null, claudeFile: true, guessed: false }).slice(1),
+    ["Add Carrick's rules section to AGENTS.md and CLAUDE.md"],
+  );
+  assert.deepEqual(
+    nextLines!({ writes: writes(mcp.BOTH_HARNESSES), hidden: "repo", allowFile: ".claude/settings.local.json", claudeFile: false, guessed: true }).at(-1),
+    guessed,
+  );
+  // Both found: the line is today's, and the rules line follows it.
+  assert.deepEqual(nextLines!({ writes: writes(mcp.BOTH_HARNESSES), hidden: null, allowFile: null, claudeFile: false, guessed: false }), [
+    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
+    rules,
+  ]);
+});
+
+test("a Claude Code-only run in one repo writes no Codex file and lists what it writes, hides and allows", posixNativeFixture, async () => {
+  const fixture = cloudWorkspace({ repos: { api: "indexed" } });
+  const out = silentTerminal();
+  try {
+    assert.equal(await initWith([fixture.repo("api")], out, true, CLAUDE_HERE), 0, out.lines.join("\n"));
+    const repo = fixture.repo("api");
+    assert.equal(fs.existsSync(path.join(repo, ".codex")), false);
+    assert.equal(fs.existsSync(path.join(repo, ".agents")), false);
+    assert.ok(fs.existsSync(path.join(repo, ".claude", "settings.local.json")));
+    const text = unwrapped(out);
+    assert.match(text, /Next: Add Carrick's hooks and skills to \.claude\/, create \.carrick\//);
+    assert.ok(text.includes("Keep these files out of git with .git/info/exclude"), text);
+    assert.ok(text.includes("Allow Carrick's read-only MCP tools in .claude/settings.local.json so headless `claude -p` runs can call them"), text);
+    assert.ok(text.includes("Add Carrick's rules section to AGENTS.md"), text);
+    assert.doesNotMatch(text, /because neither was detected/);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("a folder of repos outside any repository, Claude Code only: the folder and each repo hold Claude Code's files only", posixNativeFixture, async () => {
+  const fixture = cloudWorkspace({ repos: { api: "indexed", web: "indexed" } });
+  const out = silentTerminal();
+  try {
+    assert.equal(await initWith([fixture.folder], out, true, CLAUDE_HERE), 0, out.lines.join("\n"));
+    for (const skill of T2A_SKILLS(path.join(".claude", "skills"))) assert.ok(fs.existsSync(path.join(fixture.folder, skill)), skill);
+    assert.ok(fs.existsSync(path.join(fixture.folder, ".claude", "settings.json")));
+    for (const dir of [fixture.folder, fixture.repo("api"), fixture.repo("web")]) {
+      assert.equal(fs.existsSync(path.join(dir, ".codex")), false, `${dir}/.codex`);
+      assert.equal(fs.existsSync(path.join(dir, ".agents")), false, `${dir}/.agents`);
+    }
+    for (const name of ["api", "web"]) assert.ok(fs.existsSync(path.join(fixture.repo(name), ".claude", "settings.local.json")), name);
+    const text = unwrapped(out);
+    assert.ok(text.includes("Keep each repo's copy out of git with its .git/info/exclude"), text);
+    assert.ok(text.includes("Allow Carrick's read-only MCP tools in .claude/settings.json so headless `claude -p` runs can call them"), text);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("a folder inside another repository's work tree gets both agents' files, as before", posixNativeFixture, async () => {
+  const fixture = cloudWorkspace({ repos: { api: "indexed", web: "indexed" }, insideRepo: true });
+  const out = silentTerminal();
+  try {
+    assert.equal(await initWith([fixture.folder], out, true, CLAUDE_HERE), 0, out.lines.join("\n"));
+    assert.ok(fs.existsSync(path.join(fixture.folder, ".claude", "settings.json")));
+    assert.ok(fs.existsSync(path.join(fixture.folder, CODEX_HOOKS_FILE)));
+    for (const skill of taskSkillPaths()) assert.ok(fs.existsSync(path.join(fixture.folder, skill)), skill);
+    assert.match(unwrapped(out), /Next: Add Carrick's hooks and skills to \.claude\/, \.agents\/ and \.codex\//);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("the no-claude-command line is said only where Claude Code is used here or guessed", posixNativeFixture, async () => {
+  const line = /No claude command on this machine/;
+  // Detected off a stated machine with no commands on PATH: only folders decide.
+  const detect = (folders: string[]): mcp.Harnesses => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-t2a-home-")));
+    for (const folder of folders) fs.mkdirSync(path.join(home, folder));
+    const found = mcp.harnessesHere({ ...mcp.realEnvironment(), onPath: () => false, home, variable: () => undefined });
+    fs.rmSync(home, { recursive: true, force: true });
+    return found;
+  };
+  for (const [folders, said] of [[[".codex"], false], [[".claude"], true], [[], true]] as Array<[string[], boolean]>) {
+    const fixture = cloudWorkspace({ repos: { api: "indexed" }, noClaude: true });
+    const out = silentTerminal();
+    try {
+      assert.equal(await initWith([fixture.repo("api")], out, true, detect(folders)), 0, out.lines.join("\n"));
+      assert.equal(line.test(out.lines.join("\n")), said, `${folders.join(",") || "nothing found"}: ${out.lines.join("\n")}`);
+    } finally {
+      fixture.restore();
+    }
+  }
 });

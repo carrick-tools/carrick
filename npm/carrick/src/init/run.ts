@@ -33,15 +33,35 @@ import {
   type WorkspaceProposal,
 } from "./repos.ts";
 import { reposUrl } from "./connect.ts";
+import { checkoutOf } from "../hook/worktree.ts";
 import { downloadHostedIndex, hostedReport, nativeRunner, STEP_LABEL } from "./hosted.ts";
 import { listProjects, projectLabel, SLUG, type Project } from "./projects.ts";
-import { ownRepository, writeFolderCopy, writeRepoCopy } from "./repo-copies.ts";
-import { claudeCodeFound, codexFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
-import { mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
-import { writeLauncher } from "./launcher.ts";
-import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
+import {
+  committedHooksAreOurs,
+  holdsOurs,
+  ownRepository,
+  repoCopyPathsFor,
+  trackedPaths,
+  writeFolderCopy,
+  writeRepoCopy,
+  type CopyAgents,
+} from "./repo-copies.ts";
+import {
+  BOTH_HARNESSES,
+  claudeCodeFound,
+  codexFound,
+  connectMcpClients,
+  harnessesHere,
+  mcpLine,
+  offeredFileClients,
+  type Harnesses,
+  type OfferedClient,
+} from "./mcp.ts";
+import { mergeCarrickHooks, mergeHookSet, removeCarrickHooks, SHARED_SETTINGS } from "./settings.ts";
+import { LAUNCHER_FILE, writeLauncher } from "./launcher.ts";
+import { CODEX_DIR, CODEX_HOOKS_FILE, codexHooks, readHooksFile, writeCodexHooks } from "./codex.ts";
 import { AGENTS_FILE, CLAUDE_FILE, writeAgentsSection, writeClaudeSection } from "./agents-section.ts";
-import { ignoredSkillRoots, taskSkillWarnings, writeTaskSkills } from "./task-skills.ts";
+import { ignoredSkillRoots, skillRootsFor, taskSkillWarnings, writeTaskSkills } from "./task-skills.ts";
 import { recordCliVersion } from "./outdated.ts";
 import { offerGlobalInstall } from "../global-install.ts";
 import { currentVersion } from "../update.ts";
@@ -341,6 +361,8 @@ export function writesLine(options: {
   codex: boolean;
   folder: string | null;
   home?: string;
+  /** The agents whose files this run writes; both where it is not said. */
+  files?: CopyAgents;
 }): string {
   const mcp = [
     ...(options.claudeCode ? ["Claude Code"] : []),
@@ -348,12 +370,42 @@ export function writesLine(options: {
     ...options.editorFiles.map((file) => tilde(file, options.home)),
   ];
   const where = options.folder === null ? "" : ` in ${options.folder} and in each repo`;
+  const files = options.files ?? { claudeCode: true, codex: true };
+  const folders = !files.codex ? ".claude/" : !files.claudeCode ? ".agents/ and .codex/" : ".claude/, .agents/ and .codex/";
   const parts = [
-    `Add Carrick's hooks and skills to .claude/, .agents/ and .codex/${where}`,
+    `Add Carrick's hooks and skills to ${folders}${where}`,
     options.workspaceFile ? `create .carrick/ and ${WORKSPACE_FILE}` : "create .carrick/",
     ...(mcp.length > 0 ? [`add Carrick's MCP server to ${listed(mcp, 5)}`] : []),
   ];
   return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
+}
+
+/**
+ * The lines under "Next:": `writesLine` first, then one fact per line about
+ * what the run hides, allows and adds to the rules files, each only in its case.
+ */
+export function nextLines(options: {
+  /** `writesLine`'s answer. */
+  writes: string;
+  /** "repo": one repo where git tracks nothing this run writes; "folder": a folder of repos; null: neither. */
+  hidden: "repo" | "folder" | null;
+  /** The settings file the MCP allow entry goes into, or null where none is added. */
+  allowFile: string | null;
+  /** The folder has a CLAUDE.md, which gets the rules section too. */
+  claudeFile: boolean;
+  /** Neither agent was found, so both are set up. */
+  guessed: boolean;
+}): string[] {
+  return [
+    options.writes,
+    ...(options.hidden === "repo" ? ["Keep these files out of git with .git/info/exclude"] : []),
+    ...(options.hidden === "folder" ? ["Keep each repo's copy out of git with its .git/info/exclude"] : []),
+    ...(options.allowFile === null
+      ? []
+      : [`Allow Carrick's read-only MCP tools in ${options.allowFile} so headless \`claude -p\` runs can call them`]),
+    `Add Carrick's rules section to ${options.claudeFile ? `${AGENTS_FILE} and ${CLAUDE_FILE}` : AGENTS_FILE}`,
+    ...(options.guessed ? ["Set up both Claude Code and Codex, because neither was detected"] : []),
+  ];
 }
 
 /** The list of what the run writes, under its heading. */
@@ -532,6 +584,8 @@ type InitPlan = {
   waiting: string[];
   /** The covered repos and the services the workspace read holds for them. */
   counts: { repos: number; services: number };
+  /** The agents whose files this run writes. */
+  agents: CopyAgents;
 };
 
 /**
@@ -550,8 +604,9 @@ async function planRun(input: {
   identity: ResolvedRepos;
   credential: Credential;
   out: InitOutput;
+  harnesses: Harnesses;
 }): Promise<InitPlan> {
-  const { parsed, workspace, derived, candidates, identity, credential, out } = input;
+  const { parsed, workspace, derived, candidates, identity, credential, out, harnesses } = input;
   const repos = reposUrl(identity.workspace.slug);
   const parent = derived.parent_proposal;
   if (parent !== null && candidates.length === 1) {
@@ -599,17 +654,34 @@ async function planRun(input: {
   const editors = chooseEditors(offered, parsed.editors);
   const kept = new Set(selected.map((repo) => repo.path));
   const deselected = candidates.filter((repo) => !kept.has(repo.path)).map((repo) => path.basename(repo.path));
+  const hidden = ownRepository(workspace);
+  const folder = selected.some((repo) => realPath(repo.path) !== realPath(workspace)) ? tilde(realPath(workspace)) : null;
+  // A folder inside another repository's work tree holds the team's files, which
+  // the team is asked to track: a per-machine choice there would change what the
+  // team commits, so it gets both agents' files, as before.
+  const agents: CopyAgents = !hidden && checkoutOf(workspace) !== null ? BOTH_HARNESSES : harnesses;
+  // One repo shows its copy in nothing git shows, unless git tracks a path this
+  // run writes or the team's committed settings hold our entries (they are updated in place).
+  const teamHooks = hidden && agents.claudeCode && committedHooksAreOurs(workspace, SHARED_SETTINGS);
+  const tracked = folder === null && hidden && !teamHooks ? trackedPaths(workspace, repoCopyPathsFor(agents)) : null;
   // Every file is named before it is written.
   out.say(
-    nextBlock([
-      writesLine({
-        workspaceFile: deselected.length > 0,
-        editorFiles: offered.filter((client) => editors.includes(client.name)).map((client) => client.file),
-        claudeCode: claudeCodeFound(),
-        codex: codexFound(),
-        folder: selected.some((repo) => realPath(repo.path) !== realPath(workspace)) ? tilde(realPath(workspace)) : null,
+    nextBlock(
+      nextLines({
+        writes: writesLine({
+          workspaceFile: deselected.length > 0,
+          editorFiles: offered.filter((client) => editors.includes(client.name)).map((client) => client.file),
+          claudeCode: claudeCodeFound(),
+          codex: codexFound(),
+          folder,
+          files: agents,
+        }),
+        hidden: folder !== null ? "folder" : tracked !== null && tracked.size === 0 ? "repo" : null,
+        allowFile: !agents.claudeCode || teamHooks ? null : hidden ? ".claude/settings.local.json" : ".claude/settings.json",
+        claudeFile: fs.existsSync(path.join(workspace, CLAUDE_FILE)),
+        guessed: harnesses.guessed,
       }),
-    ]),
+    ),
   );
   return {
     credential,
@@ -627,6 +699,7 @@ async function planRun(input: {
       repos: selected.length,
       services: selected.reduce((sum, repo) => sum + held(repo)!.services.length, 0),
     },
+    agents,
   };
 }
 
@@ -637,9 +710,15 @@ export async function init(argv: string[]): Promise<number> {
 /**
  * `init` with the terminal stated rather than sniffed, so a test can be the
  * terminal. The terminal decides only whether init can sign in from here and
- * how a step draws: nothing is asked after sign-in.
+ * how a step draws: nothing is asked after sign-in. `harnesses` is which coding
+ * agents this developer uses, read off this machine where it is not given.
  */
-export async function initWith(argv: string[], out: InitOutput, interactive: boolean): Promise<number> {
+export async function initWith(
+  argv: string[],
+  out: InitOutput,
+  interactive: boolean,
+  options: { harnesses?: Harnesses } = {},
+): Promise<number> {
   const parsed = parseArgs(argv);
   if (typeof parsed === "string") {
     process.stdout.write(`${parsed}\n`);
@@ -667,6 +746,8 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       : `run carrick init${flags} in ${tilde(workspace)} again`;
 
   let plan: InitPlan;
+  // Read once, where the run is decided, and passed down.
+  let harnesses: Harnesses = BOTH_HARNESSES;
   // Puts the workspace file back as it was found, for a run that stops before
   // it writes anything.
   let restoreSelection: (() => void) | null = null;
@@ -734,7 +815,8 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       }
     }
     leftOut(excludedRepos(workspace));
-    plan = await planRun({ parsed, workspace, derived, candidates, identity, credential: saved, out });
+    harnesses = options.harnesses ?? harnessesHere();
+    plan = await planRun({ parsed, workspace, derived, candidates, identity, credential: saved, out, harnesses });
   } catch (error) {
     restoreSelection?.();
     if (error instanceof PromptCancelled) {
@@ -751,7 +833,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
 
   // From here the run writes: the selection, the hooks, the skills and the
   // MCP entries.
-  const { derived, credential, names, projects, project, deselected, editors, selected } = plan;
+  const { derived, credential, names, projects, project, deselected, editors, selected, agents } = plan;
   const label = (slug: string): string => projectLabel(slug, projects);
   // What the reader still has to do, said once at the end rather than between
   // the steps (carrick#1489).
@@ -793,7 +875,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   const hidden = ownRepository(workspace);
   if (hidden) {
     try {
-      const copy = writeFolderCopy(workspace, { slug: project })!;
+      const copy = writeFolderCopy(workspace, { slug: project }, agents)!;
       // Said once, last, in the closing block.
       if (copy.codexWritten) codexTrust = true;
       for (const refused of copy.refused) {
@@ -825,23 +907,33 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       // The same removal `carrick remove` runs, so a file holding no entry of
       // ours is left byte for byte rather than reformatted on the way past.
       const cleaned = other === null ? null : removeCarrickHooks(other);
-      const hooks = mergeCarrickHooks(settings);
+      // Claude Code not used here: a settings file and launcher of ours already
+      // here are kept current, and nothing is created.
+      const claude = agents.claudeCode || holdsOurs(settings);
+      const hooks = claude ? mergeCarrickHooks(settings) : null;
       // Validate both documents before migrating our entries between them.
       if (cleaned?.changed) writeIfChanged(otherFile, cleaned.body);
-      writeIfChanged(settingsFile, hooks.body);
-      writeLauncher(path.join(workspace, ".claude"));
+      if (hooks !== null) writeIfChanged(settingsFile, hooks.body);
+      if (agents.claudeCode || fs.existsSync(path.join(workspace, ".claude", LAUNCHER_FILE))) writeLauncher(path.join(workspace, ".claude"));
     } catch (error) {
       out.refuse(
         `Could not configure Carrick hooks: ${(error as Error).message}. Fix ${settingsName} and ${again()}.`,
       );
     }
-    // The same hooks for Codex, in the file Codex reads project hooks
-    // from. Written for both hosts for the same reason the task skills are
-    // (carrick#1335): which agent opens this workspace is not a thing init can
-    // know, and a hook file for a host nobody runs costs nothing.
+    // The same hooks for Codex, in the file Codex reads project hooks from,
+    // where this developer uses Codex. Where they do not, a hooks file and
+    // launcher of ours already here are kept current, and nothing is created.
     try {
       // Said once, last, in the closing block.
-      if (writeCodexHooks(workspace) === "written") codexTrust = true;
+      if (agents.codex) {
+        if (writeCodexHooks(workspace) === "written") codexTrust = true;
+      } else {
+        const existing = readHooksFile(workspace);
+        if (holdsOurs(existing) && writeIfChanged(path.join(workspace, CODEX_HOOKS_FILE), mergeHookSet(existing, codexHooks()).body) === "written") {
+          codexTrust = true;
+        }
+        if (fs.existsSync(path.join(workspace, CODEX_DIR, LAUNCHER_FILE))) writeLauncher(path.join(workspace, CODEX_DIR));
+      }
     } catch (error) {
       out.refuse(
         `Could not configure the Codex hooks: ${(error as Error).message}. Fix ${CODEX_HOOKS_FILE} and ${again()}.`,
@@ -853,7 +945,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // an agent reads. A file this package did not write, or one somebody has
     // since changed, is left alone and named.
     try {
-      todo.push(...taskSkillWarnings(writeTaskSkills(workspace, { slug: project })));
+      todo.push(...taskSkillWarnings(writeTaskSkills(workspace, { slug: project }, skillRootsFor(agents))));
       // Which build wrote them, so a hook running an older `carrick` than this
       // one says so instead of answering from files it does not match
       // (carrick#1372). It is also the record a run inside one repo of this
@@ -894,7 +986,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   for (const repo of selected) {
     if (realPath(repo.path) === realPath(workspace)) continue;
     try {
-      writeRepoCopy(repo.path, { slug: project });
+      writeRepoCopy(repo.path, { slug: project }, agents);
     } catch (error) {
       out.refuse(`Could not add Carrick's hooks and skills to ${path.basename(repo.path)}: ${(error as Error).message}.`);
     }
@@ -909,8 +1001,9 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     todo.push(`MCP not configured for ${outcome.client}: ${outcome.detail}`);
   }
   // Said as what is missing, not as "no agent client": the hooks above were
-  // written for two of them (carrick#1489).
-  if (!mcp.some((outcome) => outcome.client === "Claude Code")) {
+  // written for it (carrick#1489). Only where Claude Code is used here (found by
+  // its settings folder, or guessed): a Codex-only machine hears nothing of it.
+  if (harnesses.claudeCode && !mcp.some((outcome) => outcome.client === "Claude Code")) {
     todo.push(`No claude command on this machine, so Claude Code has no Carrick MCP server. Once it is installed: ${mcpLine()}`);
   }
 

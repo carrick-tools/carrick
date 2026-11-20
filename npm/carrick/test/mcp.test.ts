@@ -44,6 +44,8 @@ type Machine = {
   installId?: string | null;
   /** Whether a person is at a terminal; Codex's add asks for one. */
   terminal?: boolean;
+  /** Environment variables this machine sets. */
+  variables?: Record<string, string>;
 };
 
 function machine(state: Machine): { env: McpEnvironment; written: Record<string, string>; ran: string[] } {
@@ -79,6 +81,7 @@ function machine(state: Machine): { env: McpEnvironment; written: Record<string,
       written[file] = body;
     },
     exists: (target) => (state.directories ?? []).includes(target) || target in files,
+    variable: (name) => state.variables?.[name],
   };
   return { env, written, ran };
 }
@@ -712,4 +715,29 @@ test("doctor reads the Codex entry and writes nothing", () => {
   assert.deepEqual(ours.m.written, {});
   assert.equal(read({ [CODEX_GET]: codexEntry("https://mcp.example.test/mcp") }).found[0]?.state, "elsewhere");
   assert.equal(read({}, { [CODEX_GET]: 1 }).found[0]?.state, "absent");
+});
+
+// T2a H1: which coding agents this developer uses, read off a stated machine.
+test("an agent is here by its command or its settings folder, and neither found means both, guessed", async () => {
+  // A namespace read, so a source without the detector fails this test alone.
+  const { harnessesHere } = (await import("../src/init/mcp.ts")) as { harnessesHere?: (env: McpEnvironment) => unknown };
+  assert.equal(typeof harnessesHere, "function", "mcp.ts exports harnessesHere");
+  const here = (state: Machine): unknown => harnessesHere!(machine(state).env);
+  assert.deepEqual(here({ commands: ["claude"] }), { claudeCode: true, codex: false, guessed: false });
+  // Claude Code in an editor or the desktop app: no command, its folder named by $CLAUDE_CONFIG_DIR.
+  assert.deepEqual(here({ directories: ["/opt/claude-config"], variables: { CLAUDE_CONFIG_DIR: "/opt/claude-config" } }), {
+    claudeCode: true,
+    codex: false,
+    guessed: false,
+  });
+  // $CLAUDE_CONFIG_DIR set elsewhere: ~/.claude is not where Claude Code keeps it.
+  assert.deepEqual(here({ directories: [path.join(HOME, ".claude"), path.join(HOME, ".codex")], variables: { CLAUDE_CONFIG_DIR: "/opt/none" } }), {
+    claudeCode: false,
+    codex: true,
+    guessed: false,
+  });
+  assert.deepEqual(here({ directories: [path.join(HOME, ".codex")] }), { claudeCode: false, codex: true, guessed: false });
+  assert.deepEqual(here({ directories: ["/opt/codex"], variables: { CODEX_HOME: "/opt/codex" } }), { claudeCode: false, codex: true, guessed: false });
+  assert.deepEqual(here({ commands: ["codex"], directories: [path.join(HOME, ".claude")] }), { claudeCode: true, codex: true, guessed: false });
+  assert.deepEqual(here({}), { claudeCode: true, codex: true, guessed: true });
 });
