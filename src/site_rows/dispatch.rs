@@ -177,6 +177,7 @@ fn row(
         // A handler is no request: it states no base.
         base: None,
         procedure: None,
+        label_member: None,
     }
 }
 

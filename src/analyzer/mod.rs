@@ -380,6 +380,15 @@ pub struct ApiEndpointDetails {
     /// pass never read ([`crate::site_rows`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<crate::site_rows::Inference>,
+    /// On a CALL entry stated through an op claimed on what a scope member
+    /// returns: the labelled member that stated it (`upsert` of
+    /// `db.from("t").upsert(...)`, D14 of the tables stage), which the
+    /// method alone does not say. `None` on every other row and on every
+    /// blob written before the field. Outside the row's key and every hash:
+    /// matching never reads it. Wire path: `calls[].label_member`, omitted
+    /// when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_member: Option<String>,
 }
 
 /// Every optional field absent, every flag off. `key` and `file_path` have no
@@ -416,6 +425,7 @@ impl Default for ApiEndpointDetails {
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
+            label_member: None,
         }
     }
 }
@@ -6950,6 +6960,40 @@ mod tests {
         assert_eq!(back.name_scope, stated.name_scope);
         assert_eq!(back.library_semantics, stated.library_semantics);
         assert!(!ResolutionSource::LibraryClaim.is_candidate());
+    }
+
+    /// D14 of the tables stage: a call row's `label_member` is written when
+    /// set and omitted when not, and a row written before the field reads
+    /// back with none. Outside the key: two rows that differ only by it key
+    /// alike.
+    #[test]
+    fn a_call_rows_label_member_is_optional_on_the_wire() {
+        let before = serde_json::json!({
+            "owner": null,
+            "key": { "protocol": "http", "method": "POST", "path": "/rest/v1/notes" },
+            "params": [],
+            "request_body": null,
+            "response_body": null,
+            "handler_name": null,
+            "request_type": null,
+            "response_type": null,
+            "file_path": "src/write.ts:4",
+            "provenance": "route",
+            "resolution_source": "request_summary"
+        });
+        let old: ApiEndpointDetails =
+            serde_json::from_value(before.clone()).expect("an old row reads");
+        assert_eq!(old.label_member, None);
+        assert_eq!(serde_json::to_value(&old).expect("serialize"), before);
+        let upsert = ApiEndpointDetails {
+            label_member: Some("upsert".to_string()),
+            ..old.clone()
+        };
+        let wire = serde_json::to_value(&upsert).expect("serialize");
+        assert_eq!(wire["label_member"], "upsert");
+        let back: ApiEndpointDetails = serde_json::from_value(wire).expect("reads back");
+        assert_eq!(back.label_member.as_deref(), Some("upsert"));
+        assert_eq!(back.key, old.key);
     }
 
     /// `name_scope` is read as the cloud's `readNameScope` reads it

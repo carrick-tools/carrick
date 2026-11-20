@@ -1217,7 +1217,7 @@ pub enum ClaimProtocol {
 
 /// The op applies only where argument `arg` (or its `key`) holds `literal`
 /// (amendment 7: `on("message", ...)`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ClaimWhen {
     pub arg: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]

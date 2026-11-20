@@ -28753,6 +28753,7 @@ unfollowed_member_calls_total: 0,
                 name_scope: None,
                 library_semantics: Vec::new(),
                 inference: None,
+                label_member: None,
             };
         let procedures = procedure_sites(
             &[
@@ -30426,6 +30427,7 @@ unfollowed_member_calls_total: 0,
             within: Vec::new(),
             base: None,
             procedure: None,
+            label_member: None,
         }
     }
 

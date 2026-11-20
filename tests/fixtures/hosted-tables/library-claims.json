@@ -1,0 +1,126 @@
+{
+  "library_claims": [
+    {
+      "package": "@supabase/supabase-js",
+      "version": "1.0.0",
+      "status": "answered",
+      "surface_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "exports": [
+        {
+          "specifier": "@supabase/supabase-js",
+          "export": "createClient",
+          "role": "http_client",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "base": {
+                "arg": 0
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [
+            {
+              "member": "from",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "ops": [
+            {
+              "op": "request",
+              "member": "select",
+              "of": "instance:()>scope:from",
+              "name": {
+                "bound": "scope"
+              },
+              "name_prefix": "/rest/v1/",
+              "method_default": "GET",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "select",
+              "of": "instance:()>scope:from",
+              "name": {
+                "bound": "scope"
+              },
+              "name_prefix": "/rest/v1/",
+              "method_default": "HEAD",
+              "picker": "fixture-picker",
+              "when": {
+                "arg": 1,
+                "key": "head",
+                "literal": "true"
+              }
+            },
+            {
+              "op": "request",
+              "member": "insert",
+              "of": "instance:()>scope:from",
+              "name": {
+                "bound": "scope"
+              },
+              "name_prefix": "/rest/v1/",
+              "method_default": "POST",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "upsert",
+              "of": "instance:()>scope:from",
+              "name": {
+                "bound": "scope"
+              },
+              "name_prefix": "/rest/v1/",
+              "method_default": "POST",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "update",
+              "of": "instance:()>scope:from",
+              "name": {
+                "bound": "scope"
+              },
+              "name_prefix": "/rest/v1/",
+              "method_default": "PATCH",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "delete",
+              "of": "instance:()>scope:from",
+              "name": {
+                "bound": "scope"
+              },
+              "name_prefix": "/rest/v1/",
+              "method_default": "DELETE",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "rpc",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "name_prefix": "/rest/v1/rpc/",
+              "method_default": "POST",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

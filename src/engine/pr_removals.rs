@@ -548,6 +548,7 @@ mod tests {
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
+            label_member: None,
         }
     }
 

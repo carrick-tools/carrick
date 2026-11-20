@@ -143,6 +143,10 @@ pub struct SiteArg {
     /// `function` and an object literal, the arguments a name slot passes
     /// over as another overload's.
     pub non_string: bool,
+    /// The text of a number, boolean or `null` literal written here
+    /// (`true`): what a claim's `when` literal is compared with
+    /// ([`literal_at`]), and read by nothing else.
+    pub scalar: Option<String>,
     /// Text with a parameter of the enclosing function in it
     /// ([`text_pieces`]): a hole each caller fills with its own argument
     /// (carrick#1562). `text` is `None` while a hole is open.
@@ -173,6 +177,10 @@ pub struct SiteObject {
     /// object is not a string the source writes. Same drop rules as
     /// `fields`.
     pub objects: BTreeMap<String, SiteObject>,
+    /// Key -> the text of the number, boolean or `null` literal it holds, as
+    /// [`SiteArg::scalar`]. Such a key is in `fields` with no text. Same drop
+    /// rules as `fields`.
+    pub scalars: BTreeMap<String, String>,
 }
 
 impl SiteArg {
@@ -241,6 +249,11 @@ impl SiteArg {
                 open: object.open,
                 holes: BTreeMap::new(),
                 objects: object.objects.clone(),
+                scalars: if keep {
+                    object.scalars.clone()
+                } else {
+                    BTreeMap::new()
+                },
             };
             for (key, value) in &object.fields {
                 let (text, holes) = match object.holes.get(key) {
@@ -260,6 +273,7 @@ impl SiteArg {
                 object,
                 function: self.function,
                 non_string: self.non_string,
+                scalar: self.scalar.clone().filter(|_| keep),
                 holes,
                 spread: self.spread,
             },
@@ -2131,6 +2145,7 @@ impl<'a> LinkedNames<'a> {
             object,
             function: arg.function,
             non_string: arg.non_string,
+            scalar: arg.scalar.clone(),
             holes,
             spread: arg.spread,
         }
@@ -3912,8 +3927,69 @@ pub(super) fn site_arg(expr: &Expr, scope: &Scope<'_>) -> SiteArg {
                 | Expr::Array(_)
                 | Expr::Class(_)
         ),
+        scalar: scalar_text(expr),
         holes,
         spread: false,
+    }
+}
+
+/// The text of a number, boolean or `null` literal (`true`, `3`, `null`),
+/// as the source writes it; `None` for anything else.
+fn scalar_text(expr: &Expr) -> Option<String> {
+    match unwrap_expression(expr) {
+        Expr::Lit(Lit::Bool(value)) => Some(value.value.to_string()),
+        Expr::Lit(Lit::Num(value)) => Some(value.value.to_string()),
+        Expr::Lit(Lit::Null(_)) => Some("null".to_string()),
+        _ => None,
+    }
+}
+
+/// What a call's argument slot holds for a claim's `when` literal to be
+/// compared with ([`literal_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LiteralAt {
+    /// The literal text the slot holds: a string, number, boolean or
+    /// `null` written there.
+    Holds(String),
+    /// Nothing is written there: the argument is absent, or an object with
+    /// no spread or computed key lacks the key.
+    Unwritten,
+    /// A value the source does not state as a literal.
+    Unread,
+}
+
+/// What the slot `when` names holds among a call's arguments `args` (`None`
+/// where a spread moves them).
+pub(super) fn literal_at(
+    args: Option<&[SiteArg]>,
+    when: &crate::services::type_sidecar::ClaimWhen,
+) -> LiteralAt {
+    let Some(args) = args else {
+        return LiteralAt::Unread;
+    };
+    let Some(arg) = args.get(when.arg as usize) else {
+        return LiteralAt::Unwritten;
+    };
+    if arg.spread {
+        return LiteralAt::Unread;
+    }
+    let Some(key) = &when.key else {
+        return match (&arg.text, &arg.scalar) {
+            (Some(text), _) | (None, Some(text)) => LiteralAt::Holds(text.clone()),
+            (None, None) => LiteralAt::Unread,
+        };
+    };
+    let Some(object) = &arg.object else {
+        return LiteralAt::Unread;
+    };
+    if let Some(text) = object.scalars.get(key) {
+        return LiteralAt::Holds(text.clone());
+    }
+    match object.fields.get(key) {
+        Some(Some(text)) => LiteralAt::Holds(text.clone()),
+        Some(None) => LiteralAt::Unread,
+        None if object.open => LiteralAt::Unread,
+        None => LiteralAt::Unwritten,
     }
 }
 
@@ -4026,6 +4102,7 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
         out.fields.clear();
         out.holes.clear();
         out.objects.clear();
+        out.scalars.clear();
         out.open = true;
     };
     let put = |out: &mut SiteObject, key: String, pieces: Option<Vec<TextPiece>>| {
@@ -4035,6 +4112,7 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
             None => out.holes.remove(&key),
         };
         out.objects.remove(&key);
+        out.scalars.remove(&key);
         out.fields.insert(key, text);
     };
     for prop in &object.props {
@@ -4049,6 +4127,9 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
             Prop::KeyValue(kv) => match prop_name(&kv.key) {
                 Some(key) => {
                     put(&mut out, key.clone(), text_pieces(&kv.value, scope));
+                    if let Some(text) = scalar_text(&kv.value) {
+                        out.scalars.insert(key.clone(), text);
+                    }
                     if let Some(nested) = nested_object(&kv.value, scope) {
                         out.objects.insert(key, nested);
                     }
