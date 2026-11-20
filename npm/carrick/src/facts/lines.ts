@@ -152,8 +152,8 @@ export type Candidate = {
 const KINDS = ["contract", "op", "matched", "fn", "name", "pkg"] as const;
 type Kind = (typeof KINDS)[number];
 
-/** The kinds `pickLines` always takes; `contract` is optional. */
-type Found = Record<Exclude<Kind, "contract">, readonly Candidate[]> & { contract?: readonly Candidate[] };
+/** The kinds `pickLines` always takes; `contract` and `matched` are optional. */
+type Found = Record<Exclude<Kind, "contract" | "matched">, readonly Candidate[]> & { contract?: readonly Candidate[]; matched?: readonly Candidate[] };
 
 /** The main checkout a linked worktree belongs to, from its `.git` file. */
 function mainCheckoutOf(worktreeTop: string): string | null {
