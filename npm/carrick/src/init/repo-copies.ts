@@ -58,6 +58,7 @@ import {
   taskSkillPaths,
   SKILL_ROOTS,
   skillRootLink,
+  skillRootsFor,
   TASK_SKILLS,
   type SkillOutcome,
   type SkillScope,
@@ -85,6 +86,21 @@ const CODEX_LAUNCHER = path.join(".codex", LAUNCHER_FILE);
 /** Every file a repo copy can hold, relative to the repo. */
 export function repoCopyPaths(): string[] {
   return [LOCAL_SETTINGS, CLAUDE_LAUNCHER, CODEX_HOOKS_FILE, CODEX_LAUNCHER, ...taskSkillPaths()];
+}
+
+/** The agents a copy is written for. */
+export type CopyAgents = { claudeCode: boolean; codex: boolean };
+
+const BOTH_AGENTS: CopyAgents = { claudeCode: true, codex: true };
+
+/** The files a copy writes for these agents, relative to the repo. */
+export function repoCopyPathsFor(agents: CopyAgents): string[] {
+  const roots = skillRootsFor(agents);
+  return [
+    ...(agents.claudeCode ? [LOCAL_SETTINGS, CLAUDE_LAUNCHER] : []),
+    ...(agents.codex ? [CODEX_HOOKS_FILE, CODEX_LAUNCHER] : []),
+    ...taskSkillPaths().filter((relative) => roots.some((root) => relative.startsWith(`${root}${path.sep}`))),
+  ];
 }
 
 /** A relative path as an exclude line: anchored to the repo root, `/`-separated. */
@@ -154,6 +170,11 @@ export function git(repo: string, args: string[], timeoutMs = 5000, env?: NodeJS
   return result.stdout;
 }
 
+/** Whether this folder is inside a git work tree: its own repository's, or one above it. */
+export function insideWorkTree(folder: string): boolean {
+  return git(folder, ["rev-parse", "--is-inside-work-tree"])?.trim() === "true";
+}
+
 /** Whether this folder is the top of a git repository, not a folder inside one. */
 export function ownRepository(repo: string): boolean {
   const top = git(repo, ["rev-parse", "--show-toplevel"])?.trim();
@@ -190,7 +211,7 @@ function committedText(repo: string, relative: string): string | null {
 }
 
 /** Whether a settings document holds an entry of ours; false for one that is not JSON. */
-function holdsOurs(body: string | null): boolean {
+export function holdsOurs(body: string | null): boolean {
   if (body === null) return false;
   try {
     return installedCarrickHooks(body).length > 0;
@@ -244,8 +265,14 @@ type Planned = { relative: string; body: string; record: boolean };
  * which differs from a repo below it in three ways: a Codex hooks file git
  * tracks takes our entries, a settings file an older version edited is put
  * back, and a team's committed entries are left (see the header).
+ *
+ * `agents` are the coding agents this developer uses. An agent not among them
+ * gets no new file: only its files of ours that are already here and that git
+ * does not track are written, to this version and recorded, so they stay
+ * current and out of git, and `carrick remove` still takes them. A file of
+ * theirs git tracks is not touched.
  */
-function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | null {
+function copyInto(repo: string, scope: SkillScope, own: boolean, agents: CopyAgents): FolderCopy | null {
   if (!ownRepository(repo)) return null;
   const exclude = excludeFile(repo);
   const tracked = exclude === null ? null : trackedPaths(repo, [...repoCopyPaths(), SHARED_SETTINGS]);
@@ -271,12 +298,15 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
   let shared: { body: string } | { remove: true } | null = null;
   let teamHooksLeft = false;
   let teamHooksUpdated = false;
+  // An agent not used here keeps only a file of ours already on disk that git does not track.
+  const kept = (relative: string, ours: boolean): boolean => ours && !tracked.has(relative);
+  const present = (relative: string): boolean => fs.existsSync(path.join(repo, relative));
 
   if (own) {
     const sharedFile = path.join(repo, SHARED_SETTINGS);
     const sharedBody = readOrNull(sharedFile);
     teamHooksLeft = committedHooksAreOurs(repo, SHARED_SETTINGS);
-    if (teamHooksLeft && sharedBody !== null) {
+    if (teamHooksLeft && sharedBody !== null && agents.claudeCode) {
       // The team committed our entries: they are brought up to date in that file
       // (the hooks only; the allow entry is never added to a team's file), so the
       // commit self-update asks for exists (carrick#4898).
@@ -302,17 +332,24 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
     if (teamHooksLeft) {
       // The committed entries run already; a second set here would run twice.
       if (holdsOurs(localExisting)) hooksFile(LOCAL_SETTINGS, () => removeCarrickHooks(localExisting!).body, true);
-    } else {
+    } else if (agents.claudeCode || holdsOurs(localExisting)) {
       hooksFile(LOCAL_SETTINGS, () => mergeCarrickHooks(localExisting).body, true);
     }
     // A launcher the team committed is theirs to commit again: kept current in
     // place, out of the exclude block, so the change self-update asks them to
     // commit exists (carrick#4898).
-    if (!(own && tracked.has(CLAUDE_LAUNCHER))) writes.push({ relative: CLAUDE_LAUNCHER, body: launcherSource(), record: true });
+    if (!agents.claudeCode) {
+      if (kept(CLAUDE_LAUNCHER, present(CLAUDE_LAUNCHER))) writes.push({ relative: CLAUDE_LAUNCHER, body: launcherSource(), record: true });
+    } else if (!(own && tracked.has(CLAUDE_LAUNCHER))) writes.push({ relative: CLAUDE_LAUNCHER, body: launcherSource(), record: true });
     else writes.push({ relative: CLAUDE_LAUNCHER, body: launcherSource(), record: false });
   }
   const codexExisting = readOrNull(path.join(repo, CODEX_HOOKS_FILE));
-  if (!tracked.has(CODEX_HOOKS_FILE)) {
+  if (!agents.codex) {
+    if (kept(CODEX_HOOKS_FILE, holdsOurs(codexExisting))) {
+      hooksFile(CODEX_HOOKS_FILE, () => mergeHookSet(codexExisting, codexHooks()).body, true);
+    }
+    if (kept(CODEX_LAUNCHER, present(CODEX_LAUNCHER))) writes.push({ relative: CODEX_LAUNCHER, body: launcherSource(), record: true });
+  } else if (!tracked.has(CODEX_HOOKS_FILE)) {
     hooksFile(CODEX_HOOKS_FILE, () => mergeHookSet(codexExisting, codexHooks()).body, true);
     writes.push({ relative: CODEX_LAUNCHER, body: launcherSource(), record: true });
   } else if (own) {
@@ -321,8 +358,21 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
     hooksFile(CODEX_HOOKS_FILE, () => mergeHookSet(codexExisting, codexHooks()).body, false);
     writes.push({ relative: CODEX_LAUNCHER, body: launcherSource(), record: true });
   }
+  const used = skillRootsFor(agents);
   for (const root of SKILL_ROOTS) {
     const link = skillRootLink(repo, root);
+    if (!used.includes(root)) {
+      // An agent not used here: only its skills of ours git does not track, kept
+      // current; nothing is said about the rest.
+      if (link !== null) continue;
+      for (const name of TASK_SKILLS) {
+        const relative = skillFile(root, name);
+        if (kept(relative, skillState(readOrNull(path.join(repo, relative))) === "ours")) {
+          writes.push({ relative, body: renderTaskSkill(name, scope), record: true });
+        }
+      }
+      continue;
+    }
     if (link !== null) {
       for (const name of TASK_SKILLS) skills.push({ path: skillFile(root, name), state: "linked", wrote: false, link });
       continue;
@@ -381,8 +431,8 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
  * every body is decided before the first write. Returns the paths written,
  * relative to the repo.
  */
-export function writeRepoCopy(repo: string, scope: SkillScope): string[] | null {
-  return copyInto(repo, scope, false)?.paths ?? null;
+export function writeRepoCopy(repo: string, scope: SkillScope, agents: CopyAgents = BOTH_AGENTS): string[] | null {
+  return copyInto(repo, scope, false, agents)?.paths ?? null;
 }
 
 /**
@@ -390,8 +440,8 @@ export function writeRepoCopy(repo: string, scope: SkillScope): string[] | null 
  * repository; null otherwise, and then init writes the shared files as it
  * always has.
  */
-export function writeFolderCopy(folder: string, scope: SkillScope): FolderCopy | null {
-  return copyInto(folder, scope, true);
+export function writeFolderCopy(folder: string, scope: SkillScope, agents: CopyAgents = BOTH_AGENTS): FolderCopy | null {
+  return copyInto(folder, scope, true, agents);
 }
 
 /**

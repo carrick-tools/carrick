@@ -113,6 +113,8 @@ export type McpEnvironment = {
   readFile: (file: string) => string | null;
   writeFile: (file: string, body: string) => void;
   exists: (target: string) => boolean;
+  /** An environment variable, or undefined where it is not set. */
+  variable: (name: string) => string | undefined;
 };
 
 export function realEnvironment(): McpEnvironment {
@@ -154,6 +156,7 @@ export function realEnvironment(): McpEnvironment {
       fs.writeFileSync(file, body);
     },
     exists: (target) => fs.existsSync(target),
+    variable: (name) => process.env[name],
   };
 }
 
@@ -334,6 +337,38 @@ export const CODEX_ADD_LINE = `codex mcp add ${MCP_NAME} --url ${MCP_URL}`;
 /** Codex is on this machine when its command is. */
 export function codexFound(env: McpEnvironment = realEnvironment()): boolean {
   return env.onPath("codex");
+}
+
+/** The coding agents this developer uses, as `carrick init` and `carrick doctor` read them. */
+export type Harnesses = {
+  claudeCode: boolean;
+  codex: boolean;
+  /** Neither agent was found, so both are set up. */
+  guessed: boolean;
+};
+
+/** Both agents: what a run writes where it cannot, or must not, choose. */
+export const BOTH_HARNESSES: Harnesses = { claudeCode: true, codex: true, guessed: false };
+
+/**
+ * Which coding agents this developer uses: the agents whose files init writes
+ * and doctor checks.
+ *
+ * An agent is here when its command is on PATH or its user settings folder
+ * exists. The folder counts because Claude Code inside an editor or the desktop
+ * app runs with no `claude` command, and a missed agent loses its hooks; a false
+ * find costs only files nobody reads. Where neither agent is found, both are
+ * set up, as before this choice existed. `claudeCodeFound` and `codexFound` stay
+ * PATH-only: they decide whether a command can run.
+ */
+export function harnessesHere(env: McpEnvironment = realEnvironment()): Harnesses {
+  const settingsFolder = (variable: string, fallback: string): boolean => {
+    const set = env.variable(variable);
+    return env.exists(set !== undefined && set !== "" ? set : path.join(env.home, fallback));
+  };
+  const claudeCode = env.onPath("claude") || settingsFolder("CLAUDE_CONFIG_DIR", ".claude");
+  const codex = env.onPath("codex") || settingsFolder("CODEX_HOME", ".codex");
+  return claudeCode || codex ? { claudeCode, codex, guessed: false } : { claudeCode: true, codex: true, guessed: true };
 }
 
 /** The URL in `codex mcp get <name> --json`, or null when it prints none we can read. */

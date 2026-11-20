@@ -37,7 +37,15 @@ import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { compilerCoverage } from "../held/coverage.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { TEMPLATE_PATHS } from "../templates.ts";
-import { CODEX_ADD_LINE, inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
+import {
+  BOTH_HARNESSES,
+  CODEX_ADD_LINE,
+  harnessesHere,
+  inspectMcpClients,
+  mcpLine,
+  type Harnesses,
+  type McpInspection,
+} from "./mcp.ts";
 import { readInstallId } from "./install-id.ts";
 import { createOutput, DOCS_INIT_FILES, type InitOutput } from "./output.ts";
 import {
@@ -62,7 +70,7 @@ import {
   type InstalledHook,
 } from "./settings.ts";
 import { CODEX_DIR, CODEX_HOOKS_FILE, codexInUse, expectedCodexHooks, readHooksFile } from "./codex.ts";
-import { inspectTaskSkills, TASK_SKILLS, type InstalledSkill } from "./task-skills.ts";
+import { inspectTaskSkills, SKILL_ROOTS, skillRootsFor, TASK_SKILLS, type InstalledSkill } from "./task-skills.ts";
 import type { StatusResult } from "../contract.ts";
 
 export type DoctorOptions = { workspace: string };
@@ -408,8 +416,11 @@ export function realMachine(): HookMachine {
  * call still find Carrick on this machine (carrick#4759)? The last is asked of
  * the launcher itself, so the answer is the one a hook gets; an install under
  * another Node than this shell's is named as that, not as a failure.
+ *
+ * Asked where Claude Code is used on this machine, or where a settings file
+ * here holds our entries; otherwise there is nothing of Claude Code's to check.
  */
-export function checkHooks(workspace: string, machine: HookMachine): Line[] {
+export function checkHooks(workspace: string, machine: HookMachine, claudeCode = true): Line[] {
   const lines: Line[] = [];
   const installed: InstalledHook[] = [];
   let files = 0;
@@ -429,6 +440,7 @@ export function checkHooks(workspace: string, machine: HookMachine): Line[] {
     }
   }
   if (installed.length === 0) {
+    if (!claudeCode) return [];
     if (findingCount(lines) > 0) return lines;
     lines.push(
       warn(
@@ -493,19 +505,33 @@ export function checkHooks(workspace: string, machine: HookMachine): Line[] {
 /**
  * The hook entries in this workspace's Codex config (carrick#1335).
  *
- * Asked only where Codex is set up for this workspace, and the test for that is
- * its project config folder: `.codex/` is the layer Codex reads project hooks
- * from, and it is the folder `carrick init` writes the entries into. A
- * workspace without one runs Codex nowhere near this repository, and a warning
- * there would fire on every Claude Code user for a host they do not have.
+ * Asked where Codex is used on this machine, or where `.codex/hooks.json` here
+ * holds our entries. A `.codex/` without our entries on a machine with no Codex
+ * is a team's Codex folder, not this developer's, and says nothing. Where Codex
+ * was found (not guessed) and this workspace has no `.codex/`, Carrick's hooks
+ * do not run under it, which is the one line said about a missing folder.
  *
  * What it does NOT re-ask is whether the command still resolves. That is one
  * machine-wide question about one install, `checkHooks` above asks it of the
  * same command string, and asking twice would print the same finding twice.
  */
-export function checkCodexHooks(workspace: string): Line[] {
-  if (!codexInUse(workspace)) return [];
+export function checkCodexHooks(workspace: string, harnesses: Harnesses): Line[] {
   const body = readHooksFile(workspace);
+  let ours = false;
+  try {
+    ours = body !== null && installedCarrickHooks(body).length > 0;
+  } catch {
+    // Not JSON: not a file of ours to check unless Codex is used here.
+  }
+  if (!harnesses.codex && !ours) return [];
+  if (!codexInUse(workspace)) {
+    if (harnesses.guessed) return [];
+    return [
+      warn(
+        `Codex is installed on this machine, but ${CODEX_HOOKS_FILE} is missing, so Carrick's hooks do not run under Codex here. \`carrick init\` adds them.`,
+      ),
+    ];
+  }
   if (body === null) {
     return [
       warn(
@@ -574,10 +600,23 @@ export function checkCodexHooks(workspace: string): Line[] {
  *
  * A file nobody here wrote — a skill of the same name from somewhere else — is
  * not reported at all. It is not ours, and doctor has nothing to say about it.
+ *
+ * A root's missing skills count only where its agent is used on this machine or
+ * the root holds a skill of ours, and the total counts only those roots: a
+ * Claude Code-only install is not told about `.agents/skills`.
  */
-export function checkTaskSkills(installed: InstalledSkill[]): Line[] {
+export function checkTaskSkills(
+  installed: InstalledSkill[],
+  agents: { claudeCode: boolean; codex: boolean } = BOTH_HARNESSES,
+): Line[] {
   const lines: Line[] = [];
-  const missing = installed.filter((skill) => skill.state === "absent");
+  const used = skillRootsFor(agents);
+  const rootOf = (skill: InstalledSkill): string | undefined => SKILL_ROOTS.find((root) => skill.path.startsWith(`${root}${path.sep}`));
+  const counted = installed.filter((skill) => {
+    const root = rootOf(skill);
+    return root === undefined || used.includes(root) || installed.some((other) => rootOf(other) === root && other.state === "ours");
+  });
+  const missing = counted.filter((skill) => skill.state === "absent");
   const stale = installed.filter((skill) => skill.state === "ours" && !skill.current);
   const edited = installed.filter((skill) => skill.state === "edited");
   const linked = installed.filter((skill) => skill.state === "linked");
@@ -587,7 +626,7 @@ export function checkTaskSkills(installed: InstalledSkill[]): Line[] {
   if (missing.length > 0) {
     lines.push(
       warn(
-        `${missing.length} of the ${installed.length} task skill file(s) are missing here (${named(missing)}), so your agent has no Carrick task to follow. \`carrick init\` writes them.`,
+        `${missing.length} of the ${counted.length} task skill file(s) are missing here (${named(missing)}), so your agent has no Carrick task to follow. \`carrick init\` writes them.`,
       ),
     );
   }
@@ -872,6 +911,7 @@ function print(out: InitOutput, lines: Line[]): void {
 export async function doctor(
   argv: string[],
   out: InitOutput = createOutput(),
+  harnesses: Harnesses = harnessesHere(),
 ): Promise<number> {
   const parsed = parseArgs(argv);
   if (typeof parsed === "string") {
@@ -891,9 +931,9 @@ export async function doctor(
     ...checkDeclaredPaths(repos),
     ...checkCompilerCoverage(workspace, repos),
     ...checkWorkflow(repos),
-    ...checkHooks(workspace, realMachine()),
-    ...checkCodexHooks(workspace),
-    ...checkTaskSkills(inspectTaskSkills(workspace)),
+    ...checkHooks(workspace, realMachine(), harnesses.claudeCode),
+    ...checkCodexHooks(workspace, harnesses),
+    ...checkTaskSkills(inspectTaskSkills(workspace), harnesses),
     ...checkMcp(inspectMcpClients()),
     ...(await readIndex(workspace)),
   ];

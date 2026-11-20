@@ -49,6 +49,11 @@ export const SKILL_ROOTS = [
   path.join(".agents", "skills"),
 ];
 
+/** The roots these agents read skills from: Claude Code `.claude/skills`, Codex `.agents/skills`. */
+export function skillRootsFor(agents: { claudeCode: boolean; codex: boolean }): string[] {
+  return SKILL_ROOTS.filter((root) => (root === SKILL_ROOTS[0] ? agents.claudeCode : agents.codex));
+}
+
 /** Where one skill lands under one root, relative to the workspace. */
 export function skillFile(root: string, name: TaskSkill): string {
   return path.join(root, name, "SKILL.md");
@@ -313,16 +318,20 @@ export type SkillOutcome = {
 };
 
 /**
- * Write every skill under both roots, leaving alone anything that is not ours.
+ * Write every skill under the given roots, leaving alone anything that is not
+ * ours. Under a root not given (an agent this developer does not use), a skill
+ * of ours already there is kept current and nothing else is written or said.
  *
  * Idempotent twice over: a second run renders the same bytes, and
  * `writeIfChanged` does not touch a file that already holds them.
  */
-export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutcome[] {
+export function writeTaskSkills(workspace: string, scope: SkillScope, roots: string[] = SKILL_ROOTS): SkillOutcome[] {
   const outcomes: SkillOutcome[] = [];
   const given: string[] = [];
   for (const root of SKILL_ROOTS) {
+    const used = roots.includes(root);
     const link = skillRootLink(workspace, root);
+    if (link !== null && !used) continue;
     for (const name of TASK_SKILLS) {
       const relative = skillFile(root, name);
       if (link !== null) {
@@ -332,6 +341,7 @@ export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutc
       const target = path.join(workspace, relative);
       const existing = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null;
       const state = skillState(existing);
+      if (!used && state !== "ours") continue;
       if (state === "edited" || state === "theirs") {
         outcomes.push({ path: relative, state, wrote: false });
         continue;

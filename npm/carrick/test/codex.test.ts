@@ -26,6 +26,10 @@ import { CODEX_LAUNCHER_CALL } from "../src/init/launcher.ts";
 import { mergeHookSet } from "../src/init/settings.ts";
 import { checkCodexHooks, findingCount } from "../src/init/doctor.ts";
 import { outdatedInstall } from "../src/init/outdated.ts";
+import { BOTH_HARNESSES, type Harnesses } from "../src/init/mcp.ts";
+
+/** A machine with Claude Code and no Codex: doctor reads the workspace's files alone. */
+const NO_CODEX: Harnesses = { claudeCode: true, codex: false, guessed: false };
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -148,12 +152,13 @@ test("an install that had to name a path is recognised as ours", (t) => {
 test("a workspace with no .codex is a workspace doctor says nothing about", (t) => {
   const root = workspace(t);
   assert.equal(codexInUse(root), false);
-  assert.deepEqual(checkCodexHooks(root), [], "no Codex here, so no line about Codex");
+  assert.deepEqual(checkCodexHooks(root, NO_CODEX), [], "no Codex here, so no line about Codex");
 
-  // A `.codex` and no hook file of ours is the state that is actually broken.
+  // A `.codex` and no hook file of ours, on a machine that uses Codex, is the
+  // state that is actually broken.
   fs.mkdirSync(path.join(root, CODEX_DIR));
   assert.equal(codexInUse(root), true);
-  const missing = checkCodexHooks(root);
+  const missing = checkCodexHooks(root, BOTH_HARNESSES);
   assert.equal(findingCount(missing), 1);
   assert.match(missing[0]!.text, /carrick init/);
 });
@@ -161,7 +166,7 @@ test("a workspace with no .codex is a workspace doctor says nothing about", (t) 
 test("doctor reads the Codex entries the way it reads the Claude ones", (t) => {
   const root = workspace(t);
   writeCodexHooks(root);
-  const healthy = checkCodexHooks(root);
+  const healthy = checkCodexHooks(root, BOTH_HARNESSES);
   assert.equal(findingCount(healthy), 0, "a fresh install is not a finding");
   assert.equal(healthy[0]!.level, "done");
 
@@ -170,7 +175,7 @@ test("doctor reads the Codex entries the way it reads the Claude ones", (t) => {
   const stale = read(root);
   (stale.hooks["PostToolUse"]![0]!["hooks"] as Array<{ timeout: number }>)[0]!.timeout = 15;
   fs.writeFileSync(hooksFile(root), JSON.stringify(stale, null, 2));
-  const drifted = checkCodexHooks(root);
+  const drifted = checkCodexHooks(root, BOTH_HARNESSES);
   assert.equal(findingCount(drifted), 1);
   assert.match(drifted[0]!.text, /PostToolUse/);
   assert.equal(
@@ -181,7 +186,7 @@ test("doctor reads the Codex entries the way it reads the Claude ones", (t) => {
 
   // A file nobody can parse is a refusal, not a silent pass.
   fs.writeFileSync(hooksFile(root), "{ not json");
-  const broken = checkCodexHooks(root);
+  const broken = checkCodexHooks(root, BOTH_HARNESSES);
   assert.equal(broken[0]!.level, "refuse");
 });
 
@@ -198,13 +203,13 @@ test("an older two-entry file is stale for doctor and outdated, and a re-run add
   fs.mkdirSync(path.join(root, ".carrick"), { recursive: true });
   writeTwoEntryFile(root);
 
-  const drifted = checkCodexHooks(root);
+  const drifted = checkCodexHooks(root, BOTH_HARNESSES);
   assert.equal(findingCount(drifted), 1);
   assert.match(drifted[0]!.text, /SessionStart `.*hook session-start`/);
   assert.deepEqual(outdatedInstall(root).hooks, [CODEX_HOOKS_FILE]);
 
   assert.equal(writeCodexHooks(root), "written");
-  assert.equal(findingCount(checkCodexHooks(root)), 0);
+  assert.equal(findingCount(checkCodexHooks(root, BOTH_HARNESSES)), 0);
   assert.deepEqual(outdatedInstall(root).hooks, []);
   assert.equal(read(root).hooks["SessionStart"]!.length, 1, "added once, not twice");
 });

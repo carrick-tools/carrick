@@ -22,9 +22,13 @@ import {
   writeFolderCopy,
   writeRepoCopy,
 } from "../src/init/repo-copies.ts";
+// A namespace, so a name the source lacks fails its own tests, not the file's load.
+import * as copies from "../src/init/repo-copies.ts";
 import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
 import { installedCarrickHooks } from "../src/init/settings.ts";
-import { taskSkillPaths } from "../src/init/task-skills.ts";
+import { renderTaskSkill, stamped, taskSkillPaths, type TaskSkill } from "../src/init/task-skills.ts";
+import { ensureIndexDir } from "../src/init/repos.ts";
+import { outdatedInstall } from "../src/init/outdated.ts";
 
 const posix = { skip: process.platform === "win32" ? "git and POSIX paths" : false };
 
@@ -325,4 +329,129 @@ test("the pattern covers every name the compiler engine writes for a running che
   } finally {
     cleanup();
   }
+});
+
+// T2a: files only for the coding agent this developer uses. Git runs hermetic
+// here, in this process and in the children init starts, so a laptop that
+// ignores a path globally reads the same as CI.
+
+function hermetic(t: { after: (fn: () => void) => void }): void {
+  const before = Object.fromEntries(Object.keys(HERMETIC_GIT).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, HERMETIC_GIT);
+  t.after(() => {
+    for (const [key, value] of Object.entries(before)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+}
+
+function gitHere(dir: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { encoding: "utf8" });
+}
+
+/** A repo with one commit, as `carrick init` finds a clone, its `.carrick/` hiding itself. */
+function clone(t: { after: (fn: () => void) => void }): string {
+  hermetic(t);
+  const { dir, cleanup } = repo();
+  t.after(cleanup);
+  gitHere(dir, "add", "-A");
+  gitHere(dir, "commit", "-q", "-m", "first");
+  ensureIndexDir(dir);
+  return dir;
+}
+
+const CLAUDE_ONLY = { claudeCode: true, codex: false };
+const CODEX_ONLY = { claudeCode: false, codex: true };
+const BOTH = { claudeCode: true, codex: true };
+const CLAUDE_SKILLS = taskSkillPaths().filter((skill) => skill.startsWith(path.join(".claude", "skills")));
+const CODEX_SKILLS = taskSkillPaths().filter((skill) => skill.startsWith(path.join(".agents", "skills")));
+
+/** The paths the exclude block records (its pattern lines are not paths). */
+function blockOf(dir: string): string[] {
+  return withoutExcludeBlock(fs.readFileSync(excludeFile(dir)!, "utf8"))
+    .lines.filter((line) => line.startsWith("/"))
+    .map((line) => line.slice(1).split("/").join(path.sep));
+}
+
+/** Every file under a folder, relative to it, that holds this text. */
+function holding(dir: string, text: string): string[] {
+  const found: string[] = [];
+  const walk = (folder: string): void => {
+    for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
+      if (entry.name === ".git") continue;
+      const full = path.join(folder, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (fs.readFileSync(full, "utf8").includes(text)) found.push(path.relative(dir, full));
+    }
+  };
+  walk(dir);
+  return found;
+}
+
+test("Claude Code only: the repo gets .claude files and skills, no .codex or .agents, and git shows nothing", posix, (t) => {
+  const dir = clone(t);
+  const copy = copies.writeFolderCopy(dir, { slug: "shop" }, CLAUDE_ONLY)!;
+  const written = [LOCAL_SETTINGS, path.join(".claude", "carrick-hook.sh"), ...CLAUDE_SKILLS];
+  for (const file of written) assert.ok(fs.existsSync(path.join(dir, file)), file);
+  assert.equal(fs.existsSync(path.join(dir, ".codex")), false, ".codex/ is Codex's");
+  assert.equal(fs.existsSync(path.join(dir, ".agents")), false, ".agents/ is Codex's");
+  // The block names exactly the files written.
+  assert.deepEqual([...copy.paths].sort(), [...written].sort());
+  assert.deepEqual([...blockOf(dir)].sort(), [...written].sort());
+  assert.deepEqual([...copies.repoCopyPathsFor(CLAUDE_ONLY)].sort(), [...written].sort());
+  assert.equal(copy.codexWritten, false);
+  assert.equal(status(dir), "");
+});
+
+test("Codex only: the repo gets .codex files and .agents skills, no .claude, and no MCP allow entry", posix, (t) => {
+  const dir = clone(t);
+  const copy = copies.writeFolderCopy(dir, { slug: "shop" }, CODEX_ONLY)!;
+  const written = [CODEX_HOOKS_FILE, path.join(".codex", "carrick-hook.sh"), ...CODEX_SKILLS];
+  for (const file of written) assert.ok(fs.existsSync(path.join(dir, file)), file);
+  assert.equal(fs.existsSync(path.join(dir, ".claude")), false, ".claude/ is Claude Code's");
+  assert.deepEqual([...copy.paths].sort(), [...written].sort());
+  assert.deepEqual(holding(dir, "mcp__carrick"), []);
+  assert.equal(copy.codexWritten, true);
+  assert.equal(status(dir), "");
+});
+
+test("an agent not used keeps its files of ours current and recorded, creates none, and remove still takes them", posix, (t) => {
+  const dir = clone(t);
+  copies.writeFolderCopy(dir, { slug: "shop" }, BOTH);
+  // An older version's Codex hooks file (no SessionStart entry) and skill body,
+  // and one Codex skill the developer deleted.
+  const hooksPath = path.join(dir, CODEX_HOOKS_FILE);
+  const older = JSON.parse(fs.readFileSync(hooksPath, "utf8")) as { hooks: Record<string, unknown> };
+  delete older.hooks["SessionStart"];
+  fs.writeFileSync(hooksPath, `${JSON.stringify(older, null, 2)}\n`);
+  const [stale, gone] = CODEX_SKILLS as [string, string];
+  fs.writeFileSync(path.join(dir, stale), stamped("An older version's body.\n"));
+  fs.rmSync(path.join(dir, gone));
+  assert.deepEqual(outdatedInstall(dir).hooks, [CODEX_HOOKS_FILE], "the older file is stale before the run");
+
+  copies.writeFolderCopy(dir, { slug: "shop" }, CLAUDE_ONLY);
+  assert.equal(installedCarrickHooks(fs.readFileSync(hooksPath, "utf8")).some((hook) => hook.event === "SessionStart"), true);
+  assert.equal(fs.readFileSync(path.join(dir, stale), "utf8"), renderTaskSkill(path.basename(path.dirname(stale)) as TaskSkill, { slug: "shop" }));
+  assert.equal(fs.existsSync(path.join(dir, gone)), false, "a deleted skill is not written again");
+  for (const file of [CODEX_HOOKS_FILE, path.join(".codex", "carrick-hook.sh"), stale]) assert.ok(blockOf(dir).includes(file), file);
+  assert.equal(blockOf(dir).includes(gone), false);
+  assert.equal(status(dir), "");
+  assert.deepEqual(outdatedInstall(dir), { skills: [], hooks: [] });
+
+  removeRepoCopy(dir);
+  for (const file of repoCopyPaths()) assert.equal(fs.existsSync(path.join(dir, file)), false, file);
+});
+
+test("Claude Code only: a Codex hooks file git tracks is not touched", posix, (t) => {
+  const dir = clone(t);
+  const team = `${JSON.stringify({ hooks: { PostToolUse: [{ matcher: "apply_patch", hooks: [{ type: "command", command: "npm run lint" }] }] } }, null, 2)}\n`;
+  fs.mkdirSync(path.join(dir, ".codex"));
+  fs.writeFileSync(path.join(dir, CODEX_HOOKS_FILE), team);
+  gitHere(dir, "add", CODEX_HOOKS_FILE);
+  gitHere(dir, "commit", "-q", "-m", "team codex hooks");
+  copies.writeFolderCopy(dir, { slug: "shop" }, CLAUDE_ONLY);
+  assert.equal(fs.readFileSync(path.join(dir, CODEX_HOOKS_FILE), "utf8"), team);
+  assert.equal(fs.existsSync(path.join(dir, ".codex", "carrick-hook.sh")), false);
+  assert.equal(status(dir), "");
 });
