@@ -40,10 +40,10 @@ export function readLinesEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
 }
 
 /**
- * The held compiler's switch (part 3): opt-in, on only when
- * `CARRICK_COMPILER_LINES` is exactly `"1"` and the contract line is on. Off,
+ * The held compiler's switch (part 3): on by default; off only when
+ * `CARRICK_COMPILER_LINES` is exactly `"0"` or the contract line is off. Off,
  * no daemon starts, no engine runs and no hook asks one.
  */
 export function compilerLinesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env["CARRICK_COMPILER_LINES"] === "1" && contractLinesEnabled(env);
+  return env["CARRICK_COMPILER_LINES"] !== "0" && contractLinesEnabled(env);
 }

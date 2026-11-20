@@ -2,7 +2,7 @@
 // The held-compiler daemon's entry: `node run.ts <checkout root>`.
 //
 // Started detached by `ensureHeld` (client.ts). With CARRICK_COMPILER_LINES
-// unset it exits at once and touches nothing. It prints nothing and exits 0
+// set to "0" it exits at once and touches nothing. It prints nothing and exits 0
 // whatever happens.
 
 import { execFile } from "node:child_process";
