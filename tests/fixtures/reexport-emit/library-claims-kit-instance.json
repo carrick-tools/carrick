@@ -1,0 +1,55 @@
+{
+  "library_claims": [
+    {
+      "package": "hub-kit",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "hub-kit",
+          "export": "Hub",
+          "role": "in_process_bus",
+          "side": null,
+          "classifier": "fixture-classifier",
+          "makes": [{ "form": "new", "member": null }],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "fire",
+              "of": "instance:new",
+              "name": { "arg": 0 },
+              "payload": { "arg": 1 },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "hub-kit",
+          "export": "Local",
+          "role": "in_process_bus",
+          "side": null,
+          "classifier": "fixture-classifier",
+          "makes": [{ "form": "new", "member": null }],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "fire",
+              "of": "instance:new",
+              "name": { "arg": 0 },
+              "payload": { "arg": 1 },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
