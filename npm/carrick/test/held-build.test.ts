@@ -15,7 +15,7 @@ import { alive, takeLock } from "../src/hook/lock.ts";
 import { lockPath } from "../src/held/paths.ts";
 import { backedOff, BACK_OFF_MS, CRASH_WINDOW_MS, recordCrash } from "../src/held/backoff.ts";
 import { heldBuildId } from "../src/held/build.ts";
-import { crashesPath, socketPath } from "../src/held/paths.ts";
+import { crashesPath, helloPath, socketPath } from "../src/held/paths.ts";
 
 const ON = { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
 const LINE: HeldLine = {
@@ -221,3 +221,67 @@ for (const [name, reply] of [
     }
   });
 }
+
+/** A fake daemon on the checkout's socket whose hello comes `helloAfterMs` late (never, when null); a live child holds the lock. */
+async function lateDaemon(helloAfterMs: number | null, helloFile: boolean) {
+  const w = world();
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => undefined, 60000)"], { stdio: "ignore" });
+  const childPid = child.pid!;
+  fs.mkdirSync(path.dirname(socketPath(w.root, w.home)), { recursive: true });
+  assert.equal(takeLock(lockPath(w.root, w.home), childPid, Date.now(), 30_000), true);
+  if (helloFile) fs.writeFileSync(helloPath(w.root, w.home), JSON.stringify({ pid: childPid, build_id: "mine" }));
+  const frames: string[] = [];
+  const server = net.createServer((conn) => {
+    let buffer = "";
+    conn.on("error", () => undefined);
+    conn.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+        const frame = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
+        buffer = buffer.slice(end + 1);
+        frames.push(frame["hello"] === true ? "hello" : "request");
+        if (frame["hello"] === true && helloAfterMs !== null) {
+          setTimeout(() => conn.write(`${JSON.stringify({ hello: { build_id: "mine", pid: childPid, root: w.root } })}\n`), helloAfterMs);
+        } else if (frame["hello"] !== true) {
+          conn.end(`${JSON.stringify({ state: "ready", lines: [], ms: 1 })}\n`);
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath(w.root, w.home), resolve));
+  const started: string[] = [];
+  const ask = () => askHeld(w.root, [w.file], { env: ON, home: w.home, session: "s", kind: "edit", buildId: "mine", waitMs: 1_500, start: () => void started.push("start") });
+  const done = (): void => {
+    child.kill("SIGKILL");
+    server.close();
+    w.done();
+  };
+  return { ask, started, frames, childPid, child, done };
+}
+
+test("a daemon of this build that says hello after 200 ms is not ended", async () => {
+  const d = await lateDaemon(400, true);
+  try {
+    const answer = await d.ask();
+    assert.equal(answer.state, "ready");
+    assert.deepEqual(d.frames, ["hello", "request"]);
+    assert.equal(alive(d.childPid), true, "the busy daemon was not ended");
+    assert.deepEqual(d.started, [], "no daemon was started");
+  } finally {
+    d.done();
+  }
+});
+
+test("a silent daemon with no hello file is still replaced", async () => {
+  const d = await lateDaemon(null, false);
+  const exited = new Promise<void>((resolve) => d.child.once("exit", () => resolve()));
+  try {
+    const answer = await d.ask();
+    assert.equal(answer.state, "cold");
+    await exited;
+    assert.equal(alive(d.childPid), false, "the lock's pid was ended");
+    assert.deepEqual(d.started, ["start"], "a new daemon was started once");
+  } finally {
+    d.done();
+  }
+});

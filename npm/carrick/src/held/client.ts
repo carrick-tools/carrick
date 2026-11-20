@@ -14,7 +14,7 @@ import { backedOff } from "./backoff.ts";
 import { heldBuildId } from "./build.ts";
 import type { HeldAnswer, HeldHello, HeldRequest } from "./daemon.ts";
 import type { NotChecked } from "./state.ts";
-import { lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
+import { helloPath, lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
 
 const log = createLogger("carrick-held-client");
 
@@ -137,10 +137,11 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
      * protocol is told to exit over the socket; one that does not is ended
      * through the lock's pid.
      */
-    const replace = (viaSocket: boolean): void => {
+    const replace = (viaSocket: boolean, reason: string): void => {
       if (replacing) return;
       replacing = true;
       clearTimeout(helloTimer);
+      log(`replacing the held-compiler daemon (pid ${readJson<Lock>(lockPath(root, options.home))?.pid ?? "unknown"}): ${reason}`);
       const startNew = (): void => {
         ensureHeld(root, { env, buildId, ...(options.home === undefined ? {} : { home: options.home }), ...(options.start === undefined ? {} : { start: options.start }) });
         finish(none("cold", started));
@@ -163,7 +164,10 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
     // The hello comes first and the request only after it matched: a daemon of
     // another build is never asked, so its rules never reach an agent. One that
     // does not answer it within a short fixed wait is another build by definition.
-    const helloTimer = setTimeout(() => replace(false), HELLO_WAIT_MS);
+    // A daemon of this build that is only busy is kept: its hello may still come before the ask's own wait ends.
+    const helloTimer = setTimeout(() => {
+      if (!busyOfThisBuild(root, options.home, buildId)) replace(false, `no hello within ${HELLO_WAIT_MS} ms and no live daemon of this build`);
+    }, HELLO_WAIT_MS);
     helloTimer.unref();
     conn.write(`${JSON.stringify({ hello: true })}\n`);
     conn.on("data", (chunk) => {
@@ -176,7 +180,7 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
       try {
         parsed = JSON.parse(line) as typeof parsed;
       } catch {
-        replace(false);
+        replace(false, "not a hello");
         return;
       }
       if (parsed.bye === true) {
@@ -189,8 +193,8 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
         return;
       }
       const theirs = parsed.hello?.build_id;
-      if (typeof theirs !== "string") replace(false);
-      else if (theirs !== buildId) replace(true);
+      if (typeof theirs !== "string") replace(false, "not a hello");
+      else if (theirs !== buildId) replace(true, `build ${theirs}`);
       else {
         greeted = true;
         clearTimeout(helloTimer);
@@ -228,6 +232,19 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
     conn.on("error", noDaemon);
     conn.on("close", noDaemon);
   });
+}
+
+/**
+ * A live daemon of this build that has not said hello yet: the lock is held
+ * and the hello file the daemon wrote once it listened names the lock's pid and
+ * this build. Such a daemon is busy (an after-pass, a loaded machine), not
+ * another build, and is never ended for a late hello.
+ */
+function busyOfThisBuild(root: string, home: string | undefined, buildId: string): boolean {
+  const held = readJson<Lock>(lockPath(root, home));
+  if (held === null || !lockHeld(held, Date.now(), LOCK_CAP_MS)) return false;
+  const file = readJson<{ pid?: number; build_id?: string }>(helloPath(root, home));
+  return file !== null && file.pid === held.pid && file.build_id === buildId;
 }
 
 /**
