@@ -5290,7 +5290,7 @@ class DeclarationReader {
         const callee = this.ownCallee(holder, [], member.name, 'call');
         if (!('signatures' in callee)) continue;
         if (!callee.signatures.some(signature => this.takesString(signature))) continue;
-        const type = this.scopeTypeOf(callee.signatures, built(source.export, id), source.type, source.home);
+        const type = this.scopeTypeOf(pkg, callee.signatures, built(source.export, id), source.type, source.home);
         if (type === undefined || !take()) continue;
         const home = this.homeOf(pkg, [source.target, ...typeSymbols(type)]);
         this.typeContext = source.export;
@@ -5498,7 +5498,7 @@ class DeclarationReader {
     for (const property of sortedByName(this.namedProperties(type))) {
       if (!this.mayScope(property)) continue;
       const callee = this.ownCallee(holder, [], property.getName(), 'call');
-      if ('signatures' in callee && this.scopeTypeOf(callee.signatures, undefined, type, home) !== undefined) {
+      if ('signatures' in callee && this.scopeTypeOf(pkg, callee.signatures, undefined, type, home) !== undefined) {
         names.push(property.getName());
       }
     }
@@ -5521,7 +5521,8 @@ class DeclarationReader {
    *   object parameter;
    * - the returns (at `built`'s defaults, less those that say nothing) are
    *   all object types, none thenable, sharing one declared symbol that is
-   *   declared in the receiver's home and has a callable member of its own;
+   *   declared in the receiver's home, or in a package the listed package
+   *   declares as a dependency, and has a callable member of its own;
    * - that symbol and the receiver's share no declaration in the home
    *   (`family`): the receiver itself (`basePath(): this`), a sibling or a
    *   wrapper of one base is a builder's next link, not an object routes
@@ -5530,6 +5531,7 @@ class DeclarationReader {
    * one of the signatures that take a string, else the first of them.
    */
   private scopeTypeOf(
+    pkg: string,
     signatures: readonly ts.Signature[],
     built: ts.Signature | undefined,
     receiver: ts.Type,
@@ -5551,12 +5553,36 @@ class DeclarationReader {
     for (const { type } of returns) {
       if (!this.isObjectType(type) || symbolOf(type) !== symbol || this.isThenable(type)) return undefined;
     }
-    if (!(symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), home))) return undefined;
+    const declared = this.declaredDependencies(pkg, receiver);
+    if (
+      !(symbol.declarations ?? []).some(declaration => {
+        const file = declaration.getSourceFile();
+        if (this.isOwnFile(file, home)) return true;
+        const owner = this.packageOf(file);
+        return owner !== undefined && declared.has(owner);
+      })
+    ) {
+      return undefined;
+    }
     const chosen = returns.find(({ signature }) => built !== undefined && this.instantiates(built, signature)) ?? returns[0];
     const callable = this.namedProperties(chosen.type).some(
       member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0
     );
     return callable ? chosen.type : undefined;
+  }
+
+  /**
+   * The packages the listed package declares as dependencies, read from the
+   * manifest of the installed package that declares the receiver's type
+   * (empty when no declaration of it is in the listed package).
+   */
+  private declaredDependencies(pkg: string, receiver: ts.Type): ReadonlySet<string> {
+    const named = packageNameOf(pkg);
+    for (const declaration of (receiver.getSymbol() ?? receiver.aliasSymbol)?.declarations ?? []) {
+      const installed = this.installedPackage(declaration.getSourceFile().fileName);
+      if (installed !== undefined && (installed.packageName ?? installed.directoryName) === named) return installed.dependencies;
+    }
+    return new Set();
   }
 
   /** The type's own declaration and every base it extends or implements that its home declares. */
@@ -6865,6 +6891,8 @@ interface InstalledPackage {
   directoryName: string;
   packageName: string | undefined;
   version: string | undefined;
+  /** The names its manifest declares under dependencies, peerDependencies and optionalDependencies. */
+  dependencies: ReadonlySet<string>;
 }
 
 function readInstalledPackage(
@@ -6876,14 +6904,19 @@ function readInstalledPackage(
   if (!host.fileExists(manifest)) return null;
   let packageName: string | undefined;
   let version: string | undefined;
+  const dependencies = new Set<string>();
   try {
-    const parsed = JSON.parse(host.readFile(manifest) ?? '') as { name?: unknown; version?: unknown } | null;
+    const parsed = JSON.parse(host.readFile(manifest) ?? '') as Record<string, unknown> | null;
     if (typeof parsed?.name === 'string') packageName = parsed.name;
     if (typeof parsed?.version === 'string') version = parsed.version;
+    for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+      const declared = parsed?.[field];
+      if (declared && typeof declared === 'object') for (const name of Object.keys(declared)) dependencies.add(name);
+    }
   } catch {
     // An unreadable manifest still marks an installed directory; it names no package.
   }
-  return { directoryName, packageName, version };
+  return { directoryName, packageName, version, dependencies };
 }
 
 function isNullish(type: ts.Type): boolean {
