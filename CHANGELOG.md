@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.172](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.171...carrick-v0.3.172) (2026-11-20)
+
+
+### Features
+
+* **matched:** the type stage and judge read a GraphQL field pair (SB4-1a) ([#5007](https://github.com/carrick-tools/carrick/issues/5007)) ([1589689](https://github.com/carrick-tools/carrick/commit/15896898c758443875d4b543da55324b8bddea04))
+
+
+### Bug Fixes
+
+* **npm:** a service with no rows asks for no engine admission and leaves no note ([#5008](https://github.com/carrick-tools/carrick/issues/5008)) ([#5009](https://github.com/carrick-tools/carrick/issues/5009)) ([1575896](https://github.com/carrick-tools/carrick/commit/1575896a5f403d760d3b2e4cd96d4fe91a96dbd6))
+* **npm:** never end a busy daemon of this build for a late hello ([#4991](https://github.com/carrick-tools/carrick/issues/4991)) ([#5006](https://github.com/carrick-tools/carrick/issues/5006)) ([a651f4e](https://github.com/carrick-tools/carrick/commit/a651f4eb2d0fcc9ba4b2ef4abb1e722773281b87))
+
 ## [0.3.171](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.170...carrick-v0.3.171) (2026-11-20)
 
 
