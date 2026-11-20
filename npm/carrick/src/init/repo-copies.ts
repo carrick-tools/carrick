@@ -295,7 +295,11 @@ function copyInto(repo: string, scope: SkillScope, own: boolean): FolderCopy | n
     } else {
       hooksFile(LOCAL_SETTINGS, () => mergeCarrickHooks(localExisting).body, true);
     }
+    // A launcher the team committed is theirs to commit again: kept current in
+    // place, out of the exclude block, so the change self-update asks them to
+    // commit exists (carrick#4898).
     if (!(own && tracked.has(CLAUDE_LAUNCHER))) writes.push({ relative: CLAUDE_LAUNCHER, body: launcherSource(), record: true });
+    else writes.push({ relative: CLAUDE_LAUNCHER, body: launcherSource(), record: false });
   }
   const codexExisting = readOrNull(path.join(repo, CODEX_HOOKS_FILE));
   if (!tracked.has(CODEX_HOOKS_FILE)) {

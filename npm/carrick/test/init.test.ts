@@ -29,6 +29,7 @@ import {
   mergeHookSet,
   removeCarrickHooks,
 } from "../src/init/settings.ts";
+import { LAUNCHER_FILE, launcherSource } from "../src/init/launcher.ts";
 import { bringUpToDate } from "../src/init/self-update.ts";
 import { currentVersion } from "../src/update.ts";
 import {
@@ -3144,6 +3145,21 @@ test("a committed settings file with our stale hooks gets the current ones in pl
     const local = path.join(fixture.repo, LOCAL_FILE);
     assert.ok(!fs.existsSync(local) || installedCarrickHooksIn(local) === 0);
     assert.match(stdout, /Carrick updated its hooks in \.claude\/settings\.json, which git tracks here\. Commit the change in its own pull request\./);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a committed launcher of ours that is not current is rewritten in place, so the commit self-update asks for exists", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    const launcher = path.join(".claude", LAUNCHER_FILE);
+    fs.mkdirSync(path.join(fixture.repo, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(fixture.repo, launcher), "#!/bin/sh\n# an older version's launcher\n");
+    commitTeamRepo(fixture.repo, { settings: mergeHookSet(TEAM_SETTINGS, carrickHooks(), true).body });
+    runInit(fixture);
+    assert.match(porcelain(fixture.repo), new RegExp(`^ M \\.claude/${LAUNCHER_FILE.replace(".", "\\.")}$`, "m"));
+    assert.equal(fs.readFileSync(path.join(fixture.repo, launcher), "utf8"), launcherSource());
   } finally {
     fixture.cleanup();
   }
