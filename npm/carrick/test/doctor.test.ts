@@ -715,7 +715,7 @@ function heldFixture(): { root: string; home: string; repos: ReturnType<typeof c
       }),
     );
   };
-  placed("api", 4, [["no_values", 2], ["clean_check_fails:TS2322", 1]]);
+  placed("api", 4, [["no_values", 2], ["clean_check_fails:TS2322", 1], ["field_resolver_unread", 1]]);
   placed("empty", 0, []);
   writeState(root, "api", { at: "2026-11-19T10:00:00Z", service: "api", state: "ready", start_ms: 41_000 }, home);
   writeState(root, "web", { at: "2026-11-19T10:01:00Z", service: "web", state: "capped", budget_mb: 4096, holders: 2 }, home);
@@ -726,11 +726,12 @@ test("doctor lists, per service, the rows checked at edit time and the rest by r
   const { root, home, repos } = heldFixture();
   const lines = checkCompilerCoverage(root, repos, home, { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" }).map((l) => l.text);
   const api = lines.find((l) => l.includes('service "api"')) ?? "";
-  assert.match(api, /4 of 7 rows are checked after an edit/, api);
+  assert.match(api, /4 of 8 rows are checked after an edit/, api);
   assert.match(api, /2 rows with no stored send position/, api);
   assert.match(api, /1 row already reporting TS2322/, api);
+  assert.ok(api.includes("1 row whose edited value reaches the caller through a field resolver, which Carrick does not read"), api);
   assert.match(api, /The compiler engine is ready \(started in 41 s\)/, api);
-  assert.equal(4 + 2 + 1, 7);
+  assert.equal(4 + 2 + 1 + 1, 8);
 });
 
 test("doctor says why an engine holds no check: capped, no placed file, no route with a stored send position", () => {

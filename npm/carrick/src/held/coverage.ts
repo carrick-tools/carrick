@@ -33,6 +33,8 @@ function reasonText(reason: string): string {
       return "with no checkable type";
     case "shared_home":
       return "whose caller type is declared in a file this service also compiles";
+    case "field_resolver_unread":
+      return "whose edited value reaches the caller through a field resolver, which Carrick does not read";
     case "javascript_file":
       return "in a JavaScript file";
     case "graphql_table_unusable":

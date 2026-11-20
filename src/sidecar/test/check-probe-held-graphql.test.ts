@@ -272,6 +272,65 @@ describe('a too-deep type: the held form speaks, and the declared line never cle
   }
 });
 
+/**
+ * carrick#4940: the held check's `"wire"` mode (`npm/carrick/src/held/place.ts`) swaps a scalar-form
+ * callback's `__carrick_GqlSentS` for `__carrick_GqlWire`. That held text speaks exactly where the judge's
+ * own wire line (`plan.wireAssignmentLine`) fails, so the mode is the judge's line, not a second rule.
+ */
+const CONVERTED: Case[] = [
+  // An object field each list element holds as a plain value: the declared fill reads it in the schema's type.
+  { key: 'wire-converted-in-list', root: 'orders', sent: '{ id: string; lines: string }[]', expected: '{ id: string; lines: { sku: string }[] }[]', bucket: 'compatible' },
+];
+
+describe('the held wire mode speaks exactly where the judge\'s wire line fails (carrick#4940)', () => {
+  const hg = heldGraphql(SHOP_TYPES, [{ type: 'Query', field: 'order' }, { type: 'Query', field: 'orders' }, { type: 'Query', field: 'orderPage' }]);
+  const scalar = [...CASES, ...CONVERTED].filter((c) => c.root !== undefined && hg.leaves[`Query.${c.root}`] !== undefined);
+  const alias = (side: 'S' | 'E', c: Case): string => `${side}_${c.key.replace(/-/g, '_')}`;
+
+  /** Whether the judge's probe for the pair raises an error on its wire line, with the stub imports inlined line for line. */
+  function judgeWireFails(c: Case): boolean {
+    const plan = buildProbe(
+      {
+        pair_key: c.key,
+        protocol: 'graphql',
+        type_kind: 'response',
+        producer: { service_name: 'shop', alias: alias('S', c) },
+        consumer: { service_name: 'till', alias: alias('E', c) },
+        graphql_root: { type: 'Query', field: c.root! },
+      },
+      (n) => `@carrick/${n}`,
+      undefined,
+      undefined,
+      typesOf
+    );
+    assert.ok(plan.wireAssignmentLine !== undefined, c.key);
+    const source = plan.source
+      .split('\n')
+      .map((line) =>
+        line
+          .replace(/^import type \{ \w+ as (\w+) \} from '@carrick\/shop';$/, `type $1 = ${c.sent};`)
+          .replace(/^import type \{ \w+ as (\w+) \} from '@carrick\/till';$/, `type $1 = ${c.expected};`)
+      )
+      .join('\n');
+    assert.ok(!source.includes("from '@carrick/"), `${c.key}: every stub import is inlined`);
+    return tscErrors(source).some((l) => l.includes(`a.ts(${plan.wireAssignmentLine},`));
+  }
+
+  for (const c of scalar) {
+    it(`${c.key}: the held wire mode agrees with the judge's wire line`, () => {
+      const held = tscErrors(heldSource(c).replace('__carrick_GqlSentS<Awaited<V>, E, L>', '__carrick_GqlWire<Awaited<V>, E, L>'));
+      assert.strictEqual(held.length > 0, judgeWireFails(c), JSON.stringify(held));
+    });
+  }
+
+  it('the converted pairs are silent in the clean form and speak in the wire mode (the case is not vacuous)', () => {
+    for (const c of [...CONVERTED, CASES.find((x) => x.key === 'rf-converted-lines')!]) {
+      assert.deepEqual(tscErrors(heldSource(c)), [], c.key);
+      assert.strictEqual(judgeWireFails(c), true, c.key);
+    }
+  });
+});
+
 describe('write_shadow carries the judge\'s GraphQL rules', () => {
   const FIXTURE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'test', 'fixtures', 'held-node');
 

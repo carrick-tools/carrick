@@ -167,6 +167,11 @@ type Entry = { pos: Pos; value: Value; groups: number[] };
 
 type View = { ov: Overlay; inputs: CheckInput[]; entries: Entry[]; text: string };
 
+/** A scalar-form GraphQL check: the only form with a declared fill, and so the only one the wire mode changes. */
+const hasLeaf = (input: CheckInput): boolean => input.form?.kind === "graphql" && input.form.leaf !== null;
+/** The reason `placed` gives a set-aside check (carrick#4940). */
+const FIELD_RESOLVER_UNREAD = "field_resolver_unread";
+
 /** Whether an unarmed reason may pass when the file is edited again. */
 const transient = (reason: string): boolean => reason === "value_edited" || reason === "value_not_a_node" || reason === "not_wrappable" || reason.startsWith("clean_check_fails");
 
@@ -190,6 +195,23 @@ class HeldService implements ServiceEngine {
   private readonly leads = new Map<string, number>();
   private readonly armed = new Set<string>();
   private readonly unarmed = new Map<string, Unarmed>();
+  /**
+   * carrick#4940, per scalar-form GraphQL check: whether the judge's wire line
+   * (the form without the declared fill) spoke at its callback the first time
+   * the check armed. Kept across regates, so a check re-armed on an edited
+   * text is compared with the text it first armed on.
+   */
+  private readonly wireAtGate = new Map<string, boolean>();
+  /**
+   * Armed checks the last fill step set aside (D-4): their wire line passed
+   * at the gate and fails now while their clean check is silent, so the
+   * declared fill alone keeps them silent, on a field resolver Carrick does
+   * not read. They stay armed and in the view; `placed` counts them as not
+   * checked, `field_resolver_unread`.
+   */
+  private setAside = new Set<string>();
+  /** The checks whose clean form spoke at the edit answer in flight; null for any other request (no clean result to compare). */
+  private spokeKeys: Set<string> | null = null;
   private readonly views = new Map<string, View>();
   /**
    * Positions, by file, that lost their place or may now be placed: gated again
@@ -269,15 +291,19 @@ class HeldService implements ServiceEngine {
     this.byFile.clear();
     this.rows = rows.filter((row) => row.repo === this.init.repo && row.service === this.init.service && row.direction === "response");
     const live = new Set<string>();
+    const liveKeys = new Set<string>();
     for (const row of this.rows) {
       (row.values ?? []).forEach((v, at) => {
         const pos: Pos = { id: posId(row, at), row, at };
         live.add(pos.id);
+        row.groups.forEach((_, g) => liveKeys.add(checkKey(row, g, at)));
         this.byFile.set(v.file, [...(this.byFile.get(v.file) ?? []), pos]);
       });
     }
     for (const id of [...this.values.keys()]) if (!live.has(id)) this.values.delete(id);
     for (const id of [...this.leads.keys()]) if (!live.has(id)) this.leads.delete(id);
+    for (const key of [...this.wireAtGate.keys()]) if (!liveKeys.has(key)) this.wireAtGate.delete(key);
+    for (const key of [...this.setAside]) if (!liveKeys.has(key)) this.setAside.delete(key);
   }
 
   /** The text of `rel` at the index commit and the regions the disk text changed it by; or why neither is known. */
@@ -401,11 +427,22 @@ class HeldService implements ServiceEngine {
         this.engine.set(shadow, twin.text);
         const twinDiags = offsetDiags(twin.text, (await this.engine.pull([shadow])).get(shadow));
         const verdict = arm(clean, cleanDiags, twinDiags);
-        for (const k of verdict.armed) {
-          const c = clean.checks.find((x) => x.k === k)!;
-          const e = entries[c.n]!;
-          const key = checkKey(e.pos.row, e.groups[c.group]!, e.pos.at);
-          if (onlyNew && decided(key)) continue;
+        const arming = verdict.armed
+          .map((k) => {
+            const c = clean.checks.find((x) => x.k === k)!;
+            const e = entries[c.n]!;
+            return { k, input: inputs[c.n]!, key: checkKey(e.pos.row, e.groups[c.group]!, e.pos.at) };
+          })
+          .filter((a) => !(onlyNew && decided(a.key)));
+        // carrick#4940: a scalar-form GraphQL check arming for the first time records whether the judge's wire line speaks on this text.
+        const fresh = arming.filter((a) => hasLeaf(a.input) && !this.wireAtGate.has(a.key));
+        if (fresh.length > 0) {
+          const wire = this.overlayOf(rel, text, inputs, "wire");
+          this.engine.set(shadow, wire.text);
+          const spoke = attribute(wire, offsetDiags(wire.text, (await this.engine.pull([shadow])).get(shadow))).lines;
+          for (const a of fresh) this.wireAtGate.set(a.key, spoke.has(a.k));
+        }
+        for (const { key } of arming) {
           this.armed.add(key);
           this.unarmed.delete(key);
         }
@@ -459,7 +496,7 @@ class HeldService implements ServiceEngine {
    * the engine's message rules, a file with both appends both; a file with
    * neither keeps its text.
    */
-  private overlayOf(rel: string, text: string, inputs: CheckInput[], mode: "clean" | "twin"): Overlay {
+  private overlayOf(rel: string, text: string, inputs: CheckInput[], mode: "clean" | "twin" | "wire"): Overlay {
     const base = inputs.some((i) => i.form?.kind === "graphql") ? this.gql.wire : this.wire;
     const wire = inputs.some((i) => i.form?.kind === "message") ? [...base, ...(this.message ?? [])] : base;
     return overlay(this.shadow(rel), text, inputs, wire, mode);
@@ -503,7 +540,8 @@ class HeldService implements ServiceEngine {
       row.values!.forEach((v, at) => {
         row.groups.forEach((_, g) => {
           const key = checkKey(row, g, at);
-          if (this.armed.has(key)) armed.push({ label: row.label, protocol: row.protocol, file: v.file, group: g, position: at, ...callLine(row) });
+          if (this.armed.has(key) && this.setAside.has(key)) unarmed.push({ label: row.label, protocol: row.protocol, file: v.file, reason: FIELD_RESOLVER_UNREAD, group: g, position: at, ...callLine(row) });
+          else if (this.armed.has(key)) armed.push({ label: row.label, protocol: row.protocol, file: v.file, group: g, position: at, ...callLine(row) });
           else if (this.unarmed.has(key)) unarmed.push(this.unarmed.get(key)!);
         });
       });
@@ -611,6 +649,7 @@ class HeldService implements ServiceEngine {
 
   async answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps; after: () => Promise<Steps>; commit?: () => void; engine?: string }> {
     this.timer = new StepTimer();
+    this.spokeKeys = null;
     await this.timer.run("refresh", () => this.refreshRows());
     const requested = files
       .map((file) => path.relative(this.init.scan_root, file))
@@ -624,8 +663,13 @@ class HeldService implements ServiceEngine {
   /** Every view's lines, each marked against what the last filed answer spoke, and what this answer spoke (to commit when filed). */
   private async lines(): Promise<{ lines: HeldLine[]; spoke: Map<string, { message: string; run: string }> }> {
     const rels = [...this.views.keys()];
-    if (rels.length === 0) return { lines: [], spoke: new Map() };
+    const spokeKeys = new Set<string>();
+    if (rels.length === 0) {
+      this.spokeKeys = spokeKeys;
+      return { lines: [], spoke: new Map() };
+    }
     const pulled = await this.timer.run("pull", () => this.engine.pull(rels.map((rel) => this.shadow(rel))));
+    this.spokeKeys = spokeKeys;
     const out: HeldLine[] = [];
     const said = new Set<string>();
     const run = runOf(this.engineId, ++this.answers);
@@ -648,6 +692,7 @@ class HeldService implements ServiceEngine {
         const entry = view.entries[check.n]!;
         const g = entry.groups[check.group]!;
         const row = entry.pos.row;
+        spokeKeys.add(checkKey(row, g, entry.pos.at));
         const key = `${heldKey(row, g)}\0${g}`;
         if (said.has(key)) continue;
         said.add(key);
@@ -700,21 +745,72 @@ class HeldService implements ServiceEngine {
     return { main_commit: main, named_files: [...new Set(files)] };
   }
 
-  /** The twin pass, restored in a `finally`; then files that lost a check's place, then rows the fact file added or changed. */
+  /**
+   * The twin pass, restored in a `finally`; then files that lost a check's place, then rows the fact file added or changed;
+   * last, after an edit answer that moved anything, the fill step (so a check the regate re-armed at this edit is compared too).
+   */
   private async afterAnswer(): Promise<Steps> {
     this.afterTimer = new StepTimer();
+    let moved = false;
     // The twin pass tests texts; a request that changed none (a read of an unchanged file) has nothing new for it, and
     // the next request would wait behind it for a second and more on a large service.
     if (this.textMoved) {
       this.textMoved = false;
+      moved = true;
       await this.afterTimer.run("twin", () => this.twinPass());
     }
-    if (this.regate.size > 0) await this.afterTimer.run("regate", () => this.regatePending());
+    if (this.regate.size > 0) {
+      moved = true;
+      await this.afterTimer.run("regate", () => this.regatePending());
+    }
     if (this.needsGate) {
       this.needsGate = false;
+      moved = true;
       await this.afterTimer.run("gate", () => this.gate(true));
     }
+    const spoke = this.spokeKeys;
+    if (moved && spoke !== null) await this.afterTimer.run("fill", () => this.fillPass(spoke));
     return this.afterTimer.steps();
+  }
+
+  /**
+   * carrick#4940 (D-3, D-4): every view with a scalar-form GraphQL check goes in with the judge's wire line in place of the
+   * declared line, one pull answers for all of them, and every clean text goes back in a `finally`, as the twin pass does.
+   * A check is set aside when it is armed, its wire line was silent when it first armed, its wire line speaks at its
+   * callback now, and its clean check did not speak at this answer (`spoke`): only the declared fill keeps it silent, on a
+   * field the record holds as a plain value where the schema declares an object, which a field resolver Carrick does not
+   * read may or may not convert. A check whose wire line already spoke when it armed is never set aside (#4951).
+   */
+  private async fillPass(spoke: Set<string>): Promise<void> {
+    const views = [...this.views]
+      .filter(([, view]) => view.inputs.some(hasLeaf))
+      .map(([rel, view]) => ({ rel, view, shadow: this.shadow(rel), wire: this.overlayOf(rel, view.text, view.inputs, "wire") }));
+    const next = new Set<string>();
+    if (views.length > 0) {
+      try {
+        for (const v of views) this.engine.set(v.shadow, v.wire.text);
+        const pulled = await this.engine.pull(views.map((v) => v.shadow));
+        for (const v of views) {
+          const own = attribute(v.wire, offsetDiags(v.wire.text, pulled.get(v.shadow))).lines;
+          for (const c of v.wire.checks) {
+            if (!own.has(c.k) || !hasLeaf(v.view.inputs[c.n]!)) continue;
+            const entry = v.view.entries[c.n]!;
+            const key = checkKey(entry.pos.row, entry.groups[c.group]!, entry.pos.at);
+            if (this.armed.has(key) && this.wireAtGate.get(key) === false && !spoke.has(key)) next.add(key);
+          }
+        }
+      } catch (error) {
+        // No report for the text sent: what was set aside stays so until the next edit answer.
+        if (!(error instanceof StalePull)) throw error;
+        log("fill pull stale", String(error));
+        return;
+      } finally {
+        for (const v of views) this.engine.set(v.shadow, v.view.ov.text);
+      }
+    }
+    const changed = next.size !== this.setAside.size || [...next].some((key) => !this.setAside.has(key));
+    this.setAside = next;
+    if (changed) this.writePlaced();
   }
 
   /**

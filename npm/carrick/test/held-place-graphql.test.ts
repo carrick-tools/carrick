@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import ts from "typescript";
 import { arm, attribute, isTopOrBytes, overlay } from "../src/held/place.ts";
-import type { CheckInput, Diag, Value } from "../src/held/place.ts";
+import type { CheckInput, Diag, Overlay, Value } from "../src/held/place.ts";
 
 const dir = new URL("./fixtures/held/", import.meta.url);
 const RESOLVERS = fs.readFileSync(new URL("resolvers.ts", dir), "utf8");
@@ -133,4 +133,27 @@ test("an HTTP overlay is byte for byte the same with and without a GraphQL input
   const h = mixed.checks.find((c) => c.k === "0_0")!;
   const d: Diag = { start: h.span[1] - 2, code: 2741, message: "missing in type 'O0_0'" };
   assert.deepEqual(attribute(mixed, [d]).lines.get("0_0"), [d]);
+});
+
+test("the wire mode swaps only a scalar-form GraphQL callback for the judge's wire line; spans and callbacks are the clean overlay's", () => {
+  const sends = span(SENDS, "{ id: order.id, total: order.total }", "sends.ts");
+  const first = span(SENDS, "{ first: 1 }", "sends.ts");
+  const inputs: CheckInput[] = [
+    { n: 0, value: sends, groups: [group("{ id: string; total: number }")] },
+    { n: 1, value: first, groups: [group("{ first: number }")], form: LEAF },
+    { n: 2, value: { ...first }, groups: [group("{ first: number }")], form: FORM },
+  ];
+  const clean = overlay("sends.ts", SENDS, inputs, GQL_WIRE, "clean");
+  const wire = overlay("sends.ts", SENDS, inputs, GQL_WIRE, "wire");
+  assert.equal(wire.text.slice(0, wire.bodyEnd), clean.text.slice(0, clean.bodyEnd), "the wrapped body is the clean one");
+  assert.deepEqual(wire.checks.map((c) => [c.k, c.span, c.callback]), clean.checks.map((c) => [c.k, c.span, c.callback]));
+  const decl = (ov: Overlay, k: string): string => {
+    const c = ov.checks.find((x) => x.k === k)!;
+    return ov.text.slice(c.declSpan[0], c.declSpan[1]);
+  };
+  assert.equal(decl(wire, "1_0"), decl(clean, "1_0").replace("__carrick_GqlSentS<", "__carrick_GqlWire<"));
+  assert.ok(decl(wire, "1_0").includes("c: (o: __carrick_GqlWire<Awaited<V>, O1_0, L1_0>) => __carrick_GqlExpected<O1_0>"), decl(wire, "1_0"));
+  assert.equal(decl(wire, "0_0"), decl(clean, "0_0"), "an HTTP check keeps its clean text");
+  assert.equal(decl(wire, "2_0"), decl(clean, "2_0"), "a JSON-form GraphQL check has no fill and keeps its clean text");
+  assert.equal(wire.text.replace("__carrick_GqlWire<", "__carrick_GqlSentS<"), clean.text, "nothing else changes");
 });
