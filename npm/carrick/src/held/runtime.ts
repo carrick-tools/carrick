@@ -936,7 +936,22 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
     graphqlTypes: options.graphqlTypes ?? ((repo: string, service: string) => factTable(options.root, repo, service)),
     env,
   };
+  // The rows `start` reads for a service, counted once per fact-file stamp.
+  let counted: { stamp: string; counts: Map<string, number> } | null = null;
   return {
+    async rowCount(init: ServiceInit): Promise<number> {
+      const stamp = deps.stamp();
+      if (counted === null || counted.stamp !== stamp) {
+        const counts = new Map<string, number>();
+        for (const row of await deps.rows()) {
+          if (row.direction !== "response") continue;
+          const k = `${row.repo}\0${row.service}`;
+          counts.set(k, (counts.get(k) ?? 0) + 1);
+        }
+        counted = { stamp, counts };
+      }
+      return counted.counts.get(`${init.repo}\0${init.service}`) ?? 0;
+    },
     async start(init: ServiceInit): Promise<StartResult> {
       const entry = options.entry === undefined ? engineEntry(env) : options.entry;
       if (entry === null) return { state: "error", reason: "the compiler engine is not built" };
