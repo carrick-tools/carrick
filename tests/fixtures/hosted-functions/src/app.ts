@@ -1,5 +1,5 @@
-// The web app's own code. It calls no function yet: the consumer half of this
-// fixture (the client calls that name a function by a string) comes later.
+// The web app's own code that calls no function. The client calls that name
+// a function by a string are in direct.ts, digest.ts, page.ts and method.ts.
 export function greeting(name: string): string {
   return `hello ${name}`;
 }

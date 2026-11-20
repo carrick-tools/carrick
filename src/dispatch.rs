@@ -1540,6 +1540,7 @@ mod tests {
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
+            label_member: None,
         });
 
         let findings = dispatch_operation_findings(&[&producer, &consumer]);
@@ -1632,6 +1633,7 @@ mod tests {
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
+            label_member: None,
         }
     }
 

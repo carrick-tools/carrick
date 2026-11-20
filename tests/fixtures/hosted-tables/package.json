@@ -1,0 +1,7 @@
+{
+  "name": "hosted-tables-fixture",
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "1.0.0"
+  }
+}

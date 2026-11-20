@@ -186,6 +186,12 @@ pub struct SiteRow {
     /// path, and this is its identity. The repository is added where the
     /// row is written ([`fold`]).
     pub procedure: Option<crate::request_summary::discovery::ProcedureAt>,
+    /// The labelled member that stated a call row, on a row from an op
+    /// claimed on what a scope member returns (`upsert` of
+    /// `db.from("t").upsert(...)`, D14 of the tables stage): the method
+    /// alone does not tell `insert` from `upsert`. `None` on every other
+    /// row.
+    pub label_member: Option<String>,
 }
 
 impl SiteRow {
@@ -1428,6 +1434,9 @@ pub fn of(
                 within: Vec::new(),
                 base,
                 procedure,
+                label_member: label
+                    .filter(|label| side == RowSide::Call && label.scope.is_some())
+                    .and_then(|label| label.member.clone()),
             });
         }
     }
@@ -1494,6 +1503,7 @@ pub fn descriptor_rows(decided: &Decided) -> Vec<SiteRow> {
                     &Default::default(),
                 ),
                 procedure: None,
+                label_member: None,
             }
         })
         .collect()
@@ -2058,6 +2068,7 @@ pub fn fold_rows(
         stated.resolution_source = Some(row.source);
         stated.name_scope = row.name_scope.clone();
         stated.procedure = procedure;
+        stated.label_member = row.label_member.clone();
         stated.inference = row.inference.clone().map(|answer| Inference {
             answer: Some(answer),
             alternative: None,

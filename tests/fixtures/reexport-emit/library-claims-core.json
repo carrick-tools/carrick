@@ -1,0 +1,43 @@
+{
+  "library_claims": [
+    {
+      "package": "hub-core",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "hub-core",
+          "export": "Hub",
+          "role": "in_process_bus",
+          "side": null,
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "fire",
+              "of": "type",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": [
+            "*"
+          ]
+        }
+      ]
+    }
+  ]
+}

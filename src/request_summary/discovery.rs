@@ -177,6 +177,11 @@ pub struct SiteEnd {
     /// the key path and the router its first key belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procedure: Option<ProcedureAt>,
+    /// The sub-object hops between the instance and the member, where the
+    /// op is claimed under them (`client.functions.invoke(…)` is
+    /// `["functions"]`): set by the instance branch only (C1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
 }
 
 /// The procedure a client call names (carrick#3186): its key
@@ -788,6 +793,56 @@ pub struct DeclarationAsk {
     pub checks: Vec<LibraryCheck>,
     pub ops: Vec<Option<DeclaredOp>>,
     pub scopes: Vec<Option<AskedScope>>,
+    /// The packages the answer held as answered, which the ask read a call
+    /// landing outside of ([`outside_keys`]).
+    answered: BTreeSet<String>,
+    /// What the ask read as each package's dependencies ([`Dependencies`]).
+    depends: Dependencies,
+}
+
+/// The packages each labelled package depends on, by the package's name:
+/// what its installed manifest lists as `dependencies`, `peerDependencies`
+/// or `optionalDependencies` (carrick#4878). A package absent here has no manifest to read, and no
+/// call landing outside the answered packages is asked on it.
+pub type Dependencies = BTreeMap<String, BTreeSet<String>>;
+
+/// The store keys a call's declaration is in when that is a package the
+/// answer did not hold as answered (carrick#4878); none otherwise. A class a
+/// labelled package re-exports from its dependency is declared there, so the
+/// call's store keys name the dependency, never the labelled package. The
+/// default library and the runtime's modules are asked by their own keys and
+/// never re-exported through a package. A row naming no declaration lands
+/// nowhere.
+fn outside_keys(row: &Row, exports: &[ExportClaims], answered: &BTreeSet<String>) -> Vec<String> {
+    let keys = store_keys(row, exports);
+    if keys
+        .iter()
+        .all(|key| !is_language_key(key) && !key.starts_with("node:") && !answered.contains(key))
+    {
+        keys
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether `package` can re-export a declaration found in `outside`: its
+/// installed manifest names one of them as a dependency.
+fn reaches(depends: &Dependencies, package: &str, outside: &[String]) -> bool {
+    depends
+        .get(package)
+        .is_some_and(|names| outside.iter().any(|key| names.contains(key)))
+}
+
+/// What a service's rows call outside the repo ([`declaration_ask_answered`]).
+#[derive(Default)]
+struct Called {
+    /// Each `(store key, member)` a row's declaration and symbol name.
+    pairs: HashSet<(String, String)>,
+    /// Each `(store key, member)` called through a declaration in no answered
+    /// package, by the key it is declared in.
+    outside: HashSet<(String, String)>,
+    /// Every symbol a row calls outside the repo, whatever package declares it.
+    symbols: HashSet<String>,
 }
 
 /// One scope claim the trace asks, by its claim id, on one receiver id
@@ -868,30 +923,91 @@ pub fn declaration_ask(
     siblings: &[&RequestSummaryInputs],
     exports: &[ExportClaims],
 ) -> DeclarationAsk {
-    let mut ask = DeclarationAsk::default();
+    let answered = exports
+        .iter()
+        .map(|export| export.package.clone())
+        .collect();
+    declaration_ask_answered(inputs, siblings, exports, &answered, &Dependencies::new())
+}
+
+/// [`declaration_ask`] with the packages the store answered, with or without
+/// an export (carrick#4878). A labelled op or scope claim on member `m` is
+/// also asked when a call or member row outside the repo has symbol `m` and
+/// its declaration is in a package `C` no answered package is, and the
+/// export's package depends on `C` (`depends`, [`reaches`]): the
+/// verifier decides whether the export's member resolves to that
+/// declaration, as it does for a class the package re-exports from its
+/// dependency. Every other claim is asked on the `(package, member)` match.
+pub fn declaration_ask_answered(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    exports: &[ExportClaims],
+    answered: &BTreeSet<String>,
+    depends: &Dependencies,
+) -> DeclarationAsk {
+    let mut ask = DeclarationAsk {
+        answered: answered.clone(),
+        depends: depends.clone(),
+        ..DeclarationAsk::default()
+    };
     let Some(positions) = inputs.positions.as_ref() else {
         return ask;
     };
-    let called_by = |positions: &crate::position_rows::PositionIndex| -> HashSet<(String, String)> {
-        positions
+    // The `(store key, member)` pairs the rows call, and the members called
+    // through a declaration outside every answered package.
+    let called_by = |positions: &crate::position_rows::PositionIndex| -> Called {
+        let mut called = Called::default();
+        for row in positions
             .call_rows()
             .chain(positions.member_rows())
             .filter(|row| !in_repo(row))
-            .flat_map(|row| {
-                let symbol = row.symbol().map(str::to_string);
+        {
+            let Some(symbol) = row.symbol() else {
+                continue;
+            };
+            called.symbols.insert(symbol.to_string());
+            called.outside.extend(
+                outside_keys(row, exports, answered)
+                    .into_iter()
+                    .map(|key| (key, symbol.to_string())),
+            );
+            called.pairs.extend(
                 store_keys(row, exports)
                     .into_iter()
-                    .filter_map(move |key| Some((key, symbol.clone()?)))
-            })
-            .collect()
+                    .map(|key| (key, symbol.to_string())),
+            );
+        }
+        called
     };
     let own = called_by(positions);
-    let sibling_only: HashSet<(String, String)> = siblings
+    let mut sibling_only = Called::default();
+    // The symbols called in this service or a sibling: an op on a called
+    // scope's result is asked only for a member some row calls.
+    let mut all_symbols = own.symbols.clone();
+    for sibling in siblings
         .iter()
         .filter_map(|sibling| sibling.positions.as_ref())
-        .flat_map(called_by)
-        .filter(|pair| !own.contains(pair))
-        .collect();
+    {
+        all_symbols.extend(called_by(sibling).symbols);
+    }
+    for called in siblings
+        .iter()
+        .filter_map(|sibling| sibling.positions.as_ref())
+        .map(called_by)
+    {
+        sibling_only.pairs.extend(
+            called
+                .pairs
+                .into_iter()
+                .filter(|pair| !own.pairs.contains(pair)),
+        );
+        sibling_only.outside.extend(
+            called
+                .outside
+                .into_iter()
+                .filter(|pair| !own.outside.contains(pair)),
+        );
+    }
     // The scope checks, asked once every export's op checks are in.
     let mut scope_checks: Vec<(LibraryCheck, AskedScope)> = Vec::new();
     // Each entry of the store's answer asks its makers once over both
@@ -907,16 +1023,45 @@ pub fn declaration_ask(
             .filter(|(_, export)| export.role != LibraryRole::None)
         {
             let claims = export.claims_with_scopes_by_id();
+            let member_called = |member: &String| {
+                called
+                    .pairs
+                    .contains(&(export.package.clone(), member.clone()))
+                    || called.outside.iter().any(|(outside, called)| {
+                        called == member
+                            && reaches(depends, &export.package, std::slice::from_ref(outside))
+                    })
+            };
+            // The receivers a called scope member returns (carrick tables
+            // stage 1, S1): an op claimed `of` one is asked with the scope,
+            // whichever package declares the op's member. A call of such a
+            // member lands in the package the scope's result type is
+            // declared in, which the labelled package need not be.
+            let scope_results: Vec<String> = claims
+                .iter()
+                .filter_map(|(_, claim)| match claim {
+                    LibraryClaim::Scope { member, on, of, .. } if member_called(member) => Some(
+                        claim_receivers(&claims, *on, of.as_deref())
+                            .into_iter()
+                            .map(move |receiver| format!("{receiver}>scope:{member}")),
+                    ),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
             let wanted: Vec<&(String, &LibraryClaim)> = claims
                 .iter()
                 .filter(|(_, claim)| match claim {
                     LibraryClaim::Op {
                         member: Some(member),
+                        of,
                         ..
+                    } => {
+                        member_called(member)
+                            || (all_symbols.contains(member)
+                                && of.as_ref().is_some_and(|of| scope_results.contains(of)))
                     }
-                    | LibraryClaim::Scope { member, .. } => {
-                        called.contains(&(export.package.clone(), member.clone()))
-                    }
+                    LibraryClaim::Scope { member, .. } => member_called(member),
                     _ => false,
                 })
                 .collect();
@@ -1010,6 +1155,10 @@ pub struct MemberDeclarations {
     /// theirs verified (carrick#4473). Empty when the verifier answered and
     /// left no such pair, including answers that verified nothing.
     unanswered: HashSet<(String, String)>,
+    /// The packages the answer held as answered ([`DeclarationAsk`]'s).
+    answered: BTreeSet<String>,
+    /// The dependencies the ask read ([`DeclarationAsk`]'s).
+    depends: Dependencies,
 }
 
 impl MemberDeclarations {
@@ -1064,9 +1213,22 @@ impl MemberDeclarations {
         };
         !self.unanswered.is_empty()
             && !in_repo(row)
-            && store_keys(row, exports)
+            && (store_keys(row, exports)
                 .into_iter()
                 .any(|key| self.unanswered.contains(&(key, symbol.to_string())))
+                // A call landing outside every answered package had every
+                // labelled op of its member asked on a package that depends
+                // on the one it landed in (carrick#4878): one of them left
+                // open leaves the call open. Only a call with a reason of
+                // its own reads this ([`Discovery::declarations_unanswered`]
+                // marks saved sites, `unfollowed` re-reads a package
+                // mismatch), so it saves no call of its own.
+                || {
+                    let outside = outside_keys(row, exports, &self.answered);
+                    self.unanswered.iter().any(|(package, member)| {
+                        member == symbol && reaches(&self.depends, package, &outside)
+                    })
+                })
     }
 
     /// The declarations the verdicts for `ask` name. A verdict counts only
@@ -1074,6 +1236,8 @@ impl MemberDeclarations {
     pub fn of(ask: &DeclarationAsk, verdicts: &[SemanticsResult]) -> Self {
         let mut out = MemberDeclarations {
             checks: ask.checks.len(),
+            answered: ask.answered.clone(),
+            depends: ask.depends.clone(),
             not_reached: crate::services::type_sidecar::not_reached_in_time(verdicts),
             ..MemberDeclarations::default()
         };
@@ -1745,6 +1909,8 @@ struct ReceiverOp<'a> {
     claims: &'a ExportClaims,
     op: LibraryOp,
     member: &'a str,
+    /// The sub-object hops the op is claimed under (`["functions"]`).
+    path: &'a [String],
 }
 
 /// One call made through a listed client into a package never asked: (listed
@@ -1941,6 +2107,7 @@ impl<'a> Walker<'a> {
             new: invoke.construction,
             scope: None,
             procedure: None,
+            path: Vec::new(),
         }
     }
 
@@ -2013,17 +2180,16 @@ impl<'a> Walker<'a> {
     /// Each call-form op the store claims on a member of `site`'s receiver,
     /// one that applies to it (an instance's maker, or the export), in the
     /// order the instance branch of [`Self::library_end`] tries them:
-    /// package key, then export, then claim. Empty for a receiver read
-    /// through hops (`app.a.get(…)`), where no op is claimed.
+    /// package key, then export, then claim. A receiver read through hops
+    /// (`client.functions.invoke(…)`) takes only the `request` ops claimed
+    /// under those same hops (C1); every other op is claimed on the receiver
+    /// itself.
     ///
     /// The one answer to "which ops are claimed on this library receiver":
     /// the instance branch takes the op its member names, and a call
     /// through a computed key ([`Self::keyed_stop`]) asks whether any is.
     fn receiver_ops(&self, site: &'a LibrarySite) -> Vec<ReceiverOp<'a>> {
         let mut found = Vec::new();
-        if !site.path.is_empty() {
-            return found;
-        }
         let receivers = site.receiver_ids();
         let exports = if site.export == "default" {
             vec!["default", "export ="]
@@ -2044,7 +2210,8 @@ impl<'a> Walker<'a> {
                         of,
                         ..
                     } = claim
-                        && path.is_empty()
+                        && *path == site.path
+                        && (path.is_empty() || *op == LibraryOp::Request)
                         && receivers
                             .iter()
                             .any(|receiver| applies(*on, of.as_deref(), receiver))
@@ -2055,6 +2222,7 @@ impl<'a> Walker<'a> {
                             claims,
                             op: *op,
                             member,
+                            path,
                         });
                     }
                 }
@@ -2465,6 +2633,7 @@ impl<'a> Walker<'a> {
             return Some((
                 SiteEnd {
                     op: Some(claimed.op),
+                    path: claimed.path.to_vec(),
                     ..end(&claimed.key, claimed.export, Some(member), claimed.claims)
                 },
                 ReachedBy::Instance,
@@ -11891,6 +12060,112 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         assert_eq!(ask.ops.iter().filter(|op| op.is_some()).count(), 3);
     }
 
+    /// Tables stage 1, S1: a client package's `from(name)` is a scope claim
+    /// whose result is a builder declared in another package. The ops
+    /// claimed `of` that result are asked with the scope when `from` is
+    /// called, whichever package declares their members; a filter call the
+    /// builder has no op claim for is never asked, so it never becomes an
+    /// unanswered site.
+    #[test]
+    fn a_called_scope_member_also_asks_the_ops_claimed_on_what_it_returns() {
+        let claims = r#"{"library_claims":[{"package":"@fixture/hosted","version":"1.0.0","status":"answered","exports":[{
+            "specifier":"@fixture/hosted","export":"createClient","role":"http_client","side":"client",
+            "makes":[{"form":"call","member":null,"base":{"arg":0},"picker":"p"}],
+            "scopes":[{"member":"from","of":"instance:()","name":{"arg":0},"picker":"p"}],
+            "ops":[
+              {"op":"request","member":"select","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"GET","picker":"p"},
+              {"op":"request","member":"select","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"HEAD","picker":"p","when":{"arg":1,"key":"head","literal":"true"}},
+              {"op":"request","member":"insert","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"POST","picker":"p"},
+              {"op":"request","member":"upsert","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"POST","picker":"p"},
+              {"op":"request","member":"update","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"PATCH","picker":"p"},
+              {"op":"request","member":"delete","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"DELETE","picker":"p"}],
+            "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(claims).exports;
+        let inputs_calling = |rows: &[(&str, &str)]| {
+            let row = |at: usize, (symbol, package): &(&str, &str)| {
+                format!(
+                    "[\"call\",{at},{},\"{symbol}\",\"node_modules/{package}/index.d.ts\",1,\"{package}\",\"x\",0]",
+                    at + 1
+                )
+            };
+            let rows: Vec<String> = rows
+                .iter()
+                .enumerate()
+                .map(|(at, r)| row(at * 2, r))
+                .collect();
+            let text = format!(
+                "{{\"v\":{},\"typescript\":\"6.0.2\",\"service\":\"web\",\"files\":1}}\n{{\"f\":\"a.ts\",\"h\":\"00\",\"r\":[{}]}}\n",
+                crate::position_rows::FORMAT_VERSION,
+                rows.join(",")
+            );
+            RequestSummaryInputs {
+                positions: Some(crate::position_rows::PositionIndex::of(
+                    Path::new("/repo"),
+                    crate::position_rows::read_rows(text.as_bytes()).unwrap(),
+                )),
+                ..RequestSummaryInputs::default()
+            }
+        };
+        let builder_ops = |ask: &DeclarationAsk| -> Vec<String> {
+            ask.checks
+                .iter()
+                .filter(|check| check.receiver == "instance:()>scope:from")
+                .map(|check| check.claim_id.clone())
+                .collect()
+        };
+        // `from` is called, with `select`, `insert` and a filter: only the
+        // ops of the called members are asked, both `select` ops among them.
+        let called = inputs_calling(&[
+            ("from", "@fixture/hosted"),
+            ("select", "@fixture/hosted-rest"),
+            ("insert", "@fixture/hosted-rest"),
+            ("eq", "@fixture/hosted-rest"),
+        ]);
+        let ask = declaration_ask(&called, &[], &exports);
+        let got = builder_ops(&ask);
+        assert_eq!(got.len(), 3, "{got:#?}");
+        assert_eq!(got.iter().filter(|id| id.contains(":select")).count(), 2);
+        assert_eq!(got.iter().filter(|id| id.contains(":insert")).count(), 1);
+        assert!(got.iter().all(|id| !id.contains(":eq")), "{got:#?}");
+        assert_eq!(ask.ops.iter().filter(|op| op.is_some()).count(), 3);
+        // All five members called: the 6 builder ops.
+        let all = inputs_calling(&[
+            ("from", "@fixture/hosted"),
+            ("select", "@fixture/hosted-rest"),
+            ("insert", "@fixture/hosted-rest"),
+            ("upsert", "@fixture/hosted-rest"),
+            ("update", "@fixture/hosted-rest"),
+            ("delete", "@fixture/hosted-rest"),
+        ]);
+        assert_eq!(builder_ops(&declaration_ask(&all, &[], &exports)).len(), 6);
+        // The filter has no op claim: the answer to the ask never names it,
+        // so it is never a call left open.
+        let rows = called.positions.as_ref().unwrap();
+        let eq = rows
+            .call_rows()
+            .find(|row| row.symbol() == Some("eq"))
+            .unwrap();
+        let left = MemberDeclarations {
+            unanswered: ask
+                .ops
+                .iter()
+                .flatten()
+                .map(|op| (op.package.clone(), op.member.clone()))
+                .collect(),
+            answered: ask.answered.clone(),
+            ..MemberDeclarations::default()
+        };
+        assert!(!left.left_open(eq, &exports));
+        // `from` is never called: the builder ops are not asked, whatever
+        // else the service calls on the builder package.
+        let never = inputs_calling(&[
+            ("select", "@fixture/hosted-rest"),
+            ("eq", "@fixture/hosted-rest"),
+        ]);
+        let ask = declaration_ask(&never, &[], &exports);
+        assert!(ask.checks.is_empty(), "{:#?}", ask.checks);
+    }
+
     /// carrick#2474 R2b: the verifier judges in request order under a time
     /// limit, so the scope checks the trace adds come after every op check
     /// R1 asks: near the limit, the scopes go unchecked, never an op.
@@ -12177,5 +12452,120 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         }
         let out = std::env::var("CARRICK_LIBRARY_ASK_CENSUS_OUT").expect("an out file");
         std::fs::write(out, serde_json::to_string_pretty(&all).unwrap()).expect("the asks write");
+    }
+
+    /// The exports of a `@fixture/platform` whose `createClient` makes a
+    /// client and claims `op` on member `member` of the client's `path`.
+    fn hopped_claims(op: &str, path: &[&str], member: &str) -> Vec<ExportClaims> {
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/platform", "version": "1.0.0",
+                "specifier": "@fixture/platform", "export": "createClient",
+                "role": "http_client", "side": "client",
+                "claims": [
+                    { "kind": "make", "form": "call", "member": null },
+                    { "kind": "op", "op": op, "path": path, "member": member,
+                      "on": "instance", "name": { "arg": 0 } }
+                ]
+            }))
+            .unwrap(),
+        ]
+    }
+
+    /// C1: a `request` op claimed under the hops the call reads its member
+    /// through (`c.fns.call(…)`, op on `fns`) is an end of the instance
+    /// branch, carrying those hops. The same hops on another op, or other
+    /// hops, give none.
+    #[test]
+    fn a_request_op_claimed_through_hops_is_an_instance_end() {
+        let manifest =
+            "{ \"name\": \"web\", \"dependencies\": { \"@fixture/platform\": \"1.0.0\" } }\n";
+        let source = "import { createClient } from \"@fixture/platform\";\n\
+                      const c = createClient();\n\
+                      export function go() {\n  return c.fns.call(\"x\");\n}\n";
+        let types = "export declare class Fns { call(name: string): Promise<unknown>; }\n\
+                     export declare class Client { fns: Fns; }\n\
+                     export declare function createClient(): Client;\n";
+        let Some(on) = walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &[
+                ("package.json", manifest),
+                (
+                    "node_modules/@fixture/platform/package.json",
+                    "{ \"name\": \"@fixture/platform\", \"version\": \"1.0.0\", \"types\": \"index.d.ts\" }\n",
+                ),
+                ("node_modules/@fixture/platform/index.d.ts", types),
+                ("src/hops.ts", source),
+            ],
+            true,
+        ) else {
+            return;
+        };
+        let ends = |exports: &[ExportClaims]| -> Vec<(Option<String>, Vec<String>)> {
+            let discovery = discover(&on.inputs, &Labels::of(exports), &on.repo);
+            let ends: Vec<_> = discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("src/hops.ts"))
+                .filter_map(|site| site.end.clone())
+                // The maker call is an end of its own, with no op.
+                .filter(|end| end.op.is_some())
+                .map(|end| (end.member, end.path))
+                .collect();
+            if ends.is_empty() {
+                crate::errln!(
+                    "no end in src/hops.ts: unfollowed {:?}",
+                    discovery
+                        .unfollowed
+                        .iter()
+                        .filter(|site| site.file.ends_with("src/hops.ts"))
+                        .map(|site| (&site.callee, &site.stop))
+                        .collect::<Vec<_>>()
+                );
+            }
+            ends
+        };
+        assert_eq!(
+            ends(&hopped_claims("request", &["fns"], "call")),
+            vec![(Some("call".to_string()), vec!["fns".to_string()])]
+        );
+        assert_eq!(ends(&hopped_claims("send", &["fns"], "call")), vec![]);
+        assert_eq!(ends(&hopped_claims("request", &["other"], "call")), vec![]);
+    }
+
+    /// C1 (ruling on step 0.5): an end no hopped op matched serializes as it
+    /// did before the hops were carried, with no `path` key, on both sides
+    /// of the engine's conversion.
+    #[test]
+    fn an_end_with_no_hops_serializes_as_before() {
+        let end = SiteEnd {
+            package: "@fixture/platform".into(),
+            export: "createClient".into(),
+            member: Some("get".into()),
+            role: LibraryRole::HttpClient,
+            op: Some(LibraryOp::Request),
+            file: "src/a.ts".into(),
+            line: 1,
+            span_start: 0,
+            span_end: 1,
+            new: false,
+            scope: None,
+            procedure: None,
+            path: Vec::new(),
+        };
+        let value = serde_json::to_value(&end).unwrap();
+        assert!(value.get("path").is_none(), "{value}");
+        let labelled: super::super::decided_sites::LabelledEnd =
+            serde_json::from_value(value.clone()).unwrap();
+        let back = serde_json::to_value(&labelled).unwrap();
+        assert!(back.get("path").is_none(), "{back}");
+        let hopped = serde_json::to_value(SiteEnd {
+            path: vec!["fns".into()],
+            ..end
+        })
+        .unwrap();
+        assert_eq!(hopped["path"], serde_json::json!(["fns"]));
     }
 }

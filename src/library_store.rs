@@ -903,6 +903,43 @@ fn installed(name: &str, install: &Install<'_>) -> Option<Installed> {
         })
 }
 
+/// The dependencies each of `packages` states in its installed manifest
+/// (`dependencies`, `peerDependencies` and `optionalDependencies`, as the
+/// compiler engine's `declaredDependencies` reads them), by package name,
+/// read from the copy the service resolves ([`installed`], carrick#4878). A
+/// package with
+/// no readable installed manifest is absent: nothing is known of what it
+/// can re-export.
+pub fn installed_dependencies(
+    packages: &BTreeSet<String>,
+    service_root: &Path,
+    repo_root: &Path,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let install = Install {
+        service_root,
+        repo_root,
+        home: None,
+        yarn_registry_env: None,
+        npm_registry_env: None,
+        bun_registry_env: None,
+        xdg_config_home: None,
+    };
+    packages
+        .iter()
+        .filter_map(|name| {
+            let copy = installed(name, &install)?;
+            let text = std::fs::read_to_string(copy.dir.join("package.json")).ok()?;
+            let manifest: Value = serde_json::from_str(&text).ok()?;
+            let names = ["dependencies", "peerDependencies", "optionalDependencies"]
+                .into_iter()
+                .filter_map(|list| manifest.get(list)?.as_object())
+                .flat_map(|deps| deps.keys().cloned())
+                .collect();
+            Some((name.clone(), names))
+        })
+        .collect()
+}
+
 /// The directory whose install a linked copy belongs to. A workspace member
 /// installed by the root's install holds `node_modules/<name>` as a link into
 /// the root's store (`<R>/node_modules/.pnpm/<key>/node_modules/<name>`, or a
@@ -1901,6 +1938,18 @@ fn parse_export(
             });
             let parsed = tagged
                 .and_then(|()| serde_json::from_value::<LibraryClaim>(element).ok())
+                // An empty name prefix (R27) says nothing the op can use, and
+                // the verifier's schema refuses it for the whole request: the
+                // op is out of shape.
+                .filter(|claim| {
+                    !matches!(
+                        claim,
+                        LibraryClaim::Op {
+                            name_prefix: Some(prefix),
+                            ..
+                        } if prefix.is_empty()
+                    )
+                })
                 // A scope names a prefix, collects procedures (#2474 R6a),
                 // merges collections (amendment 9), passes its receiver
                 // through, or binds with no prefix (`mounts`, or `runs` with
@@ -2603,6 +2652,32 @@ mod tests {
             repo_root: repo,
             ..install_at(repo)
         }
+    }
+
+    /// carrick#4878: the three dependency lists the compiler engine reads,
+    /// an empty set for a manifest with none, nothing for a package with no
+    /// installed copy.
+    #[test]
+    fn installed_dependencies_read_each_installed_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("node_modules/kit/package.json"),
+            r#"{"name":"kit","version":"1.0.0","dependencies":{"core":"1"},
+                "peerDependencies":{"peer":"1"},"optionalDependencies":{"extra":"1"},
+                "devDependencies":{"dev":"1"}}"#,
+        );
+        install_package(dir.path(), "bare", "1.0.0");
+        let packages: BTreeSet<String> = ["kit", "bare", "gone"].map(String::from).into();
+        let got = installed_dependencies(&packages, dir.path(), dir.path());
+        let want: BTreeMap<String, BTreeSet<String>> = [
+            ("bare".to_string(), BTreeSet::new()),
+            (
+                "kit".to_string(),
+                ["core", "extra", "peer"].map(String::from).into(),
+            ),
+        ]
+        .into();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -4508,6 +4583,26 @@ mod tests {
         assert_eq!(answer.exports[0].claims.len(), 1);
         // Three ops and two exports.
         assert_eq!(answer.dropped, 5);
+    }
+
+    /// Contract amendment R27 on carrick#2434: an op's `name_prefix` reads
+    /// off the store's answer and goes to the verifier as written; one that is
+    /// not a string, or is empty, drops its op and is counted.
+    #[test]
+    fn an_op_name_prefix_is_sent_as_written_and_dropped_out_of_shape() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"lib","export":"createClient","role":"http_client","ops":[
+                    {"op":"request","member":"invoke","path":["functions"],"on":"instance","name":{"arg":0},
+                     "name_prefix":"/functions/v1/","method_default":"POST"},
+                    {"op":"request","member":"invoke","on":"instance","name":{"arg":0},"name_prefix":7},
+                    {"op":"request","member":"invoke","on":"instance","name":{"arg":0},"name_prefix":""}
+                ]}]}]}"#,
+        );
+        assert_eq!((answer.answered, answer.dropped), (1, 2));
+        let sent = serde_json::to_value(&answer.exports[0].claims).unwrap();
+        assert_eq!(sent.as_array().unwrap().len(), 1);
+        assert_eq!(sent[0]["name_prefix"], "/functions/v1/");
     }
 
     /// carrick#2474 R0: a scope's `runs`, `yields` and `mounts` and a

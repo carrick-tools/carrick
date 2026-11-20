@@ -61,7 +61,28 @@
             }
           ],
           "scopes": [],
-          "ops": [],
+          "ops": [
+            {
+              "op": "request",
+              "path": ["functions"],
+              "member": "invoke",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "name_prefix": "/functions/v1/",
+              "method_key": {
+                "arg": 1,
+                "key": "method"
+              },
+              "method_default": "POST",
+              "payload": {
+                "arg": 1,
+                "key": "body"
+              },
+              "picker": "fixture-picker"
+            }
+          ],
           "reserved": [],
           "calls": [],
           "patterns": []

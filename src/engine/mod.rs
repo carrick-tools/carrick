@@ -6338,8 +6338,10 @@ async fn analyze_current_repo_incremental(
                 &request_inputs,
                 &sibling_inputs,
                 &claims,
+                &settled_answered(library_ask.as_deref(), unready.as_ref()),
                 sidecar,
                 &semantics_root,
+                Path::new(repo_path),
             );
             let results = result_index_of(
                 &request_inputs,
@@ -7930,9 +7932,15 @@ async fn fact_files_of(
     };
     let asked = match trace {
         FirstTrace::Untraced => None,
-        FirstTrace::Traced { sidecar, from_dir } => {
-            member_declarations(inputs, siblings, &answer.exports, sidecar, from_dir)
-        }
+        FirstTrace::Traced { sidecar, from_dir } => member_declarations(
+            inputs,
+            siblings,
+            &answer.exports,
+            &answer.answered,
+            sidecar,
+            from_dir,
+            root,
+        ),
     };
     let exports = answer.exports.clone();
     let facts = first_discovery(
@@ -8470,13 +8478,20 @@ fn member_declarations(
     inputs: &crate::request_summary::RequestSummaryInputs,
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     claims: &[crate::library_claims::ExportClaims],
+    answered: &BTreeSet<String>,
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
+    repo_root: &Path,
 ) -> Option<AskedDeclarations> {
-    use crate::request_summary::discovery::{MemberDeclarations, declaration_ask};
+    use crate::request_summary::discovery::{MemberDeclarations, declaration_ask_answered};
     inputs.positions.as_ref()?;
     let started = Instant::now();
-    let ask = declaration_ask(inputs, siblings, claims);
+    // What each labelled package depends on, from its installed manifest
+    // (carrick#4878): a call landing outside the answered packages is asked
+    // on a package that can re-export from there.
+    let packages: BTreeSet<String> = claims.iter().map(|claim| claim.package.clone()).collect();
+    let depends = crate::library_store::installed_dependencies(&packages, from_dir, repo_root);
+    let ask = declaration_ask_answered(inputs, siblings, claims, answered, &depends);
     let mut failed = false;
     let declarations = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
@@ -8545,22 +8560,41 @@ enum FirstTrace<'a> {
 /// The member declarations the settled pass reads (carrick#4077 R5): the first
 /// answer's when the settled `claims` are its exports and its ask was whole,
 /// otherwise one ask over `claims`.
+#[allow(clippy::too_many_arguments)]
 fn settled_declarations(
     first: Option<FirstDeclarations>,
     inputs: &crate::request_summary::RequestSummaryInputs,
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     claims: &[crate::library_claims::ExportClaims],
+    answered: &BTreeSet<String>,
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
+    repo_root: &Path,
 ) -> Option<crate::request_summary::discovery::MemberDeclarations> {
     match first {
         Some(FirstDeclarations {
             exports,
             asked: Some(asked),
         }) if asked.whole && exports == claims => Some(asked.declarations),
-        _ => member_declarations(inputs, siblings, claims, sidecar, from_dir)
-            .map(|asked| asked.declarations),
+        _ => member_declarations(
+            inputs, siblings, claims, answered, sidecar, from_dir, repo_root,
+        )
+        .map(|asked| asked.declarations),
     }
+}
+
+/// The packages the settled answer holds as answered, for the declaration
+/// ask (carrick#4878): every package asked, less those the scan ended
+/// without an answer for. A read-only pass ends none.
+fn settled_answered(
+    ask: Option<&LibraryAsk>,
+    unready: Option<&BTreeSet<String>>,
+) -> BTreeSet<String> {
+    let mut answered = ask.map(|ask| ask.asked.packages()).unwrap_or_default();
+    if let Some(unready) = unready {
+        answered.retain(|package| !unready.contains(package));
+    }
+    answered
 }
 
 /// What a service's site questions read before anything is asked
@@ -16123,8 +16157,10 @@ async fn analyze_current_repo(
         &request_inputs,
         &sibling_inputs,
         &claims,
+        &settled_answered(library_ask.as_deref(), unready.as_ref()),
         sidecar,
         &service_root,
+        Path::new(repo_path),
     );
     let results = result_index_of(
         &request_inputs,
@@ -28717,6 +28753,7 @@ unfollowed_member_calls_total: 0,
                 name_scope: None,
                 library_semantics: Vec::new(),
                 inference: None,
+                label_member: None,
             };
         let procedures = procedure_sites(
             &[
@@ -30390,6 +30427,7 @@ unfollowed_member_calls_total: 0,
             within: Vec::new(),
             base: None,
             procedure: None,
+            label_member: None,
         }
     }
 
@@ -31222,9 +31260,17 @@ unfollowed_member_calls_total: 0,
         let asks = || super::DECLARATION_ASKS.with(|asks| asks.get());
         super::DECLARATION_ASKS.with(|asks| asks.set(0));
         let (_, first) = receiver_trace_first(&on, &exports, trace).await;
-        let settled =
-            super::settled_declarations(first, &on.inputs, &[], &exports, Some(&sidecar), &on.repo)
-                .expect("the service has rows");
+        let settled = super::settled_declarations(
+            first,
+            &on.inputs,
+            &[],
+            &exports,
+            &receiver_trace_answer().answered_packages,
+            Some(&sidecar),
+            &on.repo,
+            &on.repo,
+        )
+        .expect("the service has rows");
         assert!(!settled.is_empty(), "the verifier names declarations");
         assert_eq!(asks(), 1, "one ask when the settled claims are the first's");
 
@@ -31235,7 +31281,9 @@ unfollowed_member_calls_total: 0,
             &on.inputs,
             &[],
             &exports[..more],
+            &receiver_trace_answer().answered_packages,
             Some(&sidecar),
+            &on.repo,
             &on.repo,
         )
         .expect("the service has rows");

@@ -109,6 +109,18 @@ export declare class SocketServer {
 }
 `;
 
+// A table client: a factory, `from(table)` returns a builder whose members send.
+const TABLES = `export interface Builder {
+  select(): Promise<unknown>;
+  insert(row: unknown): Promise<unknown>;
+}
+export interface Tables {
+  from(table: string): Builder;
+  get(path: string): Promise<unknown>;
+}
+export declare function createTables(url: string): Tables;
+`;
+
 function writeTree(root: string, files: Record<string, string>): void {
   for (const [rel, text] of Object.entries(files)) {
     const file = path.join(root, rel);
@@ -182,6 +194,8 @@ describe('verify_library_claims: label structure v2 (carrick#2434)', () => {
       'node_modules/fixture-http/index.d.ts': HTTP,
       'node_modules/fixture-hooks/package.json': packageJson('fixture-hooks'),
       'node_modules/fixture-hooks/index.d.ts': HOOKS,
+      'node_modules/fixture-tables/package.json': packageJson('fixture-tables'),
+      'node_modules/fixture-tables/index.d.ts': TABLES,
       'node_modules/fixture-router/package.json': packageJson('fixture-router'),
       'node_modules/fixture-router/index.d.ts': ROUTER,
       'node_modules/fixture-sockets/package.json': packageJson('fixture-sockets'),
@@ -227,6 +241,75 @@ describe('verify_library_claims: label structure v2 (carrick#2434)', () => {
     assert.deepStrictEqual(
       verdicts(await send([factory, beacon({ method_default: 'POST' }), beacon({ method_default: 'SEND' })])),
       ['verified', 'verified', 'failed method_not_word']
+    );
+  });
+
+  it('name_prefix: the text before a name slot, accepted where method_default is, never checked', async () => {
+    const beacon = (parts: Record<string, unknown>) => onClient(op('request', 'beacon', { payload: { arg: 1 }, ...parts }));
+    const R = 'fixture-router';
+    const S = 'fixture-sockets';
+    assert.deepStrictEqual(
+      verdicts(
+        await send([
+          factory,
+          beacon({ name: { arg: 0 }, name_prefix: '/functions/v1/', method_default: 'POST' }),
+          // Its value is the picker's reading of the library: any text holds.
+          beacon({ name: { arg: 0 }, name_prefix: 'not-a-path' }),
+          // Invalid: no name slot for it to stand before.
+          beacon({ name: { bound: 'maker' }, name_prefix: '/functions/v1/' }),
+          // Invalid: a route registers a path, it is not an HTTP request op.
+          check(R, 'router', 'server_framework', 'export', make('call', null)),
+          check(R, 'router', 'server_framework', 'instance:()', op('receive', 'get', { name: { arg: 0 }, of: 'instance:()', method: 'GET', name_prefix: '/v1/' })),
+          // Invalid: a message role carries no HTTP field.
+          check(S, 'SocketServer', 'socket', 'export', make('new', null)),
+          check(S, 'SocketServer', 'socket', 'instance:new', op('receive', 'on', { name: { arg: 0 }, handler: { arg: 1 }, of: 'instance:new', name_prefix: '/v1/' })),
+        ])
+      ),
+      [
+        'verified',
+        'verified',
+        'verified',
+        'unchecked claim_invalid',
+        'verified',
+        'unchecked claim_invalid',
+        'verified',
+        'unchecked claim_invalid',
+      ]
+    );
+  });
+
+  it('name_prefix on a scope-bound name: placed only on an HTTP request op whose receiver has a scope step', async () => {
+    const T = 'fixture-tables';
+    const tables = (receiver: string, claim: Claim) => check(T, 'createTables', 'http_client', receiver, claim);
+    const from: Claim = { kind: 'scope', member: 'from', name: { arg: 0 }, on: 'instance' };
+    const scoped = (parts: Record<string, unknown>) =>
+      tables('instance:()>scope:from', op('request', 'select', { name: { bound: 'scope' }, method_default: 'GET', ...parts }));
+    assert.deepStrictEqual(
+      verdicts(
+        await send([
+          tables('export', make('call', null)),
+          tables('instance:()', from),
+          // Placed: a scope-bound name, a scope step on the receiver.
+          scoped({ name_prefix: '/rest/v1/' }),
+          // Control: the same op with no prefix.
+          scoped({}),
+          // Invalid: the name is bound by a scope on a receiver no scope made.
+          tables('instance:()', op('request', 'get', { name: { bound: 'scope' }, name_prefix: '/rest/v1/' })),
+          // Invalid: a maker-bound name still takes no prefix.
+          scoped({ name: { bound: 'maker' }, name_prefix: '/rest/v1/' }),
+          // Invalid: a literal name takes no prefix.
+          scoped({ name: { literal: 'items' }, name_prefix: '/rest/v1/' }),
+        ])
+      ),
+      [
+        'verified',
+        'verified',
+        'verified',
+        'verified',
+        'unchecked claim_invalid',
+        'unchecked claim_invalid',
+        'unchecked claim_invalid',
+      ]
     );
   });
 
@@ -360,6 +443,8 @@ describe('verify_library_claims: label structure v2 (carrick#2434)', () => {
       op('request', 'get', { name: { arg: 0 }, runs: { bound: 'scope', arg: 0 } }),
       op('receive', 'on', { name: { arg: 0 }, yields: { param: -1, export: 'Socket', side: 'server' } }),
       op('request', 'get', { name: { arg: 0 }, method_default: '' }),
+      op('request', 'get', { name: { arg: 0 }, name_prefix: '' }),
+      op('request', 'get', { name: { arg: 0 }, name_prefix: 7 }),
       make('call', null, { runs: { bound: 'maker', arg: 0 } }),
     ];
     for (const claim of shapes) {

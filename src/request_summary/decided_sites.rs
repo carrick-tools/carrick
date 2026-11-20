@@ -114,6 +114,18 @@ pub struct LabelledEnd {
     /// walked on a proxy ([`super::discovery::ProcedureAt`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procedure: Option<super::discovery::ProcedureAt>,
+    /// The sub-object hops the op is claimed under
+    /// ([`super::discovery::SiteEnd::path`]); empty for every end but a
+    /// hopped instance call's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    /// The condition of the op the call was chosen for, when a label of
+    /// its member applies only where a slot holds a literal and the call's
+    /// slot holds it ([`SiteLabel::when_chosen`]): every lookup of the
+    /// call's label by its end ([`SiteLabel::find`]) then takes that op.
+    /// `None` on every other end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<crate::services::type_sidecar::ClaimWhen>,
 }
 
 impl LabelledEnd {
@@ -253,6 +265,16 @@ pub struct SiteLabel {
     /// receiver's instance walk ends at, never at the op's own call.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub name_at_maker: bool,
+    /// The literal text the library puts before the `name` slot's value
+    /// (claim `name_prefix`, contract amendment R27 on carrick#2434), joined
+    /// before the name a site's slot reads ([`Self::prefixed`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_prefix: Option<String>,
+    /// The sub-object hops the op is claimed under (`["functions"]` for
+    /// `client.functions.invoke`): [`Self::find`] gives a hopped end the
+    /// label of its own hops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
     #[serde(default)]
     pub payload: Option<ArgSlot>,
     #[serde(default)]
@@ -286,6 +308,12 @@ pub struct SiteLabel {
     /// is unchanged.
     #[serde(skip)]
     pub name_scope: Option<crate::services::type_sidecar::NameScope>,
+    /// The op applies only where this slot holds this literal (claim
+    /// `when`, amendment 7): a call of the member whose slot holds it takes
+    /// this label over the member's label with no condition
+    /// ([`Self::when_chosen`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<crate::services::type_sidecar::ClaimWhen>,
 }
 
 /// The scope member an op is claimed on the result of (carrick#1678):
@@ -379,6 +407,9 @@ impl SiteLabel {
                         yields: op.yields,
                         name_scope: None,
                         name_at_maker: false,
+                        name_prefix: None,
+                        path: Vec::new(),
+                        when: None,
                     });
                 }
             }
@@ -440,6 +471,9 @@ impl SiteLabel {
                         yields: None,
                         name_scope: None,
                         name_at_maker: false,
+                        name_prefix: None,
+                        path: Vec::new(),
+                        when: None,
                     });
                     continue;
                 }
@@ -464,10 +498,12 @@ impl SiteLabel {
                     method,
                     method_key,
                     method_default,
+                    name_prefix,
                     request,
                     yields,
                     name_scope,
                     runs,
+                    when,
                     ..
                 } = claim
                 else {
@@ -515,6 +551,9 @@ impl SiteLabel {
                             yields: None,
                             name_scope: None,
                             name_at_maker: false,
+                            name_prefix: None,
+                            path: Vec::new(),
+                            when: None,
                         });
                     }
                     continue;
@@ -554,6 +593,22 @@ impl SiteLabel {
                             ..
                         })
                     ),
+                    // A prefix goes before the value of a name slot, or
+                    // before the name the scope call it is made on the
+                    // result of binds (R27b on carrick#2434); on any other
+                    // name it has nothing to stand before.
+                    name_prefix: match name.as_deref() {
+                        Some(
+                            OpName::Slot(_)
+                            | OpName::Bound {
+                                bound: BoundName::Scope,
+                                ..
+                            },
+                        ) => name_prefix.as_deref().cloned(),
+                        _ => None,
+                    },
+                    when: when.as_deref().cloned(),
+                    path: path.clone(),
                     payload: payload.as_ref().map(slot),
                     handler: handler.as_ref().map(slot),
                     method,
@@ -589,11 +644,100 @@ impl SiteLabel {
     /// member, claimed on the same receiver: a member also claimed on what a
     /// scope member returns (`get` of a router and `get` of the object its
     /// `at` returns) is two labels, told apart by the end's scope step
-    /// (carrick#1678). A maker's label (no op) is [`Self::runner`]'s.
+    /// (carrick#1678). A maker's label (no op) is [`Self::runner`]'s. An end
+    /// read through hops takes the label claimed under the same hops, or
+    /// none (`client.posts.list` never reads `client.users.list`'s label);
+    /// an end with none takes the first label claimed on the receiver
+    /// itself, else the first that is on it (C1).
     pub fn find<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Option<&'l SiteLabel> {
-        labels
+        let on = Self::candidates(labels, end);
+        // An end chosen for a conditional op takes that op; any other end
+        // takes the member's op with no condition, where it has one
+        // ([`Self::when_chosen`]).
+        match &end.when {
+            Some(when) => on
+                .into_iter()
+                .find(|label| label.when.as_ref() == Some(when)),
+            None => on
+                .iter()
+                .find(|label| label.when.is_none())
+                .or_else(|| on.first())
+                .copied(),
+        }
+    }
+
+    /// The op labels `end` may take, whatever their condition: claimed on
+    /// its receiver ([`Self::is_on`]), under the end's hops where it has
+    /// some, else on the receiver itself where any is, else all of them
+    /// (C1). [`Self::find`] and [`Self::when_chosen`] choose among these.
+    fn candidates<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Vec<&'l SiteLabel> {
+        let on: Vec<&SiteLabel> = labels
             .iter()
-            .find(|label| label.op.is_some() && label.is_on(end))
+            .filter(|label| label.op.is_some() && label.is_on(end))
+            .collect();
+        if !end.path.is_empty() {
+            return on
+                .into_iter()
+                .filter(|label| label.path == end.path)
+                .collect();
+        }
+        if on.iter().any(|label| label.path.is_empty()) {
+            return on
+                .into_iter()
+                .filter(|label| label.path.is_empty())
+                .collect();
+        }
+        on
+    }
+
+    /// Whether a label of `end`'s member applies only where a slot holds a
+    /// literal: what a call of it sends is decided by [`Self::when_chosen`].
+    pub fn has_condition(labels: &[SiteLabel], end: &LabelledEnd) -> bool {
+        Self::candidates(labels, end)
+            .iter()
+            .any(|label| label.when.is_some())
+    }
+
+    /// Which op of `end`'s member the labelled call `call` is, where the
+    /// member has an op with no condition and one or more that apply only
+    /// where a slot holds a literal (claim `when`): `Ok(Some(_))` names the
+    /// condition its slot meets, and `Ok(None)` is the op with no condition
+    /// (every condition's slot is unwritten or holds another literal). A
+    /// slot whose value the source does not state as a literal is
+    /// `Err(())`: the call sends one op or the other at run time, so it
+    /// states neither. A member with no conditional op, or with no op
+    /// without one, is `Ok(None)`, read as before.
+    pub(super) fn when_chosen(
+        labels: &[SiteLabel],
+        end: &LabelledEnd,
+        call: &super::CallIr,
+    ) -> Result<Option<crate::services::type_sidecar::ClaimWhen>, ()> {
+        let on = Self::candidates(labels, end);
+        if !on.iter().any(|label| label.when.is_none()) {
+            return Ok(None);
+        }
+        let mut unread = false;
+        for when in on.iter().filter_map(|label| label.when.as_ref()) {
+            match super::library_sites::literal_at(call.site_args.as_deref(), when) {
+                super::library_sites::LiteralAt::Holds(text) if text == when.literal => {
+                    return Ok(Some(when.clone()));
+                }
+                super::library_sites::LiteralAt::Unread => unread = true,
+                _ => {}
+            }
+        }
+        if unread { Err(()) } else { Ok(None) }
+    }
+
+    /// `name`, after the literal text the library puts before this label's
+    /// name ([`Self::name_prefix`]), joined as [`super::join_name_prefix`]
+    /// joins it. A label whose name is read nowhere ([`Self::reads_name`])
+    /// or that has no prefix leaves it as it is.
+    pub fn prefixed(&self, name: Vec<Piece>) -> Vec<Piece> {
+        match &self.name_prefix {
+            Some(prefix) if self.reads_name() => super::join_name_prefix(prefix, &name),
+            _ => name,
+        }
     }
 
     /// Whether the label is claimed on the receiver `end` is made on: the
@@ -3101,6 +3245,14 @@ impl<'a> Walk<'a, '_> {
         name_args: BTreeSet<usize>,
         name_at: Option<NameAt>,
     ) {
+        // The library puts its prefix before whatever name the slot reads
+        // (C1): every walk's name is composed here, so two walks compare
+        // composed names. The reserved names are the bare ones.
+        let bare = name;
+        let name = match self.label {
+            Some(label) if !bare.is_empty() => label.prefixed(bare.clone()),
+            _ => bare.clone(),
+        };
         let via = via_of(self.root, down);
         let placed = &down[0];
         // A site is a call of this service's own files (carrick#2618).
@@ -3139,7 +3291,7 @@ impl<'a> Walk<'a, '_> {
         // the join point, which withdraws this one then (carrick#2618,
         // `call_through::state_leaves`).
         let label = self.label;
-        if let Some(text) = literal_name(&name)
+        if let Some(text) = literal_name(&bare)
             && label.is_some_and(|label| label.reserved.contains(&text))
         {
             self.out.reserved.push(end.at());
@@ -4852,6 +5004,30 @@ fn decide(
             }
             continue;
         }
+        // A member with an op that applies only where a slot holds a
+        // literal: the call is that op where its slot holds it, the op with
+        // no condition where nothing or another literal is written there,
+        // and a lead where the source does not state the slot as a literal
+        // (it sends one op or the other at run time). The end carries the
+        // choice, so every lookup of its label agrees.
+        let chosen: LabelledEnd;
+        let end = match calls.at_span(&root.join(&end.file), end.span_start, end.span_end) {
+            Some(placed) => match SiteLabel::when_chosen(labels, end, placed.call) {
+                Err(()) => {
+                    walk.lead(&placed, end, Stop::SeveralOperations);
+                    continue;
+                }
+                Ok(Some(when)) => {
+                    chosen = LabelledEnd {
+                        when: Some(when),
+                        ..end.clone()
+                    };
+                    &chosen
+                }
+                Ok(None) => end,
+            },
+            None => end,
+        };
         let Some(label) = SiteLabel::find(labels, end) else {
             // A call that hands a maker the function it runs
             // (carrick#2426): the function holds the request, found at its
@@ -5440,6 +5616,9 @@ enum MadeBase {
     None,
     /// Every maker was handed this literal base.
     Text(String),
+    /// Every maker was handed, as a positional argument, one read of this
+    /// environment variable with no fallback ([`maker_base_env`], C1).
+    Env(EnvBase),
     /// A maker was handed a base the code does not state as text, the
     /// makers disagree, or the instance is used in a way that may change it.
     Unstated,
@@ -5470,12 +5649,25 @@ fn maker_base(
     // Then the argument as the maker call writes it, read by the resolver.
     // A spread argument holds what the source does not state.
     let spread = args.get(arg).is_some_and(|held| held.spread);
+    // A base the code does not state as text may still be one env read, as
+    // the maker call writes it (C1): positional and not spread only.
+    let env_or_unstated = |reads: &BaseReads<'_, '_>| -> MadeBase {
+        if key.is_some() || spread {
+            return MadeBase::Unstated;
+        }
+        at.and_then(|(file, span)| reads.sites.get(&(file.to_string(), span.0, span.1)))
+            .and_then(|site| maker_base_env(export, site, &reads.resolver))
+            .map_or(MadeBase::Unstated, MadeBase::Env)
+    };
     if !spread
         && let Some((file, span)) = at
         && let Some(read) = reads.fold.arg_texts(file, span, arg, key)
     {
         return match read {
-            super::resolve::ArgTexts::Values(values) => agreed_text(&values),
+            super::resolve::ArgTexts::Values(values) => match agreed_text(&values) {
+                MadeBase::Unstated => env_or_unstated(reads),
+                base => base,
+            },
             // An options object the resolver cannot read keeps today's
             // host-free reading, counted: ruled on once main's check
             // reports it (R3).
@@ -5497,7 +5689,7 @@ fn maker_base(
         }
         return MadeBase::None;
     }
-    MadeBase::Unstated
+    env_or_unstated(reads)
 }
 
 /// The base slot the make claim of `export` names for a maker call of
@@ -5669,18 +5861,33 @@ struct BaseReads<'f, 'r> {
     fold: &'f mut super::site_record::NameFold<'r>,
     root: &'f Path,
     options_unread: usize,
+    /// The library sites by repo-relative file and span: a maker call's own
+    /// site, which [`maker_base_env`] reads (C1).
+    sites: &'f HashMap<(String, u32, u32), &'f super::LibrarySite>,
+    resolver: Resolver<'r>,
 }
 
 /// One instance's base from the bases of its makers: every maker handed the
-/// same literal, or none handed one. Makers that disagree, or a base one
-/// maker does not state as text, are `Unstated`.
+/// same literal, every one handed a read of the same env variable, or none
+/// handed one. Makers that disagree (an env read beside a literal, another
+/// variable, or no base), or a base one maker does not state, are
+/// `Unstated`.
 fn agreed_base(bases: impl IntoIterator<Item = MadeBase>) -> MadeBase {
     let mut seen: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut envs: BTreeSet<EnvBase> = BTreeSet::new();
     for base in bases {
         match base {
             MadeBase::Unstated => return MadeBase::Unstated,
             MadeBase::None => seen.insert(None),
             MadeBase::Text(text) => seen.insert(Some(text)),
+            MadeBase::Env(env) => envs.insert(env),
+        };
+    }
+    if !envs.is_empty() {
+        let mut envs = envs.into_iter();
+        return match (seen.is_empty(), envs.next(), envs.next()) {
+            (true, Some(env), None) => MadeBase::Env(env),
+            _ => MadeBase::Unstated,
         };
     }
     let mut seen = seen.into_iter();
@@ -5734,7 +5941,7 @@ fn made_base(
 /// could not read inside the code (R1, D6).
 fn instance_base(bases: impl IntoIterator<Item = MadeBase>, may_change: bool) -> MadeBase {
     match agreed_base(bases) {
-        MadeBase::Text(_) if may_change => MadeBase::Unstated,
+        MadeBase::Text(_) | MadeBase::Env(_) if may_change => MadeBase::Unstated,
         base => base,
     }
 }
@@ -5959,11 +6166,6 @@ impl Decided {
     ) -> BaseCarry {
         let mut fold = super::site_record::NameFold::new(inputs, siblings, root);
         let calls = Calls::index(inputs);
-        let mut reads = BaseReads {
-            fold: &mut fold,
-            root,
-            options_unread: 0,
-        };
         let at: HashMap<(String, u32, u32), &super::LibrarySite> = library
             .sites
             .iter()
@@ -5975,6 +6177,13 @@ impl Decided {
                 )
             })
             .collect();
+        let mut reads = BaseReads {
+            fold: &mut fold,
+            root,
+            options_unread: 0,
+            sites: &at,
+            resolver: Resolver::new(inputs, siblings),
+        };
         let before = self.sites.len();
         self.sites.retain_mut(|site| {
             if site.end.role != "http_client" || site.key.is_some() || site.name.is_empty() {
@@ -6000,6 +6209,22 @@ impl Decided {
                 MadeBase::Unstated => false,
                 MadeBase::Text(base) => {
                     site.name = super::join_base(&[Piece::Lit(base)], &site.name);
+                    site.name_text().is_some()
+                }
+                // The env read, as the maker call writes it, stands before
+                // the path; a base this repository serves is stripped where
+                // the row is keyed (P2b's learned variables).
+                MadeBase::Env(EnvBase { written, name }) => {
+                    let read = Piece::Opaque {
+                        text: written.clone(),
+                        end: super::Root::Env {
+                            written,
+                            name,
+                            fallback: None,
+                        },
+                        link: None,
+                    };
+                    site.name = super::join_base(&[read], &site.name);
                     site.name_text().is_some()
                 }
             }
@@ -6455,6 +6680,178 @@ pub(crate) mod tests {
         );
     }
 
+    /// Contract amendment R27 on carrick#2434: a request op's `name_prefix`
+    /// rides on its label beside the name slot it stands before, and only
+    /// there; a label without one carries none.
+    #[test]
+    fn a_name_prefix_rides_on_the_label_of_a_name_slot() {
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([{
+                "package": "@fixture/hosted",
+                "version": "1.0.0",
+                "specifier": "@fixture/hosted",
+                "export": "createClient",
+                "role": "http_client",
+                "side": "client",
+                "claims": [
+                    { "kind": "op", "op": "request", "member": "invoke", "path": ["functions"],
+                      "on": "instance", "name": { "arg": 0 }, "name_prefix": "/functions/v1/",
+                      "method_key": { "arg": 1, "key": "method" }, "method_default": "POST",
+                      "payload": { "arg": 1, "key": "body" } },
+                    { "kind": "op", "op": "request", "member": "send", "on": "instance",
+                      "name": { "bound": "maker" }, "name_prefix": "/functions/v1/" },
+                    { "kind": "op", "op": "request", "member": "post", "on": "instance",
+                      "name": { "arg": 0 }, "method": "POST" }
+                ]
+            }]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        let prefixes: Vec<_> = labels
+            .iter()
+            .map(|label| (label.member.as_deref(), label.name_prefix.as_deref()))
+            .collect();
+        assert_eq!(
+            prefixes,
+            [
+                (Some("invoke"), Some("/functions/v1/")),
+                (Some("send"), None),
+                (Some("post"), None),
+            ]
+        );
+        let unset = serde_json::to_value(&labels[2]).unwrap();
+        assert!(unset.get("name_prefix").is_none(), "{unset}");
+    }
+
+    /// The scoped builder ops of a hosted-tables client: `select` with no
+    /// condition, `select` where argument 1's `head` key holds `true`, and
+    /// `insert`, each on what `from` returns with the scope's name and the
+    /// prefix `/rest/v1/` (R27b on carrick#2434).
+    fn table_labels() -> Vec<SiteLabel> {
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([{
+                "package": "@fixture/hosted",
+                "version": "1.0.0",
+                "specifier": "@fixture/hosted",
+                "export": "createClient",
+                "role": "http_client",
+                "side": "client",
+                "claims": [
+                    { "kind": "op", "op": "request", "member": "select",
+                      "of": "instance:()>scope:from", "name": { "bound": "scope" },
+                      "name_prefix": "/rest/v1/", "method_default": "GET" },
+                    { "kind": "op", "op": "request", "member": "select",
+                      "of": "instance:()>scope:from", "name": { "bound": "scope" },
+                      "name_prefix": "/rest/v1/", "method_default": "HEAD",
+                      "when": { "arg": 1, "key": "head", "literal": "true" } },
+                    { "kind": "op", "op": "request", "member": "insert",
+                      "of": "instance:()>scope:from", "name": { "bound": "scope" },
+                      "name_prefix": "/rest/v1/", "method_default": "POST" }
+                ]
+            }]))
+            .unwrap();
+        SiteLabel::from_exports(&exports)
+    }
+
+    /// R27b: a prefix rides on a scoped op's label, and stands before the
+    /// name the scope call binds.
+    #[test]
+    fn a_name_prefix_stands_before_the_name_a_scope_call_binds() {
+        let labels = table_labels();
+        assert!(labels.iter().all(|label| {
+            label.name_prefix.as_deref() == Some("/rest/v1/")
+                && label.scope.as_ref().is_some_and(|scope| scope.names)
+        }));
+        assert_eq!(
+            labels[0].prefixed(vec![Piece::Lit("notes".into())]),
+            [Piece::Lit("/rest/v1/notes".into())]
+        );
+    }
+
+    /// The end of a `select` call made on what `from` returns.
+    fn select_end() -> LabelledEnd {
+        LabelledEnd {
+            package: "@fixture/hosted".into(),
+            export: "createClient".into(),
+            member: Some("select".into()),
+            role: "http_client".into(),
+            op: Some("request".into()),
+            file: "src/a.ts".into(),
+            line: 1,
+            span_start: 0,
+            span_end: 1,
+            new: false,
+            scope: Some("from".into()),
+            procedure: None,
+            path: Vec::new(),
+            when: None,
+        }
+    }
+
+    /// A call of a member with an op under a `when` condition takes that op
+    /// where its slot holds the literal, the op with no condition where the
+    /// slot is unwritten or holds another literal, and neither where the
+    /// source does not state the slot as a literal. The end carries the
+    /// choice, and [`SiteLabel::find`] reads it.
+    #[test]
+    fn a_when_slot_chooses_the_op_its_literal_names() {
+        let labels = table_labels();
+        let file = super::super::tests::file_ir_of(
+            r#"
+            declare const q: { select(c: string, o?: object): void };
+            export function f(head: boolean, opts: object) {
+                q.select("*", { head: true });
+                q.select("*", { head: false });
+                q.select("*", { count: "exact" });
+                q.select("*");
+                q.select("*", { head });
+                q.select("*", opts);
+                q.select("*", { ...opts });
+            }
+        "#,
+        );
+        let calls = &file.functions["f"].calls;
+        let end = select_end();
+        let chosen: Vec<Result<Option<&str>, ()>> = calls
+            .iter()
+            .map(|call| {
+                SiteLabel::when_chosen(&labels, &end, call)
+                    .map(|when| when.map(|when| if when.literal == "true" { "head" } else { "?" }))
+            })
+            .collect();
+        assert_eq!(
+            chosen,
+            [
+                Ok(Some("head")),
+                Ok(None),
+                Ok(None),
+                Ok(None),
+                Err(()),
+                Err(()),
+                Err(())
+            ]
+        );
+        let method = |end: &LabelledEnd| {
+            SiteLabel::find(&labels, end)
+                .and_then(|label| label.method.as_ref())
+                .and_then(|method| method.default.clone())
+        };
+        assert_eq!(method(&end).as_deref(), Some("GET"));
+        let head = LabelledEnd {
+            when: SiteLabel::when_chosen(&labels, &end, &calls[0]).unwrap(),
+            ..end.clone()
+        };
+        assert_eq!(method(&head).as_deref(), Some("HEAD"));
+        // A member with no conditional op is read as before.
+        let insert = LabelledEnd {
+            member: Some("insert".into()),
+            ..end
+        };
+        assert_eq!(
+            SiteLabel::when_chosen(&labels, &insert, &calls[4]),
+            Ok(None)
+        );
+    }
+
     /// carrick#2439: the scan's settled claims give one label per op, with
     /// its slots, method fields, role and side, as the store's raw answer
     /// does; a maker labels no op, and a name bound to the maker no name
@@ -6488,6 +6885,9 @@ pub(crate) mod tests {
                     yields: None,
                     name_scope: None,
                     name_at_maker: false,
+                    name_prefix: None,
+                    path: Vec::new(),
+                    when: None,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("post".into()),
@@ -6514,6 +6914,9 @@ pub(crate) mod tests {
                     name_scope: None,
                     // A name bound to the maker is read there (carrick#3527).
                     name_at_maker: true,
+                    name_prefix: None,
+                    path: Vec::new(),
+                    when: None,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("send".into()),
@@ -6658,6 +7061,8 @@ pub(crate) mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
+            when: None,
             span_end: line * 100 + 20,
         };
         let sites = [
@@ -6717,6 +7122,8 @@ pub(crate) mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
+            when: None,
         }
     }
 
@@ -7395,6 +7802,8 @@ pub(crate) mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
+            when: None,
             span_end: start + call.len() as u32,
         };
         let bottom = DiscoverySite {
@@ -7529,6 +7938,9 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
+            path: Vec::new(),
+            when: None,
             package: "@fixture/wire".into(),
             export: "connect".into(),
             member: Some(member.into()),
@@ -7554,6 +7966,9 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
+            path: Vec::new(),
+            when: None,
             package: "lib:lib.dom.d.ts".into(),
             export: "fetch".into(),
             member: None,
@@ -7587,6 +8002,9 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
+            path: Vec::new(),
+            when: None,
             package: "node:child_process".into(),
             export: "ChildProcess".into(),
             member: Some("send".into()),
@@ -7619,6 +8037,8 @@ pub(crate) mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
+            when: None,
             span_end,
         }
     }
@@ -8449,6 +8869,9 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
+            path: Vec::new(),
+            when: None,
             name: None,
             handler: Some(ArgSlot { arg: 0, key: None }),
             scope: Some(LabelScope {
@@ -8518,6 +8941,8 @@ pub(crate) mod tests {
             new: true,
             scope: None,
             procedure: None,
+            path: Vec::new(),
+            when: None,
         };
         assert_eq!(SiteLabel::find(&labels, &built), Some(&labels[0]));
         let called = LabelledEnd {
@@ -8706,6 +9131,9 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
+            path: Vec::new(),
+            when: None,
             package: "@fixture/http".into(),
             export: "default".into(),
             member: Some("get".into()),
@@ -10202,5 +10630,211 @@ pub(crate) mod tests {
             assert!(learned.is_empty(), "{source}: {learned:?}");
             assert!(bases.is_empty(), "{source}: {bases:?}");
         }
+    }
+
+    /// [`http_get_label`] with the library's `prefix` before its name slot.
+    fn label_with_prefix(prefix: &str) -> SiteLabel {
+        SiteLabel {
+            name_prefix: Some(prefix.to_string()),
+            ..http_get_label()
+        }
+    }
+
+    /// C1: a request op's `name_prefix` stands before the name its slot
+    /// reads, composed where the site is written.
+    #[test]
+    fn a_name_prefix_stands_before_the_name_its_slot_reads() {
+        for (label, wanted) in [
+            (label_with_prefix("/x/v1/"), "/x/v1/status"),
+            (http_get_label(), "/status"),
+        ] {
+            let (decided, _, _) = decided_at(INSTANCES, &["plain.get(\"/status\")"], &label);
+            assert_eq!(
+                names_at(&decided, INSTANCES)
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .collect::<Vec<_>>(),
+                vec![Some(wanted.to_string())]
+            );
+        }
+    }
+
+    /// C1: one member claimed on the receiver and under two hops is three
+    /// labels: an end read through hops takes the label of its own hops or
+    /// none, and an end with none takes the receiver's own, in either order.
+    #[test]
+    fn a_hopped_end_reads_the_label_of_its_own_path() {
+        let at = |path: &[&str]| SiteLabel {
+            path: path.iter().map(|hop| hop.to_string()).collect(),
+            ..http_get_label()
+        };
+        let end_on = |path: &[&str]| LabelledEnd {
+            path: path.iter().map(|hop| hop.to_string()).collect(),
+            ..end_for(&http_get_label(), "x.ts", "c.get(\"/a\")", "c.get(\"/a\")")
+        };
+        for labels in [
+            [at(&[]), at(&["users"]), at(&["posts"])],
+            [at(&["posts"]), at(&["users"]), at(&[])],
+        ] {
+            let path_of = |end: &LabelledEnd| SiteLabel::find(&labels, end).map(|l| l.path.clone());
+            assert_eq!(
+                path_of(&end_on(&["posts"])),
+                Some(vec!["posts".to_string()])
+            );
+            assert_eq!(
+                path_of(&end_on(&["users"])),
+                Some(vec!["users".to_string()])
+            );
+            assert_eq!(path_of(&end_on(&["teams"])), None);
+            assert_eq!(path_of(&end_on(&[])), Some(Vec::new()));
+        }
+    }
+
+    /// The base [`maker_base`] reads at each maker call of `source` (as
+    /// `src/platform.ts` of a service depending on the platform package)
+    /// under `export`'s make claim. `None` where the sidecar is not built.
+    fn made_from(
+        source: &str,
+        export: &crate::library_claims::ExportClaims,
+    ) -> Option<Vec<MadeBase>> {
+        let manifest_text =
+            "{ \"name\": \"web\", \"dependencies\": { \"@fixture/platform\": \"1.0.0\" } }\n";
+        let on = super::super::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &[("package.json", manifest_text), ("src/platform.ts", source)],
+            true,
+        )?;
+        let library = crate::request_summary::library_sites(&on.inputs);
+        let at: HashMap<(String, u32, u32), &super::super::LibrarySite> = library
+            .sites
+            .iter()
+            .filter(|site| site.origin.is_none())
+            .map(|site| {
+                (
+                    (
+                        relative(&on.repo, &site.file),
+                        site.span_start,
+                        site.span_end,
+                    ),
+                    site,
+                )
+            })
+            .collect();
+        let mut fold = super::super::site_record::NameFold::new(&on.inputs, &[], &on.repo);
+        let mut reads = BaseReads {
+            fold: &mut fold,
+            root: &on.repo,
+            options_unread: 0,
+            sites: &at,
+            resolver: Resolver::new(&on.inputs, &[]),
+        };
+        let makers: Vec<&super::super::LibrarySite> = library
+            .sites
+            .iter()
+            .filter(|site| {
+                site.origin.is_none()
+                    && site.package() == "@fixture/platform"
+                    && site.receiver == super::super::SiteReceiver::Export
+                    && site.member.is_none()
+            })
+            .collect();
+        Some(
+            makers
+                .into_iter()
+                .map(|site| {
+                    let file = relative(&on.repo, &site.file);
+                    maker_base(
+                        export,
+                        site.form,
+                        None,
+                        &site.args,
+                        Some((&file, (site.span_start, site.span_end))),
+                        &mut reads,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// C1: a maker handed one env read as a positional argument, with no
+    /// fallback, carries that variable as the read is written; a fallback,
+    /// a keyed slot or a spread argument is a base the code does not state.
+    /// Makers of one variable agree; of two, or beside a literal, they do
+    /// not; a contested instance's env base is not kept.
+    #[test]
+    fn an_env_made_instance_carries_its_variable() {
+        let env = |written: &str, name: &str| {
+            MadeBase::Env(EnvBase {
+                written: written.to_string(),
+                name: name.to_string(),
+            })
+        };
+        let positional = platform_export();
+        let keyed: crate::library_claims::ExportClaims =
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/platform", "version": "1.0.0",
+                "specifier": "@fixture/platform", "export": "createClient",
+                "role": "http_client", "side": "client",
+                "claims": [
+                    { "kind": "make", "form": "call", "member": null,
+                      "base": { "arg": 0, "key": "url" } }
+                ]
+            }))
+            .unwrap();
+        for (source, export, wanted) in [
+            (
+                "import { createClient } from \"@fixture/platform\";\n\
+                 const PLATFORM_URL = import.meta.env.VITE_PLATFORM_URL;\n\
+                 export const client = createClient(PLATFORM_URL, \"anon\");\n",
+                &positional,
+                env("import.meta.env.VITE_PLATFORM_URL", "VITE_PLATFORM_URL"),
+            ),
+            (
+                "import { createClient } from \"@fixture/platform\";\n\
+                 export const client = createClient(process.env.PLATFORM_URL as string, \"anon\");\n",
+                &positional,
+                env("process.env.PLATFORM_URL", "PLATFORM_URL"),
+            ),
+            (
+                "import { createClient } from \"@fixture/platform\";\n\
+                 const PLATFORM_URL = import.meta.env.VITE_PLATFORM_URL ?? \"https://abc.example.co\";\n\
+                 export const client = createClient(PLATFORM_URL, \"anon\");\n",
+                &positional,
+                MadeBase::Unstated,
+            ),
+            (
+                "import { createClient } from \"@fixture/platform\";\n\
+                 export const client = createClient({ url: process.env.PLATFORM_URL });\n",
+                &keyed,
+                MadeBase::Unstated,
+            ),
+            (
+                "import { createClient } from \"@fixture/platform\";\n\
+                 const args: [string, string] = [process.env.PLATFORM_URL as string, \"anon\"];\n\
+                 export const client = createClient(...args);\n",
+                &positional,
+                MadeBase::Unstated,
+            ),
+        ] {
+            let Some(made) = made_from(source, export) else {
+                return;
+            };
+            assert_eq!(made, vec![wanted], "{source}");
+        }
+        let one = || env("process.env.A_URL", "A_URL");
+        assert_eq!(agreed_base([one(), one()]), one());
+        assert_eq!(
+            agreed_base([one(), env("process.env.B_URL", "B_URL")]),
+            MadeBase::Unstated
+        );
+        assert_eq!(
+            agreed_base([one(), MadeBase::Text("https://a.example".into())]),
+            MadeBase::Unstated
+        );
+        assert_eq!(agreed_base([one(), MadeBase::None]), MadeBase::Unstated);
+        assert_eq!(instance_base([one()], true), MadeBase::Unstated);
+        assert_eq!(instance_base([one()], false), one());
     }
 }

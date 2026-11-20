@@ -255,6 +255,34 @@ export declare function wire(): Wire;
 `;
 
 // One member per name-slot, handler and maker rule.
+const HOSTED_REST = `export declare class FilterBuilder implements PromiseLike<unknown> {
+  eq(column: string, value: unknown): FilterBuilder;
+  then<A = unknown, B = never>(ok?: ((v: unknown) => A | PromiseLike<A>) | null, bad?: ((e: any) => B | PromiseLike<B>) | null): PromiseLike<A | B>;
+}
+export declare class QueryBuilder {
+  select(columns?: string, options?: { head?: boolean }): FilterBuilder;
+  insert(values: object): FilterBuilder;
+  upsert(values: object): FilterBuilder;
+  update(values: object): FilterBuilder;
+  delete(): FilterBuilder;
+  selectCount(columns?: string, options?: { head?: number }): FilterBuilder;
+  selectLoose(columns?: string, options?: { head?: any }): FilterBuilder;
+}
+`;
+const HOSTED = `import { QueryBuilder, FilterBuilder } from "@fixture/hosted-rest";
+export type GenericSchema = { Tables: Record<string, unknown>; Functions: Record<string, unknown> };
+export declare class HostedClient<S extends GenericSchema = any> {
+  from<T extends string & keyof S["Tables"]>(relation: T): QueryBuilder;
+  rpc<F extends string & keyof S["Functions"]>(fn: F, args?: object): FilterBuilder;
+}
+export declare class PlainClient {
+  from(relation: string): QueryBuilder;
+  rpc(fn: string, args?: object): FilterBuilder;
+}
+export declare function createClient<D = any>(url: string, key: string): HostedClient<any>;
+export declare function createPlainClient(url: string, key: string): PlainClient;
+`;
+
 const RULES = `export type Handler = (message: string) => void;
 export interface EventMap {
   [event: string]: unknown;
@@ -534,6 +562,10 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       'node_modules/@fixture/typed-emitter/index.d.ts': TYPED_EMITTER,
       'node_modules/fixture-typed-socket/package.json': packageJson('fixture-typed-socket', '4.0.0', { types: 'index.d.ts' }),
       'node_modules/fixture-typed-socket/index.d.ts': TYPED_SOCKET,
+      'node_modules/@fixture/hosted/package.json': packageJson('@fixture/hosted', '1.0.0', { types: 'index.d.ts', dependencies: { '@fixture/hosted-rest': '1.0.0' } }),
+      'node_modules/@fixture/hosted/index.d.ts': HOSTED,
+      'node_modules/@fixture/hosted-rest/package.json': packageJson('@fixture/hosted-rest', '1.0.0', { types: 'index.d.ts' }),
+      'node_modules/@fixture/hosted-rest/index.d.ts': HOSTED_REST,
       'node_modules/fixture-rules/package.json': packageJson('fixture-rules', '1.0.0', { types: 'index.d.ts' }),
       'node_modules/fixture-rules/index.d.ts': RULES,
       'node_modules/fixture-queue/package.json': packageJson('fixture-queue', '3.0.0', { types: 'index.d.ts' }),
@@ -1182,6 +1214,66 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       'unchecked export_untyped',
       'unchecked module_local',
     ]);
+  });
+
+  it('reads a name typed as a key of a type parameter\'s indexed map as a string slot, scope, builder ops, HEAD and rpc (amendment 2, B6)', async () => {
+    const H = '@fixture/hosted';
+    const scoped = (member: string, parts: Record<string, unknown>): Claim =>
+      op('request', member, { of: 'instance:()>scope:from', name: { bound: 'scope' }, ...parts });
+    const checks = [
+      check(H, 'createClient', 'http_client', 'export', make('call', null, { base: { arg: 0 } })),
+      check(H, 'createClient', 'http_client', 'instance:()', scope('from', { arg: 0 }, { of: 'instance:()' })),
+      check(H, 'createClient', 'http_client', 'instance:()>scope:from', scoped('select', { method_default: 'GET' })),
+      check(H, 'createClient', 'http_client', 'instance:()>scope:from', scoped('insert', { method_default: 'POST' })),
+      check(H, 'createClient', 'http_client', 'instance:()>scope:from', scoped('update', { method_default: 'PATCH' })),
+      check(H, 'createClient', 'http_client', 'instance:()>scope:from', scoped('delete', { method_default: 'DELETE' })),
+      check(H, 'createClient', 'http_client', 'instance:()>scope:from', scoped('upsert', { method_default: 'POST' })),
+      // V1b: the HEAD op's `when` is judged, not `part_unbuilt`.
+      check(H, 'createClient', 'http_client', 'instance:()>scope:from', scoped('select', { method_default: 'HEAD', when: { arg: 1, key: 'head', literal: 'true' } })),
+      check(H, 'createClient', 'http_client', 'instance:()', op('request', 'rpc', { of: 'instance:()', name: { arg: 0 }, method_default: 'POST' })),
+      // The same shape against a plain string name stays verified.
+      check(H, 'createPlainClient', 'http_client', 'export', make('call', null, { base: { arg: 0 } })),
+      check(H, 'createPlainClient', 'http_client', 'instance:()', scope('from', { arg: 0 }, { of: 'instance:()' })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), [
+      'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'verified',
+    ]);
+  });
+
+  it('answers failed when_not_accepted for a when slot that cannot hold its literal, and unchecked member_untyped for one that says nothing', async () => {
+    const H = '@fixture/hosted';
+    const at = 'instance:()>scope:from';
+    const head = (member: string): Claim =>
+      op('request', member, { of: at, name: { bound: 'scope' }, method_default: 'HEAD', when: { arg: 1, key: 'head', literal: 'true' } });
+    const got = verdicts(await send([
+      check(H, 'createClient', 'http_client', 'export', make('call', null, { base: { arg: 0 } })),
+      check(H, 'createClient', 'http_client', 'instance:()', scope('from', { arg: 0 }, { of: 'instance:()' })),
+      check(H, 'createClient', 'http_client', at, head('selectCount')),
+      check(H, 'createClient', 'http_client', at, head('selectLoose')),
+    ]));
+    assert.deepStrictEqual(got.slice(2), ['failed when_not_accepted', 'unchecked member_untyped']);
+  });
+
+  it('judges `when` on a request op: the slot must exist and accept the literal', async () => {
+    const H = '@fixture/hosted';
+    const head = (when: Record<string, unknown>): Claim =>
+      op('request', 'select', { of: 'instance:()>scope:from', name: { bound: 'scope' }, method_default: 'HEAD', when });
+    const at = 'instance:()>scope:from';
+    const checks = [
+      check(H, 'createClient', 'http_client', at, head({ arg: 1, key: 'head', literal: 'true' })),
+      // No such key on the options object.
+      check(H, 'createClient', 'http_client', at, head({ arg: 1, key: 'nothere', literal: 'true' })),
+      // The method takes at most two arguments.
+      check(H, 'createClient', 'http_client', at, head({ arg: 5, key: 'head', literal: 'true' })),
+    ];
+    const got = verdicts(await send([
+      check(H, 'createClient', 'http_client', 'export', make('call', null, { base: { arg: 0 } })),
+      check(H, 'createClient', 'http_client', 'instance:()', scope('from', { arg: 0 }, { of: 'instance:()' })),
+      ...checks,
+    ])).slice(2);
+    assert.strictEqual(got[0], 'verified');
+    assert.match(got[1], /^failed /);
+    assert.match(got[2], /^failed /);
   });
 
   it('refuses a name slot typed as a key of a concrete index-signature map, and reads a key of a type-parameter map as a string slot (amendment 2, B6)', async () => {

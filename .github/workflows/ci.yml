@@ -154,7 +154,7 @@ jobs:
           - shard: scan-3
             runner: cargo
             targets: >-
-              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test --test untrusted_tree_test --test manifest_hash_pin_test --test constant_names_test --test name_forms_test --test unread_sites_test --test unread_sites_unready_test --test version_segments_test --test trailing_slash_route_test --test decorator_route_array_test --test hosted_functions_test --test wrapper_request_line_test --test ask_in_parts_test --test previous_release_reads_blob_test
+              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test --test untrusted_tree_test --test manifest_hash_pin_test --test constant_names_test --test name_forms_test --test unread_sites_test --test unread_sites_unready_test --test version_segments_test --test trailing_slash_route_test --test decorator_route_array_test --test hosted_functions_test --test hosted_tables_test --test wrapper_request_line_test --test ask_in_parts_test --test previous_release_reads_blob_test
           - shard: scan-4
             runner: cargo
             targets: >-
@@ -162,7 +162,7 @@ jobs:
           - shard: steps
             runner: steps
             targets: >-
-              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test --test command_object_send_test --test phase_progress_test --test queue_enum_base_class_test --test pubsub_template_hole_test --test receiver_role_split_test --test pr_empty_answer_test --test socket_inherited_listener_test
+              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test --test command_object_send_test --test phase_progress_test --test queue_enum_base_class_test --test pubsub_template_hole_test --test reexport_emit_test --test receiver_role_split_test --test pr_empty_answer_test --test socket_inherited_listener_test
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

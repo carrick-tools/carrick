@@ -296,11 +296,32 @@ const ROLE_TABLE: Readonly<Record<LibraryRole, RoleRules | undefined>> = {
  * `http_client` export with one such claim in the request is read under
  * `HTTP_V2_RULES`.
  */
+/**
+ * Where an op's `name_prefix` (contract amendment R27 on carrick#2434) may
+ * sit: a non-empty string on an HTTP `request` op whose name is a slot, the
+ * value it stands before. The schema already refuses a value that is not a
+ * non-empty string; this holds any other caller of the verifier to it too.
+ * The slot is `{arg}`, or `{bound: "scope"}` on a receiver that came through
+ * a `>scope:` step (`scoped`): the scope's name is the value the prefix
+ * stands before.
+ */
+function namePrefixPlaced(claim: OpClaim, scoped: boolean): boolean {
+  return (
+    typeof claim.name_prefix === 'string' &&
+    claim.name_prefix.length > 0 &&
+    claim.op === 'request' &&
+    (claim.protocol === undefined || claim.protocol === 'http') &&
+    claim.name !== undefined &&
+    ('arg' in claim.name || ('bound' in claim.name && claim.name.bound === 'scope' && scoped))
+  );
+}
+
 function hasV2Field(claim: LibraryClaim): boolean {
   if (claim.kind === 'make') return claim.runs !== undefined;
   if (claim.kind !== 'op') return false;
   return (
     claim.method_default !== undefined ||
+    claim.name_prefix !== undefined ||
     claim.base !== undefined ||
     claim.runs !== undefined ||
     claim.yields !== undefined ||
@@ -1602,7 +1623,8 @@ function unbuiltPart(claim: LibraryClaim): string | undefined {
       }
     }
     if (formUnbuilt(claim)) return `form.${claim.form}`;
-    if (claim.when !== undefined) return 'when';
+    // A request op's `when` is judged (`whenFailure`); on any other op it still is not.
+    if (claim.when !== undefined && claim.op !== 'request') return 'when';
   }
   for (const slot of slots) {
     if (slot === undefined) continue;
@@ -1913,6 +1935,7 @@ type PartName =
   | 'handler'
   | 'ack'
   | 'method'
+  | 'when'
   | 'runs'
   | 'mounts';
 
@@ -1924,6 +1947,8 @@ interface ClaimLayout {
   keyed: Map<number, Map<string, PartName>>;
   /** Where a `handler` slot carries `or_file` (`slotKey`). */
   orFile?: ReadonlySet<string>;
+  /** The literal a `when` slot must be able to hold (V1b). */
+  whenLiteral?: string;
 }
 
 /** One slot's place in a `ClaimLayout`: its argument, and its key when it has one. */
@@ -3276,9 +3301,11 @@ class DeclarationReader {
       ack: claim.ack,
       base: claim.base,
       method: claim.method_key,
+      when: claim.when,
       runs: runs && !boundRuns ? { arg: runs.arg, ...(runs.key === undefined ? {} : { key: runs.key }) } : undefined,
     });
     if ('failure' in layout) return layout.failure;
+    if (claim.when !== undefined) layout.value.whenLiteral = claim.when.literal;
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, form === 'new' ? 'new' : 'call');
     if ('failure' in callee) return callee.failure;
     const labels = claim.key_labels ?? {};
@@ -3365,7 +3392,7 @@ class DeclarationReader {
     if (claim.form !== 'decorate' || claim.op !== 'receive') return unchecked('claim_invalid');
     const parts = [
       claim.payload, claim.handler, claim.ack, claim.runs, claim.yields, claim.request, claim.returns,
-      claim.method_key, claim.method_default, claim.options, claim.base,
+      claim.method_key, claim.method_default, claim.name_prefix, claim.options, claim.base,
     ];
     if (parts.some(part => part !== undefined)) return unchecked('claim_invalid');
     const slots: ClaimSlot[] = [];
@@ -3463,6 +3490,7 @@ class DeclarationReader {
       claim.method === undefined &&
       claim.method_key === undefined &&
       claim.method_default === undefined &&
+      claim.name_prefix === undefined &&
       claim.base === undefined;
     const payload = claim.payload;
     if (!alone || claim.member === null || payload?.arg !== 0 || payload.key !== undefined) {
@@ -3673,7 +3701,12 @@ class DeclarationReader {
    *   `method_key`, the method when that option is absent; alone, the one
    *   method the call sends. Beside `method`, it says nothing new and is
    *   `claim_invalid`, as is `method` beside `method_key`;
-   * - `options` belongs to the #1564 checks and is `claim_invalid`.
+   * - `options` belongs to the #1564 checks and is `claim_invalid`;
+   * - `name_prefix` (contract amendment R27) is the text the library puts
+   *   before the name slot's value: a non-empty string on an HTTP `request`
+   *   op whose name is a slot (`{arg}`, or `{bound: 'scope'}` on a receiver
+   *   that has a `>scope:` step), else `claim_invalid`. Its value is the
+   *   picker's reading of the library's source and is never checked.
    * Undefined when the fields hold so far; their slots are read with the
    * call's other parts.
    */
@@ -3690,7 +3723,12 @@ class DeclarationReader {
     // leave it out, and states it as the member's own name (carrick#3048).
     if (claim.name !== undefined && 'bound' in claim.name && claim.name.bound === 'key') {
       if (!words || claim.op !== 'receive' || claim.handler === undefined) return unchecked('claim_invalid');
-      if (claim.method_key !== undefined || claim.method_default !== undefined || claim.options !== undefined) {
+      if (
+        claim.method_key !== undefined ||
+        claim.method_default !== undefined ||
+        claim.name_prefix !== undefined ||
+        claim.options !== undefined
+      ) {
         return unchecked('claim_invalid');
       }
       if (claim.protocol === 'rpc' || claim.protocol === 'graphql') {
@@ -3708,9 +3746,11 @@ class DeclarationReader {
         claim.method_key !== undefined ||
         claim.options !== undefined ||
         claim.method_default !== undefined ||
+        claim.name_prefix !== undefined ||
         claim.base !== undefined;
       return any ? unchecked('claim_invalid') : undefined;
     }
+    if (claim.name_prefix !== undefined && !namePrefixPlaced(claim, receiver.scoped)) return unchecked('claim_invalid');
     if (claim.options !== undefined) return unchecked('claim_invalid');
     if (claim.method !== undefined && (claim.method_key !== undefined || claim.method_default !== undefined)) {
       return unchecked('claim_invalid');
@@ -4097,6 +4137,13 @@ class DeclarationReader {
         if (!this.acceptsMethod(declared)) return { rank: 1, outcome: this.slotFailure(declared, 'method_not_string') };
         continue;
       }
+      if (part === 'when') {
+        const declared = this.keyParameterAt(signature, arg);
+        if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
+        const bad = this.whenFailure(declared, layout.whenLiteral);
+        if (bad) return { rank: 1, outcome: bad };
+        continue;
+      }
       if (part === 'document' || part === 'ref') {
         const declared = this.keyParameterAt(signature, arg);
         if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
@@ -4138,7 +4185,7 @@ class DeclarationReader {
     for (const [arg, keys] of layout.keyed) {
       const slot = this.keyParameterAt(signature, arg);
       if (slot === undefined) return { rank: 1, outcome: failed('param_missing') };
-      const view = this.viewFor(slot, keys, runsFailure, key => layout.orFile?.has(slotKey(arg, key)) === true);
+      const view = this.viewFor(slot, keys, runsFailure, key => layout.orFile?.has(slotKey(arg, key)) === true, layout.whenLiteral);
       if ('rank' in view) return view;
       views.set(arg, view.view);
     }
@@ -4156,7 +4203,8 @@ class DeclarationReader {
     slot: Slot,
     keys: ReadonlyMap<string, PartName>,
     runsFailure: RunsPredicate,
-    orFile: (key: string) => boolean = () => false
+    orFile: (key: string) => boolean = () => false,
+    whenLiteral?: string
   ): { view: ts.Type } | RankedFailure {
     if (slot === VARIADIC || !this.isObjectType(slot)) {
       return { rank: 1, outcome: this.slotFailure(slot, 'param_missing') };
@@ -4188,6 +4236,13 @@ class DeclarationReader {
         if (part === 'payload' && this.isFunctionSlot(type)) {
           failure = { rank: 3, outcome: failed('payload_is_function') };
           break;
+        }
+        if (part === 'when') {
+          const bad = this.whenFailure(type, whenLiteral);
+          if (bad) {
+            failure = { rank: 3, outcome: bad };
+            break;
+          }
         }
         if (part === 'method' && !this.acceptsMethod(type)) {
           failure = { rank: 3, outcome: this.slotFailure(type, 'method_not_string') };
@@ -4428,8 +4483,18 @@ class DeclarationReader {
    * B6, the `index_key_generic_map` reading, now the only one).
    */
   private isIndexMap(map: ts.Type): boolean {
-    if (map.flags & ts.TypeFlags.TypeParameter) return false;
+    if (this.rootsInTypeParameter(map)) return false;
     return this.hasIndexSignature(map);
+  }
+
+  /**
+   * The map is a type parameter, or reads a member of one (`S["Tables"]`):
+   * the service's own type argument decides its keys, as for an event map.
+   */
+  private rootsInTypeParameter(map: ts.Type): boolean {
+    let current = map;
+    while (current.flags & ts.TypeFlags.IndexedAccess) current = (current as ts.IndexedAccessType).objectType;
+    return (current.flags & ts.TypeFlags.TypeParameter) !== 0;
   }
 
   private hasIndexSignature(type: ts.Type): boolean {
@@ -6433,6 +6498,29 @@ class DeclarationReader {
     const fallback = this.checker.getDefaultFromTypeParameter(parts[0]);
     // A default that takes no string leaves the slot as it was: it says nothing.
     return fallback !== undefined && this.acceptsString(fallback) ? fallback : slot;
+  }
+
+  /**
+   * A `when` slot can hold the literal the claim names: a boolean slot holds
+   * `true` and `false`, a number slot a number, a string slot any text, and a
+   * literal type its own value. A slot that says nothing is `member_untyped`.
+   * Undefined when it holds (V1b).
+   */
+  private whenFailure(declared: Slot, literal: string | undefined): Outcome | undefined {
+    // The schema requires the literal (`validators.ts`, `when.literal`), so this is never read.
+    if (literal === undefined) return unchecked('claim_invalid');
+    const slot = this.throughConstraint(declared);
+    if (slot === VARIADIC || this.saysNothing(slot)) return unchecked('member_untyped');
+    const flags = (literal === 'true' || literal === 'false' ? ts.TypeFlags.BooleanLike : 0) |
+      (literal.trim() !== '' && Number.isFinite(Number(literal)) ? ts.TypeFlags.NumberLike : 0) |
+      ts.TypeFlags.StringLike;
+    const holds = this.parts(slot).some(part => {
+      if (part.isStringLiteral()) return part.value === literal;
+      if (part.isNumberLiteral()) return String(part.value) === literal;
+      if (part.flags & ts.TypeFlags.BooleanLiteral) return (part as ts.Type & { intrinsicName?: string }).intrinsicName === literal;
+      return (part.flags & flags) !== 0;
+    });
+    return holds ? undefined : failed('when_not_accepted');
   }
 
   /** Accepts string, or names an HTTP method as a literal in either case. */

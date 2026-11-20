@@ -10863,6 +10863,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
+            label_member: None,
         }
     }
 
@@ -11099,6 +11100,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             }),
             library_semantics: Vec::new(),
             inference: None,
+            label_member: None,
         }
     }
 

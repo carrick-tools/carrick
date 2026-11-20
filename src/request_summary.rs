@@ -13705,6 +13705,34 @@ fn join_base(base: &[Piece], path: &[Piece]) -> Vec<Piece> {
     concat([base.to_vec(), separator, path])
 }
 
+/// The literal text a library puts before the name a call hands it (a
+/// request op's `name_prefix`, `/functions/v1/` before `price-quote`), and
+/// that name, as one path (C1). Reference: `docs/reference/client-semantics.md`.
+///
+/// One slash goes between them: the prefix gets a leading `/` and loses its
+/// trailing ones, and a leading literal piece of the name loses its leading
+/// ones. A name that does not start with literal text (a parameter, a value
+/// the code does not state) still gets the prefix and its slash in front,
+/// and so does an absolute URL: the library joins whatever string it is
+/// handed. An empty name stays empty. The base, where the client has one,
+/// goes before the result ([`join_base`]).
+fn join_name_prefix(prefix: &str, name: &[Piece]) -> Vec<Piece> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let core = prefix.trim_end_matches('/');
+    let head = match core {
+        "" => "/".to_string(),
+        core if core.starts_with('/') => format!("{core}/"),
+        core => format!("/{core}/"),
+    };
+    let mut name = name.to_vec();
+    if let Some(Piece::Lit(first)) = name.first_mut() {
+        *first = first.trim_start_matches('/').to_string();
+    }
+    concat([vec![Piece::Lit(head)], name])
+}
+
 /// `scheme://…` or a protocol-relative `//…`.
 fn is_absolute_url(text: &str) -> bool {
     text.starts_with("//")
@@ -13850,6 +13878,32 @@ mod tests {
             text: text.to_string(),
             end: Root::Hole(HoleReason::UnreadExpression),
             link: None,
+        }
+    }
+
+    /// C1: a request op's `name_prefix` and the name its slot reads join
+    /// with one slash between them, whatever slashes each side writes; a
+    /// name that does not start with text still gets the prefix; an empty
+    /// name stays empty.
+    #[test]
+    fn join_name_prefix_puts_one_slash_between() {
+        let param = Piece::Param(0, "name".to_string());
+        for (prefix, name, joined) in [
+            ("/x/v1/", vec![lit("name")], vec![lit("/x/v1/name")]),
+            ("x/v1", vec![lit("name")], vec![lit("/x/v1/name")]),
+            ("/x/v1/", vec![lit("/name")], vec![lit("/x/v1/name")]),
+            (
+                "/x/v1",
+                vec![param.clone()],
+                vec![lit("/x/v1/"), param.clone()],
+            ),
+            ("/x/v1/", Vec::new(), Vec::new()),
+        ] {
+            assert_eq!(
+                join_name_prefix(prefix, &name),
+                joined,
+                "{prefix} + {name:?}"
+            );
         }
     }
 

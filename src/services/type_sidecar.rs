@@ -1217,7 +1217,7 @@ pub enum ClaimProtocol {
 
 /// The op applies only where argument `arg` (or its `key`) holds `literal`
 /// (amendment 7: `on("message", ...)`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ClaimWhen {
     pub arg: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1619,6 +1619,16 @@ pub enum LibraryClaim {
         /// one method the call sends whatever its member is called.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         method_default: Option<String>,
+        /// HTTP `request` only (contract amendment on carrick#2434, R27): the
+        /// literal text the library puts before the `name` slot's value
+        /// (name `price-quote`, prefix `/functions/v1/`: the path
+        /// `/functions/v1/price-quote`). Written by the store's picker from
+        /// the library's own source; the verifier holds it to its context and
+        /// never checks its value. An empty value drops the op on read.
+        /// Boxed, as `runs` is, so an op stays near the size of the other
+        /// claims.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name_prefix: Option<Box<String>>,
         /// HTTP (label v2): where the base URL the path joins sits.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<ClaimSlot>,
@@ -6781,6 +6791,7 @@ mod tests {
                             method: None,
                             method_key: None,
                             method_default: None,
+                            name_prefix: None,
                             base: None,
                             runs: None,
                             yields: None,
@@ -7025,6 +7036,7 @@ mod tests {
                         method: Some("GET".into()),
                         method_key: None,
                         method_default: None,
+                        name_prefix: None,
                         base: None,
                         runs: None,
                         yields: None,
@@ -7052,6 +7064,7 @@ mod tests {
                         method: Some("POST".into()),
                         method_key: Some(slot()),
                         method_default: Some("GET".into()),
+                        name_prefix: Some(Box::new("/functions/v1/".into())),
                         base: Some(slot()),
                         runs: Some(Box::new(RunsSlot {
                             arg: 0,
@@ -7094,6 +7107,7 @@ mod tests {
                         method: Some("POST".into()),
                         method_key: Some(slot()),
                         method_default: None,
+                        name_prefix: None,
                         base: None,
                         runs: None,
                         yields: None,
@@ -7696,6 +7710,7 @@ mod tests {
                         method: None,
                         method_key: None,
                         method_default: None,
+                        name_prefix: None,
                         base: None,
                         runs: None,
                         yields: None,
@@ -7731,6 +7746,7 @@ mod tests {
                         method: None,
                         method_key: None,
                         method_default: None,
+                        name_prefix: None,
                         base: None,
                         runs: None,
                         yields: None,
@@ -7817,6 +7833,7 @@ mod tests {
                         method: None,
                         method_key: Some(slot(0, Some("method"))),
                         method_default: None,
+                        name_prefix: None,
                         base: None,
                         runs: None,
                         yields: None,
@@ -7914,6 +7931,36 @@ mod tests {
         };
         let value = serde_json::to_value(&request).unwrap();
         assert!(value.get("tsconfig_path").is_none(), "{value}");
+    }
+
+    /// Contract amendment R27 on carrick#2434: an http request op's
+    /// `name_prefix` reads and writes as the store wrote it, and an op
+    /// without one writes no such key, so every claim before it is sent
+    /// byte for byte as it was.
+    #[test]
+    fn an_op_name_prefix_round_trips_and_is_absent_when_unset() {
+        let written = serde_json::json!({
+            "kind": "op", "op": "request", "member": "invoke", "path": ["functions"],
+            "on": "instance", "name": { "arg": 0 }, "name_prefix": "/functions/v1/",
+            "method_key": { "arg": 1, "key": "method" }, "method_default": "POST",
+            "payload": { "arg": 1, "key": "body" }
+        });
+        let claim: LibraryClaim = serde_json::from_value(written.clone()).unwrap();
+        let LibraryClaim::Op { name_prefix, .. } = &claim else {
+            panic!("not an op: {claim:?}");
+        };
+        assert_eq!(
+            name_prefix.as_deref().map(String::as_str),
+            Some("/functions/v1/")
+        );
+        assert_eq!(serde_json::to_value(&claim).unwrap(), written);
+
+        let mut before = written;
+        before.as_object_mut().unwrap().remove("name_prefix");
+        let claim: LibraryClaim = serde_json::from_value(before.clone()).unwrap();
+        let sent = serde_json::to_value(&claim).unwrap();
+        assert!(sent.get("name_prefix").is_none(), "{sent}");
+        assert_eq!(sent, before);
     }
 
     fn request_checks(request: &SidecarRequest) -> Vec<LibraryCheck> {

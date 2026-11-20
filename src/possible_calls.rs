@@ -507,6 +507,8 @@ mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
+            when: None,
             span_end: 20,
         };
         let lead = |end: LabelledEnd| DecidedLead {
@@ -555,6 +557,8 @@ mod tests {
                 new: false,
                 scope: None,
                 procedure: None,
+                path: Vec::new(),
+                when: None,
                 span_end: 20,
             },
             reason,

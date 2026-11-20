@@ -1499,6 +1499,8 @@ mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
+            when: None,
         };
         let decided = Decided {
             stops: vec![DecidedStop {
@@ -1564,6 +1566,8 @@ mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
+            when: None,
         };
         let discovery = Discovery {
             unfollowed: vec![site],
