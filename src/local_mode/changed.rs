@@ -354,8 +354,7 @@ impl ChangedOutput {
     /// whose call is a built request (carrick#3470) does not count: matching
     /// its method and path is the check it can have.
     fn nothing_type_checked(&self) -> bool {
-        self.type_checked == 0
-            && (self.not_type_checked.iter().any(|row| !row.descriptor) || !self.matched.is_empty())
+        self.type_checked == 0 && self.not_type_checked.iter().any(|row| !row.descriptor)
     }
 
     /// Problems the index, written by another scanner build, cannot date.
