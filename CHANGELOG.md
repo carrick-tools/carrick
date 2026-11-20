@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.168](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.167...carrick-v0.3.168) (2026-11-20)
+
+
+### Bug Fixes
+
+* **held:** count a GraphQL row kept silent only by the declared fill as not checked ([#4940](https://github.com/carrick-tools/carrick/issues/4940) S1, S2) ([#4955](https://github.com/carrick-tools/carrick/issues/4955)) ([372b156](https://github.com/carrick-tools/carrick/commit/372b156fc4d438ff14e22c2945fe0f6d3ca323df))
+* **sidecar:** a root GraphQL scalar the server's serializer rejects is not read as compatible ([#4940](https://github.com/carrick-tools/carrick/issues/4940) B1) ([#4954](https://github.com/carrick-tools/carrick/issues/4954)) ([05bc32e](https://github.com/carrick-tools/carrick/commit/05bc32eeb692153f8a2bcd947abe580e0facb70a))
+
 ## [0.3.167](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.166...carrick-v0.3.167) (2026-11-20)
 
 
