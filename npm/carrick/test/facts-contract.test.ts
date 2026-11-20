@@ -50,8 +50,8 @@ test("the contract switch is on by default: off only for exactly \"0\", or with 
   assert.equal(contractLinesEnabled({ CARRICK_FACT_LINES: "0" }), false, "unset with facts off");
 });
 
-test("the local layout is 4: the gqltypes kind added a table (contract)", () => {
-  assert.equal(LOCAL_LAYOUT, 4);
+test("the local layout is 5: the matched kind added a table (contract)", () => {
+  assert.equal(LOCAL_LAYOUT, 5);
 });
 
 test("every contract row of the pinned fixture is ingested and answered by file", async (t) => {

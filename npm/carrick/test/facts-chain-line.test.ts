@@ -470,8 +470,8 @@ async function dropChains(root: string): Promise<void> {
   db.close();
 }
 
-test("the local layout is 4: the gqltypes kind added a table (chain)", () => {
-  assert.equal(LOCAL_LAYOUT, 4);
+test("the local layout is 5: the matched kind added a table (chain)", () => {
+  assert.equal(LOCAL_LAYOUT, 5);
 });
 
 test("a file built without the chains table opens and prints today's lines, with every switch on", async (t) => {
