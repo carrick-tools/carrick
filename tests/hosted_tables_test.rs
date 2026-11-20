@@ -44,6 +44,13 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 /// The one blob a scan of the fixture writes (one service at the root).
 fn scan() -> serde_json::Value {
+    scans(1).remove(0)
+}
+
+/// The blob each of `runs` scans of one committed copy of the fixture
+/// writes, sharing one store and cache: every scan after the first takes the
+/// incremental path.
+fn scans(runs: usize) -> Vec<serde_json::Value> {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("workspace");
     copy_dir(
@@ -73,7 +80,6 @@ fn scan() -> serde_json::Value {
         .env("HOME", &home)
         .env("CARRICK_LOCAL_STORAGE_DIR", &storage)
         .env("CARRICK_CACHE_DIR", &cache)
-        .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_MOCK_ALL", "1")
         .env(
             "CARRICK_MOCK_FIXTURE_DIR",
@@ -98,26 +104,53 @@ fn scan() -> serde_json::Value {
         "CARRICK_OUTPUT_JSON",
         "CARRICK_NO_MODEL",
         "CARRICK_ALLOW_MISSING_TYPES",
+        "CARRICK_LOCAL_STORAGE_ISOLATE",
         "ACTIONS_ID_TOKEN_REQUEST_URL",
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     ] {
         cmd.env_remove(var);
     }
-    let output = cmd.output().expect("spawn carrick");
-    assert!(
-        output.status.success(),
-        "the scan failed:\n{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let mut blobs: Vec<serde_json::Value> = std::fs::read_dir(&storage)
-        .expect("storage dir")
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).expect("parse blob"))
-        .collect();
-    assert_eq!(blobs.len(), 1, "one service, one blob");
-    blobs.remove(0)
+    let mut out = Vec::with_capacity(runs);
+    for run in 0..runs {
+        // The first scan finds no earlier blob; a later one reads the store
+        // back and takes the incremental path.
+        if run == 0 {
+            cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
+        } else {
+            cmd.env_remove("CARRICK_LOCAL_STORAGE_ISOLATE");
+        }
+        let output = cmd.output().expect("spawn carrick");
+        assert!(
+            output.status.success(),
+            "the scan failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if run > 0 {
+            let logs: String = std::fs::read_dir(home.join(".carrick/logs/runs"))
+                .map(|entries| {
+                    entries
+                        .map(|entry| {
+                            std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                logs.contains("Incremental analysis complete"),
+                "the second scan took the incremental path"
+            );
+        }
+        let mut blobs: Vec<serde_json::Value> = std::fs::read_dir(&storage)
+            .expect("storage dir")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).expect("parse blob"))
+            .collect();
+        assert_eq!(blobs.len(), 1, "one service, one blob");
+        out.push(blobs.remove(0));
+    }
+    out
 }
 
 /// (`file:line`, method, path, label member) of every call row.
@@ -184,6 +217,15 @@ fn expected() -> BTreeSet<(String, String, String, Option<String>)> {
 fn each_table_call_states_its_row_with_its_method_and_prefix() {
     let blob = scan();
     assert_eq!(call_rows(&blob), expected());
+}
+
+/// A second scan, on the incremental path, states the same rows with the
+/// same labelled members.
+#[test]
+fn a_second_scan_states_the_same_rows() {
+    for (run, blob) in scans(2).iter().enumerate() {
+        assert_eq!(call_rows(blob), expected(), "scan {run}");
+    }
 }
 
 #[test]

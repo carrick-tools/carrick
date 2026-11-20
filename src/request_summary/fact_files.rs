@@ -265,7 +265,18 @@ impl FactFiles {
             .iter()
             .filter(|site| site.procedure.is_none())
             .map(|site| &site.end)
-            .chain(decided.leads.iter().map(|lead| &lead.end));
+            .chain(
+                decided
+                    .leads
+                    .iter()
+                    // A call whose conditional op's slot the source does
+                    // not state sends one op or another: no one method.
+                    .filter(|lead| {
+                        !(lead.reason == super::Stop::SeveralOperations
+                            && SiteLabel::has_condition(labels, &lead.end))
+                    })
+                    .map(|lead| &lead.end),
+            );
         let mut stated: BTreeMap<(String, u32), BTreeSet<String>> = BTreeMap::new();
         for end in ends {
             if end.role != "http_client" || end.procedure.is_some() {

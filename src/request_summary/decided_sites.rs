@@ -650,31 +650,52 @@ impl SiteLabel {
     /// an end with none takes the first label claimed on the receiver
     /// itself, else the first that is on it (C1).
     pub fn find<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Option<&'l SiteLabel> {
+        let on = Self::candidates(labels, end);
+        // An end chosen for a conditional op takes that op; any other end
+        // takes the member's op with no condition, where it has one
+        // ([`Self::when_chosen`]).
+        match &end.when {
+            Some(when) => on
+                .into_iter()
+                .find(|label| label.when.as_ref() == Some(when)),
+            None => on
+                .iter()
+                .find(|label| label.when.is_none())
+                .or_else(|| on.first())
+                .copied(),
+        }
+    }
+
+    /// The op labels `end` may take, whatever their condition: claimed on
+    /// its receiver ([`Self::is_on`]), under the end's hops where it has
+    /// some, else on the receiver itself where any is, else all of them
+    /// (C1). [`Self::find`] and [`Self::when_chosen`] choose among these.
+    fn candidates<'l>(labels: &'l [SiteLabel], end: &LabelledEnd) -> Vec<&'l SiteLabel> {
         let on: Vec<&SiteLabel> = labels
             .iter()
             .filter(|label| label.op.is_some() && label.is_on(end))
             .collect();
-        // An end chosen for a conditional op takes that op; any other end
-        // takes the member's op with no condition, where it has one
-        // ([`Self::when_chosen`]).
-        let on: Vec<&SiteLabel> = match &end.when {
-            Some(when) => on
-                .into_iter()
-                .filter(|label| label.when.as_ref() == Some(when))
-                .collect(),
-            None if on.iter().any(|label| label.when.is_none()) => on
-                .into_iter()
-                .filter(|label| label.when.is_none())
-                .collect(),
-            None => on,
-        };
         if !end.path.is_empty() {
-            return on.into_iter().find(|label| label.path == end.path);
+            return on
+                .into_iter()
+                .filter(|label| label.path == end.path)
+                .collect();
         }
-        on.iter()
-            .find(|label| label.path.is_empty())
-            .or_else(|| on.first())
-            .copied()
+        if on.iter().any(|label| label.path.is_empty()) {
+            return on
+                .into_iter()
+                .filter(|label| label.path.is_empty())
+                .collect();
+        }
+        on
+    }
+
+    /// Whether a label of `end`'s member applies only where a slot holds a
+    /// literal: what a call of it sends is decided by [`Self::when_chosen`].
+    pub fn has_condition(labels: &[SiteLabel], end: &LabelledEnd) -> bool {
+        Self::candidates(labels, end)
+            .iter()
+            .any(|label| label.when.is_some())
     }
 
     /// Which op of `end`'s member the labelled call `call` is, where the
@@ -691,10 +712,7 @@ impl SiteLabel {
         end: &LabelledEnd,
         call: &super::CallIr,
     ) -> Result<Option<crate::services::type_sidecar::ClaimWhen>, ()> {
-        let on: Vec<&SiteLabel> = labels
-            .iter()
-            .filter(|label| label.op.is_some() && label.is_on(end))
-            .collect();
+        let on = Self::candidates(labels, end);
         if !on.iter().any(|label| label.when.is_none()) {
             return Ok(None);
         }
