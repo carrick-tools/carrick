@@ -471,7 +471,7 @@ fn matched_touching(
         let repo_path = tree.repo.to_string_lossy().to_string();
         let path = |file: &str| shown(root, &repo_path, file);
         out.extend(
-            super::matched::touching(&rows, remote, files)
+            super::matched::touching(&rows, super::matched::index_name(remote), files)
                 .into_iter()
                 .filter_map(|row| super::matched::line(row, &path)),
         );

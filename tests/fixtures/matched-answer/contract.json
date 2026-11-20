@@ -5,7 +5,7 @@
   "rows": [
     {
       "id": "01829f860cf590c2",
-      "repo": "example-org/shop",
+      "repo": "shop",
       "commit": "1111111111111111111111111111111111111111",
       "source": "matched: model pair, not compiler-checked",
       "kind": "topic",
@@ -47,7 +47,7 @@
     },
     {
       "id": "94fe38591b62349e",
-      "repo": "example-org/shop",
+      "repo": "shop",
       "commit": "1111111111111111111111111111111111111111",
       "source": "matched: model pair, not compiler-checked",
       "kind": "route",
@@ -100,7 +100,7 @@
     },
     {
       "id": "64cefa096691598b",
-      "repo": "example-org/shop",
+      "repo": "shop",
       "commit": "1111111111111111111111111111111111111111",
       "source": "matched: model pair, not compiler-checked",
       "kind": "table",

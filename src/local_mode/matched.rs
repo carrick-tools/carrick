@@ -117,6 +117,13 @@ pub(super) fn touching<'a>(rows: &'a [Row], repo: &str, files: &BTreeSet<String>
         .collect()
 }
 
+/// The name the answer gives a repo: the index's bare repo name. A workspace
+/// repo is named by its remote, `owner/name`; the answer's rows carry `name`
+/// (carrick-cloud#3832), so a change's repo is compared by this form.
+pub(super) fn index_name(remote: &str) -> &str {
+    remote.rsplit('/').next().unwrap_or(remote)
+}
+
 /// Whether the reader's own copy of `repo` is at `commit`. `held` is the
 /// commits the snapshot holds a blob at, by repo basename in lower case: a
 /// repo held back at another commit, or spanning several, shows none of its
@@ -225,8 +232,8 @@ mod tests {
     /// (`lambdas/_shared/matched_answer.contract.json`); either side changing
     /// fails a test in its own repo.
     const CONTRACT_SHA256: &str =
-        "f6f0f89bfafe85410d635a7c257365f6e9ca70847d58d669cee54674775279df";
-    const VECTORS_SHA256: &str = "b52de553c88080a7563df5b3541e83be5ffd2124141e657ec9be6e6a283147f8";
+        "4e818eb68e9e43fcb2c0da3c9e9480f57ef62cd13f1ea3e94474742281003caf";
+    const VECTORS_SHA256: &str = "1d5e73535794b766fae56a975476272e315d826966a83ac54ee78c8905bff370";
 
     fn sha(text: &str) -> String {
         format!("{:x}", Sha256::digest(text.as_bytes()))
@@ -248,7 +255,7 @@ mod tests {
         let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(kinds, ["topic", "route", "table"]);
         let route = &rows[1];
-        assert_eq!(route.repo, "example-org/shop");
+        assert_eq!(route.repo, "shop");
         assert_eq!(route.method, "GET");
         assert_eq!(route.name, "/v1/orders");
         assert_eq!(route.caller.file, "apps/web/src/lib/api.ts");
@@ -302,24 +309,24 @@ mod tests {
         let rows = parse(&answer());
         let files = |f: &[&str]| f.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
         assert_eq!(
-            touching(
-                &rows,
-                "example-org/shop",
-                &files(&["db/migrations/0003_stock.sql"])
-            )
-            .len(),
+            touching(&rows, "shop", &files(&["db/migrations/0003_stock.sql"])).len(),
             1,
             "the server end counts"
         );
-        assert!(
-            touching(
-                &rows,
-                "example-org/other",
-                &files(&["apps/web/src/lib/api.ts"])
-            )
-            .is_empty()
+        assert!(touching(&rows, "other", &files(&["apps/web/src/lib/api.ts"])).is_empty());
+        assert!(touching(&rows, "shop", &files(&["apps/web/src/lib"])).is_empty());
+    }
+
+    #[test]
+    fn a_remote_is_compared_by_the_index_s_bare_name() {
+        assert_eq!(index_name("example-org/shop"), "shop");
+        assert_eq!(index_name("shop"), "shop");
+        let rows = parse(&answer());
+        let files = BTreeSet::from(["apps/web/src/lib/api.ts".to_string()]);
+        assert_eq!(
+            touching(&rows, index_name("example-org/shop"), &files).len(),
+            1
         );
-        assert!(touching(&rows, "example-org/shop", &files(&["apps/web/src/lib"])).is_empty());
     }
 
     #[test]
