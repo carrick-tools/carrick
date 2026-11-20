@@ -104,7 +104,7 @@ const route = (label: string, file: string, text: string): Wire => ({
 /** `filed: false` is an answer the daemon did not file (a superseded ask): it is never committed. */
 type Rig = { root: string; edit: (rel: string, text: string, options?: { filed?: boolean }) => Promise<HeldLine[]> };
 
-async function rig(t: { after: (fn: () => void | Promise<void>) => void }, more: Partial<RuntimeDeps> = {}): Promise<Rig> {
+async function rig(t: { after: (fn: () => void | Promise<void>) => void }, more: Partial<RuntimeDeps> = {}, extraRows: Wire[] = []): Promise<Rig> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-standing-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, "ws");
@@ -120,7 +120,7 @@ async function rig(t: { after: (fn: () => void | Promise<void>) => void }, more:
   fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
   fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "shop" }] } }));
   const header = { schema: 1, writer: 12, project_id: "p", project_slug: "shop", digest: "d", built_at: "2026-01-01T00:00:00Z", repos: [{ repo: REPO, service: SERVICE, commit }] };
-  const lines = [header, route("GET /a", A, A_TEXT), route("GET /b", B, B_TEXT)];
+  const lines = [header, route("GET /a", A, A_TEXT), route("GET /b", B, B_TEXT), ...extraRows];
   await buildFacts(lines.map((l) => JSON.stringify(l)).join("\n") + "\n", factsPath(root), [{ repo: REPO, path: root }], new Date().toISOString());
   const entry = path.join(dir, "engine.mjs");
   fs.writeFileSync(entry, FAKE_ENGINE);
@@ -208,4 +208,19 @@ test("the early answer keeps a standing break, marked, beside this edit's own", 
   const early = earlyResult({ file: path.join(r.root, B), root: r.root }, lines);
   assert.deepEqual(early.items?.map((i) => [i.path, i.standing === true]), [["/b", false]], "B's own break is this edit's");
   assert.deepEqual(early.recheck?.moved?.map((m) => [m.path, m.standing === true, m.stated]), [["/a", true, true]], "A's break stays listed, standing and stated");
+});
+
+// SD-5 (SD-D8): a `matched` table in the fact file adds nothing to the daemon's answer: a possible pair has no verdict, and the edit's fact line already names it.
+test("the daemon's answer is the same with a matched table present", async (t) => {
+  const matched = (end: string, file: string): Wire => ({ k: "matched", end, id: "p1", repo: REPO, file, line: 1, text: "possible pair (found by a model, not compiler-checked): x. Read that line before relying on it." });
+  const without = await rig(t);
+  const commitWithout = lastCommit;
+  const withRows = await rig(t, {}, [matched("caller", A), matched("server", B)]);
+  const commitWith = lastCommit;
+  const plain = await without.edit(A, breakA);
+  const more = await withRows.edit(A, breakA);
+  assert.ok(plain.length > 0, "the edit speaks, so the comparison is not vacuous");
+  // Each rig is its own repo and commit; only those and the run id differ.
+  const same = (lines: HeldLine[], root: string, commit: string): string => JSON.stringify(lines).replaceAll(root, "ROOT").replaceAll(commit, "COMMIT").replace(/"run":"[^"]*"/, '"run":"RUN"');
+  assert.equal(same(more, withRows.root, commitWith), same(plain, without.root, commitWithout));
 });

@@ -21,7 +21,7 @@ import { createLogger } from "../log.ts";
 import { factsSaid } from "../hook/reuse.ts";
 import { commonGitDir, linkedCheckoutTop } from "../hook/worktree.ts";
 import { gapsOfLines, rangesOf, rangesOfLines, touched } from "./match.ts";
-import type { CallSpan } from "./match.ts";
+import type { CallSpan, Range } from "./match.ts";
 import { factsEnabled } from "./enabled.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
 import type { ContractGroup, ContractRow, FactRow, FactStore, LocalRepo } from "./store.ts";
@@ -38,6 +38,16 @@ export const MAX_FACT_LINES = 3;
 
 /** The name kind stops after this many lines whose other file failed its check (R33.5). */
 const MAX_NAME_FAILURES = 3;
+
+/** The most `matched` lines one edit prints (SD-D8). */
+export const MAX_MATCHED_LINES = 2;
+
+/** Whether a changed range or gap of `text` (character offsets) sits on the 1-based `line`. */
+function touchesLine(text: string, line: number, ranges: readonly Range[], gaps: readonly number[]): boolean {
+  const [own] = rangesOfLines(text, [line]);
+  if (own === undefined) return false;
+  return ranges.some((range) => range.start <= own.end && range.end > own.start) || gaps.some((gap) => gap >= own.start && gap <= own.end);
+}
 
 /** Op and fn lines stop after this many failed peer proofs in one action (R36.3). */
 const MAX_PROOF_FAILURES = 3;
@@ -137,12 +147,13 @@ export type Candidate = {
  * `MAX_FACT_LINES`. The `contract` kind (carrick-cloud `edit-facts-wire.md`,
  * `k: "contract"`) has candidates only when `factLines` is asked for it
  * (`options.contract`); with none, the order is op, fn, name, pkg as ever.
+ * `matched` (a pair a model found) prints after `op`, at most `MAX_MATCHED_LINES`.
  */
-const KINDS = ["contract", "op", "fn", "name", "pkg"] as const;
+const KINDS = ["contract", "op", "matched", "fn", "name", "pkg"] as const;
 type Kind = (typeof KINDS)[number];
 
-/** The kinds `pickLines` always takes; `contract` is optional. */
-type Found = Record<Exclude<Kind, "contract">, readonly Candidate[]> & { contract?: readonly Candidate[] };
+/** The kinds `pickLines` always takes; `contract` and `matched` are optional. */
+type Found = Record<Exclude<Kind, "contract" | "matched">, readonly Candidate[]> & { contract?: readonly Candidate[]; matched?: readonly Candidate[] };
 
 /** The main checkout a linked worktree belongs to, from its `.git` file. */
 function mainCheckoutOf(worktreeTop: string): string | null {
@@ -414,7 +425,7 @@ export async function factLines(
   };
   const done = (): FactOutcome => ({ lines, used, claims, stale, callersRead, present, answered, stops, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
-  const found: Record<Exclude<Kind, "contract">, Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
+  const found: Record<Exclude<Kind, "contract">, Candidate[]> = { op: [], matched: [], fn: [], name: [], pkg: [] };
   // The contract kind, by tier, joined after the loop: every tier-1 line
   // before any tier 2, then the chain lines, then tier 3.
   const tiers: Candidate[][] = [[], [], [], [], []];
@@ -604,6 +615,16 @@ export async function factLines(
       const removed = (edit.removed ?? []).filter((line) => !added.has(line) && !added.has(line - 1));
       const gaps = byLine ? gapsOfLines(text, removed) : [];
       if (ranges.length === 0 && gaps.length === 0) continue;
+      // The pairs a model found, keyed at a changed line of this file (never on a Read): each prints the sentence the cloud wrote.
+      if (!edit.read) {
+        isolated("matched", () =>
+          facts
+            .matched(at.repo, at.rel)
+            .filter((row) => touchesLine(text, row.line, ranges, gaps))
+            .slice(0, MAX_MATCHED_LINES)
+            .map((row) => ({ key: `matched::${row.repo}::${row.pair}::${row.end}`, text: row.text, named: [] })),
+        );
+      }
       const reach = touched(text, scan, ranges, gaps);
       // A name declared twice in this file (a handler of one name in two
       // components) cannot say which one the edit reached.

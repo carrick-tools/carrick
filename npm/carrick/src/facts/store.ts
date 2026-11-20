@@ -159,8 +159,41 @@ export type ChainRow = {
   total: number;
 };
 
+/**
+ * A `matched` row (`k: "matched"`, writer 13): a pair a model found, keyed at
+ * one end (`repo`, `file`, `line`), with the sentence the cloud wrote naming
+ * the other end. `text` is cleaned by `cleanMatchedText` when read.
+ */
+export type MatchedRow = {
+  repo: string;
+  file: string;
+  line: number;
+  end: "caller" | "server";
+  /** The pair's id: both ends' rows carry it. */
+  pair: string;
+  text: string;
+};
+
+/** The longest a `matched` line prints; a longer one is cut and ends in `...`. */
+export const MATCHED_TEXT_MAX = 1200;
+
+/**
+ * The one reading of a `matched` row's text, used for every row. A model wrote
+ * the sentence and an agent reads it, so it must not forge a line: each
+ * control character (U+0000-U+001F, U+007F-U+009F, U+2028, U+2029) becomes a
+ * space, runs of spaces collapse, the ends are trimmed, and a text past
+ * `MATCHED_TEXT_MAX` characters is cut there, ending in `...`.
+ */
+export function cleanMatchedText(text: string): string {
+  const clean = text
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/ {2,}/g, " ")
+    .trim();
+  return clean.length > MATCHED_TEXT_MAX ? `${clean.slice(0, MATCHED_TEXT_MAX - 3)}...` : clean;
+}
+
 /** This package's table layout; bumped with every table a new row kind adds. */
-export const LOCAL_LAYOUT = 4;
+export const LOCAL_LAYOUT = 5;
 
 export function factsPath(root: string, schema: number = SCHEMA): string {
   return path.join(root, ".carrick", "facts", `edit-facts.s${schema}.l${LOCAL_LAYOUT}.sqlite`);
@@ -241,6 +274,12 @@ export type FactStore = {
    * first call as `contracts` is.
    */
   chains: (repo: string, file: string, name: string) => ChainRow[];
+  /**
+   * The `matched` rows keyed in `file` of `repo`, by line then wire order, each
+   * text cleaned by `cleanMatchedText`. `[]` for a file built without the
+   * `matched` table, prepared on the first call as `chains` is.
+   */
+  matched: (repo: string, file: string) => MatchedRow[];
   close: () => void;
 };
 
@@ -299,6 +338,7 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     const packageRow = open.prepare("SELECT * FROM pkgs WHERE package = ? ORDER BY id LIMIT 1");
     let contracts: ReturnType<typeof open.prepare> | null | undefined;
     let chains: ReturnType<typeof open.prepare> | null | undefined;
+    let matched: ReturnType<typeof open.prepare> | null | undefined;
     let producerResponses: ReturnType<typeof open.prepare> | null | undefined;
     let graphqlResponses: ReturnType<typeof open.prepare> | null | undefined;
     let messageResponses: ReturnType<typeof open.prepare> | null | undefined;
@@ -414,6 +454,25 @@ export async function openFacts(root: string): Promise<FactStore | null> {
         if (chains === null) return [];
         return chains.all(repo, rel, name).map((raw) => JSON.parse(String(raw["row"])) as ChainRow);
       },
+      matched: (repo, rel) => {
+        if (matched === undefined) {
+          try {
+            matched = open.prepare("SELECT * FROM matched WHERE repo = ? AND file = ? ORDER BY line, id");
+          } catch {
+            // No table: a file an older package built.
+            matched = null;
+          }
+        }
+        if (matched === null) return [];
+        return matched.all(repo, rel).map((raw) => ({
+          repo: String(raw["repo"]),
+          file: String(raw["file"]),
+          line: Number(raw["line"]),
+          end: raw["end"] === "server" ? "server" : "caller",
+          pair: String(raw["pair"]),
+          text: cleanMatchedText(String(raw["text"])),
+        }));
+      },
       close: () => open.close(),
     };
   } catch (error) {
@@ -475,7 +534,7 @@ export async function buildFacts(text: string, dest: string, local: LocalRepo[],
 }
 
 /** The row kinds this package reads. */
-const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg", "contract", "chain", "gqltypes"]);
+const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg", "contract", "chain", "gqltypes", "matched"]);
 
 const isText =(value: unknown): value is string => typeof value === "string" && value.length > 0;
 const isLine = (value: unknown): boolean => value === null || (typeof value === "number" && Number.isInteger(value));
@@ -555,6 +614,16 @@ function wholeRow(raw: Record<string, unknown>): boolean {
     // A service's SDL type table: the cloud writes one per service whose blob has it.
     case "gqltypes":
       return isText(raw["repo"]) && isText(raw["service"]) && isRecord(raw["types"]);
+    // A pair a model found, keyed at one end: the other end is named inside `text`, which the cloud wrote.
+    case "matched":
+      return (
+        isText(raw["text"]) &&
+        (raw["end"] === "caller" || raw["end"] === "server") &&
+        isText(raw["id"]) &&
+        isText(raw["repo"]) &&
+        isText(raw["file"]) &&
+        Number.isInteger(raw["line"])
+      );
     // A contract row carries no top-level `text`: its words are in its groups.
     case "contract":
       return (
@@ -636,6 +705,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       );
       CREATE TABLE chains (id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, name TEXT, row TEXT);
       CREATE TABLE gqltypes (id INTEGER PRIMARY KEY, repo TEXT, service TEXT, types TEXT);
+      CREATE TABLE matched (id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, "end" TEXT, pair TEXT, text TEXT);
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
     // Each repo's index commit, which the peer proof checks files against
@@ -671,6 +741,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       "INSERT INTO contracts (repo, file, line, side, protocol, label, direction, name, site, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
     const gqlTypes = db.prepare("INSERT INTO gqltypes (repo, service, types) VALUES (?, ?, ?)");
+    const matchedRow = db.prepare('INSERT INTO matched (repo, file, line, "end", pair, text) VALUES (?, ?, ?, ?, ?, ?)');
     const chainRow = db.prepare("INSERT INTO chains (repo, file, line, name, row) VALUES (?, ?, ?, ?, ?)");
     db.exec("BEGIN");
     let skipped = 0;
@@ -701,6 +772,10 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       }
       if (raw["k"] === "gqltypes") {
         gqlTypes.run(String(raw["repo"]), String(raw["service"]), JSON.stringify(raw["types"]));
+        continue;
+      }
+      if (raw["k"] === "matched") {
+        matchedRow.run(String(raw["repo"]), String(raw["file"]), Number(raw["line"]), String(raw["end"]), String(raw["id"]), String(raw["text"]));
         continue;
       }
       if (raw["k"] === "chain") {
@@ -743,7 +818,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     }
     db.exec("COMMIT");
     if (skipped > 0) log(`${skipped} fact row(s) missing a field or with a mistyped one; skipped`);
-    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package); CREATE INDEX contracts_file ON contracts (repo, file); CREATE INDEX chains_name ON chains (repo, file, name); CREATE INDEX gqltypes_service ON gqltypes (repo, service);");
+    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package); CREATE INDEX contracts_file ON contracts (repo, file); CREATE INDEX chains_name ON chains (repo, file, name); CREATE INDEX gqltypes_service ON gqltypes (repo, service); CREATE INDEX matched_file ON matched (repo, file);");
   } finally {
     closeQuietly(db);
   }

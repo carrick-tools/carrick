@@ -159,6 +159,7 @@
       "topic": 1
     },
     "model_readings_held": 1,
-    "dropped_pairs": 0
+    "dropped_pairs": 0,
+    "clipped": 0
   }
 }
