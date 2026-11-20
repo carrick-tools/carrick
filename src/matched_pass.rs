@@ -632,7 +632,7 @@ fn read_caller(
     several: bool,
     rows: &Rows,
     own: &OwnCode,
-    parsed: &mut HashMap<String, Option<(String, Vec<Site>, Vec<Definition>)>>,
+    parsed: &mut HashMap<String, Option<ParsedFile>>,
 ) -> CallerRead {
     let unread = |reason: &'static str| CallerRead {
         span: Err(reason),
@@ -702,6 +702,12 @@ fn read_caller(
         wrapper,
     }
 }
+
+/// A caller file as read once: its text, its calls and its functions.
+type ParsedFile = (String, Vec<Site>, Vec<Definition>);
+
+/// A pair's operation: kind, method, name.
+type Operation<'a> = (&'a str, &'a str, &'a str);
 
 /// A stored blob of one of the repository's services, with its rows file.
 struct Stored {
@@ -945,7 +951,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
 
     // A caller line two pairs name with different operations names no one
     // call.
-    let mut operations_on_line: HashMap<(&str, u32), BTreeSet<(&str, &str, &str)>> = HashMap::new();
+    let mut operations_on_line: HashMap<(&str, u32), BTreeSet<Operation<'_>>> = HashMap::new();
     for pair in pairs_in.iter().flatten() {
         operations_on_line
             .entry((pair.caller_file.as_str(), pair.caller_line))
