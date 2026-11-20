@@ -139,6 +139,11 @@ export type StartResult = { engine: ServiceEngine } | { state: "no_compiler" | "
 /** Starts a service's engine: the program, the compiler, the gate. */
 export interface ServiceRuntime {
   start(init: ServiceInit): Promise<StartResult>;
+  /**
+   * How many fact rows `start` would read for the service. A service with none gets no
+   * engine, so it asks for no admission and leaves no "not checked" note.
+   */
+  rowCount?(init: ServiceInit): Promise<number>;
 }
 
 export type DaemonDeps = {
@@ -286,6 +291,7 @@ export class HeldDaemon {
       slot = undefined;
     }
     if (slot === undefined) {
+      if ((await this.deps.runtime.rowCount?.(init)) === 0) return { state: "none", lines: [], steps: {} };
       if (!(await this.makeRoom(init))) return this.notChecked(init, "capped");
       this.begin(init, now);
       return this.notChecked(init, "cold");
@@ -426,9 +432,12 @@ export class HeldDaemon {
       slot.engine = result.engine;
       slot.status = "ready";
       // The start returns once the first gate has run: the engine's size now is its settled size.
-      const size = result.engine.holdsCompiler === false ? null : result.engine.rss();
-      if (size !== null) slot.settledMb = Math.round(size);
-      this.keep(slot.init, { state: "ready", start_ms: this.now() - slot.begunAt, ...(size === null ? {} : { settled_mb: Math.round(size) }) });
+      // An engine with no compiler holds no memory: it settles at 0 MB, so a later daemon admits it free.
+      const holdsNone = result.engine.holdsCompiler === false;
+      const size = holdsNone ? null : result.engine.rss();
+      const settled = holdsNone ? 0 : size === null ? undefined : Math.round(size);
+      if (settled !== undefined) slot.settledMb = settled;
+      this.keep(slot.init, { state: "ready", start_ms: this.now() - slot.begunAt, ...(settled === undefined ? {} : { settled_mb: settled }) });
       // Give back the admission slot; the slot stays ready so its asks still answer.
       if (result.engine.holdsCompiler === false) removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
       return;

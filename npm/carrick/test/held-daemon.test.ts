@@ -332,6 +332,50 @@ test("a service that holds no compiler gives back its slot, so the next service 
   }
 });
 
+test("a service with no rows answers none with no note, even on a full budget", async () => {
+  const w = world(["api", "web"]);
+  try {
+    const started: string[] = [];
+    const runtime: ServiceRuntime = {
+      rowCount: async (init) => (init.service === "web" ? 0 : 3),
+      start: async (init) => {
+        started.push(init.service);
+        return { engine: { answer: async () => ({ lines: [] }), rss: () => 2048, close: async () => undefined } };
+      },
+    };
+    const daemon = new HeldDaemon({ root: w.root, home: w.home, env: { ...ON, CARRICK_HELD_MEMORY_MB: "2048" }, programs: async () => w.inits, runtime });
+    await daemon.handle(w.req(w.file("api")));
+    await settle();
+    const answer = await daemon.handle(w.req(w.file("web")));
+    assert.equal(answer.state, "none");
+    assert.equal(answer.not_checked, undefined, "no note");
+    assert.deepEqual(started, ["api"], "start was never called for web");
+  } finally {
+    w.done();
+  }
+});
+
+test("a service whose engine holds no compiler is admitted at 0 MB next time", async () => {
+  const w = world(["a"]);
+  try {
+    w.release();
+    w.setEngine({ holdsCompiler: false, nullRss: true });
+    await w.daemon.handle(w.req(w.file("a")));
+    await settle();
+    assert.equal(readState(w.root, "a", w.home)?.settled_mb, 0);
+    // Another checkout's engine fills the whole 4096 MB budget.
+    writeEntry(w.home, { pid: process.ppid, root: "/other", service: "x", rss_mb: 4096, last_used: w.clock.now });
+    const again: string[] = [];
+    const runtime: ServiceRuntime = { start: async (init) => (again.push(init.service), new Promise(() => undefined)) };
+    const second = new HeldDaemon({ root: w.root, home: w.home, env: { ...ON }, totalmem: () => 16 * 1024 ** 3, programs: async () => w.inits, runtime });
+    const answer = await second.handle(w.req(w.file("a")));
+    assert.equal(answer.state, "cold");
+    assert.deepEqual(again, ["a"]);
+  } finally {
+    w.done();
+  }
+});
+
 test("a real engine whose rss is unreadable keeps its slot", async () => {
   const w = world(["a", "b"]);
   try {
