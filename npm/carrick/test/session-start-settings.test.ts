@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { writeLauncher } from "../src/init/launcher.ts";
 import { execFileSync } from "node:child_process";
@@ -406,6 +407,49 @@ test("self-update rewrites our AGENTS.md section for the snapshot's project and 
     SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 }) + SURROUND_AFTER,
   );
   assert.ok(lines.some((line) => /rules section in AGENTS\.md/.test(line)));
+});
+
+function trackedWith(root: string, files: Record<string, string>): void {
+  const env = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "carrick-no-git-config-")),
+  };
+  const run = (...args: string[]): void => {
+    execFileSync("git", ["-C", root, "-c", "user.email=t@example.com", "-c", "user.name=t", ...args], { stdio: "ignore", env });
+  };
+  for (const [name, body] of Object.entries(files)) put(root, name, body);
+  run("init", "-q");
+  run("add", ...Object.keys(files));
+  run("commit", "-q", "-m", "team");
+}
+
+const SNAPSHOT_17 = [{ project_slug: "shop-system", services: Array.from({ length: 17 }, (_, i) => `a${i}`) }];
+
+test("self-update leaves a tracked AGENTS.md and CLAUDE.md section that differs only in counts: no write, no held line (carrick#4998)", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const body = SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 1, services: 13 }) + SURROUND_AFTER;
+  trackedWith(workspace.root, { "AGENTS.md": body, "CLAUDE.md": body });
+  snapshot(workspace.root, SNAPSHOT_17);
+  const held: string[] = [];
+  const lines = bringUpToDate(workspace.root, workspace.root, running, () => {}, held);
+  assert.equal(fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"), body);
+  assert.equal(fs.readFileSync(path.join(workspace.root, "CLAUDE.md"), "utf8"), body);
+  assert.ok(!lines.some((line) => /did not update|rules section/.test(line)), lines.join("\n"));
+  assert.ok(!held.includes("AGENTS.md") && !held.includes("CLAUDE.md"));
+});
+
+test("self-update still holds a tracked AGENTS.md section whose rule line is older", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const body = SURROUND_BEFORE + OLD_SECTION + SURROUND_AFTER;
+  trackedWith(workspace.root, { "AGENTS.md": body });
+  snapshot(workspace.root, SNAPSHOT_17);
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+  assert.equal(fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"), body);
+  assert.ok(lines.some((line) => heldLine(["AGENTS.md"]).test(line)), lines.join("\n"));
 });
 
 test("self-update never adds the AGENTS.md section where the markers are absent", (t) => {

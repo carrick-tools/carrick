@@ -103,11 +103,30 @@ function span(body: string): { from: number; to: number } | null {
   return { from, to: body[after] === "\n" ? after + 1 : after };
 }
 
-/** The body with our section written in: replaced where it is, appended where it is not. */
+const COUNTS_CLAUSE = /This workspace \([^)]*\) is indexed by Carrick\./;
+
+/**
+ * True where two sections differ at most in the counts phrase. The counts are
+ * what the index held when a developer last ran init or a session started, so
+ * they differ between developers and between re-indexes; a section that is
+ * current in every word is not rewritten for them (carrick#4998).
+ */
+export function sameExceptCounts(existing: string, rendered: string): boolean {
+  const bare = (text: string): string => text.replace(COUNTS_CLAUSE, "This workspace is indexed by Carrick.");
+  return bare(existing) === bare(rendered);
+}
+
+/**
+ * The body with our section written in: replaced where it is, appended where it
+ * is not, and kept as it is where it already says the same but for its counts.
+ */
 export function withCheckSection(existing: string | null, section: string): string {
   if (existing === null || existing.trim() === "") return section;
   const found = span(existing);
-  if (found !== null) return existing.slice(0, found.from) + section + existing.slice(found.to);
+  if (found !== null) {
+    if (sameExceptCounts(existing.slice(found.from, found.to), section)) return existing;
+    return existing.slice(0, found.from) + section + existing.slice(found.to);
+  }
   const lf = existing.endsWith("\n") ? existing : `${existing}\n`;
   return `${lf}\n${section}`;
 }
