@@ -160,6 +160,12 @@ async fn main() {
     if argv.first().map(String::as_str) == Some(carrick::untrusted_yarn::COMMAND) {
         std::process::exit(carrick::untrusted_yarn::run(&argv[1..]));
     }
+    // Internal: the compiler engine's pass over the pairs a model placed
+    // after the scan, run by the cloud runner and the offline harness.
+    if argv.first().map(String::as_str) == Some(carrick::matched_pass::COMMAND) {
+        let sidecar = discover_sidecar_path().map(|(path, _)| path);
+        std::process::exit(carrick::matched_pass::run(&argv[1..], sidecar.as_deref()));
+    }
     if let Some(parsed) = local_mode::cli::parse(&argv) {
         match parsed {
             Ok(command) => {

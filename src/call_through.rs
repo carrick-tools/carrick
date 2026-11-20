@@ -1772,21 +1772,7 @@ impl Settled {
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     let mut graph = ReachGraph::of(services.iter().map(|service| &*service.data));
     let sites: Vec<&CallThroughSites> = services.iter().map(|service| service.sites).collect();
-    graph.side_calls = sites
-        .iter()
-        .flat_map(|sites| sites.side_calls.iter())
-        .map(|(key, side)| (key.clone(), side.clone()))
-        .collect();
-    graph.shapes = sites
-        .iter()
-        .flat_map(|sites| sites.return_shapes.iter())
-        .map(|(definition, shape)| (definition.clone(), *shape))
-        .collect();
-    graph.written = sites
-        .iter()
-        .flat_map(|sites| sites.written.iter())
-        .map(|(definition, segments)| (definition.clone(), segments.clone()))
-        .collect();
+    graph.read_facts(&sites);
     let owners = file_owners(services.iter().map(|service| &*service.data));
     let siblings = SiblingLines::of(services.iter().map(|service| &*service.data));
     let mut decider = Decider::new(&graph, &sites);
@@ -3366,6 +3352,25 @@ impl ReachGraph {
         graph
     }
 
+    /// Take every service's side calls, return shapes and written segments.
+    fn read_facts(&mut self, sites: &[&CallThroughSites]) {
+        self.side_calls = sites
+            .iter()
+            .flat_map(|sites| sites.side_calls.iter())
+            .map(|(key, side)| (key.clone(), side.clone()))
+            .collect();
+        self.shapes = sites
+            .iter()
+            .flat_map(|sites| sites.return_shapes.iter())
+            .map(|(definition, shape)| (definition.clone(), *shape))
+            .collect();
+        self.written = sites
+            .iter()
+            .flat_map(|sites| sites.written.iter())
+            .map(|(definition, segments)| (definition.clone(), segments.clone()))
+            .collect();
+    }
+
     /// Collect the requests written in `start` and in the definitions it
     /// reaches within [`MAX_EDGE_DEPTH`] call edges, and the rows no fact
     /// states there, each with whether it was reached only through a side
@@ -4103,6 +4108,40 @@ fn apply(
         types_unknown,
         request_dropped,
     })
+}
+
+/// Whether a function of the repository's own code hands back the parsed
+/// body of the request it makes, read off the scan's stored blobs: the one
+/// rule the scan applies to a wrapper's callers
+/// ([`ReachGraph::hands_back_parse`]), for a reader that holds a call's
+/// declaration and no scan (the engine's pass over model-found pairs,
+/// [`crate::matched_pass`]).
+pub(crate) struct OwnCode {
+    graph: ReachGraph,
+}
+
+impl OwnCode {
+    /// Every service's definitions and stored facts, as [`settle`] reads them.
+    pub(crate) fn of<'d>(services: impl Iterator<Item = &'d CloudRepoData> + Clone) -> Self {
+        let mut graph = ReachGraph::of(services.clone());
+        let sites: Vec<CallThroughSites> = services
+            .filter_map(|data| data.call_through.as_ref().map(StoredCallThrough::sites))
+            .collect();
+        graph.read_facts(&sites.iter().collect::<Vec<_>>());
+        Self { graph }
+    }
+
+    /// Whether the definition opening on `file:line` (where the compiler
+    /// declares the callee) hands back a parsed body. `false` where no
+    /// definition opens there: a callee held in a parameter, a local or a
+    /// property is not a definition the scan indexes, and the function
+    /// around it is not the callee.
+    pub(crate) fn hands_back_parse(&self, file: &str, line: u32) -> bool {
+        self.graph.hands_back_parse(&DefinitionSite {
+            file: file.to_string(),
+            line,
+        })
+    }
 }
 
 /// Whether a captured type says nothing: the compiler could not state it, or
