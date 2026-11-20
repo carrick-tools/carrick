@@ -692,6 +692,7 @@ fn a_call_of_a_procedure_with_an_unread_method_is_saved_not_guessed() {
 /// function handed to `memo`, and the value reader's `value_callee` at the
 /// direct call. A row at those lines replaces each in the declared service.
 #[test]
+#[ignore = "train only: with carrick#4882 the re-export service's set is no longer empty, and it states the declared service's 4 call rows"]
 fn a_wrapper_of_no_procedure_of_the_set_states_nothing() {
     let scan = scans(&cassette("library-claims.json"), 1).remove(0);
     assert_eq!(call_rows(&scan, "reexport"), Vec::<String>::new());
@@ -730,7 +731,6 @@ fn an_incremental_rescan_states_the_same_calls() {
 /// asked until carrick#4882 (carrick#4878) lands. Then it states the
 /// declared service's rows.
 #[test]
-#[ignore = "needs carrick#4882: a re-exported declaration's claims are not asked"]
 fn a_re_exported_maker_states_the_same_rows() {
     let scans = scans(&cassette("library-claims.json"), 1);
     let notes = "services/reexport/src/notes.functions.ts";
