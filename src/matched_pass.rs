@@ -1089,9 +1089,8 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
             pair_id: index.to_string(),
             verb: pair.method.clone(),
             operation: pair.name.clone(),
-            // The engine's field is named `http`; here it means "a kind this
-            // build reads at at least one end" (see [`reading_of`]).
-            http: kind != Reading::Neither,
+            // A kind this build reads at at least one end (see [`reading_of`]).
+            asked: kind != Reading::Neither,
             caller: MatchedEnd {
                 service: repo.service_of(&pair.caller_file),
                 file: pair.caller_file.clone(),
