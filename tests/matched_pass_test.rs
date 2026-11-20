@@ -290,9 +290,12 @@ fn matched_pass_end_to_end() {
     // A `.then` chain is read at the call it is chained on.
     let chained = pair(out, PASS, 16, "/w/:id");
     assert!(has_text(chained, "server_returns"), "{chained:#}");
-    assert!(
-        compiler(chained, "caller_expects").get("text").is_some()
-            || compiler(chained, "caller_expects").get("reason").is_some()
+    // (Which call is located is pinned by the unit test
+    // `locate_caller_call_on_line`: here the annotation types both calls.)
+    assert!(has_text(chained, "caller_expects"), "{chained:#}");
+    assert_eq!(
+        chained["verdicts"]["compiler"]["grade"], "agree",
+        "{chained:#}"
     );
     // Two pairs on one line with different operations name no one call.
     for name in ["/w/:id", "/list"] {

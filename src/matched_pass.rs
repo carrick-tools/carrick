@@ -24,10 +24,12 @@
 //! `procedure`, `event`, `topic`, `queue` or `other` pair at neither end in
 //! this build, each end saying `protocol_not_read`.
 //!
-//! Nothing else in the record is changed, and nothing outside the output
-//! file is written: the scan's blobs, rows and store are read, never
-//! rewritten. It runs in the cloud runner after the model step and in the
-//! offline harness, never in a local check.
+//! Nothing else in the record is changed. The pass writes no blob, rows file
+//! or store entry: those are read, never rewritten. The compiler processes
+//! it starts may leave their own caches under the repository root, as they
+//! do in a scan (a Deno project's dependency cache). It runs in the cloud
+//! runner after the model step and in the offline harness, never in a local
+//! check.
 //!
 //! What decides each end:
 //!
@@ -921,12 +923,25 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
     let rows = Rows::read(&root, &row_paths);
     let mut blobs: Vec<&Stored> = stored.values().collect();
     blobs.sort_by(|a, b| a.blob.service_name.cmp(&b.blob.service_name));
-    let own = OwnCode::of(
-        &blobs
-            .iter()
-            .map(|stored| stored.blob.clone())
-            .collect::<Vec<_>>(),
-    );
+    let own = OwnCode::of(blobs.iter().map(|stored| &stored.blob));
+    // What each service was read with, for the runner's log: the pass runs
+    // before any log sink, so it says so on stderr.
+    for name in &names {
+        let held = stored.get(name);
+        crate::errln!(
+            "carrick {COMMAND}: {name}: extraction config {}, rows {}",
+            if held.is_some_and(|s| s.blob.cached_extraction_config.is_some()) {
+                "stored"
+            } else {
+                "absent"
+            },
+            if held.is_some_and(|s| s.rows.exists()) {
+                "read"
+            } else {
+                "missing"
+            },
+        );
+    }
 
     // A caller line two pairs name with different operations names no one
     // call.
@@ -1494,7 +1509,7 @@ const i = client.get(
             &pair,
             false,
             &rows,
-            &OwnCode::of(&[]),
+            &OwnCode::of(std::iter::empty()),
             &mut HashMap::new(),
         );
         assert_eq!(read.wrapper, json!({ "reason": ROWS_MISSING }));

@@ -4118,63 +4118,28 @@ fn apply(
 /// [`crate::matched_pass`]).
 pub(crate) struct OwnCode {
     graph: ReachGraph,
-    /// Each definition's first and last line, by repository-relative file.
-    extents: HashMap<String, Vec<(u32, u32)>>,
 }
 
 impl OwnCode {
     /// Every service's definitions and stored facts, as [`settle`] reads them.
-    pub(crate) fn of(services: &[CloudRepoData]) -> Self {
-        let mut graph = ReachGraph::of(services.iter());
+    pub(crate) fn of<'d>(services: impl Iterator<Item = &'d CloudRepoData> + Clone) -> Self {
+        let mut graph = ReachGraph::of(services.clone());
         let sites: Vec<CallThroughSites> = services
-            .iter()
             .filter_map(|data| data.call_through.as_ref().map(StoredCallThrough::sites))
             .collect();
         graph.read_facts(&sites.iter().collect::<Vec<_>>());
-        let mut extents: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
-        for definition in services
-            .iter()
-            .flat_map(|data| data.function_definitions.values())
-            .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
-        {
-            extents
-                .entry(definition.file_path.to_string_lossy().into_owned())
-                .or_default()
-                .push((
-                    definition.line_number,
-                    definition.end_line.max(definition.line_number),
-                ));
-        }
-        Self { graph, extents }
+        Self { graph }
     }
 
-    /// Whether the definition declared at `file:line` hands back a parsed
-    /// body. The definition is the one opening on that line, else the
-    /// innermost one holding it (a declaration's line can sit inside the
-    /// function's own lines). `false` for a definition no blob indexes: the
-    /// body is not proven.
+    /// Whether the definition opening on `file:line` (where the compiler
+    /// declares the callee) hands back a parsed body. `false` where no
+    /// definition opens there: a callee held in a parameter, a local or a
+    /// property is not a definition the scan indexes, and the function
+    /// around it is not the callee.
     pub(crate) fn hands_back_parse(&self, file: &str, line: u32) -> bool {
-        let exact = DefinitionSite {
-            file: file.to_string(),
-            line,
-        };
-        if self.graph.calls.contains_key(&exact) {
-            return self.graph.hands_back_parse(&exact);
-        }
-        let Some(first) = self
-            .extents
-            .get(file)
-            .into_iter()
-            .flatten()
-            .filter(|(first, last)| *first <= line && line <= *last)
-            .min_by_key(|(first, last)| last - first)
-            .map(|(first, _)| *first)
-        else {
-            return false;
-        };
         self.graph.hands_back_parse(&DefinitionSite {
             file: file.to_string(),
-            line: first,
+            line,
         })
     }
 }
