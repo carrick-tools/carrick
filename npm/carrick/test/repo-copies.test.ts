@@ -11,6 +11,7 @@ import { execFileSync } from "node:child_process";
 import {
   EXCLUDE_BEGIN,
   EXCLUDE_END,
+  EXCLUDE_PATTERNS,
   LOCAL_SETTINGS,
   excludeFile,
   ownRepository,
@@ -18,6 +19,7 @@ import {
   repoCopyPaths,
   withExcludeBlock,
   withoutExcludeBlock,
+  writeFolderCopy,
   writeRepoCopy,
 } from "../src/init/repo-copies.ts";
 import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
@@ -149,7 +151,7 @@ test("the exclude block is one marked run of lines, and taking it out gives the 
   const body = withExcludeBlock(original, [LOCAL_SETTINGS, CODEX_HOOKS_FILE]);
   // First in the file, so what follows is the owner's, untouched, whatever
   // it ends in.
-  assert.equal(body, `${EXCLUDE_BEGIN}\n/.claude/settings.local.json\n/.codex/hooks.json\n${EXCLUDE_END}\n${original}`);
+  assert.equal(body, `${EXCLUDE_BEGIN}\n/.claude/settings.local.json\n/.codex/hooks.json\n${EXCLUDE_PATTERNS.join("\n")}\n${EXCLUDE_END}\n${original}`);
   assert.equal(withoutExcludeBlock(body).body, original);
   for (const ending of ["", "*.log\n", "*.log", "\n"]) {
     assert.equal(withoutExcludeBlock(withExcludeBlock(ending, [LOCAL_SETTINGS])).body, ending, JSON.stringify(ending));
@@ -217,6 +219,109 @@ test("an exclude file init created goes with the copy", posix, () => {
     removeRepoCopy(dir);
     assert.equal(fs.existsSync(excludeFile(dir)!), false);
     assert.equal(status(dir), "?? package.json\n");
+  } finally {
+    cleanup();
+  }
+});
+
+// carrick#4031: a running check writes temporary files beside the code it reads.
+const HERMETIC_GIT: NodeJS.ProcessEnv = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "carrick-no-git-config-")),
+};
+
+function hermeticStatus(dir: string): string {
+  return execFileSync("git", ["-C", dir, "status", "--porcelain", "-uall"], { encoding: "utf8", env: { ...process.env, ...HERMETIC_GIT } });
+}
+
+const SURFACE_FILES = ["src/__carrick_surface__.4242.1.ts", "src/deep/__carrick_surface_probe_4242_0.ts"];
+
+function writeSurfaceFiles(dir: string): void {
+  for (const relative of SURFACE_FILES) {
+    fs.mkdirSync(path.dirname(path.join(dir, relative)), { recursive: true });
+    fs.writeFileSync(path.join(dir, relative), "export {};\n");
+  }
+  fs.writeFileSync(path.join(dir, "src", "keep.ts"), "export {};\n");
+}
+
+test("a single repo's block holds the surface pattern after its paths, and git shows no temporary file", posix, () => {
+  const { dir, cleanup } = repo();
+  try {
+    assert.ok(writeFolderCopy(dir, { slug: "shop" }) !== null);
+    const lines = fs.readFileSync(excludeFile(dir)!, "utf8").split("\n");
+    const end = lines.indexOf(EXCLUDE_END);
+    assert.deepEqual(lines.slice(end - EXCLUDE_PATTERNS.length, end), EXCLUDE_PATTERNS);
+    assert.equal(lines[end - EXCLUDE_PATTERNS.length - 1]?.startsWith("/"), true);
+    writeSurfaceFiles(dir);
+    const shown = hermeticStatus(dir);
+    assert.doesNotMatch(shown, /__carrick_surface/);
+    assert.match(shown, /src\/keep\.ts/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a repo copy in a multi-repo folder gets the same line", posix, () => {
+  const { dir, cleanup } = repo();
+  try {
+    assert.ok(writeRepoCopy(dir, { slug: "shop" }) !== null);
+    assert.ok(fs.readFileSync(excludeFile(dir)!, "utf8").split("\n").includes("__carrick_surface_*"));
+    writeSurfaceFiles(dir);
+    assert.doesNotMatch(hermeticStatus(dir), /__carrick_surface/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("remove takes the pattern with the block, deletes no surface file, and leaves the owner's lines", posix, () => {
+  const { dir, cleanup } = repo();
+  try {
+    const exclude = excludeFile(dir)!;
+    fs.appendFileSync(exclude, "*.log\n");
+    const owned = fs.readFileSync(exclude, "utf8");
+    writeRepoCopy(dir, { slug: "shop" });
+    writeSurfaceFiles(dir);
+    const taken = removeRepoCopy(dir);
+    assert.ok(taken !== null);
+    assert.equal(taken.some((relative) => relative.includes("__carrick_surface")), false);
+    assert.equal(fs.readFileSync(exclude, "utf8"), owned);
+    for (const relative of SURFACE_FILES) assert.ok(fs.existsSync(path.join(dir, relative)), relative);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a block missing its closing marker still ends after the pattern line", () => {
+  const cut = `${EXCLUDE_BEGIN}\n/.codex/hooks.json\n${EXCLUDE_PATTERNS.join("\n")}\n*.tmp\n`;
+  assert.deepEqual(withoutExcludeBlock(cut), {
+    body: "*.tmp\n",
+    lines: ["/.codex/hooks.json", ...EXCLUDE_PATTERNS],
+    found: true,
+  });
+});
+
+test("a block with no paths is no block, and carries no pattern", () => {
+  assert.equal(withExcludeBlock("*.log\n", []), "*.log\n");
+  assert.equal(withExcludeBlock(null, []), "");
+  assert.equal(withExcludeBlock(withExcludeBlock("*.log\n", [LOCAL_SETTINGS]), []), "*.log\n");
+});
+
+test("the pattern covers every name the compiler engine writes for a running check", posix, () => {
+  const sidecar = path.join(import.meta.dirname, "..", "..", "..", "src", "sidecar", "src");
+  const capture = fs.readFileSync(path.join(sidecar, "capture", "index.ts"), "utf8");
+  const claims = fs.readFileSync(path.join(sidecar, "library-claims.ts"), "utf8");
+  const entry = /const SURFACE_ENTRY_BASENAME = '([^']+)'/.exec(capture)?.[1];
+  const probe = /`(__carrick_surface_probe_)\$\{/.exec(claims)?.[1];
+  assert.ok(entry && probe, "both writers found");
+  const { dir, cleanup } = repo();
+  try {
+    fs.writeFileSync(path.join(dir, ".gitignore"), withExcludeBlock(null, [LOCAL_SETTINGS]));
+    for (const name of [`${entry}.1.2.ts`, `${entry}.1.2.d.ts`, `${probe}1_0.ts`]) {
+      const target = path.join("src", "a", name);
+      const out = execFileSync("git", ["-C", dir, "check-ignore", target], { encoding: "utf8", env: { ...process.env, ...HERMETIC_GIT } });
+      assert.equal(out.trim(), target.split(path.sep).join("/"));
+    }
   } finally {
     cleanup();
   }
