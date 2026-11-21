@@ -1451,6 +1451,41 @@ impl<'a> Calls<'a> {
         calls
     }
 
+    /// This index with a caller edge for each call of a module binding the
+    /// resolver reads to definitions (K3, [`Resolver::binding_definitions`]),
+    /// where neither the call graph nor the rows reach one: `init(app)` after
+    /// `const { default: init } = await services[name]()` calls the default
+    /// export of each module the registry loads.
+    fn with_binding_callers(mut self, inputs: &'a RequestSummaryInputs) -> Self {
+        let resolver = Resolver::new(inputs, &[]);
+        let mut own: Vec<Placed<'a>> = self.by_span.values().copied().collect();
+        own.sort_by_key(|placed| {
+            (
+                placed.file,
+                placed.call.site.span_start,
+                placed.call.site.span_end,
+            )
+        });
+        for placed in own {
+            if placed.call.constructs
+                || self.target(&placed).is_some()
+                || !matches!(
+                    inputs.reach(placed.file, placed.call.site.lo, placed.call.site.hi),
+                    Reach::NoFunction
+                )
+            {
+                continue;
+            }
+            for target in resolver
+                .binding_definitions(placed.file, placed.call)
+                .unwrap_or_default()
+            {
+                self.callers.entry(target).or_default().push(placed);
+            }
+        }
+        self
+    }
+
     /// The same index, each call's callers edge read from what the rows say
     /// it reaches ([`RequestSummaryInputs::reach`], rows first): the callers
     /// discovery's value walk reads (carrick#2432).
@@ -4738,6 +4773,11 @@ fn decide(
         Calls::index(inputs)
     } else {
         Calls::index_with(inputs, siblings, &entered_files)
+    };
+    let calls = if makers.is_some() {
+        calls.with_binding_callers(inputs)
+    } else {
+        calls
     };
     // A scope claim the trace's ask got no answer for is never read as a
     // scope: only the walk index holds it, for the mounts it could have
