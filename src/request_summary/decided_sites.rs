@@ -253,6 +253,11 @@ pub struct SiteLabel {
     /// receiver's instance walk ends at, never at the op's own call.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub name_at_maker: bool,
+    /// The literal text the library puts before the `name` slot's value
+    /// (claim `name_prefix`, contract amendment R27 on carrick#2434). Carried
+    /// from the claim only: no site composes a path with it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_prefix: Option<String>,
     #[serde(default)]
     pub payload: Option<ArgSlot>,
     #[serde(default)]
@@ -379,6 +384,7 @@ impl SiteLabel {
                         yields: op.yields,
                         name_scope: None,
                         name_at_maker: false,
+                        name_prefix: None,
                     });
                 }
             }
@@ -440,6 +446,7 @@ impl SiteLabel {
                         yields: None,
                         name_scope: None,
                         name_at_maker: false,
+                        name_prefix: None,
                     });
                     continue;
                 }
@@ -464,6 +471,7 @@ impl SiteLabel {
                     method,
                     method_key,
                     method_default,
+                    name_prefix,
                     request,
                     yields,
                     name_scope,
@@ -515,6 +523,7 @@ impl SiteLabel {
                             yields: None,
                             name_scope: None,
                             name_at_maker: false,
+                            name_prefix: None,
                         });
                     }
                     continue;
@@ -554,6 +563,12 @@ impl SiteLabel {
                             ..
                         })
                     ),
+                    // A prefix goes before the value of a name slot; on any
+                    // other name it has nothing to stand before.
+                    name_prefix: match name.as_deref() {
+                        Some(OpName::Slot(_)) => name_prefix.as_deref().cloned(),
+                        _ => None,
+                    },
                     payload: payload.as_ref().map(slot),
                     handler: handler.as_ref().map(slot),
                     method,
@@ -6455,6 +6470,48 @@ pub(crate) mod tests {
         );
     }
 
+    /// Contract amendment R27 on carrick#2434: a request op's `name_prefix`
+    /// rides on its label beside the name slot it stands before, and only
+    /// there; a label without one carries none.
+    #[test]
+    fn a_name_prefix_rides_on_the_label_of_a_name_slot() {
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([{
+                "package": "@fixture/hosted",
+                "version": "1.0.0",
+                "specifier": "@fixture/hosted",
+                "export": "createClient",
+                "role": "http_client",
+                "side": "client",
+                "claims": [
+                    { "kind": "op", "op": "request", "member": "invoke", "path": ["functions"],
+                      "on": "instance", "name": { "arg": 0 }, "name_prefix": "/functions/v1/",
+                      "method_key": { "arg": 1, "key": "method" }, "method_default": "POST",
+                      "payload": { "arg": 1, "key": "body" } },
+                    { "kind": "op", "op": "request", "member": "send", "on": "instance",
+                      "name": { "bound": "maker" }, "name_prefix": "/functions/v1/" },
+                    { "kind": "op", "op": "request", "member": "post", "on": "instance",
+                      "name": { "arg": 0 }, "method": "POST" }
+                ]
+            }]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        let prefixes: Vec<_> = labels
+            .iter()
+            .map(|label| (label.member.as_deref(), label.name_prefix.as_deref()))
+            .collect();
+        assert_eq!(
+            prefixes,
+            [
+                (Some("invoke"), Some("/functions/v1/")),
+                (Some("send"), None),
+                (Some("post"), None),
+            ]
+        );
+        let unset = serde_json::to_value(&labels[2]).unwrap();
+        assert!(unset.get("name_prefix").is_none(), "{unset}");
+    }
+
     /// carrick#2439: the scan's settled claims give one label per op, with
     /// its slots, method fields, role and side, as the store's raw answer
     /// does; a maker labels no op, and a name bound to the maker no name
@@ -6488,6 +6545,7 @@ pub(crate) mod tests {
                     yields: None,
                     name_scope: None,
                     name_at_maker: false,
+                    name_prefix: None,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("post".into()),
@@ -6514,6 +6572,7 @@ pub(crate) mod tests {
                     name_scope: None,
                     // A name bound to the maker is read there (carrick#3527).
                     name_at_maker: true,
+                    name_prefix: None,
                     package: "@fixture/http".into(),
                     export: "createClient".into(),
                     member: Some("send".into()),
@@ -7529,6 +7588,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
             package: "@fixture/wire".into(),
             export: "connect".into(),
             member: Some(member.into()),
@@ -7554,6 +7614,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
             package: "lib:lib.dom.d.ts".into(),
             export: "fetch".into(),
             member: None,
@@ -7587,6 +7648,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
             package: "node:child_process".into(),
             export: "ChildProcess".into(),
             member: Some("send".into()),
@@ -8449,6 +8511,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
             name: None,
             handler: Some(ArgSlot { arg: 0, key: None }),
             scope: Some(LabelScope {
@@ -8706,6 +8769,7 @@ pub(crate) mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
             package: "@fixture/http".into(),
             export: "default".into(),
             member: Some("get".into()),
