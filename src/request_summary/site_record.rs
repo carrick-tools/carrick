@@ -3723,6 +3723,7 @@ mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
             span_end: start + call.len() as u32,
         };
         let site = super::super::decided_sites::DiscoverySite {

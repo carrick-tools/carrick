@@ -230,6 +230,40 @@ describe('verify_library_claims: label structure v2 (carrick#2434)', () => {
     );
   });
 
+  it('name_prefix: the text before a name slot, accepted where method_default is, never checked', async () => {
+    const beacon = (parts: Record<string, unknown>) => onClient(op('request', 'beacon', { payload: { arg: 1 }, ...parts }));
+    const R = 'fixture-router';
+    const S = 'fixture-sockets';
+    assert.deepStrictEqual(
+      verdicts(
+        await send([
+          factory,
+          beacon({ name: { arg: 0 }, name_prefix: '/functions/v1/', method_default: 'POST' }),
+          // Its value is the picker's reading of the library: any text holds.
+          beacon({ name: { arg: 0 }, name_prefix: 'not-a-path' }),
+          // Invalid: no name slot for it to stand before.
+          beacon({ name: { bound: 'maker' }, name_prefix: '/functions/v1/' }),
+          // Invalid: a route registers a path, it is not an HTTP request op.
+          check(R, 'router', 'server_framework', 'export', make('call', null)),
+          check(R, 'router', 'server_framework', 'instance:()', op('receive', 'get', { name: { arg: 0 }, of: 'instance:()', method: 'GET', name_prefix: '/v1/' })),
+          // Invalid: a message role carries no HTTP field.
+          check(S, 'SocketServer', 'socket', 'export', make('new', null)),
+          check(S, 'SocketServer', 'socket', 'instance:new', op('receive', 'on', { name: { arg: 0 }, handler: { arg: 1 }, of: 'instance:new', name_prefix: '/v1/' })),
+        ])
+      ),
+      [
+        'verified',
+        'verified',
+        'verified',
+        'unchecked claim_invalid',
+        'verified',
+        'unchecked claim_invalid',
+        'verified',
+        'unchecked claim_invalid',
+      ]
+    );
+  });
+
   it('a verb member under v2: its own name is its method', async () => {
     const get = (parts: Record<string, unknown>) => onClient(op('request', 'get', { name: { arg: 0 }, ...parts }));
     assert.deepStrictEqual(
@@ -360,6 +394,8 @@ describe('verify_library_claims: label structure v2 (carrick#2434)', () => {
       op('request', 'get', { name: { arg: 0 }, runs: { bound: 'scope', arg: 0 } }),
       op('receive', 'on', { name: { arg: 0 }, yields: { param: -1, export: 'Socket', side: 'server' } }),
       op('request', 'get', { name: { arg: 0 }, method_default: '' }),
+      op('request', 'get', { name: { arg: 0 }, name_prefix: '' }),
+      op('request', 'get', { name: { arg: 0 }, name_prefix: 7 }),
       make('call', null, { runs: { bound: 'maker', arg: 0 } }),
     ];
     for (const claim of shapes) {

@@ -296,11 +296,29 @@ const ROLE_TABLE: Readonly<Record<LibraryRole, RoleRules | undefined>> = {
  * `http_client` export with one such claim in the request is read under
  * `HTTP_V2_RULES`.
  */
+/**
+ * Where an op's `name_prefix` (contract amendment R27 on carrick#2434) may
+ * sit: a non-empty string on an HTTP `request` op whose name is a slot, the
+ * value it stands before. The schema already refuses a value that is not a
+ * non-empty string; this holds any other caller of the verifier to it too.
+ */
+function namePrefixPlaced(claim: OpClaim): boolean {
+  return (
+    typeof claim.name_prefix === 'string' &&
+    claim.name_prefix.length > 0 &&
+    claim.op === 'request' &&
+    (claim.protocol === undefined || claim.protocol === 'http') &&
+    claim.name !== undefined &&
+    'arg' in claim.name
+  );
+}
+
 function hasV2Field(claim: LibraryClaim): boolean {
   if (claim.kind === 'make') return claim.runs !== undefined;
   if (claim.kind !== 'op') return false;
   return (
     claim.method_default !== undefined ||
+    claim.name_prefix !== undefined ||
     claim.base !== undefined ||
     claim.runs !== undefined ||
     claim.yields !== undefined ||
@@ -3365,7 +3383,7 @@ class DeclarationReader {
     if (claim.form !== 'decorate' || claim.op !== 'receive') return unchecked('claim_invalid');
     const parts = [
       claim.payload, claim.handler, claim.ack, claim.runs, claim.yields, claim.request, claim.returns,
-      claim.method_key, claim.method_default, claim.options, claim.base,
+      claim.method_key, claim.method_default, claim.name_prefix, claim.options, claim.base,
     ];
     if (parts.some(part => part !== undefined)) return unchecked('claim_invalid');
     const slots: ClaimSlot[] = [];
@@ -3463,6 +3481,7 @@ class DeclarationReader {
       claim.method === undefined &&
       claim.method_key === undefined &&
       claim.method_default === undefined &&
+      claim.name_prefix === undefined &&
       claim.base === undefined;
     const payload = claim.payload;
     if (!alone || claim.member === null || payload?.arg !== 0 || payload.key !== undefined) {
@@ -3673,7 +3692,11 @@ class DeclarationReader {
    *   `method_key`, the method when that option is absent; alone, the one
    *   method the call sends. Beside `method`, it says nothing new and is
    *   `claim_invalid`, as is `method` beside `method_key`;
-   * - `options` belongs to the #1564 checks and is `claim_invalid`.
+   * - `options` belongs to the #1564 checks and is `claim_invalid`;
+   * - `name_prefix` (contract amendment R27) is the text the library puts
+   *   before the name slot's value: a non-empty string on an HTTP `request`
+   *   op whose name is a slot, else `claim_invalid`. Its value is the
+   *   picker's reading of the library's source and is never checked.
    * Undefined when the fields hold so far; their slots are read with the
    * call's other parts.
    */
@@ -3690,7 +3713,12 @@ class DeclarationReader {
     // leave it out, and states it as the member's own name (carrick#3048).
     if (claim.name !== undefined && 'bound' in claim.name && claim.name.bound === 'key') {
       if (!words || claim.op !== 'receive' || claim.handler === undefined) return unchecked('claim_invalid');
-      if (claim.method_key !== undefined || claim.method_default !== undefined || claim.options !== undefined) {
+      if (
+        claim.method_key !== undefined ||
+        claim.method_default !== undefined ||
+        claim.name_prefix !== undefined ||
+        claim.options !== undefined
+      ) {
         return unchecked('claim_invalid');
       }
       if (claim.protocol === 'rpc' || claim.protocol === 'graphql') {
@@ -3708,9 +3736,11 @@ class DeclarationReader {
         claim.method_key !== undefined ||
         claim.options !== undefined ||
         claim.method_default !== undefined ||
+        claim.name_prefix !== undefined ||
         claim.base !== undefined;
       return any ? unchecked('claim_invalid') : undefined;
     }
+    if (claim.name_prefix !== undefined && !namePrefixPlaced(claim)) return unchecked('claim_invalid');
     if (claim.options !== undefined) return unchecked('claim_invalid');
     if (claim.method !== undefined && (claim.method_key !== undefined || claim.method_default !== undefined)) {
       return unchecked('claim_invalid');

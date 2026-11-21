@@ -473,6 +473,197 @@ fn a_model_only_row_on_a_learned_base_is_host_free() {
     );
 }
 
+// The client calls that name a function by a string (`client.functions
+// .invoke("price-quote", …)`): the claim names the op on the client's
+// `functions` sub-object, with the prefix the library puts before the name.
+
+/// `library-claims.json` with `edit` applied, as the store's answer the scan
+/// replays (written over the copy the tree's `claims` flag makes).
+fn claims_with(edit: impl Fn(&mut serde_json::Value)) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hosted-functions/library-claims.json");
+    let mut claims: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    edit(&mut claims);
+    serde_json::to_string_pretty(&claims).unwrap()
+}
+
+/// The client export's claims in `claims`.
+fn client_claims(claims: &mut serde_json::Value) -> &mut serde_json::Value {
+    claims["library_claims"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|package| package["package"] == "@supabase/supabase-js")
+        .map(|package| &mut package["exports"][0])
+        .unwrap()
+}
+
+const CLAIMS_ANSWER: &str = "__llm__/library-claims/default.json";
+
+/// Each invoke call the fixture writes, and the row it states.
+const INVOKES: [(&str, &str, &str); 5] = [
+    ("src/direct.ts:4", "POST", "/functions/v1/price-quote"),
+    ("src/digest.ts:6", "POST", "/functions/v1/team-digest"),
+    ("src/page.ts:5", "POST", "/functions/v1/send-invite"),
+    ("src/page.ts:6", "POST", "/functions/v1/report-export"),
+    ("src/method.ts:4", "GET", "/functions/v1/price-quote"),
+];
+
+/// Every call row in the files the invoke calls are written in or reached
+/// through.
+fn invoke_file_calls(blobs: &[serde_json::Value]) -> Vec<(String, String, String)> {
+    blobs
+        .iter()
+        .flat_map(|blob| blob["calls"].as_array().into_iter().flatten())
+        .filter_map(|row| {
+            let at = row["file_path"].as_str()?;
+            [
+                "src/direct.ts",
+                "src/digest.ts",
+                "src/page.ts",
+                "src/method.ts",
+                "src/callEdge.ts",
+                "src/useEdge.ts",
+            ]
+            .iter()
+            .any(|file| at.starts_with(&format!("{file}:")))
+            .then(|| {
+                (
+                    at.to_string(),
+                    row["key"]["method"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    row["key"]["path"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn a_client_call_named_by_a_literal_states_its_folder_function_path() {
+    let (method, path, source) = one_call_at(&scan(SERVED).blobs, "src/direct.ts:4");
+    assert_eq!(
+        (method.as_str(), path.as_str()),
+        ("POST", "/functions/v1/price-quote")
+    );
+    assert_ne!(source, "model", "a fact row");
+}
+
+#[test]
+fn a_client_call_named_by_a_module_constant_states_its_path() {
+    let (method, path, _) = one_call_at(&scan(SERVED).blobs, "src/digest.ts:6");
+    assert_eq!(
+        (method.as_str(), path.as_str()),
+        ("POST", "/functions/v1/team-digest")
+    );
+}
+
+#[test]
+fn a_wrapper_states_each_callers_function() {
+    let blobs = scan(SERVED).blobs;
+    let rows = |at: &str| {
+        let (method, path, _) = one_call_at(&blobs, at);
+        (method, path)
+    };
+    assert_eq!(
+        rows("src/page.ts:5"),
+        ("POST".to_string(), "/functions/v1/send-invite".to_string())
+    );
+    assert_eq!(
+        rows("src/page.ts:6"),
+        (
+            "POST".to_string(),
+            "/functions/v1/report-export".to_string()
+        )
+    );
+    let inside: Vec<_> = invoke_file_calls(&blobs)
+        .into_iter()
+        .filter(|(at, _, _)| at.starts_with("src/callEdge.ts") || at.starts_with("src/useEdge.ts"))
+        .collect();
+    assert!(inside.is_empty(), "the callers state the rows: {inside:?}");
+}
+
+#[test]
+fn a_method_written_in_the_options_overrides_the_default() {
+    let (method, path, _) = one_call_at(&scan(SERVED).blobs, "src/method.ts:4");
+    assert_eq!(
+        (method.as_str(), path.as_str()),
+        ("GET", "/functions/v1/price-quote")
+    );
+}
+
+#[test]
+fn each_client_call_pairs_with_the_function_it_names() {
+    for config in [true, false] {
+        let blobs = scan(Tree { config, ..SERVED }).blobs;
+        let served: BTreeSet<(String, String)> = function_rows(&blobs)
+            .into_iter()
+            .map(|(_, method, path, _)| (method, path))
+            .collect();
+        let mut called = BTreeSet::new();
+        for at in INVOKES.iter().map(|(at, _, _)| *at).chain([QUOTE]) {
+            let (method, path, _) = one_call_at(&blobs, at);
+            let pairs: Vec<_> = served
+                .iter()
+                .filter(|(served_method, served_path)| {
+                    *served_path == path && carrick_match::method_matches(served_method, &method)
+                })
+                .collect();
+            assert_eq!(
+                pairs.len(),
+                1,
+                "carrick.json kept: {config}: {at} {method} {path} pairs once: {served:?}"
+            );
+            called.insert(path);
+        }
+        assert!(
+            served
+                .iter()
+                .any(|(_, path)| path == "/functions/v1/purge-sessions")
+        );
+        assert!(
+            !called.contains("/functions/v1/purge-sessions"),
+            "nothing calls purge-sessions"
+        );
+    }
+}
+
+#[test]
+fn without_the_served_marker_an_env_base_stays_on_the_path() {
+    let (method, path, _) = one_call_at(
+        &scan(Tree {
+            marker: false,
+            ..SERVED
+        })
+        .blobs,
+        "src/direct.ts:4",
+    );
+    assert_eq!(
+        (method.as_str(), path.as_str()),
+        (
+            "POST",
+            "${import.meta.env.VITE_SUPABASE_URL}/functions/v1/price-quote"
+        )
+    );
+}
+
+#[test]
+fn an_op_the_claims_do_not_state_states_no_row() {
+    let claims = claims_with(|claims| {
+        client_claims(claims)["ops"] = serde_json::json!([]);
+    });
+    let blobs = scan(Tree {
+        extra: &[(CLAIMS_ANSWER, &claims)],
+        ..SERVED
+    })
+    .blobs;
+    let rows = invoke_file_calls(&blobs);
+    assert!(rows.is_empty(), "no claimed op, no row: {rows:?}");
+}
+
 /// The request type aliases (`…_Request_…`) of the web blob's bundled types.
 fn request_types(blobs: &[serde_json::Value]) -> BTreeSet<String> {
     blobs

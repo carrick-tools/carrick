@@ -1938,6 +1938,18 @@ fn parse_export(
             });
             let parsed = tagged
                 .and_then(|()| serde_json::from_value::<LibraryClaim>(element).ok())
+                // An empty name prefix (R27) says nothing the op can use, and
+                // the verifier's schema refuses it for the whole request: the
+                // op is out of shape.
+                .filter(|claim| {
+                    !matches!(
+                        claim,
+                        LibraryClaim::Op {
+                            name_prefix: Some(prefix),
+                            ..
+                        } if prefix.is_empty()
+                    )
+                })
                 // A scope names a prefix, collects procedures (#2474 R6a),
                 // merges collections (amendment 9), passes its receiver
                 // through, or binds with no prefix (`mounts`, or `runs` with
@@ -4571,6 +4583,26 @@ mod tests {
         assert_eq!(answer.exports[0].claims.len(), 1);
         // Three ops and two exports.
         assert_eq!(answer.dropped, 5);
+    }
+
+    /// Contract amendment R27 on carrick#2434: an op's `name_prefix` reads
+    /// off the store's answer and goes to the verifier as written; one that is
+    /// not a string, or is empty, drops its op and is counted.
+    #[test]
+    fn an_op_name_prefix_is_sent_as_written_and_dropped_out_of_shape() {
+        let answer = parse_answer(
+            r#"{"library_claims":[{"package":"lib","version":"1.0.0","status":"answered","exports":[
+                {"specifier":"lib","export":"createClient","role":"http_client","ops":[
+                    {"op":"request","member":"invoke","path":["functions"],"on":"instance","name":{"arg":0},
+                     "name_prefix":"/functions/v1/","method_default":"POST"},
+                    {"op":"request","member":"invoke","on":"instance","name":{"arg":0},"name_prefix":7},
+                    {"op":"request","member":"invoke","on":"instance","name":{"arg":0},"name_prefix":""}
+                ]}]}]}"#,
+        );
+        assert_eq!((answer.answered, answer.dropped), (1, 2));
+        let sent = serde_json::to_value(&answer.exports[0].claims).unwrap();
+        assert_eq!(sent.as_array().unwrap().len(), 1);
+        assert_eq!(sent[0]["name_prefix"], "/functions/v1/");
     }
 
     /// carrick#2474 R0: a scope's `runs`, `yields` and `mounts` and a

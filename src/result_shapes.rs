@@ -355,6 +355,7 @@ mod tests {
             new: false,
             scope: None,
             procedure: None,
+            path: Vec::new(),
         }
     }
 

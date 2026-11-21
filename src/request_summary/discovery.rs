@@ -177,6 +177,11 @@ pub struct SiteEnd {
     /// the key path and the router its first key belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procedure: Option<ProcedureAt>,
+    /// The sub-object hops between the instance and the member, where the
+    /// op is claimed under them (`client.functions.invoke(…)` is
+    /// `["functions"]`): set by the instance branch only (C1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
 }
 
 /// The procedure a client call names (carrick#3186): its key
@@ -1873,6 +1878,8 @@ struct ReceiverOp<'a> {
     claims: &'a ExportClaims,
     op: LibraryOp,
     member: &'a str,
+    /// The sub-object hops the op is claimed under (`["functions"]`).
+    path: &'a [String],
 }
 
 /// One call made through a listed client into a package never asked: (listed
@@ -2069,6 +2076,7 @@ impl<'a> Walker<'a> {
             new: invoke.construction,
             scope: None,
             procedure: None,
+            path: Vec::new(),
         }
     }
 
@@ -2141,17 +2149,16 @@ impl<'a> Walker<'a> {
     /// Each call-form op the store claims on a member of `site`'s receiver,
     /// one that applies to it (an instance's maker, or the export), in the
     /// order the instance branch of [`Self::library_end`] tries them:
-    /// package key, then export, then claim. Empty for a receiver read
-    /// through hops (`app.a.get(…)`), where no op is claimed.
+    /// package key, then export, then claim. A receiver read through hops
+    /// (`client.functions.invoke(…)`) takes only the `request` ops claimed
+    /// under those same hops (C1); every other op is claimed on the receiver
+    /// itself.
     ///
     /// The one answer to "which ops are claimed on this library receiver":
     /// the instance branch takes the op its member names, and a call
     /// through a computed key ([`Self::keyed_stop`]) asks whether any is.
     fn receiver_ops(&self, site: &'a LibrarySite) -> Vec<ReceiverOp<'a>> {
         let mut found = Vec::new();
-        if !site.path.is_empty() {
-            return found;
-        }
         let receivers = site.receiver_ids();
         let exports = if site.export == "default" {
             vec!["default", "export ="]
@@ -2172,7 +2179,8 @@ impl<'a> Walker<'a> {
                         of,
                         ..
                     } = claim
-                        && path.is_empty()
+                        && *path == site.path
+                        && (path.is_empty() || *op == LibraryOp::Request)
                         && receivers
                             .iter()
                             .any(|receiver| applies(*on, of.as_deref(), receiver))
@@ -2183,6 +2191,7 @@ impl<'a> Walker<'a> {
                             claims,
                             op: *op,
                             member,
+                            path,
                         });
                     }
                 }
@@ -2593,6 +2602,7 @@ impl<'a> Walker<'a> {
             return Some((
                 SiteEnd {
                     op: Some(claimed.op),
+                    path: claimed.path.to_vec(),
                     ..end(&claimed.key, claimed.export, Some(member), claimed.claims)
                 },
                 ReachedBy::Instance,
@@ -12305,5 +12315,120 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         }
         let out = std::env::var("CARRICK_LIBRARY_ASK_CENSUS_OUT").expect("an out file");
         std::fs::write(out, serde_json::to_string_pretty(&all).unwrap()).expect("the asks write");
+    }
+
+    /// The exports of a `@fixture/platform` whose `createClient` makes a
+    /// client and claims `op` on member `member` of the client's `path`.
+    fn hopped_claims(op: &str, path: &[&str], member: &str) -> Vec<ExportClaims> {
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/platform", "version": "1.0.0",
+                "specifier": "@fixture/platform", "export": "createClient",
+                "role": "http_client", "side": "client",
+                "claims": [
+                    { "kind": "make", "form": "call", "member": null },
+                    { "kind": "op", "op": op, "path": path, "member": member,
+                      "on": "instance", "name": { "arg": 0 } }
+                ]
+            }))
+            .unwrap(),
+        ]
+    }
+
+    /// C1: a `request` op claimed under the hops the call reads its member
+    /// through (`c.fns.call(…)`, op on `fns`) is an end of the instance
+    /// branch, carrying those hops. The same hops on another op, or other
+    /// hops, give none.
+    #[test]
+    fn a_request_op_claimed_through_hops_is_an_instance_end() {
+        let manifest =
+            "{ \"name\": \"web\", \"dependencies\": { \"@fixture/platform\": \"1.0.0\" } }\n";
+        let source = "import { createClient } from \"@fixture/platform\";\n\
+                      const c = createClient();\n\
+                      export function go() {\n  return c.fns.call(\"x\");\n}\n";
+        let types = "export declare class Fns { call(name: string): Promise<unknown>; }\n\
+                     export declare class Client { fns: Fns; }\n\
+                     export declare function createClient(): Client;\n";
+        let Some(on) = walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &[
+                ("package.json", manifest),
+                (
+                    "node_modules/@fixture/platform/package.json",
+                    "{ \"name\": \"@fixture/platform\", \"version\": \"1.0.0\", \"types\": \"index.d.ts\" }\n",
+                ),
+                ("node_modules/@fixture/platform/index.d.ts", types),
+                ("src/hops.ts", source),
+            ],
+            true,
+        ) else {
+            return;
+        };
+        let ends = |exports: &[ExportClaims]| -> Vec<(Option<String>, Vec<String>)> {
+            let discovery = discover(&on.inputs, &Labels::of(exports), &on.repo);
+            let ends: Vec<_> = discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("src/hops.ts"))
+                .filter_map(|site| site.end.clone())
+                // The maker call is an end of its own, with no op.
+                .filter(|end| end.op.is_some())
+                .map(|end| (end.member, end.path))
+                .collect();
+            if ends.is_empty() {
+                crate::errln!(
+                    "no end in src/hops.ts: unfollowed {:?}",
+                    discovery
+                        .unfollowed
+                        .iter()
+                        .filter(|site| site.file.ends_with("src/hops.ts"))
+                        .map(|site| (&site.callee, &site.stop))
+                        .collect::<Vec<_>>()
+                );
+            }
+            ends
+        };
+        assert_eq!(
+            ends(&hopped_claims("request", &["fns"], "call")),
+            vec![(Some("call".to_string()), vec!["fns".to_string()])]
+        );
+        assert_eq!(ends(&hopped_claims("send", &["fns"], "call")), vec![]);
+        assert_eq!(ends(&hopped_claims("request", &["other"], "call")), vec![]);
+    }
+
+    /// C1 (ruling on step 0.5): an end no hopped op matched serializes as it
+    /// did before the hops were carried, with no `path` key, on both sides
+    /// of the engine's conversion.
+    #[test]
+    fn an_end_with_no_hops_serializes_as_before() {
+        let end = SiteEnd {
+            package: "@fixture/platform".into(),
+            export: "createClient".into(),
+            member: Some("get".into()),
+            role: LibraryRole::HttpClient,
+            op: Some(LibraryOp::Request),
+            file: "src/a.ts".into(),
+            line: 1,
+            span_start: 0,
+            span_end: 1,
+            new: false,
+            scope: None,
+            procedure: None,
+            path: Vec::new(),
+        };
+        let value = serde_json::to_value(&end).unwrap();
+        assert!(value.get("path").is_none(), "{value}");
+        let labelled: super::super::decided_sites::LabelledEnd =
+            serde_json::from_value(value.clone()).unwrap();
+        let back = serde_json::to_value(&labelled).unwrap();
+        assert!(back.get("path").is_none(), "{back}");
+        let hopped = serde_json::to_value(SiteEnd {
+            path: vec!["fns".into()],
+            ..end
+        })
+        .unwrap();
+        assert_eq!(hopped["path"], serde_json::json!(["fns"]));
     }
 }
