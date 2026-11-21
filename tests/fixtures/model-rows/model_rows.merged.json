@@ -61,7 +61,12 @@
         "params": [],
         "file_path": "web/src/trpc.ts:14",
         "procedure": {
-          "path": "order.byId"
+          "path": "order.byId",
+          "router": {
+            "repo": "acme/shop",
+            "file": "",
+            "binding": ""
+          }
         },
         "resolution_source": "model",
         "model_end": {
@@ -143,7 +148,12 @@
           "file_location": "web/src/trpc.ts:14",
           "line": 14,
           "procedure": {
-            "path": "order.byId"
+            "path": "order.byId",
+            "router": {
+              "repo": "acme/shop",
+              "file": "",
+              "binding": ""
+            }
           },
           "resolution_source": "model",
           "model_end": {
