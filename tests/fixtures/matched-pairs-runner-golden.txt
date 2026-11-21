@@ -10,9 +10,9 @@ pairs.json d2768fa18d2d09e946d23164d3e087b120ba03f9c55bb981dcedae658941e68c
 record.json d48ba5bc079d70e2c266b4ed52dd61e41d922f179ec098f306fa1d21aa9cf30d
 --- log
 
-  N call site(s) Carrick could not read (e.g. apps/web/src/client.ts:N: it calls a member of an interface, and no implementation was found)
+  N call site(s) Carrick could not resolve to a target; a row may be a call inside the service (e.g. apps/web/src/client.ts:N: it calls a member of an interface, and no implementation was found)
   N call(s) with no resolved expected type (e.g. http|GET|/w/N (apps/web/src/client.ts:N))
-  N row(s) the model alone states (N joined a deterministic row)
+  N row(s) only the model states (N joined a deterministic row)
   types captured on a bare checkout: anything through a dependency is `any`
 ## 🪢 Carrick · monorepo (N services)
 ### Major version conflicts (N)
