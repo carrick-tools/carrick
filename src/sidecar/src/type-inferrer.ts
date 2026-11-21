@@ -31,6 +31,7 @@ import {
   type FunctionExpression,
   type MethodDeclaration,
   type CallExpression,
+  type PropertyAccessExpression,
   type ObjectLiteralExpression,
   type ParameterDeclaration,
   type ConditionalExpression,
@@ -44,6 +45,14 @@ import {
 } from 'ts-morph';
 import { typeToStringAsDeclared } from './print-type.js';
 import { functionBodyOf, peelValueWrappers } from './function-body.js';
+import {
+  CALLBACK_VERDICT,
+  callResultIsPrimitive,
+  composeReplyVerdicts,
+  wrapperReplyVerdict,
+  type ReplyVerdict,
+  type WrapperReplyContext,
+} from './wrapper-reply.js';
 import type {
   InferRequestItem,
   InferResult,
@@ -494,6 +503,8 @@ type FunctionLike =
   | ArrowFunction
   | FunctionExpression
   | MethodDeclaration;
+
+type WrapperVerdict = ReplyVerdict;
 
 /**
  * What the def-use walk found downstream of a call whose result was bound:
@@ -946,6 +957,14 @@ export class TypeInferrer {
    */
   private frameworkPackages: ReadonlySet<string> = new Set();
   private statedParams = this.statedParamsFor({ sends: new Map(), sets: new Map(), returns: new Map(), bodies: new Set() });
+
+  /**
+   * carrick#1969 T1: what a wrapper does with the callback a handler name is
+   * bound to, keyed by that callback, set where `functionWrappedBy` resolves
+   * it and cleared where a handler resolves without a wrapper. Read through
+   * `responseHandlerOf`.
+   */
+  private readonly wrapperVerdicts = new WeakMap<FunctionLike, WrapperVerdict>();
 
   /**
    * carrick#2111: where the model named a type for the response this request
@@ -1720,7 +1739,9 @@ export class TypeInferrer {
     const atLine = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
     if (!atLine) return request;
     const within = (inner: Node, outer: Node): boolean =>
-      inner.getPos() >= outer.getPos() && inner.getEnd() <= outer.getEnd();
+      inner.getSourceFile() === outer.getSourceFile() &&
+      inner.getPos() >= outer.getPos() &&
+      inner.getEnd() <= outer.getEnd();
     if (within(node, atLine.registration) || within(node, atLine.handler)) {
       return request;
     }
@@ -1777,12 +1798,8 @@ export class TypeInferrer {
         this.log(
           `Line ${request.line_number} is a route registration; following handler return`
         );
-        return this.buildFunctionReturnInferredType(
-          request,
-          atLine.handler,
-          extractionConfig,
-          true
-        );
+        const replier = this.responseHandlerOf(atLine.handler);
+        return replier ? this.buildFunctionReturnInferredType(request, replier, extractionConfig, true) : null;
       }
       this.log(`No function found for request at ${request.file_path}:${request.line_number}`);
       return null;
@@ -9565,11 +9582,7 @@ export class TypeInferrer {
       return true;
     }
     if (request.span_start === undefined || request.expression_text) return false;
-    const own = call.getType();
-    if (own.isString() || own.isNumber() || own.isBoolean() || own.isStringLiteral() ||
-        own.isNumberLiteral() || own.isBooleanLiteral()) {
-      return false;
-    }
+    if (callResultIsPrimitive(call)) return false;
     return (
       this.handlerFromRegistrationCall(call) !== undefined ||
       args.slice(1).some((arg) => this.isCallableType(arg.getType()))
@@ -9588,10 +9601,16 @@ export class TypeInferrer {
     handler: FunctionLike,
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
+    const declared = this.declaredResponseInferredType(request, registration);
+    if (declared) return declared;
+    const replier = this.responseHandlerOf(handler);
+    if (!replier) {
+      this.log(`Route at ${request.file_path}:${request.line_number} replies through a wrapper whose reply cannot be read`);
+      return null;
+    }
     return (
-      this.declaredResponseInferredType(request, registration) ??
-      this.buildFunctionReturnInferredType(request, handler, extractionConfig, true) ??
-      this.labelledSendBodies(request, handler)
+      this.buildFunctionReturnInferredType(request, replier, extractionConfig, true) ??
+      this.labelledSendBodies(request, replier)
     );
   }
 
@@ -9704,6 +9723,12 @@ export class TypeInferrer {
     call: CallExpression
   ): FunctionLike | undefined {
     if (this.calledOnCollectionOrPromise(call)) return undefined;
+    // A call whose own result is a primitive is a value, never a registration
+    // (`JSON.stringify(body, this.replacer)`); one handed an inline function
+    // keeps its reading. The same check `registersHandlerAt` runs.
+    if (callResultIsPrimitive(call) && !call.getArguments().some((arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg))) {
+      return undefined;
+    }
     for (const arg of [...call.getArguments()].reverse()) {
       const handler = this.asHandlerFunction(arg);
       if (handler) {
@@ -9754,7 +9779,7 @@ export class TypeInferrer {
     const expr = this.unwrapExpressionNode(node);
 
     const inline = functionBodyOf([peelValueWrappers(expr)], { methods: false });
-    if (inline) return inline;
+    if (inline) return this.resolvedDirectly(inline);
 
     if (Node.isIdentifier(expr)) {
       for (const def of expr.getDefinitionNodes()) {
@@ -9765,7 +9790,53 @@ export class TypeInferrer {
       }
     }
 
+    if (Node.isPropertyAccessExpression(expr)) return this.memberHandler(expr, followWrapperCalls);
+
     return undefined;
+  }
+
+  /**
+   * carrick#1969 T2: the function a member reference (`ctl.list`, `ns.list`,
+   * `instance.list`) names, by the compiler's symbol for the member, through
+   * an import alias. Each declaration reads as a handler by the shape it is:
+   * a method with a body, a property or class field holding a function
+   * literal, a wrapper call (through `functionWrappedBy`, so the wrapper's
+   * verdict is set), or a name; a shorthand property by its value; a function
+   * or variable declaration (a namespace export). A member with two
+   * different functions, or none, names no handler.
+   */
+  private memberHandler(access: PropertyAccessExpression, followWrapperCalls: boolean): FunctionLike | undefined {
+    let symbol = access.getNameNode().getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    const found = new Set<FunctionLike>();
+    for (const declaration of symbol?.getDeclarations() ?? []) {
+      const func = this.functionFromMemberDeclaration(declaration, followWrapperCalls);
+      if (func) found.add(func);
+    }
+    return found.size === 1 ? [...found][0] : undefined;
+  }
+
+  private functionFromMemberDeclaration(declaration: Node, followWrapperCalls: boolean): FunctionLike | undefined {
+    if (Node.isMethodDeclaration(declaration)) {
+      return declaration.getBody() ? this.resolvedDirectly(declaration) : undefined;
+    }
+    if (Node.isShorthandPropertyAssignment(declaration)) {
+      for (const valueDeclaration of declaration.getValueSymbol()?.getDeclarations() ?? []) {
+        const func = this.functionFromDeclaration(valueDeclaration, followWrapperCalls);
+        if (func) return func;
+      }
+      return undefined;
+    }
+    if (Node.isPropertyAssignment(declaration) || Node.isPropertyDeclaration(declaration)) {
+      const initializer = declaration.getInitializer();
+      if (!initializer) return undefined;
+      const direct = functionBodyOf([declaration]);
+      if (direct) return this.resolvedDirectly(direct);
+      const value = this.unwrapExpressionNode(initializer);
+      if (Node.isCallExpression(value)) return followWrapperCalls ? this.functionWrappedBy(value, 0) : undefined;
+      return this.asHandlerFunction(value, followWrapperCalls);
+    }
+    return this.functionFromDeclaration(declaration, followWrapperCalls);
   }
 
   /**
@@ -9785,11 +9856,11 @@ export class TypeInferrer {
     if (Node.isFunctionDeclaration(decl)) {
       // A declaration with no body anywhere (`declare function`) is still the
       // handler's function; its body is out of reach, which callers read.
-      return functionBodyOf(decl.getSymbol()?.getDeclarations() ?? [decl], { methods: false }) ?? decl;
+      return this.resolvedDirectly(functionBodyOf(decl.getSymbol()?.getDeclarations() ?? [decl], { methods: false }) ?? decl);
     }
 
     if (Node.isArrowFunction(decl) || Node.isFunctionExpression(decl)) {
-      return decl;
+      return this.resolvedDirectly(decl);
     }
 
     // `getDefinitionNodes()` may return the name identifier of a `const h = …`
@@ -9807,7 +9878,7 @@ export class TypeInferrer {
       const initializer = varDecl.getInitializer();
       if (initializer) {
         const direct = functionBodyOf([varDecl], { methods: false });
-        if (direct) return direct;
+        if (direct) return this.resolvedDirectly(direct);
         const inner = this.unwrapExpressionNode(initializer);
         if (followWrapperCalls && Node.isCallExpression(inner)) {
           return this.functionWrappedBy(inner, 0);
@@ -9831,20 +9902,58 @@ export class TypeInferrer {
   private functionWrappedBy(call: CallExpression, depth: number): FunctionLike | undefined {
     if (depth >= WRAPPER_CALL_MAX_DEPTH) return undefined;
     if (!this.isCallableType(call.getType())) return undefined;
-    const wrapped: FunctionLike[] = [];
-    for (const arg of call.getArguments()) {
+    const wrapped: Array<{ func: FunctionLike; index: number; inner: WrapperVerdict }> = [];
+    call.getArguments().forEach((arg, index) => {
       const value = this.unwrapExpressionNode(arg);
-      const func =
-        Node.isArrowFunction(value) || Node.isFunctionExpression(value)
-          ? value
-          : Node.isCallExpression(value)
-            ? this.functionWrappedBy(value, depth + 1)
-            : Node.isIdentifier(value)
-              ? this.asHandlerFunction(value, false)
-              : undefined;
-      if (func) wrapped.push(func);
-    }
-    return wrapped.length === 1 ? wrapped[0] : undefined;
+      if (Node.isArrowFunction(value) || Node.isFunctionExpression(value)) {
+        wrapped.push({ func: value, index, inner: CALLBACK_VERDICT });
+        return;
+      }
+      const func = Node.isCallExpression(value)
+        ? this.functionWrappedBy(value, depth + 1)
+        : Node.isIdentifier(value)
+          ? this.asHandlerFunction(value, false)
+          : undefined;
+      if (func) wrapped.push({ func, index, inner: this.wrapperVerdicts.get(func) ?? CALLBACK_VERDICT });
+    });
+    if (wrapped.length !== 1) return undefined;
+    const [{ func, index, inner }] = wrapped;
+    // carrick#1969 T1: what this wrapper does with the callback's result
+    // decides what the route's reply is read from (`responseHandlerOf`).
+    const verdict = composeReplyVerdicts(inner, wrapperReplyVerdict(call, index, this.wrapperReplyContext()));
+    this.log(`Wrapper call at ${call.getSourceFile().getBaseName()}:${call.getStartLineNumber()}: reply read from ${verdict.kind}`);
+    this.wrapperVerdicts.set(func, verdict);
+    return func;
+  }
+
+  private wrapperReplyContext(): WrapperReplyContext {
+    const stated = this.statedParams;
+    return {
+      readsReplies: stated.readsReplies,
+      sendAt: (call) => stated.sendAt(call),
+      setsBody: (target) => stated.setsBody(target),
+      rootSymbol: (expression) => stated.rootSymbol(expression),
+      isNothing: (type) => stated.isNothing(type),
+      awaited: (type) => this.unwrapPromiseType(type),
+    };
+  }
+
+  /**
+   * carrick#1969 T1: the function a registration's response is read from,
+   * for its resolved handler: the handler itself, the function a wrapper
+   * that builds the reply returns, or none where the wrapper's reply cannot
+   * be read. Request readers keep the handler.
+   */
+  private responseHandlerOf(handler: FunctionLike): FunctionLike | undefined {
+    const verdict = this.wrapperVerdicts.get(handler);
+    if (!verdict || verdict.kind === 'callback') return handler;
+    return verdict.kind === 'runs' ? verdict.handler : undefined;
+  }
+
+  /** A handler resolved without a wrapper call: no wrapper verdict speaks for it. */
+  private resolvedDirectly<F extends FunctionLike>(func: F): F {
+    this.wrapperVerdicts.delete(func);
+    return func;
   }
 
   /**
@@ -11366,7 +11475,7 @@ export class TypeInferrer {
     const empty = !today || this.isEmptyResponseReading(today);
     if (reads && !empty && !this.statedParams.readsReturns) return today;
     const at = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
-    const handler = at?.handler ?? this.exportedFunctionOpeningOn(sourceFile, request.line_number);
+    const handler = at ? this.responseHandlerOf(at.handler) : this.exportedFunctionOpeningOn(sourceFile, request.line_number);
     if (!handler) return today;
     const sent = reads ? this.statedParams.reply(handler) : undefined;
     if (sent) {

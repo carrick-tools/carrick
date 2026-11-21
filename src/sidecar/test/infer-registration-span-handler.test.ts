@@ -161,8 +161,8 @@ describe('carrick#4080: a span at a registration reads its handler', () => {
     assert.strictEqual(span, await ask("router.get('/items'", 'response_body', 'line'));
   });
 
-  it('(d) a method reference no handler resolves: nothing, not the path', async () => {
-    assert.strictEqual(await ask("router.get('/member'", 'response_body', 'span'), undefined);
+  it('(d) a member reference is followed to the function it names', async () => {
+    assert.strictEqual(await ask("router.get('/member'", 'response_body', 'span'), 'number[]');
   });
 
   it('(e) a handler that returns void: nothing, not the path', async () => {
