@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.173](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.172...carrick-v0.3.173) (2026-11-21)
+
+
+### Bug Fixes
+
+* **held:** start the engine on the next turn so the cold answer returns first ([#5014](https://github.com/carrick-tools/carrick/issues/5014)) ([#5015](https://github.com/carrick-tools/carrick/issues/5015)) ([113e57b](https://github.com/carrick-tools/carrick/commit/113e57b8ac7bec7356e0b3a714c0dc87c657d549))
+
 ## [0.3.172](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.171...carrick-v0.3.172) (2026-11-20)
 
 
