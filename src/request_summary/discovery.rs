@@ -1507,6 +1507,12 @@ struct Outcome<'a> {
     /// With `stop`: it is what the callee's values agree on ([`Walker::agree`]),
     /// so the walk read values even where it entered no function.
     valued: bool,
+    /// With `stop`: it is a hole handed into a sibling's function, filled
+    /// as the stop of a site that saved none (carrick#4486). A specific
+    /// stop absorbed after it takes its place; it never pushes one out.
+    filled: bool,
+    /// With `beside`: it is a filled hole, replaced the same way.
+    beside_filled: bool,
     /// The shallowest definition still being read that the walk came back
     /// to: until it is done, this answer is not final.
     cycle_at: Option<usize>,
@@ -1580,7 +1586,7 @@ impl<'a> Outcome<'a> {
     fn drop_stop_for_ends(&mut self, own: impl Fn(&Path) -> bool) {
         if let Some(read_in) = self.stop_read_in
             && self.cycle_at.is_none()
-            && self.beside.is_none()
+            && (self.beside.is_none() || (self.beside_filled && !self.filled))
             && !own(read_in)
             && !matches!(
                 self.stop,
@@ -1588,7 +1594,9 @@ impl<'a> Outcome<'a> {
             )
         {
             self.beside = self.stop.take();
+            self.beside_filled = self.filled;
         }
+        self.filled = false;
         self.stop = None;
         self.stop_read_in = None;
     }
@@ -1639,14 +1647,20 @@ impl<'a> Outcome<'a> {
                 None => self.ends.push(found),
             }
         }
-        if self.stop.is_none() {
+        // The first stop stays, except a filled hole, which a specific stop
+        // read beside it replaces (carrick#4486).
+        if self.stop.is_none() || (self.filled && other.stop.is_some() && !other.filled) {
             self.stop = other.stop;
             self.stop_read_in = other.stop_read_in;
             self.also = other.also;
             self.valued = other.valued;
+            self.filled = other.filled;
         }
-        if self.beside.is_none() {
+        if self.beside.is_none()
+            || (self.beside_filled && other.beside.is_some() && !other.beside_filled)
+        {
             self.beside = other.beside;
+            self.beside_filled = other.beside_filled;
         }
         self.missed |= other.missed;
         self.unanswered.extend(other.unanswered);
@@ -3998,6 +4012,16 @@ impl<'a> Walker<'a> {
         if known.iter().all(|value| matches!(value, Held::Callback)) {
             return Outcome::stopped(Stop::InjectedCallee, invoke.file).below(&chain);
         }
+        // One value that is a hole with a reason, read at a call in a
+        // sibling's file (carrick#4486): the reason is kept as a stop, so a
+        // call that also reaches an end saves it beside the end (#4474).
+        // Own files are left as they were: their one-caller case is saved
+        // with the call's fallback word, and re-wording it is a separate
+        // change (T2 of #4486).
+        let sibling_hole = match known.as_slice() {
+            [Held::Stop(reason)] if !self.inputs.files.contains_key(invoke.file) => Some(*reason),
+            _ => None,
+        };
         // Why each value reached nothing, where it says: the resolver's
         // reason, a callback's, or the stop the walk met inside it. A value
         // that reached nothing and says no reason is `None`.
@@ -4022,6 +4046,14 @@ impl<'a> Walker<'a> {
                 Held::Param(..) => Outcome::default(),
             })
             .collect();
+        if let Some(reason) = sibling_hole {
+            return Outcome {
+                valued: true,
+                filled: true,
+                ..Outcome::stopped(reason, invoke.file)
+            }
+            .below(&chain);
+        }
         if outcomes.len() == 1 {
             return outcomes.remove(0).below(&chain);
         }
