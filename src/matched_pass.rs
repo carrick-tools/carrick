@@ -909,8 +909,13 @@ fn graded(judged: &MatchedVerdict) -> Value {
     verdict
 }
 
-/// The record's schema word, the only one this pass reads.
+/// The record's schema word, the only one this pass annotates.
 const SCHEMA: &str = "carrick.matched/1";
+
+/// The model step's record since carrick-cloud MR-4: ends, not pairs. It holds
+/// no pair for this pass to type, so it passes through untouched until the
+/// pass reads ends (MR-T).
+const ENDS_SCHEMA: &str = "carrick.matched/2";
 
 /// The four sides of a pair.
 const SIDES: [&str; 4] = [
@@ -985,9 +990,13 @@ pub struct Inputs<'a> {
 }
 
 /// Annotate `record` in place. An error is a record this pass cannot read at
-/// all (no `pairs` array); everything else is stated in the record.
+/// all (no `pairs` array); everything else is stated in the record. A
+/// `carrick.matched/2` record holds no pairs and is left exactly as it came.
 pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
     let started = Instant::now();
+    if record.get("schema").and_then(Value::as_str) == Some(ENDS_SCHEMA) {
+        return Ok(());
+    }
     if record.get("schema").and_then(Value::as_str) != Some(SCHEMA) {
         return Err(format!("the record's `schema` is not `{SCHEMA}`"));
     }
@@ -1876,9 +1885,38 @@ await fetch('/top');
     }
 
     #[test]
+    fn an_ends_record_has_no_pairs_and_passes_through_untouched() {
+        let (dir, repo, _outside) = sandbox();
+        let contract: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/matched-record/contract.json"
+        ))
+        .unwrap();
+        assert_eq!(contract["schema"], ENDS_SCHEMA);
+        let mut record = contract.clone();
+        annotate_offline(&repo, &mut record).expect("a v2 record is read as no pairs");
+        assert_eq!(record, contract, "nothing is added to a v2 record");
+        // `run` writes it back as it came and exits 0.
+        let input = dir.path().join("in.json");
+        let out = dir.path().join("out.json");
+        std::fs::write(&input, contract.to_string()).unwrap();
+        let args: Vec<String> = [
+            input.to_str().unwrap(),
+            "--repo",
+            repo.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(run(&args, None), 0);
+        let written: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(written, contract);
+    }
+
+    #[test]
     fn the_schema_must_be_the_matched_record_one() {
         let (dir, repo, _outside) = sandbox();
-        for schema in [json!("carrick.matched/2"), Value::Null] {
+        for schema in [json!("carrick.matched/3"), Value::Null] {
             let mut record = record_of(vec![route_pair("a.ts", 1, "a.ts")]);
             record["schema"] = schema;
             let before = record.clone();

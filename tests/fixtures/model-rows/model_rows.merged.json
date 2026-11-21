@@ -42,7 +42,7 @@
           "path": "/functions/v1/x"
         },
         "params": [],
-        "file_path": "web/src/x.ts",
+        "file_path": "web/src/x.ts:7",
         "resolution_source": "model",
         "model_end": {
           "line": 7,
@@ -59,7 +59,7 @@
           "path": "/v1/items"
         },
         "params": [],
-        "file_path": "web/src/items.ts",
+        "file_path": "web/src/items.ts:5",
         "resolution_source": "model",
         "model_end": {
           "line": 5,
@@ -183,7 +183,7 @@
           "path": "/api/orders/:id"
         },
         "params": [],
-        "file_path": "api/src/orders.ts",
+        "file_path": "api/src/orders.ts:30",
         "resolution_source": "model",
         "model_end": {
           "line": 30,
@@ -199,7 +199,7 @@
           "topic": "orders.created"
         },
         "params": [],
-        "file_path": "api/src/pub.ts",
+        "file_path": "api/src/pub.ts:4",
         "resolution_source": "model",
         "model_end": {
           "line": 4,
@@ -216,7 +216,7 @@
           "path": "/v1/items"
         },
         "params": [],
-        "file_path": "api/src/items.ts",
+        "file_path": "api/src/items.ts:9",
         "resolution_source": "model",
         "model_end": {
           "line": 9,
