@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.174](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.173...carrick-v0.3.174) (2026-11-21)
+
+
+### Bug Fixes
+
+* boundary unread and model lines say what the count is ([#5025](https://github.com/carrick-tools/carrick/issues/5025)) ([01bfb9c](https://github.com/carrick-tools/carrick/commit/01bfb9cd1b71aec86d6f5f73040af3b45f94baa6))
+
 ## [0.3.173](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.172...carrick-v0.3.173) (2026-11-21)
 
 
