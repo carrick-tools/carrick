@@ -6372,6 +6372,7 @@ async fn analyze_current_repo_incremental(
                     responses: Some((&returned, &results)),
                     caller_stops: &caller_stops,
                     library_leads: &protocol_extractions.library.leads,
+                    library_rows: &protocol_extractions.library.rows,
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
@@ -8206,11 +8207,33 @@ async fn site_rows_of(
     // The calls the walks stopped at, but none in a mock or test tree: such
     // a call is no call of the service (carrick#3688 U3).
     let mut unread = unread;
+    // A method the library reader read through its decorator factory states
+    // a row or saves a lead at the decorator's call (carrick#3781 R5).
+    let library_read = |at: &crate::request_summary::own_decorators::OwnDecoratorAt| {
+        use crate::unread_sites::DecoratorRead;
+        let call = at.decorator.site();
+        if context
+            .library_rows
+            .iter()
+            .any(|row| row.file == at.file && row.span_start == call.span_start)
+        {
+            DecoratorRead::Row
+        } else if context
+            .library_leads
+            .iter()
+            .any(|lead| lead.file == at.file && lead.span_start == call.span_start)
+        {
+            DecoratorRead::Lead
+        } else {
+            DecoratorRead::Unread
+        }
+    };
     let own_decorators = crate::unread_sites::of_own_decorators(
         &crate::request_summary::own_decorators::of(inputs),
+        library_read,
         claims,
-        &unread,
-        &rows.leads,
+        &mut unread,
+        &mut rows.leads,
         root,
     );
     unread.extend(own_decorators);
@@ -8340,6 +8363,9 @@ struct SiteContext<'a> {
     /// The verified library sites whose name the library reader states
     /// none for (carrick#3504 B10-3), saved as unread sites.
     library_leads: &'a [crate::library_claims::LibraryLead],
+    /// The rows the library reader stated: a method decorated through an
+    /// own factory that states one saves nothing there (carrick#3781 R5).
+    library_rows: &'a [crate::library_claims::LibraryRow],
     library: Option<&'a crate::request_summary::LibrarySites>,
     /// For the receiver trace (carrick#2474 R1): the member declarations
     /// verified op claims resolve to ([`member_declarations`]). `None` only
@@ -16190,6 +16216,7 @@ async fn analyze_current_repo(
             responses: Some((&returned, &results)),
             caller_stops: &caller_stops,
             library_leads: &protocol_extractions.library.leads,
+            library_rows: &protocol_extractions.library.rows,
             library: library_ask.as_ref().map(|ask| &ask.sites),
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
