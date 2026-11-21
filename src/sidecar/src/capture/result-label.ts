@@ -79,13 +79,19 @@ function readMember(
   }
   if (read.length === 0) return missing(`the labelled member '${name}' holds no value`);
   if (read.length === 1) return { type: read[0] };
+  // Without the checker's own union the members cannot be joined honestly;
+  // abstaining beats publishing the first of them.
+  const joined = joinTypes(checker, read);
+  if (!joined) return missing(`the labelled member '${name}' holds several types`);
+  return { type: joined };
+}
+
+/** The checker's own union of `types` (two or more), or none where it offers none. */
+export function joinTypes(checker: ts.TypeChecker, types: ts.Type[]): ts.Type | undefined {
   const union = (
     checker as unknown as { getUnionType?: (types: ts.Type[], reduction?: number) => ts.Type }
   ).getUnionType;
-  // Without the checker's own union the members cannot be joined honestly;
-  // abstaining beats publishing the first of them.
-  if (!union) return missing(`the labelled member '${name}' holds several types`);
-  return { type: union.call(checker, read) };
+  return union?.call(checker, types);
 }
 
 function readParse(

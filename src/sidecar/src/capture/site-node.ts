@@ -14,6 +14,8 @@
  */
 
 import ts from 'typescript';
+import { isDroppedReplyStatus, replyStatus } from './reply-status.js';
+import { joinTypes } from './result-label.js';
 
 // ===========================================================================
 // Call-result locators
@@ -562,6 +564,165 @@ function functionsAnsweringFor(checker: ts.TypeChecker, handler: FunctionNode): 
 /** Each handler's reach set, per checker (the inferrer and the capture hold two programs). */
 const reachSets = new WeakMap<FunctionNode, { checker: ts.TypeChecker; reached: Set<FunctionNode> }>();
 
+function awaitedAt(checker: ts.TypeChecker, node: ts.Node): ts.Type {
+  const type = checker.getTypeAtLocation(node);
+  return checker.getAwaitedType(type) ?? type;
+}
+
+/** One type, or two the checker holds for one (a top type is one only with itself). */
+export function sameType(checker: ts.TypeChecker, a: ts.Type, b: ts.Type): boolean {
+  return a === b || sameAnswer(checker, a, b);
+}
+
+/**
+ * The node of `other` that `located` stands for in `own`'s return (see
+ * `ReturnRead.member`), or none.
+ */
+function memberOf(
+  checker: ts.TypeChecker,
+  located: ts.Node,
+  inReturn: ts.Expression,
+  other: ts.Expression
+): ts.Node | undefined {
+  const mine = unwrapTransparent(inReturn);
+  const theirs = unwrapTransparent(other);
+  if (mine === unwrapTransparent(located as ts.Expression)) return theirs;
+  if (!ts.isCallExpression(mine) || !ts.isCallExpression(theirs)) return undefined;
+  const index = mine.arguments.findIndex((a) => unwrapTransparent(a) === unwrapTransparent(located as ts.Expression));
+  if (index < 0 || index >= theirs.arguments.length) return undefined;
+  return sameCallee(checker, mine, theirs) ? unwrapTransparent(theirs.arguments[index]) : undefined;
+}
+
+/** Two calls of one callee: one declaration, or none and one written callee. */
+function sameCallee(
+  checker: ts.TypeChecker,
+  a: ts.CallExpression | ts.NewExpression,
+  b: ts.CallExpression | ts.NewExpression
+): boolean {
+  const sent = checker.getResolvedSignature(a)?.getDeclaration();
+  const there = checker.getResolvedSignature(b)?.getDeclaration();
+  return sent ? sent === there : !there && a.expression.getText() === b.expression.getText();
+}
+
+type SendCall = ts.CallExpression | ts.NewExpression;
+const isSendCall = (n: ts.Node): n is SendCall => ts.isCallExpression(n) || ts.isNewExpression(n);
+
+/**
+ * The send the located node is: the located call itself, or the call it is
+ * an argument of (`c.json(<located>)`). None for any other node.
+ */
+function locatedSend(located: ts.Node): SendCall | undefined {
+  let node: ts.Node = located;
+  while (ts.isExpression(node) && node.parent && wrapsValueTransparently(node.parent as ts.Expression)) {
+    node = node.parent;
+  }
+  const inner = ts.isExpression(located) ? unwrapTransparent(located) : located;
+  if (isSendCall(inner)) return inner;
+  const parent = node.parent;
+  return parent && isSendCall(parent) && (parent.arguments ?? []).some((a) => a === node) ? parent : undefined;
+}
+
+/**
+ * Whether a return is a reply that sends no success body (carrick#4778): a
+ * call of the located send's own callee, which makes it a reply by the
+ * locator's word, whose status the reader calls error or redirect. A return
+ * that calls anything else (a helper, `rows.slice(0, 500)`) is kept, as is
+ * a reply whose status is success, variable or undecided.
+ */
+function leavesAnswer(checker: ts.TypeChecker, send: SendCall | undefined, returned: ts.Expression): boolean {
+  if (!send) return false;
+  const call = unwrapTransparent(returned);
+  return (
+    isSendCall(call) &&
+    sameCallee(checker, send, call) &&
+    isDroppedReplyStatus(replyStatus(checker, call, { readChain: true }))
+  );
+}
+
+/**
+ * carrick#4778: whether `fn` has several returns whose answers differ. Each
+ * return answers with the node `located` stands for in it where it has one
+ * (so `c.json(a)` beside `c.json(b)` differ by `a` and `b`, not by the one
+ * reply type both calls give); a return with no such node answers with its
+ * whole expression. `located` outside every return of `fn` (a send in a
+ * statement) leaves the function alone.
+ */
+function severalReturnsOf(
+  checker: ts.TypeChecker,
+  fn: FunctionNode,
+  located: ts.Node,
+  within: boolean
+): SeveralReturns | undefined {
+  const expressions = returnedExpressions(fn);
+  if (expressions.length < 2) return undefined;
+  const inReturn = within
+    ? expressions.find((e) => e.getStart() <= located.getStart() && located.getEnd() <= e.getEnd())
+    : undefined;
+  if (within && !inReturn) return undefined;
+  const all: ReturnRead[] = expressions.map((expression) => {
+    const member = inReturn ? memberOf(checker, located, inReturn, expression) : undefined;
+    return member ? { expression, member } : { expression };
+  });
+  // Each return is asked on its own merits, whichever function the others
+  // call: an error or redirect reply is no part of the route's answer.
+  const send = locatedSend(located);
+  const returns = all.filter((r) => !leavesAnswer(checker, send, r.expression));
+  if (returns.length === 0) return undefined;
+  const dropped = returns.length < all.length;
+  // The located return left the answer: what stays is the answer, however
+  // many returns stay and whatever their types.
+  if (inReturn && !returns.some((r) => r.expression === inReturn)) return { fn, returns, dropped };
+  if (returns.length === 1) return undefined;
+  const answers = returns.map((r) => awaitedAt(checker, r.member ?? r.expression));
+  const mirrored = returns.every((r) => r.member);
+  const first = answers[0];
+  if (mirrored && answers.every((a) => sameType(checker, first, a))) return undefined;
+  if (!mirrored && !inReturn) {
+    // The located node is in a helper: only the handler's own returns decide.
+    if (answers.every((a) => sameType(checker, first, a))) return undefined;
+  }
+  return { fn, returns, dropped };
+}
+
+/**
+ * carrick#4778: the type of a function with several differing returns, as
+ * the union of what each answers with (`ReturnRead.member`). A return with no
+ * such node that is framework machinery (a reply that carries no body) states
+ * no payload and is left out; any other is unread, and so is the whole.
+ * One reader for the capture and the inferrer's `response_body` rows, so
+ * each return is read as a lone return is: at the node the located one
+ * stands for in it.
+ */
+export function typeOfSeveralReturns(
+  checker: ts.TypeChecker,
+  several: SeveralReturns,
+  isMachinery: (type: ts.Type) => boolean
+): { type: ts.Type } | { reason: string } {
+  const read: ts.Type[] = [];
+  for (const { expression, member } of several.returns) {
+    const type = checker.getTypeAtLocation(member ?? expression);
+    if (!member) {
+      const awaited = checker.getAwaitedType(type) ?? type;
+      if (isMachinery(awaited)) continue;
+      return {
+        reason:
+          'several_returns: the function that answers has several returns of different types ' +
+          'and one of them has no payload this anchor reads, so no single return is its type',
+      };
+    }
+    if (!read.some((r) => sameType(checker, r, type))) read.push(type);
+  }
+  if (read.length === 0) {
+    return { reason: 'several_returns: no return of the function that answers states a payload' };
+  }
+  if (read.length === 1) return { type: read[0] };
+  const joined = joinTypes(checker, read);
+  if (!joined) {
+    return { reason: 'several_returns: the returns of the function that answers cannot be joined' };
+  }
+  return { type: joined };
+}
+
 /** The nodes a value type can be read at: the capture's own target rule. */
 export function isPreferredTarget(node: ts.Node): boolean {
   return (
@@ -591,8 +752,33 @@ function isMemberName(node: ts.Node): boolean {
   );
 }
 
+/**
+ * One return of a function that answers for a route (carrick#4778). `member`
+ * is the node of that return the located node stands for: the located node
+ * itself or, where the located node is the argument of the call the function
+ * returns (`c.json(<located>)`), the same argument of this return's call.
+ * Absent where this return has no such node (a framework reply that carries
+ * no body, a return of another shape).
+ */
+export interface ReturnRead {
+  expression: ts.Expression;
+  member?: ts.Node;
+}
+
+/**
+ * The function that answers for a route has several returns that do not all
+ * answer with one type, so no one return is its answer.
+ */
+export interface SeveralReturns {
+  fn: FunctionNode;
+  /** The returns that answer: an error or redirect reply is left out. */
+  returns: ReturnRead[];
+  /** Some return of `fn` left the answer by its status. */
+  dropped: boolean;
+}
+
 /** A located node is the row's own, or why none is. */
-export type HandlerAnchor = { node: ts.Node } | { reason: string };
+export type HandlerAnchor = { node: ts.Node; severalReturns?: SeveralReturns } | { reason: string };
 
 /**
  * The node a route row reads, given the node a text or line locator found
@@ -643,7 +829,17 @@ export function anchorInHandler(
     }
     return undefined;
   };
-  if (ownFunction(node)) return { node };
+  const done = (answer: ts.Node): HandlerAnchor => {
+    // carrick#4778: the handler's own several returns answer first (the
+    // located node may sit in a helper it returns); else the function around
+    // the node.
+    const own = ownFunction(answer);
+    const several =
+      severalReturnsOf(checker, handler, answer, own === handler) ??
+      (own && own !== handler ? severalReturnsOf(checker, own, answer, true) : undefined);
+    return several ? { node: answer, severalReturns: several } : { node: answer };
+  };
+  if (ownFunction(node)) return done(node);
 
   const outside =
     `anchor_outside_handler: the located node (line ${line}) is outside ${where} and ` +
@@ -680,7 +876,7 @@ export function anchorInHandler(
       reason: `${outside}, and its text names ${answers.size} different answers inside them`,
     };
   }
-  return { node: matches[0] };
+  return done(matches[0]);
 }
 
 /**
