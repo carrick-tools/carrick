@@ -458,7 +458,7 @@ test("the boundary keeps the CLI's wording", () => {
   assert.ok(
     lines.includes("  1 call site(s) that named a client member and did not resolve to it (usersClient.get)"),
   );
-  assert.ok(lines.includes("  6 row(s) the model alone states (11 joined a deterministic row)"));
+  assert.ok(lines.includes("  6 row(s) only the model states (11 joined a deterministic row)"));
   assert.ok(
     lines.includes("  1 model endpoint(s) dropped in modules a routing convention claims"),
   );
@@ -1276,7 +1276,7 @@ test("the port and the cli say the same boundary lines", () => {
     fs.readFileSync(path.join(testDir, "..", "..", "..", "tests", "fixtures", "unread-sites", "boundary.expected.json"), "utf8"),
   ) as { service: string; boundary: Boundary; lines: string[] };
   assert.deepEqual(boundaryLines(expected.boundary, expected.service), expected.lines);
-  assert.ok(expected.lines.some((line) => line.includes("call site(s) Carrick could not read")));
+  assert.ok(expected.lines.some((line) => line.includes("call site(s) Carrick could not resolve to a target; a row may be a call inside the service")));
 });
 
 // carrick#3956: a route with several dispatch cases states one row per case at

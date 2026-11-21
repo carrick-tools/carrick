@@ -516,7 +516,10 @@ impl ServiceBoundary {
             "call(s) with no resolved expected type",
         );
         if let Some(unread) = &self.unread_sites {
-            push(unread, "call site(s) Carrick could not read");
+            push(
+                unread,
+                "call site(s) Carrick could not resolve to a target; a row may be a call inside the service",
+            );
         }
         if let Some(lost) = &self.walk_rows_lost
             && let Some(reason) = lost.reasons.first()
@@ -535,7 +538,7 @@ impl ServiceBoundary {
         }
         if self.model_only_rows > 0 {
             out.push(format!(
-                "  {} row(s) the model alone states ({} joined a deterministic row)",
+                "  {} row(s) only the model states ({} joined a deterministic row)",
                 self.model_only_rows, self.model_rows_joined
             ));
         }
@@ -2098,11 +2101,11 @@ mod tests {
         );
         let unread = lines
             .iter()
-            .find(|line| line.contains("could not read"))
+            .find(|line| line.contains("could not resolve to a target"))
             .expect("an unread line");
         assert_eq!(
             unread,
-            "  5 call site(s) Carrick could not read (e.g. src/value-callee.ts:4: the function called is a value in this code, and Carrick found no function behind it)"
+            "  5 call site(s) Carrick could not resolve to a target; a row may be a call inside the service (e.g. src/value-callee.ts:4: the function called is a value in this code, and Carrick found no function behind it)"
         );
 
         let expected = serde_json::json!({
@@ -2133,7 +2136,7 @@ mod tests {
             !none
                 .lines("svc")
                 .iter()
-                .any(|l| l.contains("could not read"))
+                .any(|l| l.contains("could not resolve to a target"))
         );
     }
 

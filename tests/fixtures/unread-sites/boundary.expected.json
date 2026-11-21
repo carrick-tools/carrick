@@ -62,7 +62,7 @@
     "  1 file(s) the analyzer never answered for (src/a.ts: parse error)",
     "  2 SDK call(s) that produced no edge (e.g. @acme/sdk ×2: no surface)",
     "  1 route(s) that send no response body (not counted above) (GET /health)",
-    "  5 call site(s) Carrick could not read (e.g. src/value-callee.ts:4: the function called is a value in this code, and Carrick found no function behind it)"
+    "  5 call site(s) Carrick could not resolve to a target; a row may be a call inside the service (e.g. src/value-callee.ts:4: the function called is a value in this code, and Carrick found no function behind it)"
   ],
   "service": "svc"
 }

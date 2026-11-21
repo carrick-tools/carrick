@@ -79,10 +79,10 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
   push(boundary.routes_without_response_type, "route(s) with no resolved response type");
   push(boundary.routes_without_body, "route(s) that send no response body (not counted above)");
   push(boundary.calls_without_expected_type, "call(s) with no resolved expected type");
-  push(boundary.unread_sites, "call site(s) Carrick could not read");
+  push(boundary.unread_sites, "call site(s) Carrick could not resolve to a target; a row may be a call inside the service");
   if ((boundary.model_only_rows ?? 0) > 0) {
     out.push(
-      `  ${boundary.model_only_rows} row(s) the model alone states (${boundary.model_rows_joined ?? 0} joined a deterministic row)`,
+      `  ${boundary.model_only_rows} row(s) only the model states (${boundary.model_rows_joined ?? 0} joined a deterministic row)`,
     );
   }
   if ((boundary.model_endpoints_discarded_in_claimed_modules ?? 0) > 0) {
