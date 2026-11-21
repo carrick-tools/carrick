@@ -27,6 +27,7 @@ import type {
   CompilerEnd,
   CheckProgressPhase,
   CheckResult,
+  BreakEvidence,
   CheckStubInput,
   GraphqlTypes,
   CheckVerdict,
@@ -42,6 +43,7 @@ import { scrubPaths, type ScrubContext } from './check-scrub.js';
 import { toolEnv } from './tool-env.js';
 import {
   assembleWorkspace,
+  CHECKER_TSCONFIG,
   writeProbes,
   type AssembledWorkspace,
 } from './check-workspace.js';
@@ -50,6 +52,13 @@ import { openProbeProgram, pairForeignFindings, probeDeepFindings } from './chec
 import { onlyDeclaredOpenMembers } from './deep-walk.js';
 import { pairFieldReports } from './check-fields.js';
 import { pairDispatchUnions } from './check-union.js';
+import {
+  buildRelaxedProbe,
+  evidenceFromDiagnostics,
+  provenBecause,
+  withBreakEvidence,
+  type RelaxedPlan,
+} from './check-relaxed.js';
 
 export type CheckProgress = (phase: CheckProgressPhase, message: string) => void;
 
@@ -711,6 +720,26 @@ export async function runCheck(
   ]);
 
   const tClassified = Date.now();
+  // ---- The relaxed re-check (incompatible-rule T1) --------------------------
+  // After every verdict above is final, over the pairs the judge called
+  // incompatible and no others, in its own files and its own compile. It
+  // attaches evidence to those verdicts and changes nothing else.
+  const incompatible = new Set(
+    verdicts.filter((v) => v.bucket === 'incompatible').map((v) => v.pair_id)
+  );
+  const evidence =
+    incompatible.size === 0
+      ? new Map<string, BreakEvidence>()
+      : await relaxedEvidence({
+          plans: probing.filter((plan) => incompatible.has(plan.pairId)),
+          probeDiagsByPair,
+          ws,
+          tscPath: opts.relaxedTscPath ?? tscPath,
+          totalMs: opts.relaxedTimeoutMs ?? relaxedLimitMs(tTsc - tInstalled),
+          nodeOptions: heap.nodeOptions,
+          progress,
+        });
+  const tRelaxed = Date.now();
   const workspaceDirOut = cleanup ? '' : ws.workspaceDir;
   if (cleanup) safeRm(ws);
 
@@ -721,7 +750,7 @@ export async function runCheck(
     install_ok: true,
     ts_version: tsVersion,
     judge,
-    verdicts,
+    verdicts: withBreakEvidence(verdicts, evidence, 'the relaxed re-check made no evidence for this pair'),
     degraded_services: dedupeDegraded(degraded),
     errors,
     phase_ms: {
@@ -731,8 +760,99 @@ export async function runCheck(
       tsc: tTsc - tInstalled,
       probe_program: tProbeProgram - tAttributed,
       classify: tClassified - tProbeProgram,
+      relaxed: tRelaxed - tClassified,
     },
   };
+}
+
+/** The relaxed probes' directory and tsconfig, beside the judge's own and outside its `include`. */
+export const RELAXED_DIR = 'relaxed';
+const RELAXED_TSCONFIG = 'tsconfig.relaxed.json';
+
+/**
+ * The relaxed re-check's time cap: twice the judge's own compile, and never
+ * under a minute. It compiles the same stubs plus a block per incompatible
+ * pair, so the judge's time is the measure of what it costs.
+ */
+export function relaxedLimitMs(judgeMs: number): number {
+  return Math.max(60_000, 2 * judgeMs);
+}
+
+/**
+ * Run the relaxed re-check over the pairs the judge called incompatible and
+ * read one evidence record per pair. Every way it can fail (a probe that
+ * cannot be built, a compiler that throws, ends abnormally or runs out of
+ * time, a file the compiler did not check) gives `proven: true` with the
+ * cause; it never throws and never touches the judge's files or verdicts.
+ */
+async function relaxedEvidence(input: {
+  plans: ProbePlan[];
+  probeDiagsByPair: Map<string, RawDiagnostic[]>;
+  ws: AssembledWorkspace;
+  tscPath: string;
+  totalMs: number;
+  nodeOptions: string | undefined;
+  progress: CheckProgress;
+}): Promise<Map<string, BreakEvidence>> {
+  const evidence = new Map<string, BreakEvidence>();
+  const relaxed: RelaxedPlan[] = [];
+  for (const plan of input.plans) {
+    const built = buildRelaxedProbe(plan, input.probeDiagsByPair.get(plan.pairId) ?? []);
+    if ('cause' in built) evidence.set(plan.pairId, provenBecause(built.cause));
+    else relaxed.push(built);
+  }
+  if (relaxed.length === 0) return evidence;
+  const failAll = (cause: string) => {
+    for (const r of relaxed) evidence.set(r.pairId, provenBecause(cause));
+    return evidence;
+  };
+  try {
+    input.progress('checking', `re-checking ${relaxed.length} incompatible pair(s) with not-proven differences allowed`);
+    input.ws.guard.mkdir(path.join(input.ws.probesDir, RELAXED_DIR));
+    for (const r of relaxed) {
+      input.ws.guard.writeFile(path.join(input.ws.probesDir, RELAXED_DIR, r.fileName), r.source);
+    }
+    // The judge's own options, its own files left out. Every option stays as
+    // the judge has it: skipping the declaration files' check made TypeScript
+    // 6 drop the judge's own mismatches from the relaxed file.
+    const config = JSON.parse(CHECKER_TSCONFIG) as { include: string[] };
+    config.include = [`${RELAXED_DIR}/**/*.ts`];
+    input.ws.guard.writeFile(path.join(input.ws.probesDir, RELAXED_TSCONFIG), JSON.stringify(config, null, 2) + '\n');
+    const run = await runProcess(
+      input.tscPath,
+      ['--noEmit', '--pretty', 'false', '-p', path.join(input.ws.probesRel, RELAXED_TSCONFIG)],
+      input.ws.workspaceDir,
+      { ...process.env, NODE_OPTIONS: input.nodeOptions },
+      { totalMs: input.totalMs }
+    );
+    if (run.timedOut) {
+      return failAll(`the relaxed re-check did not finish within ${Math.round(input.totalMs / 1000)}s`);
+    }
+    const diagnostics = parseTscOutput(run.stdout + '\n' + run.stderr);
+    if (
+      run.signal !== null ||
+      (run.code !== 0 && diagnostics.length === 0) ||
+      diagnostics.some(isConfigDiagnostic)
+    ) {
+      const cause = abnormalCause(run.stderr + '\n' + run.stdout);
+      return failAll(
+        `the relaxed re-check's compiler ended abnormally (exit code ${run.code ?? 'null'}${run.signal ? `, ${run.signal}` : ''})` +
+          (cause ? ` because ${cause}` : '')
+      );
+    }
+    const byFile = new Map<string, RawDiagnostic[]>();
+    for (const d of diagnostics) {
+      if (!byFile.has(d.file)) byFile.set(d.file, []);
+      byFile.get(d.file)!.push(d);
+    }
+    for (const r of relaxed) {
+      const diags = byFile.get(`${input.ws.probesRel}/${RELAXED_DIR}/${r.fileName}`) ?? [];
+      evidence.set(r.pairId, evidenceFromDiagnostics(r, diags));
+    }
+    return evidence;
+  } catch (e) {
+    return failAll(`the relaxed re-check could not run: ${e instanceof Error ? e.message : String(e)}`.slice(0, 300));
+  }
 }
 
 /**

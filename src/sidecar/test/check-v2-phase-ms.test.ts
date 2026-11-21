@@ -48,7 +48,7 @@ describe('check_v2: phase timings', () => {
 
   after(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  it('a successful check returns all six phases as non-negative integers', async () => {
+  it('a successful check returns all seven phases as non-negative integers', async () => {
     const result = await runCheck({ stubs, pairs: PAIRS });
     assert.strictEqual(result.success, true, JSON.stringify(result.errors));
     const phases = result.phase_ms;
@@ -59,6 +59,7 @@ describe('check_v2: phase timings', () => {
       'install',
       'probe_program',
       'probes',
+      'relaxed',
       'tsc',
     ]);
     for (const [k, v] of Object.entries(phases)) {
