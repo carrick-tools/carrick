@@ -279,7 +279,7 @@ impl TextValue {
 
 /// Whether two chains agree on every definition both fill (carrick#3504
 /// B10-1b, P5): parts read at different calls of one function never join.
-fn chains_agree(head: &[CallAt], tail: &[CallAt]) -> bool {
+pub(in crate::request_summary) fn chains_agree(head: &[CallAt], tail: &[CallAt]) -> bool {
     head.iter()
         .all(|a| tail.iter().filter(|b| b.fills == a.fills).all(|b| b == a))
 }
