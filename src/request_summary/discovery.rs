@@ -836,6 +836,8 @@ struct Called {
     /// Each `(store key, member)` called through a declaration in no answered
     /// package, by the key it is declared in.
     outside: HashSet<(String, String)>,
+    /// Every symbol a row calls outside the repo, whatever package declares it.
+    symbols: HashSet<String>,
 }
 
 /// One scope claim the trace asks, by its claim id, on one receiver id
@@ -958,6 +960,7 @@ pub fn declaration_ask_answered(
             let Some(symbol) = row.symbol() else {
                 continue;
             };
+            called.symbols.insert(symbol.to_string());
             called.outside.extend(
                 outside_keys(row, exports, answered)
                     .into_iter()
@@ -973,6 +976,15 @@ pub fn declaration_ask_answered(
     };
     let own = called_by(positions);
     let mut sibling_only = Called::default();
+    // The symbols called in this service or a sibling: an op on a called
+    // scope's result is asked only for a member some row calls.
+    let mut all_symbols = own.symbols.clone();
+    for sibling in siblings
+        .iter()
+        .filter_map(|sibling| sibling.positions.as_ref())
+    {
+        all_symbols.extend(called_by(sibling).symbols);
+    }
     for called in siblings
         .iter()
         .filter_map(|sibling| sibling.positions.as_ref())
@@ -1006,26 +1018,45 @@ pub fn declaration_ask_answered(
             .filter(|(_, export)| export.role != LibraryRole::None)
         {
             let claims = export.claims_with_scopes_by_id();
+            let member_called = |member: &String| {
+                called
+                    .pairs
+                    .contains(&(export.package.clone(), member.clone()))
+                    || called.outside.iter().any(|(outside, called)| {
+                        called == member
+                            && reaches(depends, &export.package, std::slice::from_ref(outside))
+                    })
+            };
+            // The receivers a called scope member returns (carrick tables
+            // stage 1, S1): an op claimed `of` one is asked with the scope,
+            // whichever package declares the op's member. A call of such a
+            // member lands in the package the scope's result type is
+            // declared in, which the labelled package need not be.
+            let scope_results: Vec<String> = claims
+                .iter()
+                .filter_map(|(_, claim)| match claim {
+                    LibraryClaim::Scope { member, on, of, .. } if member_called(member) => Some(
+                        claim_receivers(&claims, *on, of.as_deref())
+                            .into_iter()
+                            .map(move |receiver| format!("{receiver}>scope:{member}")),
+                    ),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
             let wanted: Vec<&(String, &LibraryClaim)> = claims
                 .iter()
                 .filter(|(_, claim)| match claim {
                     LibraryClaim::Op {
                         member: Some(member),
+                        of,
                         ..
+                    } => {
+                        member_called(member)
+                            || (all_symbols.contains(member)
+                                && of.as_ref().is_some_and(|of| scope_results.contains(of)))
                     }
-                    | LibraryClaim::Scope { member, .. } => {
-                        called
-                            .pairs
-                            .contains(&(export.package.clone(), member.clone()))
-                            || called.outside.iter().any(|(outside, called)| {
-                                called == member
-                                    && reaches(
-                                        depends,
-                                        &export.package,
-                                        std::slice::from_ref(outside),
-                                    )
-                            })
-                    }
+                    LibraryClaim::Scope { member, .. } => member_called(member),
                     _ => false,
                 })
                 .collect();
@@ -12017,6 +12048,112 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             "{got:#?}"
         );
         assert_eq!(ask.ops.iter().filter(|op| op.is_some()).count(), 3);
+    }
+
+    /// Tables stage 1, S1: a client package's `from(name)` is a scope claim
+    /// whose result is a builder declared in another package. The ops
+    /// claimed `of` that result are asked with the scope when `from` is
+    /// called, whichever package declares their members; a filter call the
+    /// builder has no op claim for is never asked, so it never becomes an
+    /// unanswered site.
+    #[test]
+    fn a_called_scope_member_also_asks_the_ops_claimed_on_what_it_returns() {
+        let claims = r#"{"library_claims":[{"package":"@fixture/hosted","version":"1.0.0","status":"answered","exports":[{
+            "specifier":"@fixture/hosted","export":"createClient","role":"http_client","side":"client",
+            "makes":[{"form":"call","member":null,"base":{"arg":0},"picker":"p"}],
+            "scopes":[{"member":"from","of":"instance:()","name":{"arg":0},"picker":"p"}],
+            "ops":[
+              {"op":"request","member":"select","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"GET","picker":"p"},
+              {"op":"request","member":"select","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"HEAD","picker":"p","when":{"arg":1,"key":"head","literal":"true"}},
+              {"op":"request","member":"insert","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"POST","picker":"p"},
+              {"op":"request","member":"upsert","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"POST","picker":"p"},
+              {"op":"request","member":"update","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"PATCH","picker":"p"},
+              {"op":"request","member":"delete","of":"instance:()>scope:from","name":{"bound":"scope"},"method_default":"DELETE","picker":"p"}],
+            "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(claims).exports;
+        let inputs_calling = |rows: &[(&str, &str)]| {
+            let row = |at: usize, (symbol, package): &(&str, &str)| {
+                format!(
+                    "[\"call\",{at},{},\"{symbol}\",\"node_modules/{package}/index.d.ts\",1,\"{package}\",\"x\",0]",
+                    at + 1
+                )
+            };
+            let rows: Vec<String> = rows
+                .iter()
+                .enumerate()
+                .map(|(at, r)| row(at * 2, r))
+                .collect();
+            let text = format!(
+                "{{\"v\":{},\"typescript\":\"6.0.2\",\"service\":\"web\",\"files\":1}}\n{{\"f\":\"a.ts\",\"h\":\"00\",\"r\":[{}]}}\n",
+                crate::position_rows::FORMAT_VERSION,
+                rows.join(",")
+            );
+            RequestSummaryInputs {
+                positions: Some(crate::position_rows::PositionIndex::of(
+                    Path::new("/repo"),
+                    crate::position_rows::read_rows(text.as_bytes()).unwrap(),
+                )),
+                ..RequestSummaryInputs::default()
+            }
+        };
+        let builder_ops = |ask: &DeclarationAsk| -> Vec<String> {
+            ask.checks
+                .iter()
+                .filter(|check| check.receiver == "instance:()>scope:from")
+                .map(|check| check.claim_id.clone())
+                .collect()
+        };
+        // `from` is called, with `select`, `insert` and a filter: only the
+        // ops of the called members are asked, both `select` ops among them.
+        let called = inputs_calling(&[
+            ("from", "@fixture/hosted"),
+            ("select", "@fixture/hosted-rest"),
+            ("insert", "@fixture/hosted-rest"),
+            ("eq", "@fixture/hosted-rest"),
+        ]);
+        let ask = declaration_ask(&called, &[], &exports);
+        let got = builder_ops(&ask);
+        assert_eq!(got.len(), 3, "{got:#?}");
+        assert_eq!(got.iter().filter(|id| id.contains(":select")).count(), 2);
+        assert_eq!(got.iter().filter(|id| id.contains(":insert")).count(), 1);
+        assert!(got.iter().all(|id| !id.contains(":eq")), "{got:#?}");
+        assert_eq!(ask.ops.iter().filter(|op| op.is_some()).count(), 3);
+        // All five members called: the 6 builder ops.
+        let all = inputs_calling(&[
+            ("from", "@fixture/hosted"),
+            ("select", "@fixture/hosted-rest"),
+            ("insert", "@fixture/hosted-rest"),
+            ("upsert", "@fixture/hosted-rest"),
+            ("update", "@fixture/hosted-rest"),
+            ("delete", "@fixture/hosted-rest"),
+        ]);
+        assert_eq!(builder_ops(&declaration_ask(&all, &[], &exports)).len(), 6);
+        // The filter has no op claim: the answer to the ask never names it,
+        // so it is never a call left open.
+        let rows = called.positions.as_ref().unwrap();
+        let eq = rows
+            .call_rows()
+            .find(|row| row.symbol() == Some("eq"))
+            .unwrap();
+        let left = MemberDeclarations {
+            unanswered: ask
+                .ops
+                .iter()
+                .flatten()
+                .map(|op| (op.package.clone(), op.member.clone()))
+                .collect(),
+            answered: ask.answered.clone(),
+            ..MemberDeclarations::default()
+        };
+        assert!(!left.left_open(eq, &exports));
+        // `from` is never called: the builder ops are not asked, whatever
+        // else the service calls on the builder package.
+        let never = inputs_calling(&[
+            ("select", "@fixture/hosted-rest"),
+            ("eq", "@fixture/hosted-rest"),
+        ]);
+        let ask = declaration_ask(&never, &[], &exports);
+        assert!(ask.checks.is_empty(), "{:#?}", ask.checks);
     }
 
     /// carrick#2474 R2b: the verifier judges in request order under a time
