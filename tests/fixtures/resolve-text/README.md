@@ -229,6 +229,27 @@ at `ParamHub(_)`) and `subscribe`'s parameter.
 With no callers read (`text_values`), every probe reads as before S6-2: a
 hole, `unread_expression`, except `p_field_typed`, `orders.typed`.
 
+## Names an own builder returns (`builders.ts`, carrick#3815)
+
+Each `p_build_*` probe's argument is a call of a builder the file writes. The
+call reads as what the builder returns, with its parameters bound to that
+call's arguments. The builder call is on no value's call list. Read through
+callers (`texts_through_callers`):
+
+| Probe | Texts, with the calls read through (innermost first) |
+|---|---|
+| `p_build_lit` (`topicFor("x")`, an arrow over a module constant) | `svc.x`, no calls |
+| `p_build_param` (`topicFor(kind)` beside `p_build_lit` in `both`) | `svc.filled`: `both("filled")` |
+| `p_build_local` (`twoSteps("z")`: a constant declared, then returned) | `two.z`, no calls |
+| `p_build_member` (`ROUTES.byId("7")`, a builder in a constant object) | `jobs.7`, no calls |
+| `p_build_nested` (`nested("q")`, which calls `topicFor` with its parameter) | `svc.n.q`, no calls |
+| `p_build_keyed` (`keyedTopic({ area: "west" })`, a key of the parameter) | `area.west`, no calls |
+| `p_build_async` (an `async` builder: its call is a promise) | a hole, `unread_expression` |
+| `p_build_self` (a builder that calls itself) | a hole, `recursion` |
+
+With no callers read (`text_values`), each probe reads the same, except
+`p_build_param`: a hole, `parameter_unread`.
+
 ## Names a `for…of` head binds (`loops.ts`, carrick#2093)
 
 Each `p_*` probe's argument is a loop head's name (or a template over two).

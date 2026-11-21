@@ -3234,6 +3234,9 @@ pub(super) struct Resolver<'a> {
     /// [`Self::pieces_through_callers`], B10-2a2). Off for every other entry
     /// point, which answers a parameter as before.
     callers_mode: Cell<text_reader::CallersRead>,
+    /// The own builder calls whose returns the open text query is reading,
+    /// innermost last ([`text_reader::BoundCall`], carrick#3815).
+    bound_calls: RefCell<Vec<text_reader::BoundCall<'a>>>,
     /// The exported module bindings some importer may change or hand on,
     /// by declaring file and name; `None`: every one is contested
     /// (carrick#2448). Built on first use.
@@ -3292,6 +3295,7 @@ impl<'a> Resolver<'a> {
             bindings_reading: RefCell::new(HashSet::new()),
             texts_reading: RefCell::new(HashSet::new()),
             callers_mode: Cell::new(text_reader::CallersRead::Off),
+            bound_calls: RefCell::new(Vec::new()),
             contested: std::cell::OnceCell::new(),
         }
     }
