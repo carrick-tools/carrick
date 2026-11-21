@@ -114,13 +114,14 @@ A client must skip progress frames rather than treat the first frame as the answ
 | `check_v2` | A keepalive every 1.5 s while it installs and checks; `phase` names the stage. |
 | `position_rows` | As `infer`, counting the files walked, with `phase` `positions`. |
 | `implementations` | As `infer`, counting the questions answered, with `phase` `implementations`. |
+| `resource_keys` | As `infer`, counting the queries answered, with `phase` `resource_keys`. |
 | every other action | None. |
 
 Frames are written by the work itself, between units, except for `check_v2`, whose work runs in child processes. A handler that stops finishing units stops writing them.
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `infer`, `retype_check`, `retype_prescreen`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `write_shadow`, `add_program_files`, `position_rows` and `implementations` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
+`init` resolves a project; `bundle`, `infer`, `retype_check`, `retype_prescreen`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `write_shadow`, `add_program_files`, `position_rows`, `implementations` and `resource_keys` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
 
 `capture_v2`, `check_v2`, `resolve_definitions`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -147,6 +148,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `reach` | no | The files a set of edits can reach in a `reach_graph` graph: `{ reached, augmented, exports_moved }` |
 | `position_rows` | yes | Write the compiler's rows for every call, member access, comparison and identifier of a service's files (record-only) |
 | `implementations` | yes | The implementations of the bodyless declaration each given call goes through |
+| `resource_keys` | yes | The property keys at key paths of a make call's type argument, with each key's declaration |
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
@@ -1085,6 +1087,34 @@ Each query is the span of a `call` (or `member`) position row: `start` and `end`
 ```
 
 One answer per query, in request order. A declaration and each implementation are named as a position row names a declaration, so an implementation joins to a definition as a `call` row at it would; its line is where the implementation's declaration starts, decorators included. Implementations are sorted by `decl_file`, then position, and never include the declaration's own signatures. More than 16 → `too_many: true` and none listed. `reason`, when nothing was searched: `not_in_program`, `no_call` (no `call` or `member` node has that span), `no_symbol`, `no_declaration`, `has_body` (the declaration runs its own body) or `checker_threw`. The position rows carry no implementations (version 4).
+
+#### `resource_keys` - The keys at key paths of a make call's type argument
+
+A general compiler read: it holds no library name, path template or domain word. `createClient<Database>(...)` asked for `["public", "Tables"]` lists the keys of `Database["public"]["Tables"]`. Asked of the service's analysis process; nothing is released.
+
+```json
+{
+  "request_id": "16",
+  "action": "resource_keys",
+  "queries": [{ "file": "/repo/src/client.ts", "start": 90, "end": 130, "type_arg": 0, "paths": [["public", "Tables"]] }],
+  "scan_root": "/repo"
+}
+```
+
+Each query is the span of a `call` position row, a type argument index and key paths. The type argument is resolved by the checker and each path is walked property by property.
+
+```json
+{
+  "request_id": "16",
+  "status": "success",
+  "result": { "answers": [{ "paths": [{
+    "path": ["public", "Tables"],
+    "keys": [{ "name": "accounts", "decl_file": "src/types.ts", "decl_line": 4 }]
+  }] }] }
+}
+```
+
+One answer per query, in request order, with one entry per asked path (the path as asked) and its keys in declaration order. `decl_file` and `decl_line` are as a position row names a declaration; both are `null` for a key with no declaration. A path the type does not have gives no keys and `reason: "path_missing"` on that path. A query that reads nothing has no paths and a `reason`: `not_in_program`, `no_call` (no call has that span), `no_type_argument` (the call has no type argument at that index) or `checker_threw`.
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 

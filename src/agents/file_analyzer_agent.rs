@@ -315,6 +315,12 @@ pub enum ResolutionSource {
     /// and its base is a parameter nothing fills. See
     /// [`crate::request_summary::descriptors`].
     RequestDescriptor,
+    /// A row a TYPE states: a key of a resource type (a table, a view or a
+    /// function of a hosted database), read by the compiler engine at the
+    /// type argument of a served package's make call
+    /// ([`crate::type_resources`]). A fact: the type states it outright. The
+    /// row carries no type entries and a [`crate::type_resources::Resource`].
+    TypeResource,
 }
 
 impl ResolutionSource {

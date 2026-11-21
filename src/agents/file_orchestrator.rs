@@ -1763,6 +1763,10 @@ impl ResolutionSource {
             // A built request (carrick#3470) is a site row at an object
             // literal, never a call site the reader's passes compete for.
             Self::RequestDescriptor => 0,
+            // A row a type states (a key of a resource type) is a producer row
+            // at a declaration, never a call site the reader's passes
+            // compete for.
+            Self::TypeResource => 0,
             // Never arbitrated here: a declared operation (carrick#831) is
             // not a statement about a call SITE, so it never competes for one.
             // The rows it produces are materialised into the graph after every

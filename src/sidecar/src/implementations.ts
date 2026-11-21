@@ -171,7 +171,7 @@ class ImplementationFinder {
  * node a row of that kind was written at. A call is preferred where both
  * kinds share the span.
  */
-function positionAt(
+export function positionAt(
   file: ts.SourceFile,
   start: number,
   end: number
