@@ -166,6 +166,35 @@ test("a file in no service answers none at once and starts nothing", async () =>
   }
 });
 
+test("a cold answer returns before the engine start's synchronous work", async () => {
+  const w = world(["api"]);
+  try {
+    let busyDone = false;
+    const held = w.daemon as unknown as { deps: { runtime: ServiceRuntime } };
+    held.deps.runtime = {
+      start: () => {
+        const until = Date.now() + 300;
+        while (Date.now() < until) {
+          // busy-wait: the synchronous work before a start's first await
+        }
+        busyDone = true;
+        const engine: ServiceEngine = { answer: async () => ({ lines: [], after: async () => undefined }), rss: () => 1, close: async () => undefined };
+        return Promise.resolve({ engine });
+      },
+    };
+    const cold = await w.daemon.handle(w.req(w.file("api")));
+    assert.equal(cold.state, "cold");
+    assert.deepEqual(cold.not_checked, [{ service: "api", state: "cold" }]);
+    assert.ok(cold.ms < 100, `the answer took ${cold.ms} ms`);
+    assert.equal(busyDone, false, "the start had not run when the answer returned");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(busyDone, true);
+    assert.equal(readState(w.root, "api", w.home)?.state, "ready");
+  } finally {
+    w.done();
+  }
+});
+
 test("the first request answers cold and starts the service once; a later one answers ready", async () => {
   const w = world(["api"]);
   try {
@@ -173,8 +202,8 @@ test("the first request answers cold and starts the service once; a later one an
     const first = await w.daemon.handle(w.req(w.file("api")));
     assert.equal(first.state, "cold");
     const second = await w.daemon.handle(w.req(w.file("api")));
-    assert.equal(w.startCalls.length, 1, "a second request while starting starts nothing");
     await settle();
+    assert.equal(w.startCalls.length, 1, "a second request while starting starts nothing");
     const third = await w.daemon.handle(w.req(w.file("api")));
     assert.equal(third.state, "ready");
     assert.deepEqual(third.lines.map((l) => l.label), ["GET /api"]);
@@ -192,6 +221,7 @@ test("a path reached through a symlink maps to its service", async () => {
     fs.symlinkSync(w.root, link);
     const answer = await w.daemon.handle(w.req(path.join(link, "api", "src", "a.ts")));
     assert.notEqual(answer.state, "none");
+    await settle();
     assert.deepEqual(w.startCalls, ["api"]);
   } finally {
     w.done();
@@ -287,12 +317,14 @@ test("over the memory budget answers capped, and the least recently used idle en
     // neither engine has been idle for 2 minutes: capped, nothing started.
     const capped = await w.daemon.handle(w.req(w.file("c")));
     assert.equal(capped.state, "capped");
+    await settle();
     assert.deepEqual(w.startCalls, ["a", "b"]);
     // Three minutes on, `a` is the older of the two: it is closed, `c` starts.
     w.clock.now += 3 * MIN;
     await w.daemon.handle(w.req(w.file("b"), { kind: "read" }));
     const fits = await w.daemon.handle(w.req(w.file("c")));
     assert.equal(fits.state, "cold");
+    await settle();
     assert.equal(w.fakes.get("a")!.closed, true);
     assert.equal(w.fakes.get("b")!.closed, false);
     assert.deepEqual(w.startCalls, ["a", "b", "c"]);
@@ -326,6 +358,7 @@ test("a service that holds no compiler gives back its slot, so the next service 
     await w.daemon.tick();
     const next = await w.daemon.handle(w.req(w.file("b")));
     assert.equal(next.state, "cold");
+    await settle();
     assert.deepEqual(w.startCalls, ["a", "b"]);
   } finally {
     w.done();
@@ -370,6 +403,7 @@ test("a service whose engine holds no compiler is admitted at 0 MB next time", a
     const second = new HeldDaemon({ root: w.root, home: w.home, env: { ...ON }, totalmem: () => 16 * 1024 ** 3, programs: async () => w.inits, runtime });
     const answer = await second.handle(w.req(w.file("a")));
     assert.equal(answer.state, "cold");
+    await settle();
     assert.deepEqual(again, ["a"]);
   } finally {
     w.done();

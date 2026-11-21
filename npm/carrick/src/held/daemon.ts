@@ -417,10 +417,16 @@ export class HeldDaemon {
     this.keep(init, { state: "starting" });
     this.emptySince = null;
     this.entry(slot, slot.settledMb ?? ADMISSION_MB);
-    void this.deps.runtime.start(init).then(
-      (result) => this.started(slot, result),
-      (error: unknown) => this.started(slot, { state: "error", reason: String(error) }),
-    );
+    // The next turn of the event loop: a start's synchronous work (it clears the old shadow folder before its
+    // first await) must not hold back the `cold` answer this ask is about to return.
+    setImmediate(() => {
+      void Promise.resolve()
+        .then(() => this.deps.runtime.start(init))
+        .then(
+          (result) => this.started(slot, result),
+          (error: unknown) => this.started(slot, { state: "error", reason: String(error) }),
+        );
+    });
   }
 
   private started(slot: Slot, result: StartResult): void {
