@@ -144,8 +144,15 @@ const DOCUMENT_TYPES: ReadonlySet<string> = new Set([
   'TypedDocumentString',
 ]);
 
+/** `name: { bound: 'binding' }`: the op call's value is a procedure named by the variable that holds it (amendment 13). */
+function isBinding(claim: LibraryClaim): boolean {
+  return claim.kind === 'op' && claim.name !== undefined && 'bound' in claim.name && claim.name.bound === 'binding';
+}
+
 /** The method words an op reads under its protocol; absent, the role's own. */
 function methodWords(claim: OpClaim, rules: RoleRules): ReadonlySet<string> | undefined {
+  // A procedure named by its binding states a transport method (GET, POST), not a procedure kind (amendment 13).
+  if (isBinding(claim)) return rules.methods;
   if (claim.protocol === 'rpc') return RPC_WORDS;
   if (claim.protocol === 'graphql') return GRAPHQL_WORDS;
   return rules.methods;
@@ -991,7 +998,7 @@ export class LibraryClaimsVerifier {
         if (!rules) return { outcome: unchecked('role_unsupported') };
         // An export given two roles is classified two ways; neither is a fact.
         if ((roles.get(exportKey(check))?.size ?? 0) > 1) return { outcome: unchecked('role_conflict') };
-        if (placementInvalid(check.claim) || handleMisplaced(check.claim) || orFileMisplaced(check.claim)) return { outcome: unchecked('claim_invalid') };
+        if (placementInvalid(check.claim) || handleMisplaced(check.claim) || orFileMisplaced(check.claim) || makerFlagMisplaced(check.claim)) return { outcome: unchecked('claim_invalid') };
         if (check.claim.kind === 'op' && check.claim.protocol !== undefined) {
           if (!PROTOCOLS.has(check.claim.protocol)) return { outcome: unchecked('claim_invalid') };
           if (!ROLE_PROTOCOLS[check.role].has(check.claim.protocol)) return { outcome: unchecked('protocol_role') };
@@ -1581,7 +1588,8 @@ function formUnbuilt(claim: OpClaim): boolean {
  */
 function unbuiltPart(claim: LibraryClaim): string | undefined {
   const slots: (ClaimSlot | NameSlot | undefined)[] = [];
-  if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.name, claim.handler);
+  // A make's `ref` name is judged (amendment 13); an `of` make's still is not.
+  if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.of === undefined && claim.name ? { ...claim.name, ref: undefined } : claim.name, claim.handler);
   if (claim.kind === 'scope') slots.push(claim.name, claim.mounts);
   if (claim.kind === 'op') {
     const name = claim.name;
@@ -1678,6 +1686,25 @@ function orFileMisplaced(claim: LibraryClaim): boolean {
   if (claim.kind === 'scope') slots.push(claim.runs, claim.merges, claim.mounts);
   if (claim.kind === 'op') slots.push(claim.payload, claim.ack, claim.options, claim.method_key, claim.base);
   return slots.some(slot => slot?.or_file === true);
+}
+
+/**
+ * `maker: true` (amendment 13) flags the `method_key` slot of a binding op and
+ * no other slot; anywhere else the claim is `claim_invalid`. A binding op's
+ * `method_key` must carry it. `maker: false` is
+ * no flag.
+ */
+function makerFlagMisplaced(claim: LibraryClaim): boolean {
+  const slots = nameSlots(claim);
+  if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.handler, claim.runs);
+  if (claim.kind === 'scope') slots.push(claim.runs, claim.merges, claim.mounts);
+  if (claim.kind === 'op') {
+    slots.push(claim.payload, claim.handler, claim.ack, claim.options, claim.base);
+    if (!isBinding(claim)) slots.push(claim.method_key);
+    // On a binding op the labelled call is the handler step, which carries no method: the slot is the maker's.
+    else if (claim.method_key !== undefined && claim.method_key.maker !== true) return true;
+  }
+  return slots.some(slot => slot?.maker === true);
 }
 
 /**
@@ -2734,10 +2761,14 @@ class DeclarationReader {
     collections?: () => readonly ts.Type[] | undefined
   ): Judged {
     if (claim.of !== undefined) return this.judgeOfMake(receiver, claim);
+    // A name that is a function or a class is a `ref` part, read as an op's is (amendment 13).
+    const ref = claim.name?.ref;
+    if (ref !== undefined && ref !== 'function' && ref !== 'class') return { outcome: unchecked('claim_invalid') };
     const layout = this.layout({
       base: claim.base,
       prefix: claim.prefix,
-      name: claim.name,
+      name: ref === undefined ? claim.name : undefined,
+      ref: ref === undefined || claim.name === undefined ? undefined : { arg: claim.name.arg, ...(claim.name.key === undefined ? {} : { key: claim.name.key }) },
       handler: claim.handler,
       runs: claim.runs,
     });
@@ -3240,6 +3271,9 @@ class DeclarationReader {
       if (name.bound === 'export') {
         // The export is the name (a decorator, a handler class): a receive op with a handler.
         if (claim.op !== 'receive' || claim.handler === undefined) return unchecked('claim_invalid');
+      } else if (name.bound === 'binding') {
+        // The op call's value is a procedure (amendment 13): a receive over rpc with a handler.
+        if (claim.op !== 'receive' || claim.protocol !== 'rpc' || claim.handler === undefined) return unchecked('claim_invalid');
       } else if (name.bound === 'maker' || name.bound === 'scope' || name.bound === 'key') {
         const bound =
           name.bound === 'maker' ? receiver.makerBindsName : name.bound === 'scope' ? receiver.scoped : receiver.keyBound === true;
@@ -3271,11 +3305,12 @@ class DeclarationReader {
       name: nameSlot,
       document: documentSlot,
       ref: refSlot,
-      payload: claim.payload,
+      payload: isBinding(claim) ? undefined : claim.payload,
       handler: claim.handler,
       ack: claim.ack,
       base: claim.base,
-      method: claim.method_key,
+      // A binding op's payload and maker slot are on other signatures, read in `bindingOutcome`.
+      method: isBinding(claim) ? undefined : claim.method_key,
       runs: runs && !boundRuns ? { arg: runs.arg, ...(runs.key === undefined ? {} : { key: runs.key }) } : undefined,
     });
     if ('failure' in layout) return layout.failure;
@@ -3284,6 +3319,7 @@ class DeclarationReader {
     const labels = claim.key_labels ?? {};
     let best: RankedFailure | undefined;
     let held = false;
+    let heldSignature: ts.Signature | undefined;
     // An overload that holds but for a request member the declarations lack
     // (carrick#2968): the op stands without its request, unless another
     // overload holds the request too. Every other request fault fails the op.
@@ -3317,6 +3353,7 @@ class DeclarationReader {
       }
       if (result.rank === Infinity) {
         held = true;
+        heldSignature = signature;
         requestDropped = undefined;
         break;
       }
@@ -3327,7 +3364,51 @@ class DeclarationReader {
       const ran = this.boundRunsOutcome(receiver.makerHolding!, boundRuns);
       return ran.verdict === 'verified' && requestDropped !== undefined ? { ...ran, requestDropped } : ran;
     }
+    if (isBinding(claim)) {
+      const bound = this.bindingOutcome(receiver, claim, heldSignature!);
+      if (bound) return bound;
+    }
     return this.opVerified(callee, bodyMembers, requestDropped);
+  }
+
+  /**
+   * What a `bound: 'binding'` op adds to the handler member's own reading
+   * (amendment 13): the value the member returns is callable, its call takes
+   * the `payload` slot, and the maker's call takes the `method_key` slot
+   * flagged `maker`. Undefined when all three hold.
+   */
+  private bindingOutcome(receiver: MessageReceiver, claim: OpClaim, held: ts.Signature): Outcome | undefined {
+    const returned = this.checker.getReturnTypeOfSignature(held);
+    if (this.saysNothing(returned)) return unchecked('member_untyped');
+    const calls = this.checker.getNonNullableType(returned).getCallSignatures();
+    if (calls.length === 0) return failed('result_not_callable');
+    // The slot is declared, not necessarily passable: with no validator a body type is `undefined`, and its key still is declared.
+    const slotOn = (signatures: readonly ts.Signature[], slot: ClaimSlot): Outcome | undefined => {
+      let untyped = false;
+      for (const signature of signatures) {
+        const declared = this.keyParameterAt(signature, slot.arg);
+        if (declared === undefined) continue;
+        if (slot.key === undefined) return undefined;
+        if (declared === VARIADIC || this.parts(declared).some(part => this.isOpenTop(part))) {
+          untyped = true;
+          continue;
+        }
+        const named = (type: ts.Type) => this.checker.getPropertyOfType(this.checker.getNonNullableType(type), slot.key!) !== undefined;
+        if (this.parts(declared).some(named)) return undefined;
+      }
+      return untyped ? unchecked('member_untyped') : failed('slot_missing');
+    };
+    if (claim.payload !== undefined) {
+      const missing = slotOn(calls, claim.payload);
+      if (missing) return missing;
+    }
+    if (claim.method_key?.maker === true) {
+      // A maker slot reads the call that built the receiver; a receiver no maker built has none.
+      if (receiver.makerHolding === undefined) return unchecked('claim_invalid');
+      const missing = slotOn(receiver.makerHolding, claim.method_key);
+      if (missing) return missing;
+    }
+    return undefined;
   }
 
   /** A verified op: the callee's declarations and members, for `labelledMembers`. */

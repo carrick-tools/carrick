@@ -86,6 +86,8 @@ const ELEMENTS: Record<string, LibraryCheck> = {
   // Amendment 8 (library-claims-decorated-name.test.ts): judged on a decorate receive, claim_invalid on this call-form route.
   'bound decorated': route({ name: { bound: 'decorated' } }),
   'name first': route({ name: { first: [{ arg: 0 }, { arg: 1, key: 'name' }, { bound: 'decorated' }] } }),
+  // Amendment 13 (library-claims-binding.test.ts): judged; claim_invalid on this non-rpc route.
+  'bound binding': route({ name: { bound: 'binding' } }),
   'bound subscribed': route({ name: { bound: 'subscribed', param: 0, at: ['topic'] } }),
   'form new': route({ form: 'new' }),
   'form set': route({ form: 'set' }),
@@ -102,6 +104,7 @@ const ELEMENTS: Record<string, LibraryCheck> = {
   'returns result': route({ returns: { result: { member: ['data'] } } }),
   'scope form decorate': scope({ form: 'decorate' }),
   'scope name slot ref': scope({ name: { arg: 0, ref: 'class' } }),
+  'make slot ref': check('export', { kind: 'make', form: 'call', member: null, name: { arg: 0, ref: 'function' } }),
   'make slot at': check('export', { kind: 'make', form: 'call', member: null, name: { arg: 0, at: ['id'] } }),
 };
 
@@ -123,6 +126,8 @@ const BUILT = new Set([
   'bound path',
   'bound export',
   'bound decorated',
+  'bound binding',
+  'make slot ref',
   'name first',
   'protocol http',
   'protocol graphql',

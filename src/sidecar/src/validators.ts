@@ -583,6 +583,8 @@ const ClaimSlotSchema = z
     handle: z.boolean().optional(),
     // QW-1: on a `handler` slot only (else `claim_invalid`, judged by the verifier).
     or_file: z.boolean().optional(),
+    // Amendment 13: on a binding op's `method_key` only (else `claim_invalid`, judged by the verifier).
+    maker: z.boolean().optional(),
   })
   .strict();
 
@@ -600,7 +602,7 @@ const NameLiteralSchema = z.object({ literal: z.string().min(1) }).strict();
 
 const BoundNameSchema = z
   .object({
-    bound: z.enum(['maker', 'scope', 'key', 'path', 'export', 'subscribed', 'decorated']),
+    bound: z.enum(['maker', 'scope', 'key', 'path', 'export', 'subscribed', 'decorated', 'binding']),
     join: z.string().min(1).optional(),
     param: z.number().int().nonnegative().optional(),
     at: z.array(z.string().min(1)).optional(),
