@@ -2,8 +2,8 @@
  * carrick#4472 T2: a verify request may name another service's tsconfig. The
  * checks are then judged in a probe-only program built from that tsconfig's
  * compiler options (its `lib`, `types`, `paths`), released after the request.
- * A request without the field is judged in the service's own program, as
- * before.
+ * A request without the field is judged in the programs the service.s files
+ * are typed under (carrick#4932).
  *
  * The fixture is a repo with an app that loads no DOM lib and a kit package
  * that does, and installs its own copy of a queue package.

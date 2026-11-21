@@ -132,6 +132,18 @@ export class GoverningConfigs {
     return this.listingOwner(this.serviceConfig, absolute) ?? this.serviceConfig;
   }
 
+  /**
+   * Absolute paths of the configs the service config's files are typed
+   * under (`ProjectGraph.owners`), in search order; empty with no service
+   * config.
+   */
+  serviceOwners(): string[] {
+    if (this.serviceConfig === undefined) return [];
+    this.listingOwner(this.serviceConfig, this.serviceConfig);
+    const entry = this.graphs.get(this.serviceConfig);
+    return entry === undefined ? [this.serviceConfig] : entry.graph.owners().map((owner) => owner.configPath);
+  }
+
   private configsIn(dir: string): string[] {
     let configs = this.dirConfigs.get(dir);
     if (configs === undefined) {

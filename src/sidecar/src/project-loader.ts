@@ -511,6 +511,18 @@ export class ProjectLoader {
   }
 
   /**
+   * The keys (`projectKeyFor`) of the projects the service's files are typed
+   * under, one per distinct set of options, in search order (carrick#4932):
+   * `''` alone for a tsconfig that owns all its files, and for a service with
+   * no tsconfig. A solution config owns none of its files, so its own key is
+   * not among them.
+   */
+  serviceProjectKeys(): string[] {
+    const owners = this.governing?.serviceOwners() ?? [];
+    return owners.length === 0 ? [''] : owners.map((config) => (config === this.namedTsconfigPath ? '' : config));
+  }
+
+  /**
    * The project behind a key from `projectKeyFor`, built on first use and
    * kept: a service whose files all belong to one project builds one.
    */

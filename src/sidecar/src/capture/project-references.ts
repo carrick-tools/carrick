@@ -138,6 +138,28 @@ export class ProjectGraph {
     return found;
   }
 
+  /**
+   * The projects that own at least one file (`ownerOf`), in search order,
+   * less any whose options are alike to an earlier one's (`emitsAlike`): one
+   * per way the service's files are typed. The named config alone where no
+   * project owns a file, and for a config that references nothing.
+   */
+  owners(): ServiceProject[] {
+    if (!this.hasReferences) return [this.named];
+    const owning = new Set<ServiceProject>();
+    for (const entry of this.projects()) {
+      for (const file of entry.files) {
+        const owner = this.listingOwnerOf(file);
+        if (owner) owning.add(owner);
+      }
+    }
+    const kept: ServiceProject[] = [];
+    for (const { project } of this.projects()) {
+      if (owning.has(project) && !kept.some((earlier) => emitsAlike(earlier, project))) kept.push(project);
+    }
+    return kept.length > 0 ? kept : [this.named];
+  }
+
   /** Position in search order, 0 for the named config. */
   rank(project: ServiceProject): number {
     if (project === this.named) return 0;
