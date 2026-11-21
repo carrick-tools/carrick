@@ -1123,6 +1123,9 @@ pub struct MemberDeclarations {
     answered: BTreeSet<String>,
     /// The dependencies the ask read ([`DeclarationAsk`]'s).
     depends: Dependencies,
+    /// The (store key, member) pairs one op check of verified, whatever
+    /// declarations it named ([`Self::unlinked`]).
+    verified: HashSet<(String, String)>,
 }
 
 impl MemberDeclarations {
@@ -1267,7 +1270,30 @@ impl MemberDeclarations {
                 .into_iter()
                 .filter(|pair| !verified.contains(pair)),
         );
+        out.verified = verified;
         out
+    }
+
+    /// Whether the member `row` reads is one a verified op check names in
+    /// the package its declaration is in, while no verified declaration is
+    /// the call's own: the verifier and the service's own compiler read the
+    /// package at different files (a dual-format package's `.d.cts` and
+    /// `.d.mts`), or the call is another member of that name. The call is a
+    /// site this scan could not link, not one nothing was said of: it is
+    /// saved with a reason, never dropped (carrick#4932). A construction
+    /// states no declared op, and a member declared in the repository is no
+    /// package's.
+    fn unlinked(&self, row: &Row, exports: &[ExportClaims]) -> bool {
+        let (Some(symbol), Some(file), Some(line)) =
+            (row.symbol(), row.decl_file(), row.decl_line())
+        else {
+            return false;
+        };
+        !in_repo(row)
+            && self.at(file, line).is_empty()
+            && store_keys(row, exports)
+                .into_iter()
+                .any(|key| self.verified.contains(&(key, symbol.to_string())))
     }
 
     /// The ops the declaration at `decl_file:decl_line` stands for.
@@ -2793,6 +2819,18 @@ impl<'a> Walker<'a> {
                     // A class built here has a constructor with no body to
                     // read; a value that is no definition is the gap.
                     return (!construction).then_some(Stop::ValueCallee);
+                }
+                // A verified op names this member in the declaring package
+                // and none of its verified declarations is this call's
+                // (carrick#4932): the package matches no call it can link,
+                // whatever its other store keys say.
+                if !construction
+                    && self
+                        .labels
+                        .declarations
+                        .is_some_and(|d| d.unlinked(row, self.labels.exports))
+                {
+                    return Some(Stop::PackageUnmatched);
                 }
                 // Missed only when every package the declaration stands for
                 // misses it: one labelled none, or answered and matched,
@@ -4993,6 +5031,123 @@ mod tests {
                 "check {flip} unchecked, its pair's other verified: {mixed:?}"
             );
         }
+    }
+
+    /// The declarations a verified `get` of `fixture-pkg` names, as the
+    /// verifier read the package: its `.d.cts` twin at line 10.
+    fn twin_declarations() -> MemberDeclarations {
+        let op = DeclaredOp {
+            package: "fixture-pkg".to_string(),
+            export: "default".to_string(),
+            member: "get".to_string(),
+            op: LibraryOp::Receive,
+            scope: None,
+        };
+        let mut by_declaration = HashMap::new();
+        by_declaration.insert(
+            ("node_modules/fixture-pkg/index.d.cts".to_string(), 10),
+            vec![op],
+        );
+        MemberDeclarations {
+            by_declaration,
+            verified: HashSet::from([("fixture-pkg".to_string(), "get".to_string())]),
+            ..MemberDeclarations::default()
+        }
+    }
+
+    fn member_row(package: &str, file: &str, line: u32) -> Row {
+        Row(
+            crate::position_rows::Kind::Call,
+            0,
+            5,
+            Some("get".into()),
+            Some(file.into()),
+            Some(line),
+            Some(package.into()),
+            None,
+            0,
+        )
+    }
+
+    /// carrick#4932: a verified op names a member at `.d.cts:10`; the call's
+    /// own compiler read the package's `.d.mts:10`. The call is one the scan
+    /// could not link, so it is saved, not dropped.
+    #[test]
+    fn a_call_at_the_twin_file_of_a_verified_declaration_is_unlinked() {
+        let declarations = twin_declarations();
+        let row = member_row("fixture-pkg", "node_modules/fixture-pkg/index.d.mts", 10);
+        assert!(
+            declarations
+                .at("node_modules/fixture-pkg/index.d.mts", 10)
+                .is_empty()
+        );
+        assert!(declarations.unlinked(&row, &[]));
+    }
+
+    /// Another package's member of the same name is nothing to this op.
+    #[test]
+    fn another_package_s_member_of_the_same_name_is_not_unlinked() {
+        let declarations = twin_declarations();
+        let row = member_row("other-pkg", "node_modules/other-pkg/index.d.mts", 10);
+        assert!(!declarations.unlinked(&row, &[]));
+    }
+
+    /// A call at a verified declaration is a row as before, not unlinked.
+    #[test]
+    fn a_call_at_a_verified_declaration_is_not_unlinked() {
+        let declarations = twin_declarations();
+        let row = member_row("fixture-pkg", "node_modules/fixture-pkg/index.d.cts", 10);
+        assert!(!declarations.unlinked(&row, &[]));
+        // A member of the repository is no package's.
+        let local = member_row("fixture-pkg", "src/own.ts", 3);
+        assert!(!declarations.unlinked(&local, &[]));
+    }
+
+    /// carrick#4932 through the walk: the verifier names the twin file, the
+    /// service's rows the plain `.d.ts`, and the declaration stands for a
+    /// second package the store labelled no network role: `app.get` calls are
+    /// saved `package_unmatched`, where a read of the other key dropped them.
+    #[test]
+    fn a_verified_op_s_calls_at_another_file_of_its_package_are_saved() {
+        let edit = |exports: &mut Vec<ExportClaims>| {
+            let server = exports
+                .iter_mut()
+                .find(|export| export.package == "fixture-server")
+                .expect("the fixture labels fixture-server");
+            server.type_packages = vec!["fixture-server".to_string()];
+            let mut plain = server.clone();
+            plain.package = "fixture-plain".to_string();
+            plain.role = LibraryRole::None;
+            plain.claims = Vec::new();
+            plain.calls = Vec::new();
+            exports.push(plain);
+        };
+        let (on, exports, ask, verdicts) =
+            traced_fixture_verdicts("receiver-trace", ".", "web", &[], edit)
+                .expect("the fixture walks: a skipped test proves nothing");
+        let mut twin = verdicts.clone();
+        for verdict in &mut twin {
+            for declared in &mut verdict.declarations {
+                declared.decl_file = declared.decl_file.replace(".d.ts", ".d.cts");
+            }
+        }
+        let rows = |verdicts: &[SemanticsResult]| {
+            unread_traced(&on, &exports, &MemberDeclarations::of(&ask, verdicts))
+                .into_iter()
+                .filter(|row| row.file.ends_with("helpers.ts") && row.line == 10)
+                .map(|row| (row.callee, row.reason))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(&verdicts),
+            [],
+            "the verified declaration links the call"
+        );
+        assert_eq!(
+            rows(&twin),
+            [(Some("app.get".to_string()), Stop::PackageUnmatched)],
+            "the twin file links nothing: the call is saved"
+        );
     }
 
     /// A traced fixture through the whole site pass, with `declarations` as
