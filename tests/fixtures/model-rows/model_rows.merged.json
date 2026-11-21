@@ -1,0 +1,282 @@
+[
+  {
+    "repo_name": "acme/shop",
+    "commit_hash": "1111111111111111111111111111111111111111",
+    "last_updated": "2026-11-21T09:00:00Z",
+    "endpoints": [],
+    "calls": [
+      {
+        "owner": null,
+        "key": {
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/orders/:id"
+        },
+        "params": [],
+        "request_body": null,
+        "response_body": null,
+        "handler_name": null,
+        "request_type": null,
+        "response_type": null,
+        "file_path": "web/src/orders.ts"
+      },
+      {
+        "owner": null,
+        "key": {
+          "protocol": "http",
+          "method": "POST",
+          "path": "/api/notes"
+        },
+        "params": [],
+        "request_body": null,
+        "response_body": null,
+        "handler_name": null,
+        "request_type": null,
+        "response_type": null,
+        "file_path": "web/src/notes.ts"
+      },
+      {
+        "key": {
+          "protocol": "http",
+          "method": "POST",
+          "path": "/functions/v1/x"
+        },
+        "params": [],
+        "file_path": "web/src/x.ts",
+        "resolution_source": "model",
+        "model_end": {
+          "line": 7,
+          "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "confidence": "stated",
+          "basis": "text",
+          "run_id": "run-1"
+        }
+      },
+      {
+        "key": {
+          "protocol": "http",
+          "method": "GET",
+          "path": "/v1/items"
+        },
+        "params": [],
+        "file_path": "web/src/items.ts",
+        "resolution_source": "model",
+        "model_end": {
+          "line": 5,
+          "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "confidence": "stated",
+          "basis": "text",
+          "run_id": "run-0"
+        }
+      }
+    ],
+    "mounts": [],
+    "apps": {},
+    "imported_handlers": [],
+    "function_definitions": {},
+    "config_json": "{\"directory\":\"web\"}",
+    "package_json": null,
+    "packages": null,
+    "service_name": "web",
+    "mount_graph": {
+      "nodes": {},
+      "mounts": [],
+      "endpoints": [],
+      "data_calls": [
+        {
+          "method": "GET",
+          "target_url": "/api/orders/:id",
+          "canonical_path": "/api/orders/:id",
+          "client": "fetch",
+          "file_location": "web/src/orders.ts:12",
+          "line": 12
+        },
+        {
+          "method": "POST",
+          "target_url": "/api/notes",
+          "canonical_path": "/api/notes",
+          "client": "fetch",
+          "file_location": "web/src/notes.ts:256",
+          "line": 256
+        },
+        {
+          "method": "POST",
+          "target_url": "/functions/v1/x",
+          "canonical_path": "/functions/v1/x",
+          "client": "model",
+          "file_location": "web/src/x.ts:7",
+          "line": 7,
+          "resolution_source": "model",
+          "model_end": {
+            "line": 7,
+            "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "confidence": "stated",
+            "basis": "text",
+            "run_id": "run-1"
+          }
+        },
+        {
+          "method": "GET",
+          "target_url": "/v1/items",
+          "canonical_path": "/v1/items",
+          "client": "model",
+          "file_location": "web/src/items.ts:5",
+          "line": 5,
+          "resolution_source": "model",
+          "model_end": {
+            "line": 5,
+            "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "confidence": "stated",
+            "basis": "text",
+            "run_id": "run-0"
+          }
+        }
+      ]
+    },
+    "unread_sites": [
+      {
+        "file": "web/src/x.ts",
+        "line": 9,
+        "span_start": 1,
+        "span_end": 9,
+        "reason": "value_callee",
+        "slot": "callee",
+        "depth": 0
+      }
+    ],
+    "unread_sites_total": 1,
+    "unread_sites_by_reason": {
+      "value_callee": 1
+    },
+    "model_rows": {
+      "added": 2,
+      "dropped": {
+        "scanner_reads_site": 1
+      },
+      "unread_stated": 1
+    }
+  },
+  {
+    "repo_name": "acme/shop",
+    "commit_hash": "1111111111111111111111111111111111111111",
+    "last_updated": "2026-11-21T09:00:00Z",
+    "endpoints": [
+      {
+        "owner": null,
+        "key": {
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/health"
+        },
+        "params": [],
+        "request_body": null,
+        "response_body": null,
+        "handler_name": null,
+        "request_type": null,
+        "response_type": null,
+        "file_path": "api/src/health.ts"
+      },
+      {
+        "key": {
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/orders/:id"
+        },
+        "params": [],
+        "file_path": "api/src/orders.ts",
+        "resolution_source": "model",
+        "model_end": {
+          "line": 30,
+          "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "confidence": "stated",
+          "basis": "text",
+          "run_id": "run-1"
+        }
+      },
+      {
+        "key": {
+          "protocol": "pubsub",
+          "topic": "orders.created"
+        },
+        "params": [],
+        "file_path": "api/src/pub.ts",
+        "resolution_source": "model",
+        "model_end": {
+          "line": 4,
+          "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "confidence": "stated",
+          "basis": "text",
+          "run_id": "run-1"
+        }
+      },
+      {
+        "key": {
+          "protocol": "http",
+          "method": "GET",
+          "path": "/v1/items"
+        },
+        "params": [],
+        "file_path": "api/src/items.ts",
+        "resolution_source": "model",
+        "model_end": {
+          "line": 9,
+          "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "confidence": "stated",
+          "basis": "text",
+          "run_id": "run-0"
+        }
+      }
+    ],
+    "calls": [],
+    "mounts": [],
+    "apps": {},
+    "imported_handlers": [],
+    "function_definitions": {},
+    "config_json": "{\"directory\":\"api\"}",
+    "package_json": null,
+    "packages": null,
+    "service_name": "api",
+    "model_rows": {
+      "added": 3,
+      "dropped": {
+        "bad_path": 3,
+        "bad_text": 1,
+        "scanner_serves_key": 1,
+        "no_service": 1,
+        "no_index_key": 2
+      },
+      "unread_stated": 0
+    }
+  },
+  {
+    "repo_name": "acme/shop",
+    "commit_hash": "1111111111111111111111111111111111111111",
+    "last_updated": "2026-11-21T09:00:00Z",
+    "endpoints": [
+      {
+        "owner": null,
+        "key": {
+          "protocol": "http",
+          "method": "ALL",
+          "path": "/functions/v1/x"
+        },
+        "params": [],
+        "request_body": null,
+        "response_body": null,
+        "handler_name": null,
+        "request_type": null,
+        "response_type": null,
+        "file_path": "edge/src/x.ts"
+      }
+    ],
+    "calls": [],
+    "mounts": [],
+    "apps": {},
+    "imported_handlers": [],
+    "function_definitions": {},
+    "config_json": "{\"directory\":\"edge\"}",
+    "package_json": null,
+    "packages": null,
+    "service_name": "edge"
+  }
+]
