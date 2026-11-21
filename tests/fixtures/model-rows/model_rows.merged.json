@@ -55,31 +55,6 @@
       {
         "key": {
           "protocol": "http",
-          "method": "POST",
-          "path": ""
-        },
-        "params": [],
-        "file_path": "web/src/trpc.ts:14",
-        "procedure": {
-          "path": "order.byId",
-          "router": {
-            "repo": "acme/shop",
-            "file": "",
-            "binding": ""
-          }
-        },
-        "resolution_source": "model",
-        "model_end": {
-          "line": 14,
-          "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "confidence": "inferred",
-          "basis": "symbol",
-          "run_id": "run-1"
-        }
-      },
-      {
-        "key": {
-          "protocol": "http",
           "method": "GET",
           "path": "/v1/items"
         },
@@ -141,30 +116,6 @@
           }
         },
         {
-          "method": "POST",
-          "target_url": "",
-          "canonical_path": "",
-          "client": "model",
-          "file_location": "web/src/trpc.ts:14",
-          "line": 14,
-          "procedure": {
-            "path": "order.byId",
-            "router": {
-              "repo": "acme/shop",
-              "file": "",
-              "binding": ""
-            }
-          },
-          "resolution_source": "model",
-          "model_end": {
-            "line": 14,
-            "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "confidence": "inferred",
-            "basis": "symbol",
-            "run_id": "run-1"
-          }
-        },
-        {
           "method": "GET",
           "target_url": "/v1/items",
           "canonical_path": "/v1/items",
@@ -198,7 +149,7 @@
       "value_callee": 1
     },
     "model_rows": {
-      "added": 3,
+      "added": 2,
       "dropped": {
         "scanner_reads_site": 1
       },
@@ -261,6 +212,31 @@
       {
         "key": {
           "protocol": "http",
+          "method": "ALL",
+          "path": ""
+        },
+        "params": [],
+        "file_path": "api/src/trpc.ts:14",
+        "procedure": {
+          "path": "order.byId",
+          "router": {
+            "repo": "acme/shop",
+            "file": "",
+            "binding": ""
+          }
+        },
+        "resolution_source": "model",
+        "model_end": {
+          "line": 14,
+          "line_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "confidence": "inferred",
+          "basis": "symbol",
+          "run_id": "run-1"
+        }
+      },
+      {
+        "key": {
+          "protocol": "http",
           "method": "GET",
           "path": "/v1/items"
         },
@@ -286,7 +262,7 @@
     "packages": null,
     "service_name": "api",
     "model_rows": {
-      "added": 3,
+      "added": 4,
       "dropped": {
         "bad_path": 3,
         "bad_text": 1,
