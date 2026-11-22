@@ -38,8 +38,10 @@ function ownerName(remote: string): string {
 
 /** The repo name an origin names (`acme/api-server` -> `api-server`), lower case as GitHub compares it; null when it names none. */
 function originRepoName(remote: string | null): string | null {
-  const full = remote === null ? null : splitRemote(remote)?.name ?? null;
-  return full === null ? null : full.slice(full.lastIndexOf("/") + 1).toLowerCase();
+  if (remote === null) return null;
+  // The index stores a GitHub repo as `owner/name`, which is no URL: ownerName reads that spelling as it is.
+  const full = ownerName(remote);
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(full) ? full.slice(full.lastIndexOf("/") + 1).toLowerCase() : null;
 }
 
 /**
@@ -61,7 +63,8 @@ export function matchRepos(repos: readonly string[], local: readonly LocalEntry[
       found = local.filter((entry) => entry.remote !== null && ownerName(entry.remote) === repo);
     } else {
       found = local.filter((entry) => entry.name === repo);
-      if (found.length === 0) found = local.filter((entry) => originRepoName(entry.remote) === repo.toLowerCase());
+      // A folder that is itself a header repo's name is that repo's checkout, never another one's.
+      if (found.length === 0) found = local.filter((entry) => !repos.includes(entry.name) && originRepoName(entry.remote) === repo.toLowerCase());
     }
     if (found.length === 1) out.push({ repo, path: found[0]!.path });
   }
@@ -73,10 +76,11 @@ export function matchRepos(repos: readonly string[], local: readonly LocalEntry[
  * hosted name to local name, read off the store's repo table and the index.
  * A repo whose folder is named as it is, or whose checkout the index no longer
  * lists, is absent (its rows keep the name they have). A local name that is
- * also another repo's hosted name (`taken`) is never used.
+ * also a hosted repo's name (a stored one, or one of `known`) is never used.
  */
-export function localNames(stored: readonly LocalRepo[], local: readonly LocalEntry[], taken: ReadonlySet<string> = new Set()): Map<string, string> {
+export function localNames(stored: readonly LocalRepo[], local: readonly LocalEntry[], known: Iterable<string> = []): Map<string, string> {
   const out = new Map<string, string>();
+  const taken = new Set([...known, ...stored.map((entry) => entry.repo)]);
   for (const entry of stored) {
     const at = local.filter((l) => l.path === entry.path);
     const name = at.length === 1 ? at[0]!.name : null;

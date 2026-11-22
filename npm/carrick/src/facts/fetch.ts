@@ -77,7 +77,7 @@ async function knownFile(root: string, env: NodeJS.ProcessEnv): Promise<{ digest
   try {
     const open = new sqlite.DatabaseSync(file, { readOnly: true });
     db = open;
-    const meta = new Map(open.prepare("SELECT key, value FROM meta WHERE key IN ('digest', 'writer', 'contract')").all().map((raw) => [String(raw["key"]), String(raw["value"])]));
+    const meta = new Map(open.prepare("SELECT key, value FROM meta WHERE key IN ('digest', 'writer', 'contract', 'commits')").all().map((raw) => [String(raw["key"]), String(raw["value"])]));
     const digest = meta.get("digest");
     const writer = Number(meta.get("writer"));
     if (!digest || !Number.isInteger(writer)) return null;
@@ -87,6 +87,12 @@ async function knownFile(root: string, env: NodeJS.ProcessEnv): Promise<{ digest
     if (contractLinesEnabled(env) && !hasTable("contracts")) return null;
     // Likewise with the chain line on and no `chains` table.
     if (chainLinesEnabled(env) && !hasTable("chains")) return null;
+    // A checkout the index lists now that the file's repo table does not map (a folder
+    // renamed from its repo, built before the origin was read; a clone made since): the
+    // file is built again, whatever its digest.
+    const stored = open.prepare("SELECT repo, path FROM repos").all().map((raw) => `${String(raw["repo"])}\0${String(raw["path"])}`);
+    const names = Object.keys(JSON.parse(meta.get("commits") ?? "{}") as Record<string, unknown>);
+    if (matchRepos(names, localRepos(root)).some((entry) => !stored.includes(`${entry.repo}\0${entry.path}`))) return null;
     // Whether the file carries contract rows follows the file, not the switch.
     return { digest, writer, contract: meta.get("contract") === "1" };
   } catch {

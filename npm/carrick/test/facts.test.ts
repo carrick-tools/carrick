@@ -773,7 +773,12 @@ test("a bare repo name maps to a renamed checkout by its origin, and two such ch
   const one = [{ name: "fresh1", path: "/w/fresh1", remote: "https://github.com/acme/mono-ticket-a1.git" }];
   assert.deepEqual(matchRepos(["mono-ticket-a1"], one), [{ repo: "mono-ticket-a1", path: "/w/fresh1" }]);
   assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: "git@github.com:acme/Mono-Ticket-A1.git" }]), [{ repo: "mono-ticket-a1", path: "/w/fresh1" }]);
+  // The index's own spelling of a GitHub origin, `owner/name`.
+  assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: "acme/mono-ticket-a1" }]), [{ repo: "mono-ticket-a1", path: "/w/fresh1" }]);
   assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: null }]), []);
+  // A folder-of-repos index: a folder named as a header repo is that repo's, and is never another repo's by its origin.
+  const folders = [{ name: "api", path: "/w/api", remote: "acme/api-server" }, { name: "web", path: "/w/web", remote: "acme/web" }];
+  assert.deepEqual(matchRepos(["api", "api-server", "web"], folders), [{ repo: "api", path: "/w/api" }, { repo: "web", path: "/w/web" }]);
   assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: "not a remote" }]), []);
   const two = [...one, { name: "copy", path: "/w/copy", remote: "git@github.com:acme/mono-ticket-a1" }];
   assert.deepEqual(matchRepos(["mono-ticket-a1"], two), []);
@@ -823,11 +828,34 @@ test("a checkout whose folder is not the repo's name gets its rows counted for t
   assert.equal(await count(first, "clone-two"), 0);
   assert.equal(await count(second, "clone-one"), 0);
   const { openFacts } = await import("../src/facts/store.ts");
+  const { locate } = await import("../src/facts/lines.ts");
   for (const [root] of [[first], [second]] as const) {
     const store = (await openFacts(root!))!;
     assert.deepEqual(store.repos, [{ repo: "mono-ticket-a1", path: root }]);
+    // The edit lines place a file of the renamed checkout in the hosted repo.
+    assert.deepEqual(locate(path.join(root!, "src", "a.ts"), store.repos), { repo: "mono-ticket-a1", rel: path.join("src", "a.ts"), top: root });
     store.close();
   }
+});
+
+test("a fact file built before the origin was read, with no repo mapped for a renamed checkout, is asked for again", async (t) => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-origin-stale-")));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const root = await renamedCheckout(base, "fresh1", "mono-ticket-a1", "carrick-tools/mono-ticket-a1");
+  const bodies: Array<Record<string, unknown>> = [];
+  const request = (async (_url: string, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response(JSON.stringify({ unchanged: true }));
+  }) as typeof fetch;
+  const env = { ...process.env, CARRICK_TOKEN: "t" };
+  await refreshFacts(root, { request, env });
+  assert.equal(bodies[0]!["known_digest"], "d", "the file maps the checkout: its digest is sent");
+  // The same file, built as 0.3.173 did: no repo mapped.
+  const db = new (await loadSqlite())!.DatabaseSync(factsPath(root));
+  db.exec("DELETE FROM repos");
+  db.close();
+  await refreshFacts(root, { request, env });
+  assert.equal("known_digest" in bodies[1]!, false, "the file does not map the checkout: it is built again");
 });
 
 test("two checkouts of one hosted repo in one index: neither is mapped, so neither is read", async (t) => {

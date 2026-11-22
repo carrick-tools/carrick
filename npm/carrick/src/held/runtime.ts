@@ -886,8 +886,8 @@ function factStamp(root: string): string {
  * the daemon keys a service by its local name (the folder's), the fact file by
  * the hosted one. Empty when every repo's folder is named as it is.
  */
-function renames(root: string, store: FactStore, taken: ReadonlySet<string> = new Set()): Map<string, string> {
-  return localNames(store.repos, localRepos(root), taken);
+function renames(root: string, store: FactStore): Map<string, string> {
+  return localNames(store.repos, localRepos(root), Object.keys(commitsOf(store.meta) ?? {}));
 }
 
 const named = (names: ReadonlyMap<string, string>, repo: string): string => names.get(repo) ?? repo;
@@ -920,8 +920,7 @@ async function factRows(root: string): Promise<ContractRow[]> {
   if (store === null) return [];
   try {
     const rows = [...store.producerResponses(), ...store.graphqlProducerResponses(), ...messageSendRows(store.messageRows())];
-    // A local name another row already carries is not taken over (the rows would read as one repo's).
-    const names = renames(root, store, new Set(rows.map((row) => row.repo)));
+    const names = renames(root, store);
     if (names.size === 0) return rows;
     const at = (repo: string) => named(names, repo);
     return rows.map((row) => ({
