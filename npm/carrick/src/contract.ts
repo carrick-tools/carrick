@@ -357,8 +357,9 @@ export type RecheckScope = {
   /** Every other service, with whose copy its verdicts used. */
   not_reread: { service: string; operations: number; reason: string }[];
   /**
-   * The ones of `not_reread` judged at a version that predates the work: edited
-   * since the index with no re-check copy, or reading a path edited since it.
+   * Services judged at a version that predates the work that also pair with one
+   * of this file's rows or whose scan reads this file. A service stale for a
+   * reason unrelated to the file is not named.
    */
   stale: string[];
 };

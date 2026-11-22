@@ -865,7 +865,7 @@ for (const [name, arrange, reason] of [
   [
     "an answer with a stale service",
     (root: string, home: string, file: string) => answer(home, queue(root, home, file), reread(clean(), ["billing"])),
-    /1 service that reads it was judged at its indexed version \(billing\)/,
+    /1 service connected to it by import or operation was judged at its indexed version \(billing\)/,
   ],
   [
     "a deferred answer",

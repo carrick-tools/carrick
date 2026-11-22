@@ -261,6 +261,21 @@ pub struct Reach {
     services: Vec<IndexedService>,
     /// Indexed files per re-read service, for the miss reason.
     files: std::collections::BTreeMap<String, usize>,
+    /// The edited file, relative to the scan root.
+    file: String,
+    /// The services the index pairs with any row of the edited file.
+    indexed_pairs: std::collections::BTreeSet<String>,
+}
+
+/// The services the index pairs with a row of `relative`.
+fn paired_services(repo: &IndexedRepo, relative: &str) -> std::collections::BTreeSet<String> {
+    repo.files
+        .get(relative)
+        .into_iter()
+        .flatten()
+        .flat_map(|item| &item.counterparts)
+        .map(|counterpart| counterpart.service.clone())
+        .collect()
 }
 
 /// The services holding an operation that reads a type declared in `relative`.
@@ -336,6 +351,8 @@ impl Reach {
             files: indexed_files(repo, &reread),
             reread,
             services: repo.services.clone(),
+            file: relative.to_string(),
+            indexed_pairs: paired_services(repo, relative),
         }
     }
 
@@ -359,6 +376,8 @@ impl Reach {
             files: indexed_files(repo, &reread),
             reread,
             services: repo.services.clone(),
+            file: relative.to_string(),
+            indexed_pairs: paired_services(repo, relative),
         }
     }
 }
@@ -616,7 +635,7 @@ pub fn run(
                 deferred: false,
                 deadline: missed,
                 rebuilding: false,
-                scope: Some(plan.scope.clone()),
+                scope: Some(plan.answer_scope(&plan.indexed_pairs)),
             }))
         }
     }
@@ -1018,7 +1037,15 @@ struct Plan {
     /// current ([`Copies::current`]).
     current: Option<Vec<crate::cloud_storage::CloudRepoData>>,
     files: std::collections::BTreeMap<String, usize>,
+    /// The workspace's stale services: every service judged at a version older
+    /// than the work, whatever the edited file. The input of the per-row note;
+    /// the answer names only the ones about the edited file
+    /// ([`Plan::answer_scope`]).
     scope: RecheckScope,
+    /// The services whose import closure holds the edited file.
+    importers: std::collections::BTreeSet<String>,
+    /// The services the index pairs with a row of the edited file.
+    indexed_pairs: std::collections::BTreeSet<String>,
 }
 
 /// A re-read service's blob, kept with the digest of the edits it was read
@@ -1370,7 +1397,10 @@ impl Plan {
         let began = Instant::now();
         // Every service's, the re-read ones too: a re-read service that reads
         // an outside edit is never current, and its copy is not whole.
-        let mut readers = readers_of_the_edit(repo, reach.services.iter(), held);
+        let Readers {
+            reasons: mut readers,
+            importers,
+        } = readers_of_the_edit(repo, reach.services.iter(), held, Some(&reach.file));
         took("plan-make/readers-of-the-edit", began);
         let began = Instant::now();
         let copies = Copies::of(
@@ -1456,7 +1486,26 @@ impl Plan {
             current,
             files: reach.files.clone(),
             scope,
+            importers,
+            indexed_pairs: reach.indexed_pairs.clone(),
         }
+    }
+
+    /// The scope the answer states: `stale` keeps only the services that are
+    /// about the edited file, those that pair with one of its rows (`pairs`)
+    /// or whose scan reads it. The workspace's other stale services stay in
+    /// `self.scope` and in their `not_reread` reasons (carrick#5056).
+    fn answer_scope(&self, pairs: &std::collections::BTreeSet<String>) -> RecheckScope {
+        let mut scope = self.scope.clone();
+        let mut kept: Vec<String> = Vec::new();
+        for name in &self.scope.stale {
+            let about_the_file = self.importers.contains(name) || pairs.contains(name);
+            if about_the_file && !kept.contains(name) {
+                kept.push(name.clone());
+            }
+        }
+        scope.stale = kept;
+        scope
     }
 
     /// The miss to remember when this re-check ran out of time: the edited
@@ -1524,9 +1573,10 @@ fn readers_of_the_edit<'a>(
     repo: &Path,
     services: impl Iterator<Item = &'a IndexedService>,
     held: &Held,
-) -> std::collections::BTreeMap<String, String> {
+    edited: Option<&str>,
+) -> Readers {
     let repo_path = repo.to_string_lossy().to_string();
-    let mut readers = std::collections::BTreeMap::new();
+    let mut readers = Readers::default();
     // One listing of what changed, shared by every service's view of it.
     let listing = crate::change_scope::ChangedSince::new(&repo_path, &[], &[]);
     for service in services {
@@ -1537,7 +1587,7 @@ fn readers_of_the_edit<'a>(
             .and_then(|blob| blob.config_json.as_deref())
             .and_then(|json| serde_json::from_str::<crate::config::Config>(json).ok());
         let Some(config) = config else {
-            readers.insert(
+            readers.reasons.insert(
                 service.name.clone(),
                 "its config is not on this machine, so what it reads is unknown; judged at its indexed version"
                     .to_string(),
@@ -1549,20 +1599,45 @@ fn readers_of_the_edit<'a>(
         // folder is no service's own, so it stays, and the walk names a service
         // that reads it (carrick#4390).
         let changes = listing.view(move |path| path.is_some_and(|path| own.covers(path)));
-        let read = crate::change_scope::untouched_since(
-            &repo_path,
-            std::slice::from_ref(&config),
-            &changes,
-            &service.commit,
-        );
-        if let Some(Some(path)) = read.first() {
-            readers.insert(
+        let read = match edited {
+            Some(edited) => crate::change_scope::untouched_since_reading(
+                &repo_path,
+                std::slice::from_ref(&config),
+                &changes,
+                &service.commit,
+                edited,
+            ),
+            None => crate::change_scope::untouched_since(
+                &repo_path,
+                std::slice::from_ref(&config),
+                &changes,
+                &service.commit,
+            )
+            .into_iter()
+            .map(|read| (read, false))
+            .collect(),
+        };
+        if let Some((_, true)) = read.first() {
+            readers.importers.insert(service.name.clone());
+        }
+        if let Some((Some(path), _)) = read.first() {
+            readers.reasons.insert(
                 service.name.clone(),
                 format!("reads {path}, edited since the index; judged at its indexed version"),
             );
         }
     }
     readers
+}
+
+/// What [`readers_of_the_edit`] found.
+#[derive(Default)]
+struct Readers {
+    /// Each service that reads a path edited outside its own folder, with why.
+    reasons: std::collections::BTreeMap<String, String>,
+    /// The services whose import closure holds the edited file itself (never a
+    /// directory they read whole). Empty when no file was asked about.
+    importers: std::collections::BTreeSet<String>,
 }
 
 /// The services of the repo that read any of `paths`, in index order, by the
@@ -1984,6 +2059,11 @@ fn inside(
         Ran::Extraction
     };
     state_stale_counterparts(&mut items, &plan.scope.stale);
+    let pairs: std::collections::BTreeSet<String> = items
+        .iter()
+        .flat_map(|item| &item.counterparts)
+        .map(|counterpart| counterpart.service.clone())
+        .collect();
     Ok(Fresh {
         items,
         unread,
@@ -1996,7 +2076,7 @@ fn inside(
             &std::collections::BTreeMap::new(),
         ),
         elapsed: Duration::default(),
-        scope: plan.scope.clone(),
+        scope: plan.answer_scope(&pairs),
         moved,
         engine_ready: engine_ready_of(&rejoined.index, &name, &plan.scope.reread),
     })
@@ -2375,7 +2455,9 @@ pub(super) fn rejoin(
                 .iter()
                 .filter(|service| others || repo_copies.digests.contains_key(&service.name)),
             &held,
+            None,
         )
+        .reasons
         .into_keys()
         .collect();
         readers.extend(
@@ -3756,6 +3838,8 @@ mod tests {
                 not_reread: Vec::new(),
                 stale: Vec::new(),
             },
+            importers: Default::default(),
+            indexed_pairs: Default::default(),
         };
         let recorded = plan.miss_of(&svc("types-owner"), TEN_S, TEN_S);
         assert_eq!(
@@ -4022,6 +4106,8 @@ mod tests {
                 not_reread: Vec::new(),
                 stale: Vec::new(),
             },
+            importers: Default::default(),
+            indexed_pairs: Default::default(),
         };
         assert_eq!(
             plan.miss_of(&shared(), TEN_S, TEN_S),
