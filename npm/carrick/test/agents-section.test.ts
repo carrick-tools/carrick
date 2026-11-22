@@ -14,40 +14,36 @@ import {
   hasClaudeSection,
   removeAgentsSection,
   removeClaudeSection,
+  RULES_FILE,
   renderCheckSection,
+  renderRules,
   sameExceptCounts,
   withCheckSection,
   writeAgentsSection,
   writeClaudeSection,
+  writeRules,
 } from "../src/init/agents-section.ts";
 
 const SCOPE = { slug: "shop-system" };
 const COUNTS = { repos: 3, services: 43 };
-const SECTION = renderCheckSection(SCOPE, COUNTS);
+const SECTION = renderCheckSection();
+const ONE_LINE =
+  "Carrick indexes every service in this workspace. Before you add or change a route, a call to another service, an event or a shared function, read `.carrick/RULES.md` (written by `carrick init`) and follow it.";
 
 function folder(): { dir: string; file: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-agents-section-"));
   return { dir, file: path.join(dir, AGENTS_FILE) };
 }
 
+test("the rendered section is exactly the markers and the one line", () => {
+  assert.equal(SECTION, `<!-- carrick:check start -->\n${ONE_LINE}\n<!-- carrick:check end -->\n`);
+});
+
 test("a missing AGENTS.md is created holding the check section", () => {
   const { dir, file } = folder();
   try {
-    assert.equal(writeAgentsSection(dir, SCOPE, COUNTS), "written");
-    const body = fs.readFileSync(file, "utf8");
-    assert.equal(body, SECTION);
-    assert.ok(body.includes("## Carrick: use it while you work, not only at the end\n\nThis workspace (3 repositories, 43 services) is indexed by Carrick. The\n"));
-    // Rule 5 asks for the branch-wide check only where another service reads
-    // the change, and leaves the per-file check to the edit hook: the same
-    // contract check rate as the per-file wording (4 of 7) with no duplicate
-    // per-file calls (carrick-cloud#3068, impact-2026-11-06 rule5b, D13).
-    assert.ok(
-      body.includes(
-        "5. Run `carrick check --changed` before you say it is done only when your change\n   touches a route, a call to another service, an event or a type another\n   service reads. Each file you edit is already checked for you, so a change no\n   other service sees needs nothing more. If Carrick found a problem or changed\n   what you did, say so in one line in your final summary. Otherwise do not\n   mention it.\n<!-- carrick:check end -->",
-      ),
-    );
-    assert.ok(!body.includes("carrick check <file>"));
-    assert.ok(!body.includes("## Carrick check\n"));
+    assert.equal(writeAgentsSection(dir), "written");
+    assert.equal(fs.readFileSync(file, "utf8"), SECTION);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -58,11 +54,11 @@ test("an existing file keeps every line of its own, and a re-run changes nothing
   try {
     const theirs = "# Repo\n\n## Carrick\n\nAsk Carrick first.\n\n## Style\n\nTabs.\n";
     fs.writeFileSync(file, theirs);
-    assert.equal(writeAgentsSection(dir, SCOPE, COUNTS), "written");
+    assert.equal(writeAgentsSection(dir), "written");
     const first = fs.readFileSync(file, "utf8");
     assert.ok(first.startsWith(theirs));
     assert.ok(first.endsWith(SECTION));
-    assert.equal(writeAgentsSection(dir, SCOPE, COUNTS), "unchanged");
+    assert.equal(writeAgentsSection(dir), "unchanged");
     assert.equal(fs.readFileSync(file, "utf8"), first);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -74,25 +70,22 @@ test("a re-run replaces our section in place and leaves what surrounds it", () =
   try {
     const stale = "<!-- carrick:check start -->\n## Carrick check\n\nold words\n<!-- carrick:check end -->\n";
     fs.writeFileSync(file, `# Top\n\n${stale}\n## After\n\nmine\n`);
-    assert.equal(writeAgentsSection(dir, SCOPE, COUNTS), "written");
+    assert.equal(writeAgentsSection(dir), "written");
     assert.equal(fs.readFileSync(file, "utf8"), `# Top\n\n${SECTION}\n## After\n\nmine\n`);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("a re-run rewrites the old rule 5 in an existing section", () => {
+test("a file holding the old long section is rewritten to the one line and the rest is untouched", () => {
   const { dir, file } = folder();
   try {
-    writeAgentsSection(dir, SCOPE, COUNTS);
-    const old = SECTION.replace(
-      "If Carrick found a problem or changed\n   what you did, say so in one line in your final summary. Otherwise do not\n   mention it.",
-      "In your final summary, say what\n   Carrick found and what you changed because of it.",
-    );
-    assert.notEqual(old, SECTION);
-    fs.writeFileSync(file, old);
-    assert.equal(writeAgentsSection(dir, SCOPE, COUNTS), "written");
-    assert.equal(fs.readFileSync(file, "utf8"), SECTION);
+    const long = renderRules(SCOPE, COUNTS);
+    const old = `<!-- carrick:check start -->\n${long}<!-- carrick:check end -->\n`;
+    fs.writeFileSync(file, `# Top\n\n${old}\n## After\n\nmine\n`);
+    assert.equal(writeAgentsSection(dir), "written");
+    assert.equal(fs.readFileSync(file, "utf8"), `# Top\n\n${SECTION}\n## After\n\nmine\n`);
+    assert.equal(writeAgentsSection(dir), "unchanged");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -103,7 +96,7 @@ test("remove takes out our section only, and the file where it was all there was
   try {
     const theirs = "# Repo\n\nKeep me.\n";
     fs.writeFileSync(file, theirs);
-    writeAgentsSection(dir, SCOPE, COUNTS);
+    writeAgentsSection(dir);
     assert.ok(hasAgentsSection(dir));
     assert.equal(removeAgentsSection(dir), "section removed");
     assert.equal(fs.readFileSync(file, "utf8"), theirs);
@@ -111,7 +104,7 @@ test("remove takes out our section only, and the file where it was all there was
     assert.equal(removeAgentsSection(dir), null);
 
     fs.rmSync(file);
-    writeAgentsSection(dir, SCOPE, COUNTS);
+    writeAgentsSection(dir);
     assert.equal(removeAgentsSection(dir), "file removed");
     assert.equal(fs.existsSync(file), false);
   } finally {
@@ -141,17 +134,40 @@ test("withCheckSection: empty body, old section in place, and no markers", () =>
 });
 
 test("the scope clause is the project slug, or the repo form without one", () => {
-  assert.ok(SECTION.includes('Pass `project: "shop-system"` on every Carrick\ncall.'));
-  const bare = renderCheckSection({ slug: null }, COUNTS);
+  const rules = renderRules(SCOPE, COUNTS);
+  assert.ok(rules.includes('Pass `project: "shop-system"` on every Carrick\ncall.'));
+  const bare = renderRules({ slug: null }, COUNTS);
   assert.ok(bare.includes('Pass `repo: "<owner/repo>"` on every Carrick\ncall.'));
   assert.ok(!bare.includes("project:"));
 });
 
 test("the counts sentence reads one repository and 1 service, many, and falls back when unknown", () => {
-  assert.ok(renderCheckSection(SCOPE, { repos: 1, services: 1 }).includes("This workspace (one repository, 1 service) is indexed by Carrick. The\n"));
-  assert.ok(SECTION.includes("This workspace (3 repositories, 43 services) is indexed by Carrick. The\n"));
+  assert.ok(renderRules(SCOPE, { repos: 1, services: 1 }).includes("This workspace (one repository, 1 service) is indexed by Carrick. The\n"));
+  assert.ok(renderRules(SCOPE, COUNTS).includes("This workspace (3 repositories, 43 services) is indexed by Carrick. The\n"));
   for (const unknown of [null, { repos: 2, services: 0 }]) {
-    assert.ok(renderCheckSection(SCOPE, unknown).includes("This workspace is indexed by Carrick. The\n"));
+    assert.ok(renderRules(SCOPE, unknown).includes("This workspace is indexed by Carrick. The\n"));
+  }
+});
+
+test("renderRules holds the heading, the intro and the five rules, and ends in one newline", () => {
+  const rules = renderRules(SCOPE, COUNTS);
+  assert.ok(rules.startsWith("## Carrick: use it while you work, not only at the end\n\nThis workspace (3 repositories, 43 services) is indexed by Carrick. The\n"));
+  assert.ok(rules.endsWith("   what you did, say so in one line in your final summary. Otherwise do not\n   mention it.\n"));
+  for (const n of [1, 2, 3, 4, 5]) assert.ok(rules.includes(`\n${n}. `), String(n));
+  assert.ok(!rules.includes("carrick:check"));
+});
+
+test("writeRules writes .carrick/RULES.md with the scope and counts, and a re-run changes nothing", () => {
+  const { dir } = folder();
+  try {
+    const target = path.join(dir, RULES_FILE);
+    assert.equal(writeRules(dir, SCOPE, COUNTS), "written");
+    assert.equal(fs.readFileSync(target, "utf8"), renderRules(SCOPE, COUNTS));
+    assert.equal(writeRules(dir, SCOPE, COUNTS), "unchanged");
+    assert.equal(writeRules(dir, SCOPE, OTHER_COUNTS), "written");
+    assert.ok(fs.readFileSync(target, "utf8").includes("(one repository, 17 services)"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -160,7 +176,7 @@ test("remove deletes the new span and nothing else", () => {
   try {
     const theirs = "# Repo\n\n## Carrick check\n\nMine.\n\n## After\n\nkeep\n";
     fs.writeFileSync(file, theirs);
-    writeAgentsSection(dir, SCOPE, COUNTS);
+    writeAgentsSection(dir);
     assert.equal(removeAgentsSection(dir), "section removed");
     assert.equal(fs.readFileSync(file, "utf8"), theirs);
   } finally {
@@ -173,12 +189,12 @@ test("remove deletes the new span and nothing else", () => {
 test("a team CLAUDE.md gets the block below its own text, and none is created where there is none", () => {
   const { dir } = folder();
   try {
-    assert.equal(writeClaudeSection(dir, SCOPE, COUNTS), null);
+    assert.equal(writeClaudeSection(dir), null);
     assert.ok(!fs.existsSync(path.join(dir, CLAUDE_FILE)));
     fs.writeFileSync(path.join(dir, CLAUDE_FILE), "# Team rules\n\nKeep handlers small.\n");
-    assert.equal(writeClaudeSection(dir, SCOPE, COUNTS), "written");
+    assert.equal(writeClaudeSection(dir), "written");
     assert.equal(fs.readFileSync(path.join(dir, CLAUDE_FILE), "utf8"), `# Team rules\n\nKeep handlers small.\n\n${SECTION}`);
-    assert.equal(writeClaudeSection(dir, SCOPE, COUNTS), "unchanged");
+    assert.equal(writeClaudeSection(dir), "unchanged");
     assert.ok(hasClaudeSection(dir));
     assert.ok(!fs.existsSync(path.join(dir, AGENTS_FILE)));
   } finally {
@@ -190,7 +206,7 @@ test("a CLAUDE.md that only imports AGENTS.md gets the inline block too", () => 
   const { dir } = folder();
   try {
     fs.writeFileSync(path.join(dir, CLAUDE_FILE), "@AGENTS.md\n");
-    assert.equal(writeClaudeSection(dir, SCOPE, COUNTS), "written");
+    assert.equal(writeClaudeSection(dir), "written");
     assert.equal(fs.readFileSync(path.join(dir, CLAUDE_FILE), "utf8"), `@AGENTS.md\n\n${SECTION}`);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -202,7 +218,7 @@ test("remove takes the block out of CLAUDE.md and keeps the file, even where it 
   const claude = path.join(dir, CLAUDE_FILE);
   try {
     fs.writeFileSync(claude, "# Team rules\n");
-    writeClaudeSection(dir, SCOPE, COUNTS);
+    writeClaudeSection(dir);
     assert.equal(removeClaudeSection(dir), "section removed");
     assert.equal(fs.readFileSync(claude, "utf8"), "# Team rules\n");
     assert.equal(removeClaudeSection(dir), null);
@@ -215,7 +231,7 @@ test("remove takes the block out of CLAUDE.md and keeps the file, even where it 
   }
 });
 
-// A section that differs only in its counts phrase is current (carrick#4998).
+// A rules file that differs only in its counts phrase is current (carrick#4998).
 const OTHER_COUNTS = { repos: 1, services: 17 };
 
 function hermeticGit(repo: string, ...args: string[]): string {
@@ -231,44 +247,31 @@ function hermeticGit(repo: string, ...args: string[]): string {
 }
 
 test("sameExceptCounts: other counts, no counts and a changed rule line", () => {
-  const a = renderCheckSection(SCOPE, { repos: 1, services: 13 });
-  const b = renderCheckSection(SCOPE, OTHER_COUNTS);
+  const a = renderRules(SCOPE, { repos: 1, services: 13 });
+  const b = renderRules(SCOPE, OTHER_COUNTS);
   assert.notEqual(a, b);
   assert.ok(sameExceptCounts(a, b));
-  assert.ok(sameExceptCounts(a, renderCheckSection(SCOPE, null)));
-  assert.ok(sameExceptCounts(renderCheckSection(SCOPE, null), b));
+  assert.ok(sameExceptCounts(a, renderRules(SCOPE, null)));
+  assert.ok(sameExceptCounts(renderRules(SCOPE, null), b));
   assert.ok(!sameExceptCounts(a, b.replace("1. Before you write", "1. First write")));
-  assert.ok(!sameExceptCounts(a, renderCheckSection({ slug: "other" }, OTHER_COUNTS)));
+  assert.ok(!sameExceptCounts(a, renderRules({ slug: "other" }, OTHER_COUNTS)));
 });
 
-test("init leaves a tracked AGENTS.md and CLAUDE.md section that differs only in counts byte for byte", () => {
+test("init leaves a tracked AGENTS.md and CLAUDE.md that hold the current section byte for byte", () => {
   const { dir, file } = folder();
   try {
     const claude = path.join(dir, CLAUDE_FILE);
-    const held = `# Team\n\n${renderCheckSection(SCOPE, { repos: 1, services: 13 })}`;
+    const held = `# Team\n\n${SECTION}`;
     fs.writeFileSync(file, held);
     fs.writeFileSync(claude, held);
     hermeticGit(dir, "init", "-q");
     hermeticGit(dir, "add", ".");
     hermeticGit(dir, "commit", "-q", "-m", "team");
-    assert.equal(writeAgentsSection(dir, SCOPE, OTHER_COUNTS), "unchanged");
-    assert.equal(writeClaudeSection(dir, SCOPE, OTHER_COUNTS), "unchanged");
+    assert.equal(writeAgentsSection(dir), "unchanged");
+    assert.equal(writeClaudeSection(dir), "unchanged");
     assert.equal(fs.readFileSync(file, "utf8"), held);
     assert.equal(fs.readFileSync(claude, "utf8"), held);
     assert.equal(hermeticGit(dir, "status", "--porcelain"), "");
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("a section with a changed rule line is rewritten with today's counts, and a new one carries the counts", () => {
-  const { dir, file } = folder();
-  try {
-    const old = renderCheckSection(SCOPE, { repos: 1, services: 13 }).replace("1. Before you write", "1. First write");
-    fs.writeFileSync(file, old);
-    assert.equal(writeAgentsSection(dir, SCOPE, OTHER_COUNTS), "written");
-    assert.equal(fs.readFileSync(file, "utf8"), renderCheckSection(SCOPE, OTHER_COUNTS));
-    assert.equal(withCheckSection("# Team\n", renderCheckSection(SCOPE, OTHER_COUNTS)).includes("(one repository, 17 services)"), true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

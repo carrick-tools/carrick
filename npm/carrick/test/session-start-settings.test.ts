@@ -14,7 +14,7 @@ import { fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
 import { currentVersion } from "../src/update.ts";
 import { CODEX_HOOKS_FILE, codexHooks } from "../src/init/codex.ts";
 import { carrickHooks, mergeCarrickHooks } from "../src/init/settings.ts";
-import { renderCheckSection } from "../src/init/agents-section.ts";
+import { renderCheckSection, renderRules, RULES_FILE } from "../src/init/agents-section.ts";
 import { bringUpToDate, updateHooks } from "../src/init/self-update.ts";
 import { recordWrittenSkills, skillFile, SKILL_ROOTS, stamped, TASK_SKILLS, writeTaskSkills } from "../src/init/task-skills.ts";
 
@@ -396,7 +396,7 @@ const TWO_REPOS = [
   { project_slug: "shop-system", services: Array.from({ length: 23 }, (_, i) => `b${i}`) },
 ];
 
-test("self-update rewrites our AGENTS.md section for the snapshot's project and counts", (t) => {
+test("self-update rewrites an older AGENTS.md section to the one line", (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   put(workspace.root, "AGENTS.md", SURROUND_BEFORE + OLD_SECTION + SURROUND_AFTER);
@@ -404,7 +404,7 @@ test("self-update rewrites our AGENTS.md section for the snapshot's project and 
   const lines = bringUpToDate(workspace.root, workspace.root, running);
   assert.equal(
     fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"),
-    SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 }) + SURROUND_AFTER,
+    SURROUND_BEFORE + renderCheckSection() + SURROUND_AFTER,
   );
   assert.ok(lines.some((line) => /rules section in AGENTS\.md/.test(line)));
 });
@@ -427,18 +427,55 @@ function trackedWith(root: string, files: Record<string, string>): void {
 
 const SNAPSHOT_17 = [{ project_slug: "shop-system", services: Array.from({ length: 17 }, (_, i) => `a${i}`) }];
 
-test("self-update leaves a tracked AGENTS.md and CLAUDE.md section that differs only in counts: no write, no held line (carrick#4998)", (t) => {
+test("self-update leaves a tracked AGENTS.md and CLAUDE.md that hold the current section: no write, no held line", (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
-  const body = SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 1, services: 13 }) + SURROUND_AFTER;
+  const body = SURROUND_BEFORE + renderCheckSection() + SURROUND_AFTER;
   trackedWith(workspace.root, { "AGENTS.md": body, "CLAUDE.md": body });
   snapshot(workspace.root, SNAPSHOT_17);
+  put(workspace.root, RULES_FILE, renderRules({ slug: "shop-system" }, { repos: 1, services: 13 }));
   const held: string[] = [];
   const lines = bringUpToDate(workspace.root, workspace.root, running, () => {}, held);
   assert.equal(fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"), body);
   assert.equal(fs.readFileSync(path.join(workspace.root, "CLAUDE.md"), "utf8"), body);
   assert.ok(!lines.some((line) => /did not update|rules section/.test(line)), lines.join("\n"));
   assert.ok(!held.includes("AGENTS.md") && !held.includes("CLAUDE.md"));
+});
+
+test("self-update writes a missing .carrick/RULES.md, rewrites an older one, and leaves a current one and a counts-only difference alone", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  put(workspace.root, "AGENTS.md", SURROUND_BEFORE + renderCheckSection());
+  snapshot(workspace.root, TWO_REPOS);
+  const target = path.join(workspace.root, RULES_FILE);
+  const lines = bringUpToDate(workspace.root, workspace.root, running);
+  assert.equal(fs.readFileSync(target, "utf8"), renderRules({ slug: "shop-system" }, { repos: 2, services: 43 }));
+  assert.ok(lines.some((line) => /rules section in \.carrick[\\/]RULES\.md/.test(line)), lines.join("\n"));
+
+  const past = new Date(1_000_000);
+  fs.utimesSync(target, past, past);
+  assert.ok(!bringUpToDate(workspace.root, workspace.root, running).some((line) => /rules section/.test(line)));
+  assert.equal(fs.statSync(target).mtimeMs, past.getTime());
+
+  snapshot(workspace.root, SNAPSHOT_17);
+  assert.ok(!bringUpToDate(workspace.root, workspace.root, running).some((line) => /rules section/.test(line)));
+  assert.equal(fs.statSync(target).mtimeMs, past.getTime());
+
+  fs.writeFileSync(target, "## Carrick: an older rule set\n");
+  bringUpToDate(workspace.root, workspace.root, running);
+  assert.equal(fs.readFileSync(target, "utf8"), renderRules({ slug: "shop-system" }, { repos: 1, services: 17 }));
+});
+
+test("self-update leaves a tracked .carrick/RULES.md alone and names it as held", (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const rules = "## Carrick: team rules\n";
+  trackedWith(workspace.root, { "AGENTS.md": SURROUND_BEFORE + renderCheckSection(), [RULES_FILE]: rules });
+  snapshot(workspace.root, SNAPSHOT_17);
+  const held: string[] = [];
+  bringUpToDate(workspace.root, workspace.root, running, () => {}, held);
+  assert.equal(fs.readFileSync(path.join(workspace.root, RULES_FILE), "utf8"), rules);
+  assert.ok(held.includes(RULES_FILE), held.join(","));
 });
 
 test("self-update still holds a tracked AGENTS.md section whose rule line is older", (t) => {
@@ -472,8 +509,9 @@ test("self-update leaves a current AGENTS.md section unwritten", (t) => {
   const target = put(
     workspace.root,
     "AGENTS.md",
-    SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 }),
+    SURROUND_BEFORE + renderCheckSection(),
   );
+  put(workspace.root, RULES_FILE, renderRules({ slug: "shop-system" }, { repos: 2, services: 43 }));
   snapshot(workspace.root, TWO_REPOS);
   const past = new Date(1_000_000);
   fs.utimesSync(target, past, past);
@@ -496,7 +534,7 @@ test("self-update leaves the AGENTS.md section alone, and says why, without a re
 test("self-update adds the block to a CLAUDE.md created after init, refreshes a stale one, and never touches it without the AGENTS.md marker (carrick#3515)", (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
-  const current = renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 });
+  const current = renderCheckSection();
   put(workspace.root, "AGENTS.md", current);
   put(workspace.root, "CLAUDE.md", "# Team\n");
   snapshot(workspace.root, TWO_REPOS);
@@ -541,11 +579,11 @@ test("a Codex session start rewrites the AGENTS.md section and skills, never .co
   assert.equal(run.code, 0);
   const context = (JSON.parse(run.stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput
     .additionalContext;
-  assert.match(context, /rules section in AGENTS\.md up to date/);
+  assert.match(context, /rules section in AGENTS\.md and \.carrick.RULES\.md up to date/);
   assert.match(context, /task skills in \.agents\/skills up to date/);
   assert.equal(
     fs.readFileSync(path.join(workspace.root, "AGENTS.md"), "utf8"),
-    SURROUND_BEFORE + renderCheckSection({ slug: "shop-system" }, { repos: 2, services: 43 }) + SURROUND_AFTER,
+    SURROUND_BEFORE + renderCheckSection() + SURROUND_AFTER,
   );
   assert.equal(fs.readFileSync(agentsSkill, "utf8"), currentSkill);
   assert.equal(fs.readFileSync(codexFile, "utf8"), codexBody);

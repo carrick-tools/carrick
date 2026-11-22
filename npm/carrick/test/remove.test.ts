@@ -707,7 +707,7 @@ test("the folder plan lists our AGENTS.md check section, and a file without it l
   try {
     fs.writeFileSync(path.join(dir, "AGENTS.md"), "# Repo\n\n## Carrick check\n\nMine, no markers.\n");
     assert.equal(folderPlan(dir).agents, false);
-    writeAgentsSection(dir, { slug: "shop-system" }, { repos: 1, services: 1 });
+    writeAgentsSection(dir);
     const plan = folderPlan(dir);
     assert.equal(plan.agents, true);
     assert.ok(folderLines(plan).includes('The "Carrick check" section in AGENTS.md'));
@@ -723,8 +723,8 @@ test("the folder plan and the run name CLAUDE.md when it holds our block, and th
   const claude = path.join(dir, "CLAUDE.md");
   fs.writeFileSync(claude, "# Team rules\n");
   assert.equal(folderPlan(dir).claude, false);
-  writeAgentsSection(dir, { slug: "shop-system" }, { repos: 1, services: 1 });
-  writeClaudeSection(dir, { slug: "shop-system" }, { repos: 1, services: 1 });
+  writeAgentsSection(dir);
+  writeClaudeSection(dir);
   const plan = folderPlan(dir);
   assert.equal(plan.claude, true);
   assert.ok(folderLines(plan).includes('The "Carrick check" section in CLAUDE.md'));

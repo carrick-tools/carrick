@@ -1242,6 +1242,8 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
         // Which build wrote the files below, so a hook running an older
         // `carrick` than this one says so (carrick#1372).
         path.join(".carrick", "cli-version"),
+        // The rules the one-line AGENTS.md section points at.
+        path.join(".carrick", "RULES.md"),
         // Which skills this install was given, so a session start adds only
         // the ones new to it (carrick#1333).
         path.join(".carrick", "task-skills-written.json"),
@@ -1258,10 +1260,14 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
         ...taskSkillPaths(),
       ].sort(),
     );
-    assert.equal(
-      fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8").includes("Never leave a second copy of logic that"),
-      true,
-    );
+    // The section is the one line; the rules, with the scope argument, are in
+    // the ignored `.carrick/RULES.md`.
+    const agentsBody = fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8");
+    assert.ok(agentsBody.includes("read `.carrick/RULES.md` (written by `carrick init`) and follow it."), agentsBody);
+    assert.ok(!agentsBody.includes("Never leave a second copy of logic that"), agentsBody);
+    const rulesBody = fs.readFileSync(path.join(fixture.repo, ".carrick", "RULES.md"), "utf8");
+    assert.ok(rulesBody.includes("Never leave a second copy of logic that"), rulesBody);
+    assert.ok(rulesBody.includes('Pass `project: "payments"` on every Carrick'), rulesBody);
 
     // And the set is hidden where it has to be: all git can see in the tree
     // after a first run is the check section in AGENTS.md; the settings, the
