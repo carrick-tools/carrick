@@ -1208,6 +1208,10 @@ struct Walks<'r> {
     reads: ClosureReads,
     closure_took: std::time::Duration,
     walked: usize,
+    /// The exact closure files of the service last judged, when the caller
+    /// asked to keep them ([`untouched_since_reading`]).
+    keep_files: bool,
+    last_files: Option<BTreeSet<String>>,
 }
 
 impl<'r> Walks<'r> {
@@ -1225,6 +1229,8 @@ impl<'r> Walks<'r> {
             reads: ClosureReads::default(),
             closure_took: std::time::Duration::ZERO,
             walked: 0,
+            keep_files: false,
+            last_files: None,
         }
     }
 
@@ -1243,7 +1249,10 @@ impl<'r> Walks<'r> {
             reads,
             closure_took,
             walked,
+            keep_files,
+            last_files,
         } = self;
+        let keep_files: bool = *keep_files;
         let repo_path: &str = repo_path;
         let top: &Option<PathBuf> = top;
         let reads: &ClosureReads = reads;
@@ -1372,6 +1381,9 @@ impl<'r> Walks<'r> {
                 },
             };
             *closure_took += started.elapsed();
+            if keep_files {
+                *last_files = Some(inputs.files.clone());
+            }
             inputs
         };
         match against {
@@ -1420,11 +1432,58 @@ pub fn untouched_since(
     changes: &ChangedSince,
     base: &str,
 ) -> Vec<Option<String>> {
+    read_since(repo_path, services, changes, base, None)
+        .into_iter()
+        .map(|(read, _)| read)
+        .collect()
+}
+
+/// [`untouched_since`] with one more fact per service: whether the closure
+/// the same decision walked holds `file` (a path relative to the scan root,
+/// the form `changes` compares in). Only the exact closure files count: the
+/// directories a service reads whole, its roots and its lookup directories
+/// never do, so a tsconfig `include` over a sibling's folder does not make a
+/// service an importer of every file in it. A service whose closure was not
+/// walked (git could not compare, or the decision needed no walk) reads
+/// `false`.
+pub fn untouched_since_reading(
+    repo_path: &str,
+    services: &[Config],
+    changes: &ChangedSince,
+    base: &str,
+    file: &str,
+) -> Vec<(Option<String>, bool)> {
+    read_since(repo_path, services, changes, base, Some(file))
+}
+
+fn read_since(
+    repo_path: &str,
+    services: &[Config],
+    changes: &ChangedSince,
+    base: &str,
+    file: Option<&str>,
+) -> Vec<(Option<String>, bool)> {
     let mut walks = Walks::new(repo_path, changes);
-    let reads: Vec<Option<String>> = services
+    walks.keep_files = file.is_some();
+    let reads: Vec<(Option<String>, bool)> = services
         .iter()
         .map(|service| {
+            walks.last_files = None;
             let scope = walks.scope(service, Against::Base(base));
+            let imports = match (file, walks.last_files.take()) {
+                (Some(file), Some(files)) => {
+                    let root = changes
+                        .scan_root
+                        .get_or_init(|| crate::git_state::RootPaths::of(repo_path).ok())
+                        .as_ref();
+                    root.is_some_and(|root| {
+                        files
+                            .iter()
+                            .any(|path| root.scan_relative(path).as_deref() == Some(file))
+                    })
+                }
+                _ => false,
+            };
             let label = service.service_name.as_deref().unwrap_or("(root)");
             match &scope {
                 Scope::Carried { .. } => {
@@ -1439,15 +1498,16 @@ pub fn untouched_since(
                     reason.as_str()
                 ),
             }
-            match scope {
+            let read = match scope {
                 Scope::Carried { .. } => None,
                 Scope::Analysed { detail, .. } => Some(detail),
-            }
+            };
+            (read, imports)
         })
         .collect();
     info!(
         "pr base: {} of {} service(s) read nothing changed since {}; the closure walk took {:.2}s over {} service(s)",
-        reads.iter().filter(|read| read.is_none()).count(),
+        reads.iter().filter(|(read, _)| read.is_none()).count(),
         reads.len(),
         short(base),
         walks.closure_took.as_secs_f64(),

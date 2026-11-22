@@ -202,7 +202,7 @@ test("a re-check that judged a service at its indexed version prints nothing wit
   broken.recheck = result.recheck;
   assert.match(
     renderPostToolUse(broken) ?? "",
-    /^Carrick re-checked src\/routes\/users\.ts: 2 contract problems in what it re-read; 4 services that read this edit were judged at their indexed version \(inventory, billing, ledger, and 1 more\)\.\n/,
+    /^Carrick re-checked src\/routes\/users\.ts: 2 contract problems in what it re-read; 4 services that read or pair with this edit were judged at their indexed version \(inventory, billing, ledger, and 1 more\)\.\n/,
   );
   // With nothing stale, the headline is the plain one.
   result.recheck.scope = { reread: ["catalog"], not_reread: [], stale: [] };

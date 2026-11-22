@@ -7624,6 +7624,116 @@ fn not_reread_reason(answer: &serde_json::Value, service: &str) -> String {
         .to_string()
 }
 
+/// A new file nothing imports and no row pairs is no business of a service in
+/// ANOTHER repository that has edits of its own. The answer's `stale` names the
+/// services that pair with the file or read it, not every dirty service of the
+/// workspace (carrick#5056).
+#[test]
+#[serial]
+fn a_re_check_of_an_unrelated_file_names_no_stale_service_of_another_repository() {
+    let workspace = shop_in_two_repos();
+    let root = workspace.path();
+    index(root);
+    edit(
+        &root.join(TWO_REPO_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let label = root.join("catalog/app/lib/label.ts");
+    std::fs::create_dir_all(label.parent().expect("a parent")).expect("make the dir");
+    std::fs::write(
+        &label,
+        "export function widgetLabel(name: string): string {\n  return name.trim();\n}\n",
+    )
+    .expect("write the new file");
+    let answer = recheck_json(root, "catalog/app/lib/label.ts", &AMPLE);
+    assert_ne!(
+        answer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answer:#}"
+    );
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!([]),
+        "{answer:#}"
+    );
+
+    // Control: a row of the route pairs with the client, so it stays named.
+    statement_in(&root.join(TWO_REPO_ROUTE), "route edit");
+    let answer = recheck_json(root, TWO_REPO_ROUTE, &AMPLE);
+    let index: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".carrick/index.json")).expect("read the index"),
+    )
+    .expect("the index is JSON");
+    let client_service = index["repos"]
+        .as_array()
+        .expect("repos")
+        .iter()
+        .find(|repo| {
+            repo["name"]
+                .as_str()
+                .is_some_and(|name| name.contains("inventory"))
+        })
+        .and_then(|repo| repo["services"][0]["name"].as_str())
+        .expect("the client repo's service id")
+        .to_string();
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!([client_service]),
+        "{answer:#}"
+    );
+    assert!(
+        answer["items"][0]["verdict"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(STALE_NOTE)),
+        "{answer:#}"
+    );
+}
+
+/// Services that share a tsconfig `include` over the whole workspace each read
+/// every other service's folder as a directory, so a service that does not
+/// import a new file is still not one that reads it: the answer names none for
+/// the file, and names the paired service for the route (carrick#5056).
+#[test]
+#[serial]
+fn a_re_check_does_not_name_services_that_only_share_a_tsconfig_include() {
+    let workspace = workspace_prepared(SHOP, &["shop"], |repo| {
+        std::fs::write(
+            repo.join("tsconfig.json"),
+            "{ \"include\": [\"catalog\", \"inventory\", \"ledger\"] }\n",
+        )
+        .expect("write the shared tsconfig");
+    });
+    let root = workspace.path();
+    index(root);
+
+    let label = root.join("shop/catalog/app/lib/label.ts");
+    std::fs::create_dir_all(label.parent().expect("a parent")).expect("make the dir");
+    std::fs::write(
+        &label,
+        "export function widgetLabel(name: string): string {\n  return name.trim();\n}\n",
+    )
+    .expect("write the new file");
+    let answer = recheck_json(root, "shop/catalog/app/lib/label.ts", &AMPLE);
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!([]),
+        "{answer:#}"
+    );
+
+    statement_in(&root.join(SHOP_ROUTE), "route edit");
+    let answer = recheck_json(root, SHOP_ROUTE, &AMPLE);
+    assert_eq!(
+        answer["recheck"]["scope"]["stale"],
+        serde_json::json!(["inventory"]),
+        "{answer:#}"
+    );
+    assert!(
+        not_reread_reason(&answer, "ledger").starts_with("reads "),
+        "{answer:#}"
+    );
+}
+
 /// What `carrick init` writes at a repo root (agent skills, hook config, an
 /// agents file) is read by no service, so it leaves every other service at its
 /// indexed version with nothing to re-check. A root manifest is a repo input,
@@ -7677,11 +7787,21 @@ fn a_re_check_leaves_other_services_alone_for_root_files_no_service_reads() {
     );
     let answer = recheck_json(root, SHOP_LEDGER, &AMPLE);
     assert_eq!(reread(&answer), ["ledger"], "{answer:#}");
+    // A bump of the root manifest moves each service's inputs, so each says so
+    // in its own reason, but a file of `ledger` is none of their business: the
+    // answer names no stale service for it (carrick#5056).
     assert_eq!(
         answer["recheck"]["scope"]["stale"],
-        serde_json::json!(["catalog", "inventory"]),
+        serde_json::json!([]),
         "{answer:#}"
     );
+    for service in ["catalog", "inventory"] {
+        assert_ne!(
+            not_reread_reason(&answer, service),
+            "no edits since the index; judged at its indexed version",
+            "{answer:#}"
+        );
+    }
 }
 
 /// A root config one service reads by name (its tsconfig extends it) still
@@ -7714,7 +7834,11 @@ fn a_re_check_names_the_service_whose_tsconfig_extends_an_edited_root_config() {
     assert_eq!(reread(&answer), ["ledger"], "{answer:#}");
     assert_eq!(
         answer["recheck"]["scope"]["stale"],
-        serde_json::json!(["catalog"]),
+        serde_json::json!([]),
+        "{answer:#}"
+    );
+    assert!(
+        not_reread_reason(&answer, "catalog").contains("tsconfig.base.json"),
         "{answer:#}"
     );
     assert_eq!(

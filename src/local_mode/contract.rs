@@ -823,9 +823,11 @@ pub struct RecheckScope {
     pub reread: Vec<String>,
     /// Every other service, judged at its newest known version.
     pub not_reread: Vec<NotReread>,
-    /// The ones of `not_reread` with edits since the index and no re-check copy
-    /// of them, or that read a path edited since the index, so they are judged
-    /// against a version that predates the edit.
+    /// The services of any repository of the workspace judged at a version
+    /// older than the work that also pair with one of the edited file's rows
+    /// or whose scan reads the file (carrick#5056). A service stale for a
+    /// reason unrelated to this file is not named here; a `not_reread` row
+    /// with its reason exists only for the edited repository's services.
     pub stale: Vec<String>,
 }
 

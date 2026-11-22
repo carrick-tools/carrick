@@ -375,13 +375,13 @@ export function answersTheEdit(result: CheckResult): boolean {
 /** Services a stale re-check line names before it counts the rest. */
 const MAX_STALE_SERVICES = 3;
 
-/** "N services that read <subject> were judged at their indexed version (a, b, and K more)". */
+/** "N services that read or pair with <subject> were judged at their indexed version (a, b, and K more)". */
 export function staleClause(stale: readonly string[], subject: string): string {
   const names = stale.slice(0, MAX_STALE_SERVICES).join(", ");
   const more = stale.length > MAX_STALE_SERVICES ? `, and ${stale.length - MAX_STALE_SERVICES} more` : "";
   return stale.length === 1
-    ? `1 service that reads ${subject} was judged at its indexed version (${names})`
-    : `${stale.length} services that read ${subject} were judged at their indexed version (${names}${more})`;
+    ? `1 service that reads or pairs with ${subject} was judged at its indexed version (${names})`
+    : `${stale.length} services that read or pair with ${subject} were judged at their indexed version (${names}${more})`;
 }
 
 /** Operations a Stop line names before it counts the rest. */
@@ -585,8 +585,8 @@ function headline(result: CheckResult, where: string, problems: number, late: bo
   const count = `${problems} contract ${problems === 1 ? "problem" : "problems"}`;
   if (recheckDidNotRun(result)) return `Carrick: ${where}: ${count}.`;
   const stale = result.recheck?.scope?.stale ?? [];
-  // A service that reads this edit was judged at a version that predates it,
-  // so the problems are stated for what was re-read; the Stop hook queues
+  // A service that reads or pairs with this file was judged at a version that
+  // predates the work, so the problems are stated for what was re-read; the Stop hook queues
   // `check --changed` for it (carrick#3466).
   if (stale.length > 0) return `Carrick re-checked ${where}: ${count} in what it re-read; ${staleClause(stale, "this edit")}.`;
   return `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}: ${count}.`;
