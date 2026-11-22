@@ -19,7 +19,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createLogger } from "../log.ts";
 import { factsSaid } from "../hook/reuse.ts";
-import { commonGitDir, linkedCheckoutTop } from "../hook/worktree.ts";
+import { linkedCheckoutTop, mainCheckoutOf } from "../hook/worktree.ts";
 import { gapsOfLines, rangesOf, rangesOfLines, touched } from "./match.ts";
 import type { CallSpan, Range } from "./match.ts";
 import { factsEnabled } from "./enabled.ts";
@@ -154,12 +154,6 @@ type Kind = (typeof KINDS)[number];
 
 /** The kinds `pickLines` always takes; `contract` and `matched` are optional. */
 type Found = Record<Exclude<Kind, "contract" | "matched">, readonly Candidate[]> & { contract?: readonly Candidate[]; matched?: readonly Candidate[] };
-
-/** The main checkout a linked worktree belongs to, from its `.git` file. */
-function mainCheckoutOf(worktreeTop: string): string | null {
-  const common = commonGitDir(worktreeTop);
-  return common ? path.dirname(common) : null;
-}
 
 function real(dir: string): string {
   try {

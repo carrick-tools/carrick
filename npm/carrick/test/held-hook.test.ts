@@ -364,7 +364,7 @@ test("a message that still names the check's machinery is never written", () => 
 // T7 (#4654): an edit the compiler engine did not check says so, once per session,
 // service and state. Agent-facing text.
 
-const note = (state: "cold" | "capped" | "no_compiler" | "error", more: Record<string, unknown> = {}) => ({ service: "api", state, ...more });
+const note = (state: "cold" | "capped" | "no_compiler" | "error" | "worktree", more: Record<string, unknown> = {}) => ({ service: "api", state, ...more });
 
 test("each not-checked state prints one line with its reason, once per session per service and state", async (t) => {
   const cases = [
@@ -383,6 +383,23 @@ test("each not-checked state prints one line with its reason, once per session p
     const second = context((await edit(ws, `n-${c.state}`)).stdout);
     assert.ok(!second.includes("compiler engine did not check"), `${c.state} said again: ${second}`);
   }
+});
+
+test("the worktree line has no doctor tail and comes once per session, service and worktree (#5038)", async (t) => {
+  const ws = await workspace(t);
+  const checkout = path.join(ws.root, ".claude", "worktrees", "a");
+  const daemon = await fakeDaemon(ws, { state: "worktree", lines: [], ms: 1, not_checked: [note("worktree", { checkout })] });
+  t.after(() => daemon.close());
+  const WANT =
+    "Carrick: the compiler engine did not check this edit of api: the file is in a git worktree, and the engine reads only the main checkout. The late re-check reads the worktree; run `carrick check --changed` there before you finish.";
+  const first = context((await edit(ws, "n-wt")).stdout);
+  assert.ok(first.includes(WANT), first);
+  assert.ok(!first.includes("doctor"), first);
+  assert.ok(!context((await edit(ws, "n-wt")).stdout).includes("did not check"), "said again");
+  await daemon.close();
+  const other = await fakeDaemon(ws, { state: "worktree", lines: [], ms: 1, not_checked: [note("worktree", { checkout: `${checkout}2` })] });
+  t.after(() => other.close());
+  assert.ok(context((await edit(ws, "n-wt")).stdout).includes(WANT), "a second worktree is told too");
 });
 
 test("a different state or service of the same session is a new line; a late answer and a read print none", async (t) => {

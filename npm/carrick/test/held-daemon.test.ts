@@ -806,3 +806,106 @@ test("an edit asked during the start is answered when the engine is ready", asyn
     w.done();
   }
 });
+
+// A file in a linked git worktree is never judged by the main checkout's engine (T2, #5038).
+
+function git(dir: string, ...args: string[]): void {
+  spawnSync("git", args, { cwd: dir, stdio: "ignore", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+}
+
+/** A repo whose services sit at the repo top (`""`) or under it, plus a nested linked worktree `.claude/worktrees/b` of it. */
+function worktreeWorld(serviceDir: string, rowCount?: number) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "wt")));
+  const root = path.join(dir, "repo");
+  const home = path.join(dir, "home");
+  const dirOf = path.join(root, serviceDir);
+  fs.mkdirSync(path.join(dirOf, "src"), { recursive: true });
+  fs.writeFileSync(path.join(dirOf, "src", "x.ts"), "export const x = 1;\n");
+  fs.writeFileSync(path.join(root, ".gitignore"), ".claude/worktrees/\n");
+  git(root, "init", "-q", "-b", "main");
+  git(root, "add", ".");
+  git(root, "commit", "-q", "-m", "init");
+  git(root, "worktree", "add", "-q", ".claude/worktrees/b", "-b", "b");
+  const init: ServiceInit = { repo: "shop", service: "api", repo_path: root, sidecar_root: dirOf, tsconfig: null, scan_root: root };
+  const events: string[] = [];
+  const runtime: ServiceRuntime = {
+    ...(rowCount === undefined ? {} : { rowCount: async () => rowCount }),
+    start: async () => {
+      events.push("start");
+      return { engine: { answer: async () => (events.push("answer"), { lines: [] }), rss: () => 100, close: async () => undefined } };
+    },
+  };
+  const daemon = new HeldDaemon({ root, home, env: { ...ON }, programs: async () => [init], runtime });
+  const req = (file: string): HeldRequest => ({ session: "s1", files: [file], kind: "edit", edited_at: 1 });
+  return { dir, root, daemon, events, req, main: path.join(dirOf, "src", "x.ts"), twin: path.join(root, ".claude", "worktrees", "b", serviceDir, "src", "x.ts"), done: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+test("a worktree file under a repo-top service is never served by the main engine: it answers worktree and starts nothing", async () => {
+  const w = worktreeWorld("");
+  try {
+    const answer = await w.daemon.handle(w.req(w.twin));
+    assert.equal(answer.state, "worktree");
+    assert.deepEqual(answer.lines, []);
+    assert.deepEqual(answer.not_checked, [{ service: "api", state: "worktree", checkout: path.join(w.root, ".claude", "worktrees", "b") }]);
+    await settle();
+    assert.deepEqual(w.events, [], "no start, no answer");
+  } finally {
+    w.done();
+  }
+});
+
+test("a worktree file under a sub-folder service answers worktree, not none", async () => {
+  const w = worktreeWorld("apps/api");
+  try {
+    const answer = await w.daemon.handle(w.req(w.twin));
+    assert.equal(answer.state, "worktree");
+    assert.equal(answer.not_checked?.[0]?.service, "api");
+    assert.deepEqual(w.events, []);
+  } finally {
+    w.done();
+  }
+});
+
+test("a worktree file whose twin's service has no rows answers none with no note", async () => {
+  const w = worktreeWorld("apps/api", 0);
+  try {
+    const answer = await w.daemon.handle(w.req(w.twin));
+    assert.equal(answer.state, "none");
+    assert.equal(answer.not_checked, undefined);
+    assert.deepEqual(w.events, []);
+  } finally {
+    w.done();
+  }
+});
+
+test("a file in the main checkout is served as before", async () => {
+  const w = worktreeWorld("");
+  try {
+    const answer = await w.daemon.handle(w.req(w.main));
+    assert.equal(answer.state, "cold");
+    assert.deepEqual(answer.not_checked, [{ service: "api", state: "cold" }]);
+    await settle();
+    assert.deepEqual(w.events, ["start"]);
+  } finally {
+    w.done();
+  }
+});
+
+test("a worktree that holds its own program (its own init) is served as today", async () => {
+  const w = worktreeWorld("");
+  try {
+    const top = path.join(w.root, ".claude", "worktrees", "b");
+    const own: ServiceInit = { repo: "shop", service: "api", repo_path: top, sidecar_root: top, tsconfig: null, scan_root: top };
+    const daemon = new HeldDaemon({
+      root: top,
+      home: path.join(w.dir, "home2"),
+      env: { ...ON },
+      programs: async () => [own],
+      runtime: { start: () => new Promise(() => undefined) },
+    });
+    const answer = await daemon.handle(w.req(w.twin));
+    assert.equal(answer.state, "cold");
+  } finally {
+    w.done();
+  }
+});

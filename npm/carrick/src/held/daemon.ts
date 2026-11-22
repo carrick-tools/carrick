@@ -14,6 +14,7 @@ import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import { readJson, releaseLock, takeLock, touchLock } from "../hook/lock.ts";
 import { answerEarly, supersededEntry } from "../hook/rechecks.ts";
+import { linkedCheckoutTop, mainCheckoutOf } from "../hook/worktree.ts";
 import { heldBuildId } from "./build.ts";
 import { heldDir, helloPath, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
 import { readState, writeState, type NotChecked, type ServiceState } from "./state.ts";
@@ -101,7 +102,7 @@ export type HeldLine = {
   named_files: string[];
 };
 
-export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "error";
+export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "error" | "worktree";
 
 export type HeldAnswer = {
   state: HeldState;
@@ -200,6 +201,17 @@ const key = (init: ServiceInit): string => `${init.repo}\0${init.service}`;
 
 const within = (file: string, dir: string): boolean => file === dir || file.startsWith(dir + path.sep);
 
+/**
+ * Whether a program serves a file: the file is inside the program's folder AND in the
+ * same git checkout. A nested worktree's file sits under a repo-root program's folder
+ * but is another checkout's text, so it is never that program's (T2, #5038).
+ */
+const serves = (file: string, dir: string): boolean => {
+  if (!within(file, dir)) return false;
+  const top = linkedCheckoutTop(file);
+  return top === null || within(dir, realPath(top));
+};
+
 export class HeldDaemon {
   private readonly deps: DaemonDeps;
   private readonly root: string;
@@ -266,9 +278,11 @@ export class HeldDaemon {
     const engines: string[] = [];
     const commits: Array<() => void> = [];
     const steps: Steps = { programs: tenth(performance.now() - started) };
+    const served = new Set<string>();
     for (const { init, dir } of programs) {
-      const mine = files.filter((f) => within(f, dir));
+      const mine = files.filter((f) => serves(f, dir));
       if (mine.length === 0) continue;
+      for (const f of mine) served.add(f);
       const answer = await this.serveService(init, mine, request);
       states.push(answer.state);
       if (answer.state === "ready") ready.push(`${init.repo}/${init.service}`);
@@ -278,8 +292,24 @@ export class HeldDaemon {
       if (answer.engine !== undefined) engines.push(answer.engine);
       addSteps(steps, answer.steps);
     }
+    // A worktree file no program serves is not checked: say so, and start nothing (T2, #5038).
+    const told = new Set<string>();
+    for (const file of files) {
+      if (served.has(file)) continue;
+      const top = linkedCheckoutTop(file);
+      const main = top === null ? null : mainCheckoutOf(top);
+      if (top === null || main === null) continue;
+      const twin = path.join(realPath(main), path.relative(realPath(top), file));
+      for (const { init, dir } of programs) {
+        if (!within(twin, dir) || told.has(`${init.service}\0${top}`)) continue;
+        if (((await this.deps.runtime.rowCount?.(init)) ?? 1) === 0) continue;
+        told.add(`${init.service}\0${top}`);
+        notes.push({ service: init.service, state: "worktree", checkout: top });
+        states.push("worktree");
+      }
+    }
     // One state for the whole request: the most useful one any service gave.
-    const order: HeldState[] = ["ready", "cold", "capped", "no_compiler", "error"];
+    const order: HeldState[] = ["ready", "cold", "capped", "no_compiler", "error", "worktree"];
     const state = order.find((s) => states.includes(s)) ?? "none";
     // The services whose engines answered, and those engines: what an early answer's rows are the whole list of (T1 P1.4).
     return { state, lines, steps, notes, commits, ...(ready.length > 0 ? { service: ready.join(", ") } : {}), ...(engines.length > 0 ? { engine: engines.join(", ") } : {}) };

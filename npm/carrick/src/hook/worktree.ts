@@ -45,6 +45,12 @@ export function commonGitDir(top: string): string | null {
   }
 }
 
+/** The main checkout a linked worktree belongs to, from its `.git` file; null when it cannot be read. */
+export function mainCheckoutOf(worktreeTop: string): string | null {
+  const common = commonGitDir(worktreeTop);
+  return common ? path.dirname(common) : null;
+}
+
 /** The top folder of the linked worktree `file` sits in, or null in the main checkout or none (carrick#3595). */
 export function linkedCheckoutTop(file: string): string | null {
   const own = checkoutOf(path.dirname(file));
