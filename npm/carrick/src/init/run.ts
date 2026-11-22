@@ -35,6 +35,7 @@ import {
 import { reposUrl } from "./connect.ts";
 import { checkoutOf } from "../hook/worktree.ts";
 import { downloadHostedIndex, hostedReport, nativeRunner, STEP_LABEL } from "./hosted.ts";
+import { fetchFactsNow } from "../facts/fetch.ts";
 import { listProjects, projectLabel, SLUG, type Project } from "./projects.ts";
 import {
   committedHooksAreOurs,
@@ -1039,13 +1040,19 @@ export async function initWith(
   const startedAt = Date.now();
   const read = await out.step(
     STEP_LABEL,
-    (progress) =>
-      downloadHostedIndex(
+    async (progress) => {
+      const outcome = await downloadHostedIndex(
         derived.workspace,
         nativeRunner(out.quiet, progress),
         derived.repos.map((repo) => repo.path),
         progress,
-      ),
+      );
+      // The fact file the edit and Read hooks answer from is part of the index
+      // on this machine. Fetched here, and waited for while the cloud builds
+      // it, so the first agent session starts with it (`fetchFactsNow`).
+      if (outcome.kind === "downloaded") await fetchFactsNow(derived.workspace);
+      return outcome;
+    },
     (outcome) => hostedReport(outcome, (Date.now() - startedAt) / 1000),
   );
   const downloaded = read.kind === "downloaded";
