@@ -31,8 +31,10 @@ export type ServiceState = {
 /** One edit the engine did not check, for the hook's line. `state` is the answer's state. */
 export type NotChecked = {
   service: string;
-  state: "cold" | "capped" | "no_compiler" | "error";
+  state: "cold" | "capped" | "no_compiler" | "error" | "worktree";
   reason?: string;
+  /** `worktree`: the top folder of the linked worktree the edited file sits in. */
+  checkout?: string;
   budget_mb?: number;
   holders?: number;
   took_s?: number;
