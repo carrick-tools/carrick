@@ -289,7 +289,7 @@ test("each call carries the background budget and a timeout past it", async () =
     enqueue(s.root, "s1", [s.file("a.ts")], Date.now(), { home: s.home });
     await runQueue(s.root, { env: env(s), home: s.home });
     const [line] = fs.readFileSync(s.envLog, "utf8").split("\n").filter(Boolean);
-    assert.deepEqual(JSON.parse(line!), { budget: "180000", timeout: "195000" });
+    assert.deepEqual(JSON.parse(line!), { budget: "300000", timeout: "315000" });
     assert.ok(fs.existsSync(fakeBin));
   } finally {
     s.cleanup();
