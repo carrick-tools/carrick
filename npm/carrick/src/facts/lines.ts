@@ -405,13 +405,13 @@ export function pickLines(
  * line between tiers 2 and 3: for a changed function the cloud walked to from
  * routes' handlers (`k: "chain"`), one line naming the first of its routes
  * whose line holds here, in the route's lead and its contract row's first
- * group. A `read` edit never gets the contract or chain kind, even with them.
+ * group. A `read` edit never gets the contract kind; with `options.chain` it gets the chain kind alone, one line for the file (`chainCandidates`), and with `options.chainOnly` (the Read switch is off) nothing else, and the file is not `answered`.
  */
 export async function factLines(
   root: string,
   edits: readonly FactEdit[],
   session: string | undefined,
-  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv; limit?: number; exclude?: ReadonlySet<string>; contract?: boolean; chain?: boolean; store?: FactStore | null } = {},
+  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv; limit?: number; exclude?: ReadonlySet<string>; contract?: boolean; chain?: boolean; chainOnly?: boolean; store?: FactStore | null } = {},
 ): Promise<FactOutcome> {
   const started = performance.now();
   const now = options.now ?? Date.now();
@@ -437,7 +437,7 @@ export async function factLines(
   const takenIds = new Set<string>();
   const rest: Array<{ at: NonNullable<ReturnType<typeof locate>>; rows: ContractRow[] }> = [];
   // The changed functions of each edited file whose chain rows are looked up after the loop, when every file's tiers 1-2 are known.
-  const chained: Array<{ at: NonNullable<ReturnType<typeof locate>>; names: string[]; outer: Map<string, string[]> }> = [];
+  const chained: Array<{ at: NonNullable<ReturnType<typeof locate>>; names: string[]; outer: Map<string, string[]>; read: boolean }> = [];
   // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
   if (!factsEnabled(options.env)) {
     stale = false;
@@ -570,23 +570,29 @@ export async function factLines(
     // model's reading), the route's hop files and its registration file
     // (other than the edited file): each place on disk must read as at the
     // index commit.
-    const chainCandidates = (at: { repo: string; rel: string; top: string }, names: readonly string[], outer: ReadonlyMap<string, readonly string[]>): Candidate[] =>
-      names.flatMap((name) => {
+    // On a Read (`read`) the same lines are found for every named thing in the
+    // file, but only the best one is said: fewest hops, then most callers in
+    // other services, then the order found. A route the read file registers is
+    // skipped (its own op line says it).
+    const chainCandidates = (at: { repo: string; rel: string; top: string }, names: readonly string[], outer: ReadonlyMap<string, readonly string[]>, read = false): Candidate[] => {
+      const ranked: Array<{ candidate: Candidate; depth: number; callers: number }> = [];
+      for (const name of names) {
         let rows = facts.chains(at.repo, at.rel, name);
         for (const encloser of outer.get(name) ?? []) {
           if (rows.length > 0) break;
           rows = facts.chains(at.repo, at.rel, encloser);
         }
-        return rows.flatMap((chain) =>
-          chain.routes.flatMap((route) => {
+        for (const chain of rows) {
+          for (const route of chain.routes) {
+            if (read && route.repo === at.repo && route.file === at.rel) continue;
             const same = facts.contracts(route.repo, route.file).filter((one) => one.side === route.side && one.label === route.label && one.line === route.line && printable(one));
             const response = same.find((one) => one.direction === "response");
             const base = response ?? same[0];
-            if (base === undefined || (response !== undefined && takenIds.has(takenId(response)))) return [];
+            if (base === undefined || (response !== undefined && takenIds.has(takenId(response)))) continue;
             const callers = callerPlaces(same, route.service);
-            if (callers.length === 0) return [];
+            if (callers.length === 0) continue;
             const words = callerWords(at, callers.slice(0, CHAIN_CALLERS_PRINTED));
-            if (words === null) return [];
+            if (words === null) continue;
             const peers = [...new Set([...route.path.map((hop) => hop.file), route.file])]
               .filter((file) => !(route.repo === at.repo && file === at.rel))
               .map((file) => ({ repo: route.repo, file }));
@@ -597,8 +603,10 @@ export async function factLines(
             const count = chain.total > 1 ? `, reached by at least ${chain.total} operations` : "";
             const where = route.depth === 1 ? `(${hopAt})` : `, through ${hop.name} (${hopAt})`;
             const rest = callers.length > CHAIN_CALLERS_PRINTED ? ` and ${callers.length - CHAIN_CALLERS_PRINTED} more` : "";
-            return [
-              {
+            ranked.push({
+              depth: route.depth,
+              callers: callers.length,
+              candidate: {
                 key: `chain::${chain.repo}::${chain.file}::${chain.name}`,
                 text: `Carrick: ${chain.name} (${chain.file}:${chain.line}${count}) runs in the handler of ${route.label}${route.depth === 1 ? " " : ""}${where}. Other services call that route: ${words.words}${rest}. If your change adds a side effect or changes what the route returns, open those callers first.`,
                 named: pathsOf(others),
@@ -606,10 +614,15 @@ export async function factLines(
                 skipIf: [groupKey],
                 alsoClaims: [groupKey, ...(response !== undefined ? [rowKey(response)] : [])],
               },
-            ];
-          }),
-        );
-      });
+            });
+          }
+        }
+      }
+      if (!read) return ranked.map((one) => one.candidate);
+      // Array.prototype.sort is stable: equal ranks keep the order found.
+      const best = ranked.filter((one) => !said.has(one.candidate.key) && !(one.candidate.key in claims) && options.exclude?.has(one.candidate.key) !== true).sort((a, b) => a.depth - b.depth || b.callers - a.callers)[0];
+      return best === undefined ? [] : [best.candidate];
+    };
     for (const edit of edits) {
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
@@ -683,8 +696,9 @@ export async function factLines(
       const declared = new Map<string, number>();
       for (const span of scan.spans) declared.set(span.name, (declared.get(span.name) ?? 0) + 1);
       const names = reach.names.filter((name) => declared.get(name) === 1);
-      // The chain kind's lookup, after every file's tiers 1-2 (a Read never says one).
-      if (options.contract === true && options.chain === true && !edit.read && names.length > 0) {
+      // The chain kind's lookup, after every file's tiers 1-2. A Read looks up
+      // every named thing in the file and says the best one (`chainCandidates`).
+      if (options.contract === true && options.chain === true && names.length > 0) {
         const start = new Map(scan.spans.map((span) => [span.name, span.start]));
         // Each name's enclosing named things, innermost first (once-declared names only).
         const outer = new Map<string, string[]>();
@@ -693,8 +707,10 @@ export async function factLines(
           const around = scan.spans.filter((span) => span !== own && span.start <= own.start && span.end >= own.end && declared.get(span.name) === 1);
           outer.set(name, around.sort((a, b) => a.end - a.start - (b.end - b.start)).map((span) => span.name));
         }
-        chained.push({ at, names: [...names].sort((a, b) => start.get(a)! - start.get(b)!), outer });
+        chained.push({ at, names: [...names].sort((a, b) => start.get(a)! - start.get(b)!), outer, read: edit.read === true });
       }
+      // A Read of the chain kind alone (the Read switch is off): no op, fn or name lookup, and the file is never answered.
+      if (edit.read && options.chainOnly === true) continue;
       // The op rows this edit reaches: tier 1 of the contract kind.
       const reachedOps: FactRow[] = [];
       const opRan = isolated("op", () => {
@@ -767,7 +783,7 @@ export async function factLines(
     }
     for (const one of chained) {
       try {
-        tiers[2]!.push(...chainCandidates(one.at, one.names, one.outer));
+        tiers[2]!.push(...chainCandidates(one.at, one.names, one.outer, one.read));
       } catch (error) {
         log("chain fact lines failed", String(error));
         stopped("rule_failed");
