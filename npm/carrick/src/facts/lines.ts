@@ -619,7 +619,7 @@ export async function factLines(
               callers: callers.length,
               candidate: {
                 key: `chain::${chain.repo}::${chain.file}::${chain.name}`,
-                text: `Carrick: ${chain.name} (${chain.file}:${chain.line}) runs in the handler of ${route.label}${route.depth === 1 ? " " : ""}${where}${otherRoutes(chain)}. Other services call that route: ${words.words}${rest}. If your change adds a side effect or changes what the route returns, open those callers first.`,
+                text: `Carrick: ${chain.name} (${chain.file}:${chain.line}) runs in the handler of ${route.label}${route.depth === 1 ? " " : ""}${where}${otherRoutes(chain)}. Other services call that route: ${words.words}${rest}. Open those callers before you change ${chain.name}, because what you add here runs on their calls too.`,
                 named: pathsOf(others),
                 holds: peersHold(at, others),
                 skipIf: [groupKey],
