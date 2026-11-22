@@ -23,7 +23,8 @@ import type { QueueEntry } from "./rechecks.ts";
 import { engineReadyOf } from "./timings.ts";
 import type { Timing } from "./timings.ts";
 import type { CheckResult } from "../contract.ts";
-import { factLines } from "../facts/lines.ts";
+import { factLines, MAX_FACT_LINES } from "../facts/lines.ts";
+import { owedLines } from "./owed.ts";
 import { openFacts } from "../facts/store.ts";
 import type { FactEdit } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
@@ -325,6 +326,10 @@ export async function editFlow(
   contexts.push(...earlyNow);
   contexts.push(...unchecked.lines);
   contexts.push(...facts.lines);
+  // Files this session read before the fact file landed get their Read lines
+  // here, once, after the edit's own and under the same cap (`owed.ts`).
+  const owed = session && facts.present ? await owedLines(choice.root, session, { limit: MAX_FACT_LINES - facts.used.length, exclude: new Set(facts.used), skip: factFiles }) : null;
+  if (owed) contexts.push(...owed.lines);
   // A missing or stale fact file is refreshed in the background, detached.
   if (facts.stale) (await import("../facts/fetch.ts")).startFactsRefresh(choice.root);
   // The `carrick` this hook is running is whatever PATH answered with, which
@@ -339,7 +344,7 @@ export async function editFlow(
   if (mismatch) contexts.push(mismatch);
   if (told.length > 0 && session) markTold(session, told);
   if (led.length > 0 && session) markLed(session, led);
-  if (session) markFacts(session, facts.claims);
+  if (session) markFacts(session, { ...facts.claims, ...owed?.claims });
   contexts.unshift(...extra);
   emitPostToolUse(contexts);
 }

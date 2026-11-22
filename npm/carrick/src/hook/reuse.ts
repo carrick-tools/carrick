@@ -82,6 +82,13 @@ export type SessionRecord = {
    * claimed only once the line is printed.
    */
   facts: Record<string, { at: number; named: string[] }>;
+  /**
+   * Absolute path -> the workspace root it was read in, for every file a Read
+   * answered while the workspace had no fact file. Its Read lines are owed: the
+   * first Read, shell read or edit after the file lands says them once
+   * (`owed.ts`).
+   */
+  owed: Record<string, string>;
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -128,6 +135,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     covered: {},
     said: [],
     facts: {},
+    owed: {},
     updated: "",
   };
   const file = sessionFile(sessionId, home);
@@ -177,6 +185,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
             entry[1].named.every((named) => typeof named === "string"),
         ),
       ),
+      owed: Object.fromEntries(Object.entries(record.owed ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string")),
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -365,6 +374,46 @@ export function markFacts(sessionId: string, claims: Record<string, { at: number
   if (Object.keys(claims).length === 0) return;
   const current = readSession(sessionId, home);
   Object.assign(current.facts, claims);
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** The most files one session is owed Read lines for; the newest are kept. */
+export const MAX_OWED = 20;
+
+/** The files (absolute paths) this session read in `root` while it had no fact file. */
+export function factsOwed(sessionId: string, root: string, home?: string): string[] {
+  return Object.entries(readSession(sessionId, home).owed).flatMap(([file, at]) => (at === root ? [file] : []));
+}
+
+/** Whether this session is owed Read lines for any file. */
+export function hasOwed(sessionId: string, home?: string): boolean {
+  return Object.keys(readSession(sessionId, home).owed).length > 0;
+}
+
+/** The workspace roots this session is owed Read lines in. */
+export function owedRoots(sessionId: string, home?: string): string[] {
+  return [...new Set(Object.values(readSession(sessionId, home).owed))];
+}
+
+/** Remember that `files` were read in `root` while it had no fact file. */
+export function markOwed(sessionId: string, files: readonly string[], root: string, home?: string): void {
+  if (files.length === 0) return;
+  const current = readSession(sessionId, home);
+  for (const file of files) {
+    delete current.owed[file];
+    current.owed[file] = root;
+  }
+  current.owed = Object.fromEntries(Object.entries(current.owed).slice(-MAX_OWED));
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** These files' Read lines are no longer owed. */
+export function clearOwed(sessionId: string, files: readonly string[], home?: string): void {
+  if (files.length === 0) return;
+  const current = readSession(sessionId, home);
+  for (const file of files) delete current.owed[file];
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }
