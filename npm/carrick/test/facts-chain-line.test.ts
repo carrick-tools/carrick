@@ -340,33 +340,93 @@ test("an edit of a function its routes' own code calls prints their contract lin
   ]);
 });
 
-// Reads never say a chain line.
+// A Read says the chain line too: the best one for the file, once per session.
 
-test("a Read prints no chain line even when the caller asks for the contract and chain kinds", async (t) => {
+const READ_LINES = (ws: Ws) => ({ file: ws.at("orders-api/src/services/lines.ts"), read: true });
+
+test("a Read of a function a route's handler reaches prints the chain line and claims it", async (t) => {
   const ws = await workspace(t, baseRows());
-  const read = await run(ws, { file: ws.at("orders-api/src/services/lines.ts"), read: true }, { session: "read" });
-  assert.deepEqual(read.lines, []);
-  assert.deepEqual(Object.keys(read.claims), []);
-  // Not vacuous: an edit of the same file prints the chain line.
-  const edit = await run(ws, { file: ws.at("orders-api/src/services/lines.ts"), whole: true }, { session: "edit" });
-  assert.deepEqual(edit.lines, [BUILD_GET]);
+  const read = await run(ws, READ_LINES(ws), { session: "read" });
+  assert.deepEqual(read.lines, [BUILD_GET]);
+  assert.ok("chain::orders-api::src/services/lines.ts::buildLines" in read.claims);
+  assert.deepEqual(read.answered, [], "the chain kind alone never answers the file");
 });
 
-test("with every switch on, the Read hook prints no chain line", async (t) => {
+test("the chain line said at a Read is silent at the Edit and at a second Read of the same session, and says once in another session", async (t) => {
   const ws = await workspace(t, baseRows());
-  const read = await runHook("post-read.ts", {
+  const read = await run(ws, READ_LINES(ws), { session: "s1" });
+  assert.deepEqual(read.lines, [BUILD_GET]);
+  markFacts("s1", read.claims, ws.home);
+  assert.deepEqual((await run(ws, READ_LINES(ws), { session: "s1" })).lines, []);
+  assert.deepEqual((await run(ws, linesEdit(ws), { session: "s1" })).lines, []);
+  assert.deepEqual((await run(ws, READ_LINES(ws), { session: "s2" })).lines, [BUILD_GET]);
+});
+
+test("a Read says one chain line for the file: the route with the fewest hops, then the most callers", async (t) => {
+  const direct: RouteSpec = { ...POST_ROUTE, path: [{ file: "src/routes/refunds.ts", line: 3, name: "post_handler", call: 4 }] };
+  const rows = [
+    contractRow(GET, "src/routes/orders.ts", 3, 4),
+    contractRow(POST, "src/routes/refunds.ts", 3, 9),
+    // buildLines reaches GET in two hops and POST in one: POST is said although GET is stored first.
+    chainRow("buildLines", "src/services/lines.ts", 1, [viaFormat(GET_ROUTE), direct]),
+    chainRow("sumLines", "src/services/lines.ts", 4, [viaFormat(GET_ROUTE)]),
+  ];
+  const ws = await workspace(t, rows);
+  const read = await run(ws, READ_LINES(ws), { session: "rank" });
+  assert.equal(read.lines.length, 1);
+  assert.ok(read.lines[0]!.startsWith("Carrick: buildLines") && read.lines[0]!.includes(`handler of ${POST}`), read.lines[0]);
+});
+
+test("a Read skips a route the read file registers itself, and one whose caller is in its own service", async (t) => {
+  const hop = (line: number, name: string, call: number): RouteSpec => ({ label: GET, file: "src/routes/orders.ts", line, path: [{ file: "src/routes/orders.ts", line, name, call }] });
+  const rows = [contractRow(GET, "src/routes/orders.ts", 5, 4, "/orders/:orderId"), chainRow("formatOrder", "src/routes/orders.ts", 2, [hop(5, "get_orderId_handler", 6)])];
+  const ws = await workspace(t, rows, { "orders-api/src/routes/orders.ts": ORDERS_B });
+  const read = await run(ws, { file: ws.at("orders-api/src/routes/orders.ts"), read: true }, { session: "own" });
+  assert.deepEqual(read.lines, []);
+  // Not vacuous: an Edit of the same function prints the route's contract line.
+  const edit = await run(ws, { file: ws.at("orders-api/src/routes/orders.ts"), snippets: ["return { id: order.id };"] }, { session: "own-edit" });
+  assert.ok(edit.lines.length > 0);
+});
+
+test("chainOnly: the Read prints the chain line and no op, fn or name line, and answers no file", async (t) => {
+  const ws = await workspace(t, baseRows());
+  const out = await factLines(ws.root, [READ_LINES(ws)], "only", { home: ws.home, contract: true, chain: true, chainOnly: true });
+  assert.deepEqual(out.lines, [BUILD_GET]);
+  assert.deepEqual(out.answered, []);
+});
+
+test("a Read with the chain kind off prints no chain line", async (t) => {
+  const ws = await workspace(t, baseRows());
+  assert.deepEqual((await run(ws, READ_LINES(ws), { session: "off", chain: false })).lines, []);
+});
+
+const readHook = (ws: Ws, session: string, env: Record<string, string>) =>
+  runHook("post-read.ts", {
     payload: {
       hook_event_name: "PostToolUse",
       tool_name: "Read",
-      session_id: "hook-read-all-on",
+      session_id: session,
       cwd: ws.root,
       tool_input: { file_path: ws.at("orders-api/src/services/lines.ts") },
       tool_response: { file: { filePath: ws.at("orders-api/src/services/lines.ts"), content: LINES } },
     },
-    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_READ_LINES: "1", CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "1", CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...env }),
   });
-  assert.equal(read.code, 0);
-  assert.ok(!read.stdout.includes("buildLines ("), read.stdout);
+
+test("the Read hook prints the chain line with the Read switch off and with it on, and not with the chain switch off", async (t) => {
+  const ws = await workspace(t, baseRows());
+  const cases: Array<[Record<string, string>, boolean]> = [
+    [{}, true],
+    [{ CARRICK_READ_LINES: "1" }, true],
+    [{ CARRICK_CHAIN_LINES: "0" }, false],
+    [{ CARRICK_READ_LINES: "1", CARRICK_CHAIN_LINES: "0" }, false],
+    [{ CARRICK_FACT_LINES: "0" }, false],
+  ];
+  for (const [i, [env, prints]] of cases.entries()) {
+    const out = await readHook(ws, `read-hook-${i}`, env);
+    assert.equal(out.code, 0);
+    assert.equal(out.stdout.includes("buildLines (src/services/lines.ts:1"), prints, `${JSON.stringify(env)}: ${out.stdout}`);
+  }
 });
 
 // The switch, through the post-edit hook.

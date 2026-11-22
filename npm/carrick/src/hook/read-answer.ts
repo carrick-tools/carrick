@@ -14,7 +14,7 @@
 import path from "node:path";
 import { createLogger } from "../log.ts";
 import { resolveRoot, rootNote } from "../root.ts";
-import { readLinesEnabled } from "../facts/enabled.ts";
+import { chainLinesEnabled, contractLinesEnabled, readLinesEnabled } from "../facts/enabled.ts";
 import { markRead, markTold, toldKey } from "./reuse.ts";
 import { stampOf } from "./generation.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
@@ -95,7 +95,11 @@ export async function answerReads(
   const used: string[] = [];
   let factsMs: number | undefined;
   const unanswered: Array<{ file: string; root: string }> = [];
-  const { MAX_FACT_LINES, factLines } = readLinesEnabled() && options.facts !== false ? await import("../facts/lines.ts") : { MAX_FACT_LINES: 0, factLines: null };
+  // With the Read switch off, the fact file is still opened for the chain line
+  // alone ("other services call the route this function runs in"): no other
+  // fact line prints, and every file still takes the binary's `check`.
+  const wholeFile = readLinesEnabled();
+  const { MAX_FACT_LINES, factLines } = (wholeFile || chainLinesEnabled()) && options.facts !== false ? await import("../facts/lines.ts") : { MAX_FACT_LINES: 0, factLines: null };
   for (const [root, group] of roots) {
     const outcome =
       factLines === null
@@ -104,7 +108,7 @@ export async function answerReads(
             root,
             group.map((file) => ({ file, read: true })),
             session,
-            { limit: (options.limit ?? MAX_FACT_LINES) - used.length, exclude: new Set([...(options.exclude ?? []), ...used]) },
+            { limit: (options.limit ?? MAX_FACT_LINES) - used.length, exclude: new Set([...(options.exclude ?? []), ...used]), contract: contractLinesEnabled(), chain: chainLinesEnabled(), chainOnly: !wholeFile },
           );
     if (outcome !== null) {
       factsMs = (factsMs ?? 0) + outcome.ms;
