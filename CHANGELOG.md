@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.174](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.173...carrick-v0.3.174) (2026-11-22)
+
+
+### Bug Fixes
+
+* a checkout whose folder name differs from the repo's gets its compiler engine and fact lines (origin match) ([#5027](https://github.com/carrick-tools/carrick/issues/5027)) ([f1ed11d](https://github.com/carrick-tools/carrick/commit/f1ed11de3be2872bbf9bf0d4690a0ab945149293))
+* an edit made while the compiler engine starts is checked once it is ready ([#5031](https://github.com/carrick-tools/carrick/issues/5031)) ([a503a1d](https://github.com/carrick-tools/carrick/commit/a503a1d498520fe8f61380fd6a778cb0c61acbdd))
+* boundary unread and model lines say what the count is ([#5025](https://github.com/carrick-tools/carrick/issues/5025)) ([01bfb9c](https://github.com/carrick-tools/carrick/commit/01bfb9cd1b71aec86d6f5f73040af3b45f94baa6))
+* Stop names a re-check that ran past its budget when an earlier Stop saw it running ([#5030](https://github.com/carrick-tools/carrick/issues/5030)) ([051d208](https://github.com/carrick-tools/carrick/commit/051d208224f2ec0a6594a5ddc82b1469ce3561ea))
+
 ## [0.3.173](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.172...carrick-v0.3.173) (2026-11-21)
 
 
