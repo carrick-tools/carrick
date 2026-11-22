@@ -203,7 +203,7 @@ test("a re-check that judged a service at its indexed version prints nothing wit
   broken.recheck = result.recheck;
   assert.match(
     renderPostToolUse(broken) ?? "",
-    /^Carrick re-checked src\/routes\/users\.ts: 2 contract problems in what it re-read; 4 services that read or pair with this edit were judged at their indexed version \(inventory, billing, ledger, and 1 more\)\.\n/,
+    /^Carrick re-checked src\/routes\/users\.ts: 2 contract problems in what it re-read; 4 services connected to this edit by import or operation were judged at their indexed version \(inventory, billing, ledger, and 1 more\)\.\n/,
   );
   // With nothing stale, the headline is the plain one.
   result.recheck.scope = { reread: ["catalog"], not_reread: [], stale: [] };
@@ -1435,7 +1435,7 @@ test("T2: an early item line is followed by its copy line, outside the 400-chara
 });
 
 test("the not-checked line names files that share a reason in one clause", () => {
-  const stale = "4 services that read it were judged at their indexed version (web, admin, billing, and 1 more)";
+  const stale = "4 services connected to it by import or operation were judged at their indexed version (web, admin, billing, and 1 more)";
   const tail = " A background `carrick check --changed` is queued; its answer comes with the next Carrick line.";
   // One file: the clause is as it was.
   assert.equal(notCoveredLine([{ file: "api/a.ts", reason: stale }]), `Carrick did not check the whole change: api/a.ts: ${stale}.${tail}`);
