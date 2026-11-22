@@ -475,12 +475,29 @@ export function sessionCheckedLines(
   return { text: out.join("\n"), key };
 }
 
+/** Files one clause of the not-checked line names before it counts the rest. */
+const MAX_GAP_FILES = 3;
+
 /**
  * The Stop hook's line for a change it could not state from the per-file
  * re-checks: each file and why, and that the whole-change check is queued.
+ * Files with the same reason share one clause, in first-seen order.
  */
 export function notCoveredLine(gaps: ReadonlyArray<{ file: string; reason: string }>): string {
-  const named = gaps.map((gap) => `${gap.file}: ${gap.reason.trim().replace(/\.+$/, "")}`).join("; ");
+  // Files that share a reason are one clause: eight files with one reason
+  // printed the same sentence eight times.
+  const groups = new Map<string, string[]>();
+  for (const gap of gaps) {
+    const reason = gap.reason.trim().replace(/\.+$/, "");
+    groups.set(reason, [...(groups.get(reason) ?? []), gap.file]);
+  }
+  const named = [...groups]
+    .map(([reason, files]) => {
+      if (files.length === 1) return `${files[0]}: ${reason}`;
+      const more = files.length - MAX_GAP_FILES;
+      return `${files.length} files (${files.slice(0, MAX_GAP_FILES).join(", ")}${more > 0 ? `, and ${more} more` : ""}), each because ${reason}`;
+    })
+    .join("; ");
   return `Carrick did not check the whole change: ${named}. A background \`carrick check --changed\` is queued; its answer comes with the next Carrick line.`;
 }
 
