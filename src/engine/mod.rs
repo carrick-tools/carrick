@@ -22545,7 +22545,10 @@ unfollowed_member_calls_total: 0,
 
         // And the map feeding the cache is rebuilt correctly from that blob.
         let previous = PreviousIntents::from_definitions(&deserialized.function_definitions);
-        assert_eq!(previous.for_hash("deadbeef"), Some("fetches a user by id"));
+        assert_eq!(
+            previous.for_function_hash("getUser", "deadbeef"),
+            Some("fetches a user by id")
+        );
     }
 
     #[test]
