@@ -13,6 +13,7 @@ import { realOf, sidecarInstallDir, untrustedTree, type ReadBound } from './chec
 
 interface Config {
   workspace?: string[];
+  imports?: Record<string, string>;
   compilerOptions?: Record<string, unknown>;
   exclude?: string[];
 }
@@ -68,6 +69,18 @@ function jsrPackageName(specifier: string): string | undefined {
   return `${scope}/${name.split('@')[0]}`;
 }
 
+/** `spec` through the first import map that names it (exact key, or a `prefix/` key); a value that is a path becomes a file URL. */
+function mapBare(spec: string, scopes: { file: string; config: Config }[]): string {
+  for (const { file, config } of scopes) {
+    for (const [key, value] of Object.entries(config.imports ?? {})) {
+      const mapped = key === spec ? value : key.endsWith('/') && spec.startsWith(key) ? value + spec.slice(key.length) : undefined;
+      if (mapped === undefined) continue;
+      return mapped.startsWith('.') || path.isAbsolute(mapped) ? pathToFileURL(path.resolve(path.dirname(file), mapped)).href : mapped;
+    }
+  }
+  return spec;
+}
+
 /** Explicit TS configs keep their existing behaviour, including mixed repos. */
 export function findDenoConfig(repoRoot: string, explicit?: string): DenoConfig | undefined {
   if (explicit && !/^deno\.jsonc?$/.test(path.basename(explicit))) return undefined;
@@ -95,8 +108,15 @@ export function findDenoConfig(repoRoot: string, explicit?: string): DenoConfig 
   const opts = { ...workspace.config.compilerOptions, ...nearest.config.compilerOptions };
   const typesOwner = nearest.config.compilerOptions?.types !== undefined ? nearest.file : workspace.file;
   if (Array.isArray(opts.types)) {
-    opts.types = opts.types.map((spec: unknown) => typeof spec === 'string' && (spec.startsWith('.') || path.isAbsolute(spec))
-      ? pathToFileURL(path.resolve(path.dirname(typesOwner), spec)).href : spec);
+    // The graph root Deno reads sits outside the service, so a bare name is
+    // resolved here, through the nearest import map and then the workspace's,
+    // the way Deno would from inside the service.
+    const scopes = [nearest, workspace].filter((c, i, all) => all.indexOf(c) === i);
+    opts.types = opts.types.map((spec: unknown) => {
+      if (typeof spec !== 'string') return spec;
+      if (spec.startsWith('.') || path.isAbsolute(spec)) return pathToFileURL(path.resolve(path.dirname(typesOwner), spec)).href;
+      return mapBare(spec, scopes);
+    });
   }
   return {
     configPath: explicit ? path.resolve(repoRoot, explicit) : nearest.file,
@@ -170,13 +190,21 @@ export class DenoProject {
     const place = path.relative(config.workspaceRoot, path.resolve(repoRoot)).split(path.sep).join('/') || '.';
     const cache = path.join(config.workspaceRoot, '.carrick', 'deno', createHash('sha256').update(place).digest('hex').slice(0, 16));
     this.cacheDir = cache;
-    // The graph root lives within the service so compilerOptions.types uses
-    // that member's import-map scope, just like the real source files do.
-    const entry = path.join(repoRoot, '.carrick', 'deno', 'graph.ts');
+    // The graph root sits in the cache, beside the files Deno reads and the
+    // workspace's own `.carrick/`, never inside the service: a file there
+    // shows in `git status` while it exists, and the folder it leaves makes
+    // the checkout look like a workspace of its own. It is written, read by
+    // `deno info` and removed.
+    const entry = path.join(cache, 'graph.ts');
+    // A `.carrick/` that Carrick makes here, in a checkout it has not indexed
+    // (a git worktree under another checkout, say), ignores itself the way an
+    // indexed one does, so git sees nothing of it.
+    const selfIgnore = path.join(config.workspaceRoot, '.carrick', '.gitignore');
     // Its cache and its graph root are the only places a Deno project writes,
     // both inside `.carrick/deno` (carrick#1748).
-    const guard = WriteGuard.of({ dirs: [cache, path.dirname(entry)], protect: [repoRoot, config.workspaceRoot] });
+    const guard = WriteGuard.of({ dirs: [cache], files: [selfIgnore], protect: [repoRoot, config.workspaceRoot] });
     guard.mkdir(cache);
+    if (!fs.existsSync(selfIgnore)) guard.writeFile(selfIgnore, '# Written by Carrick. Everything here is derived from your source.\n*\n');
     const raw = { ...config.compilerOptions };
     const libs = Array.isArray(raw.lib) ? raw.lib as string[] : ['deno.window'];
     const denoLibs = libs.filter(l => l.startsWith('deno.'));
@@ -215,7 +243,6 @@ export class DenoProject {
       guard.writeFile(globalPath, text);
       this.globals.push(globalPath);
     }
-    guard.mkdir(path.dirname(entry));
     const roots = this.parsed.fileNames.map(f => pathToFileURL(f).href);
     const extraTypes = config.compilerOptions.types;
     if (Array.isArray(extraTypes)) roots.push(...extraTypes.filter((t): t is string => typeof t === 'string'));

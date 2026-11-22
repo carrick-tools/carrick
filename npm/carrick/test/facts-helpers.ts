@@ -52,6 +52,8 @@ export async function workspace(
     fs.writeFileSync(path.join(root, rel), text);
   }
   fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
+  // A workspace root holds an index; a `.carrick/` without one is not a root.
+  fs.writeFileSync(path.join(root, ".carrick", "index.json"), "{}");
   fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: SLUG }] } }));
   if (rows !== null) {
     // Only a repo folder the test wrote is a checkout here, as `matchRepos`

@@ -41,6 +41,8 @@ async function factsWorkspace(
   });
   fs.cpSync(path.join(testDir, "fixtures", "facts"), root, { recursive: true });
   fs.mkdirSync(path.join(root, ".carrick"), { recursive: true });
+  // A workspace root holds an index; a `.carrick/` without one is not a root.
+  fs.writeFileSync(path.join(root, ".carrick", "index.json"), "{}");
   const ndjson = options.ndjson === undefined ? fs.readFileSync(WIRE, "utf8") : options.ndjson;
   if (ndjson !== null) {
     // The workspace is the fact file's project.
