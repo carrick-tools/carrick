@@ -112,9 +112,11 @@ Init does not hide a path git already tracks:
   Carrick's entries to it, and git shows the file as changed. Codex reads hooks
   only from that file and from `$CODEX_HOME/hooks.json`, so it has no file per
   clone.
-- The Carrick rules section is written as before, in `AGENTS.md` and in a
-  `CLAUDE.md` the repository already has, and git shows those files as changed.
-  Whether the section stays is under review.
+- The Carrick section in `AGENTS.md`, and in a `CLAUDE.md` the repository
+  already has, is one line between its markers that points at
+  `.carrick/RULES.md`, and git shows those files as changed. The rules
+  themselves are in `.carrick/RULES.md`, which git ignores, so a change to the
+  rules never changes a committed file.
 
 An older install that put Carrick's entries in a tracked `.claude/settings.json`
 is moved, and `carrick init` takes them out of that file. When nothing else in
@@ -184,10 +186,11 @@ workspace keeps the hook entries and skill bodies of whichever version first ran
   (`npm/carrick/src/init/self-update.ts`): the hook entries in
   `.claude/settings.json` and `.claude/settings.local.json` (Claude Code
   sessions only), and, in Claude Code and Codex alike, the task skills still
-  ours under `.claude/skills` and `.agents/skills` and the Carrick rules section
+  ours under `.claude/skills` and `.agents/skills`, the one-line Carrick section
   between its markers in `AGENTS.md`, and in a `CLAUDE.md` the folder already
   has (init writes it there too and never creates that file; `carrick remove`
-  takes it out and keeps the file). It prints one line for
+  takes it out and keeps the file), and the rules file `.carrick/RULES.md`,
+  written when it is missing or differs from this version's text. It prints one line for
   each ("Carrick brought its hook entries in <file> up to date for <version>.")
   and records the version, so the "run `carrick init`" line is not what an
   upgrade costs. It skips a file that holds no entry of ours, a settings file
@@ -271,7 +274,7 @@ files the Read hook asked about, and the last edit per workspace.
 functions a task added and asked for one `find_similar` call (carrick#1330).
 Across 68 graded runs no code edit followed that call, and summaries repeated
 that a new function "isn't in the index yet". Reuse is decided before the code
-is written (rule 1 of the AGENTS.md section, the `carrick-reuse` skill), so the
+is written (rule 1 in `.carrick/RULES.md`, the `carrick-reuse` skill), so the
 line and the per-session list of new functions were removed from both hosts.
 `carrick check --recheck` still answers with `recheck.new_functions`. The
 post-edit hook prints one block for a new function that has `similar` rows,
