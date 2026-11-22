@@ -1170,7 +1170,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
             let pair = pair.as_ref()?;
             let several =
                 operations_on_line[&(pair.caller_file.as_str(), pair.caller_line)].len() > 1;
-            Some(read_caller(&root, pair, several, &rows, &own, &mut parsed))
+            Some(read_caller(root, pair, several, rows, own, &mut parsed))
         })
         .collect();
 
