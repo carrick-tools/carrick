@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.176](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.175...carrick-v0.3.176) (2026-11-22)
+
+
+### Features
+
+* **init:** one line in AGENTS.md and CLAUDE.md, the rules in .carrick/RULES.md ([#5064](https://github.com/carrick-tools/carrick/issues/5064)) ([7200b40](https://github.com/carrick-tools/carrick/commit/7200b4016f913e63b0adbd79f79d52507e5ff948))
+* **matched-pass:** type each end of a carrick.matched/2 record (T-S1) ([#5057](https://github.com/carrick-tools/carrick/issues/5057)) ([54027a6](https://github.com/carrick-tools/carrick/commit/54027a6b2d0212a057c1eb678f262bd728525c1d))
+
+
+### Bug Fixes
+
+* a .carrick folder with no index is not a workspace, and the Deno read writes nothing into a service folder ([#5028](https://github.com/carrick-tools/carrick/issues/5028)) ([ef06eb8](https://github.com/carrick-tools/carrick/commit/ef06eb89bfb64e62113da666662a3102d16a1c9b))
+* a re-check names a stale service only when it pairs with or reads the edited file ([#5061](https://github.com/carrick-tools/carrick/issues/5061)) ([775f80b](https://github.com/carrick-tools/carrick/commit/775f80bc8475be05f6056da9b51f20dbfa5f8964))
+
 ## [0.3.175](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.174...carrick-v0.3.175) (2026-11-22)
 
 
