@@ -804,6 +804,34 @@ fn a_serving_end_on_an_express_style_handler_gets_its_response_type() {
     assert!(text.contains("total: number"), "{text}");
 }
 
+/// A handler that answers through its response object reads `void` without
+/// the scan's extraction config: that is a stop, never a type.
+#[test]
+fn a_handler_answering_through_its_response_object_is_never_typed_void() {
+    let Some((_, out)) = ends_run() else { return };
+    let mut wrong = Vec::new();
+    for (line, name) in [(20, "/items"), (23, "/notes"), (26, "/gone")] {
+        let serving = &end(out, "apps/api/src/orders.ts", line, name)["type"];
+        let typed = serving["expanded_definition"].as_str();
+        let says_nothing = |t: &str| matches!(t.trim(), "void" | "undefined" | "never");
+        // A real type, or a stop; never a type that says nothing.
+        let stated =
+            typed.is_some_and(|t| t.contains("id: number")) || serving["reason"].is_string();
+        if serving["basis"] != "compiler" || !stated || typed.is_some_and(says_nothing) {
+            wrong.push(format!("{name}: {serving:#}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_call_end_typed_any_states_type_is_any() {
+    let Some((_, out)) = ends_run() else { return };
+    let call = &end(out, WEB, 30, "/raw")["type"];
+    assert_eq!(call["reason"], "type_is_any", "{call:#}");
+    assert!(call.get("expanded_definition").is_none(), "{call:#}");
+}
+
 #[test]
 fn an_end_the_engine_cannot_type_states_its_reason() {
     let Some((input, out)) = ends_run() else {

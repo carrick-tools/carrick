@@ -100,6 +100,62 @@
       "confidence": "stated",
       "basis": "text",
       "carried_from": null
+    },
+    {
+      "id": "a1a1a1a1a1a1a1a1",
+      "side": "endpoint",
+      "protocol": "http",
+      "kind": "route",
+      "method": "GET",
+      "path": "/items",
+      "file": "apps/api/src/orders.ts",
+      "line": 20,
+      "line_sha256": "2a32f26643c282bb3f16d332e1f45077026ccdd3b669e36874b0ee779d328497",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "a2a2a2a2a2a2a2a2",
+      "side": "endpoint",
+      "protocol": "http",
+      "kind": "route",
+      "method": "GET",
+      "path": "/notes",
+      "file": "apps/api/src/orders.ts",
+      "line": 23,
+      "line_sha256": "e3f5d2cd87a30718209e77f06d37ef67b655217a1306d6ac25c0235464564a27",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "a3a3a3a3a3a3a3a3",
+      "side": "endpoint",
+      "protocol": "http",
+      "kind": "route",
+      "method": "GET",
+      "path": "/gone",
+      "file": "apps/api/src/orders.ts",
+      "line": 26,
+      "line_sha256": "02c02d1e74d05cec90397b8c92ff9c493b5caf0e13e03cf8291af12594da69fd",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "a4a4a4a4a4a4a4a4",
+      "side": "call",
+      "protocol": "http",
+      "kind": "route",
+      "method": "GET",
+      "path": "/raw",
+      "file": "apps/web/src/orders.ts",
+      "line": 30,
+      "line_sha256": "ab0526e4e0bdf0bfa8a279f693bd182a4e743b97f8f738f95a7350dc384d453a",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
     }
   ],
   "dropped": {}

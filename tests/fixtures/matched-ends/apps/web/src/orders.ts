@@ -25,3 +25,7 @@ export async function loadGraph(): Promise<unknown> {
 }
 
 declare function gql(query: string): Promise<unknown>;
+
+export async function loadRaw(): Promise<unknown> {
+  return request<any>('/raw');
+}

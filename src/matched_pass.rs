@@ -1405,15 +1405,55 @@ fn storable_alias(alias: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
+/// A type text that says nothing about what the end carries, so it is stated
+/// as a stop and never as a type. A call end whose result is `any` or
+/// `unknown` is `type_is_any`. A serving end whose response reads `void`,
+/// `undefined`, `never`, `Promise<void>`, `any` or `unknown` is
+/// `response_not_read`: the handler may answer through its response object
+/// (`res.json(body)`), which the scan reads only with the extraction config
+/// it stores, and the pass has none. The compiler cannot tell that apart from
+/// a handler that returns nothing, and a wrong concrete type is worse than a
+/// stop. The one rule for both formats' ends; the pairs path has its own
+/// [`reading`].
+fn empty_reading(text: &str, call: bool) -> Option<&'static str> {
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if matches!(squeezed.as_str(), "any" | "unknown") {
+        return Some(if call {
+            "type_is_any"
+        } else {
+            "response_not_read"
+        });
+    }
+    if !call
+        && matches!(
+            squeezed.as_str(),
+            "void" | "undefined" | "never" | "Promise<void>"
+        )
+    {
+        return Some("response_not_read");
+    }
+    None
+}
+
 /// The `type` of one end, in the shape the cloud's record validator enforces:
 /// a read (`basis`, `type_kind`, `alias`, `resolved_definition`, optional
 /// `expanded_definition`, `read_at`), or `basis`, `type_kind` and `reason`
 /// alone. The reader stamps key, file and line from the end. The side is read
 /// by [`reading`], the rule the pairs path uses, so both formats state the
 /// same type. Nothing is cut: a text the cloud would refuse is a reason.
-fn type_of(read: &MatchedEndTypes, file: &str, line: u32) -> Value {
+fn type_of(read: &MatchedEndTypes, call: bool, file: &str, line: u32) -> Value {
     let unread =
         |reason: &str| json!({ "basis": "compiler", "type_kind": "response", "reason": reason });
+    // The type stage states a top type the source itself declares (`any`,
+    // `unknown`) as `declared` with no type: the same fact as a text of `any`.
+    let text = match (&read.type_read, read.reason.as_deref()) {
+        (Some(t), _) => Some(t.expanded.trim()),
+        (None, Some("declared")) => Some("any"),
+        _ => None,
+    };
+    if let Some(reason) = text.and_then(|t| empty_reading(t, call)) {
+        return unread(reason);
+    }
     let side = reading(read, file, line);
     let (Some(text), Some(type_read)) = (side.get("text").and_then(Value::as_str), &read.type_read)
     else {
@@ -1587,7 +1627,7 @@ fn annotate_ends(record: &mut Value, inputs: &Inputs<'_>, started: Instant) -> R
             Some(types) => {
                 let row = &types[position];
                 let read = if end.call { &row.caller } else { &row.server };
-                type_of(read, &end.file, end.line)
+                type_of(read, end.call, &end.file, end.line)
             }
             // No engine: only what was decided without it is stated.
             None => match stated.iter().find(|(at, _)| *at == index) {
@@ -1598,6 +1638,7 @@ fn annotate_ends(record: &mut Value, inputs: &Inputs<'_>, started: Instant) -> R
                         type_read: None,
                         reason: Some((*reason).to_string()),
                     },
+                    end.call,
                     &end.file,
                     end.line,
                 ),
@@ -1860,6 +1901,48 @@ const i = client.get(
             }),
             reason: reason.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn a_response_that_says_nothing_is_a_stop_never_a_type() {
+        for text in [
+            "void",
+            "undefined",
+            "never",
+            "Promise<void>",
+            "any",
+            "unknown",
+            " Promise< void > ",
+        ] {
+            let value = type_of(&end_types(Some(text), None), false, "a.ts", 3);
+            assert_eq!(
+                value,
+                json!({ "basis": "compiler", "type_kind": "response", "reason": "response_not_read" }),
+                "{text}"
+            );
+        }
+        // The type stage's word for a top type the source declares.
+        let declared = type_of(&end_types(None, Some("declared")), false, "a.ts", 3);
+        assert_eq!(declared["reason"], "response_not_read");
+        // A handler that returns its body keeps its type.
+        let body = type_of(&end_types(Some("{ id: number }"), None), false, "a.ts", 3);
+        assert_eq!(body["expanded_definition"], "{ id: number }");
+        assert!(body["reason"].is_null());
+    }
+
+    #[test]
+    fn a_call_result_typed_any_is_type_is_any() {
+        for text in ["any", "unknown"] {
+            let value = type_of(&end_types(Some(text), None), true, "a.ts", 3);
+            assert_eq!(value["reason"], "type_is_any", "{text}");
+        }
+        assert_eq!(
+            type_of(&end_types(None, Some("declared")), true, "a.ts", 3)["reason"],
+            "type_is_any"
+        );
+        // `void` is a legitimate call result.
+        let void = type_of(&end_types(Some("void"), None), true, "a.ts", 3);
+        assert_eq!(void["expanded_definition"], "void");
     }
 
     #[test]
