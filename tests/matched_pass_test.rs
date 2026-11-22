@@ -715,3 +715,149 @@ fn an_unusable_rows_dir_warns_and_never_fails_the_scan() {
         assert!(log.contains("were not kept"), "{log}");
     }
 }
+
+// ---- carrick.matched/2: the pass types each end on its own ----------------
+
+/// The pass over the ends record (`tests/fixtures/matched-ends`, invented),
+/// run once with no store, as the runner runs it today.
+fn ends_run() -> Option<&'static (Value, Value)> {
+    static RUN: OnceLock<Option<(Value, Value)>> = OnceLock::new();
+    RUN.get_or_init(|| {
+        if !sidecar_built() {
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("orders");
+        copy_tree(&manifest_dir().join("tests/fixtures/matched-ends"), &tree);
+        let input: Value =
+            serde_json::from_slice(&std::fs::read(tree.join("ends.json")).unwrap()).unwrap();
+        let out = dir.path().join("out.json");
+        let output = carrick(&[
+            "__matched-pass".as_ref(),
+            tree.join("ends.json").as_os_str(),
+            "--repo".as_ref(),
+            tree.as_os_str(),
+            "--out".as_ref(),
+            out.as_os_str(),
+        ])
+        .output()
+        .expect("spawn carrick");
+        assert!(
+            output.status.success(),
+            "pass failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        Some((input, output))
+    })
+    .as_ref()
+}
+
+/// The output end at `file:line` naming `path` (or the GraphQL field).
+fn end<'a>(record: &'a Value, file: &str, line: u64, name: &str) -> &'a Value {
+    record["ends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|end| {
+            end["file"] == file
+                && end["line"] == line
+                && (end["path"] == name || end["name"] == name)
+        })
+        .unwrap_or_else(|| panic!("no end {file}:{line} {name}"))
+}
+
+const WEB: &str = "apps/web/src/orders.ts";
+
+#[test]
+fn a_call_through_a_typed_wrapper_gets_the_wrappers_declared_type() {
+    let Some((_, out)) = ends_run() else { return };
+    assert_eq!(out["engine"]["status"], "done", "{}", out["engine"]);
+    let call = &end(out, WEB, 15, "/orders")["type"];
+    assert_eq!(call["basis"], "compiler", "{call:#}");
+    assert_eq!(call["type_kind"], "response");
+    assert!(call["reason"].is_null(), "{call:#}");
+    let alias = call["alias"].as_str().expect("an alias");
+    assert!(
+        alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && alias.len() <= 200,
+        "{alias}"
+    );
+    let text = call["expanded_definition"].as_str().expect("a type");
+    assert!(
+        text.contains("id: string") && text.contains("total: number"),
+        "{text}"
+    );
+    assert!(call["resolved_definition"].is_string(), "{call:#}");
+    assert_eq!(call["read_at"]["file"], WEB);
+    assert_eq!(call["read_at"]["line"], 15);
+}
+
+/// The handler registered with `app.get(path, handler)` hands its body back.
+/// A body written through `res.json(..)` is read only with the extraction
+/// config the scan stores, which the runner's pass does not hold yet.
+#[test]
+fn a_serving_end_on_an_express_style_handler_gets_its_response_type() {
+    let Some((_, out)) = ends_run() else { return };
+    let serving = &end(out, "apps/api/src/orders.ts", 9, "/orders")["type"];
+    assert_eq!(serving["basis"], "compiler", "{serving:#}");
+    let text = serving["expanded_definition"].as_str().expect("a type");
+    assert!(text.contains("total: number"), "{text}");
+}
+
+/// A handler that answers through its response object reads `void` without
+/// the scan's extraction config: that is a stop, never a type.
+#[test]
+fn a_handler_answering_through_its_response_object_is_never_typed_void() {
+    let Some((_, out)) = ends_run() else { return };
+    let mut wrong = Vec::new();
+    for (line, name) in [(20, "/items"), (23, "/notes"), (26, "/gone")] {
+        let serving = &end(out, "apps/api/src/orders.ts", line, name)["type"];
+        let typed = serving["expanded_definition"].as_str();
+        let says_nothing = |t: &str| matches!(t.trim(), "void" | "undefined" | "never");
+        // A real type, or a stop; never a type that says nothing.
+        let stated =
+            typed.is_some_and(|t| t.contains("id: number")) || serving["reason"].is_string();
+        if serving["basis"] != "compiler" || !stated || typed.is_some_and(says_nothing) {
+            wrong.push(format!("{name}: {serving:#}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_call_end_typed_any_states_type_is_any() {
+    let Some((_, out)) = ends_run() else { return };
+    let call = &end(out, WEB, 30, "/raw")["type"];
+    assert_eq!(call["reason"], "type_is_any", "{call:#}");
+    assert!(call.get("expanded_definition").is_none(), "{call:#}");
+}
+
+#[test]
+fn an_end_the_engine_cannot_type_states_its_reason() {
+    let Some((input, out)) = ends_run() else {
+        return;
+    };
+    for name in ["/orders", "/stock"] {
+        assert_eq!(
+            end(out, WEB, 20, name)["type"]["reason"],
+            "several_sites_on_line",
+            "{name}"
+        );
+    }
+    // The cloud refuses a `type` on a GraphQL end: none is written.
+    assert!(end(out, WEB, 24, "orders").get("type").is_none());
+    assert_eq!(
+        end(out, "db/001_orders.sql", 1, "/rest/v1/orders")["type"]["reason"],
+        "not_typescript_source"
+    );
+    // Every end of the record is in the output, with only `type` added, and
+    // the record says nothing else changed but `engine`.
+    let mut stripped = out.clone();
+    stripped.as_object_mut().unwrap().remove("engine");
+    for end in stripped["ends"].as_array_mut().unwrap() {
+        end.as_object_mut().unwrap().remove("type");
+    }
+    let mut expected = input.clone();
+    expected.as_object_mut().unwrap().remove("engine");
+    assert_eq!(stripped, expected);
+}

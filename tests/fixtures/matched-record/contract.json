@@ -20,7 +20,7 @@
         {
           "kind": "graphql_field",
           "endpoints": 1,
-          "calls": 0
+          "calls": 1
         },
         {
           "kind": "procedure",
@@ -80,7 +80,18 @@
       "line_sha256": "c517e829fe03ec038a8869b0eb9f6164a1f64b5439e8a95cb39cf054478ec15f",
       "confidence": "stated",
       "basis": "text",
-      "carried_from": null
+      "carried_from": null,
+      "type": {
+        "basis": "compiler",
+        "type_kind": "response",
+        "alias": "Endpoint_call_GET_v1_orders_response",
+        "resolved_definition": "OrderList",
+        "expanded_definition": "{ orders: { id: string; total: number; }[]; }",
+        "read_at": {
+          "file": "apps/web/src/lib/api.ts",
+          "line": 3
+        }
+      }
     },
     {
       "id": "04ede230ad1ba56e",
@@ -94,7 +105,17 @@
       "line_sha256": "c62e8fc2d2b62ca3669790df9f28acda28e4d16ccbf68dcaa3ab0862b2a8eb8d",
       "confidence": "stated",
       "basis": "text",
-      "carried_from": null
+      "carried_from": null,
+      "type": {
+        "basis": "compiler",
+        "type_kind": "response",
+        "alias": "Endpoint_endpoint_GET_v1_orders_response",
+        "resolved_definition": "{ orders: { id: string; total: number; }[]; }",
+        "read_at": {
+          "file": "apps/api/src/orders/orders.router.ts",
+          "line": 1
+        }
+      }
     },
     {
       "id": "a3ce96735e2d5da7",
@@ -123,6 +144,26 @@
       "file": "apps/api/src/schema.graphql",
       "line": 2,
       "line_sha256": "faae004a144bab160f489894fc290d18f8afc3c03195185c8e54468517975362",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "494364a570f12481",
+      "side": "call",
+      "protocol": "graphql",
+      "kind": "graphql_field",
+      "name": "orders",
+      "gql_kind": "query",
+      "base": "${API_URL}/graphql",
+      "base_at": {
+        "file": "apps/web/src/lib/api.ts",
+        "line": 6,
+        "line_sha256": "057996bd132aa58690aac582bb844367a43a67e4f7d39867a29be3618ee1ea52"
+      },
+      "file": "apps/web/src/lib/api.ts",
+      "line": 5,
+      "line_sha256": "b3e99eb3c317f3240a46ea48abeea3013ccc000ef02e6b4b5bf9d912d4b29bb7",
       "confidence": "stated",
       "basis": "text",
       "carried_from": null
