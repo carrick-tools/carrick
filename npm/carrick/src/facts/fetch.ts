@@ -25,10 +25,9 @@ import type { RefreshOptions } from "../hook/refresh.ts";
 import { status as readStatus } from "../cli.ts";
 import type { StatusResult } from "../contract.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
-import { splitRemote } from "../git-remote.ts";
 import { chainLinesEnabled, contractLinesEnabled, factsEnabled } from "./enabled.ts";
 import { buildFacts, closeQuietly, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
-import type { LocalRepo } from "./store.ts";
+import { localRepos, matchRepos } from "./repo-match.ts";
 
 const log = createLogger("carrick-facts");
 
@@ -53,47 +52,6 @@ export type FactsRefreshOptions = {
   /** Injected in tests: the workspace status and the detached start of the hosted move that a new fact file begins. */
   forward?: { status?: () => Promise<StatusResult | null>; start?: RefreshOptions["start"] };
 };
-
-/** Each repo of the local index and where it is checked out (`.carrick/index.json`). */
-export function localRepos(root: string): Array<{ name: string; path: string; remote: string | null }> {
-  try {
-    const index = JSON.parse(fs.readFileSync(path.join(root, ".carrick", "index.json"), "utf8")) as {
-      repos?: Array<{ name?: unknown; path?: unknown; services?: Array<{ enrichment?: { remote?: unknown } }> }>;
-    };
-    return (index.repos ?? [])
-      .filter((repo) => typeof repo.name === "string" && typeof repo.path === "string")
-      .map((repo) => {
-        const remote = (repo.services ?? []).map((service) => service.enrichment?.remote).find((value) => typeof value === "string");
-        return { name: repo.name as string, path: repo.path as string, remote: (remote as string | undefined) ?? null };
-      });
-  } catch {
-    return [];
-  }
-}
-
-/**
- * The fact file's repos matched to their checkouts here. A header repo that
- * is a remote (`owner/name`, as the index stores a GitHub repo) maps only to
- * the one checkout whose origin names exactly that; a bare name maps only to
- * the one checkout of exactly that name. No match, or more than one, leaves
- * the repo unmapped: its rows are never read. Two header repos that map to
- * one checkout (`api` and `owner/api`) are both left unmapped.
- */
-export function matchRepos(repos: readonly string[], local: ReturnType<typeof localRepos>): LocalRepo[] {
-  const out: LocalRepo[] = [];
-  for (const repo of repos) {
-    const found = repo.includes("/")
-      ? local.filter((entry) => entry.remote !== null && ownerName(entry.remote) === repo)
-      : local.filter((entry) => entry.name === repo);
-    if (found.length === 1) out.push({ repo, path: found[0]!.path });
-  }
-  return out.filter((entry) => out.filter((other) => other.path === entry.path).length === 1);
-}
-
-/** The `owner/name` an origin names, in either spelling git accepts, or the text itself. */
-function ownerName(remote: string): string {
-  return splitRemote(remote)?.name ?? remote;
-}
 
 /** Whether a staged URL is https on an `amazonaws.com` host (a presigned S3 URL). */
 function stagedUrlAllowed(url: string): boolean {

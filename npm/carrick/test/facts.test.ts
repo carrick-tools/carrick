@@ -745,17 +745,18 @@ test("a file over 512 KB is skipped: a 2 MB generated file returns in under 50 m
   assert.ok(outcome.ms < 50, `took ${outcome.ms} ms`);
 });
 
-test("a fact file's repo maps to a checkout only by its exact remote, else its exact name", async () => {
-  const { matchRepos } = await import("../src/facts/fetch.ts");
+test("a fact file's repo maps to a checkout by its exact remote, else its exact name, else its origin's repo name", async () => {
+  const { matchRepos } = await import("../src/facts/repo-match.ts");
   const local = [
     { name: "web", path: "/w/web", remote: "git@github.com:acme/web.git" },
     { name: "api", path: "/w/api", remote: "https://github.com/acme/api-server" },
     { name: "jobs", path: "/w/jobs-1", remote: null },
     { name: "jobs", path: "/w/jobs-2", remote: null },
   ];
-  // The remote's last segment is not the repo.
+  // A folder named as the repo wins whatever its origin says.
   assert.deepEqual(matchRepos(["api"], local), [{ repo: "api", path: "/w/api" }]);
-  assert.deepEqual(matchRepos(["api-server"], local), []);
+  // With no folder of that name, the origin's repo name is the repo (a renamed folder).
+  assert.deepEqual(matchRepos(["api-server"], local), [{ repo: "api-server", path: "/w/api" }]);
   // An exact owner/name remote, in either spelling git accepts.
   assert.deepEqual(matchRepos(["acme/web", "acme/api-server"], local), [
     { repo: "acme/web", path: "/w/web" },
@@ -767,8 +768,83 @@ test("a fact file's repo maps to a checkout only by its exact remote, else its e
   assert.deepEqual(matchRepos(["jobs"], local), []);
 });
 
+test("a bare repo name maps to a renamed checkout by its origin, and two such checkouts in one index are neither read", async () => {
+  const { matchRepos } = await import("../src/facts/repo-match.ts");
+  const one = [{ name: "fresh1", path: "/w/fresh1", remote: "https://github.com/acme/mono-ticket-a1.git" }];
+  assert.deepEqual(matchRepos(["mono-ticket-a1"], one), [{ repo: "mono-ticket-a1", path: "/w/fresh1" }]);
+  assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: "git@github.com:acme/Mono-Ticket-A1.git" }]), [{ repo: "mono-ticket-a1", path: "/w/fresh1" }]);
+  assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: null }]), []);
+  assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: "not a remote" }]), []);
+  const two = [...one, { name: "copy", path: "/w/copy", remote: "git@github.com:acme/mono-ticket-a1" }];
+  assert.deepEqual(matchRepos(["mono-ticket-a1"], two), []);
+  // The folder named as the repo: the same answer as before the origin was read.
+  const named = [{ name: "mono-ticket-a1", path: "/w/mono-ticket-a1", remote: "https://github.com/acme/mono-ticket-a1.git" }, ...one];
+  assert.deepEqual(matchRepos(["mono-ticket-a1"], named), [{ repo: "mono-ticket-a1", path: "/w/mono-ticket-a1" }]);
+});
+
+/** A checkout `dir/<folder>` whose index names it `folder` and its origin `remote`; a fact file naming `hosted` built from it. */
+async function renamedCheckout(base: string, folder: string, hosted: string, remote: string, siblings: string[] = []): Promise<string> {
+  const { localRepos, matchRepos } = await import("../src/facts/repo-match.ts");
+  const root = path.join(base, folder);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "s" }] } }));
+  fs.writeFileSync(path.join(root, ".carrick", "index.json"), JSON.stringify({ repos: [folder, ...siblings].map((name) => ({ name, path: path.join(base, name), services: [{ enrichment: { remote } }] })) }));
+  const place = { service: "web", repo: "web-peer", file: "src/c.ts", line: 4, loc: "web-peer/src/c.ts:4" };
+  const row = {
+    k: "contract", side: "producer", protocol: "http", label: "POST /v1/payments/calculate", direction: "response", service: "api", repo: hosted, file: "src/a.ts", line: 1,
+    name: null, site: null, locator: "registration", values: [{ file: "src/a.ts", span: [0, 5] }], untyped: [], total: 1,
+    groups: [{ type: "{ total: number }", symbol: null, home: null, places: [place], total: 1, shown: 1, lead: "", more: "", tail: "", shortened: false }],
+  };
+  const header = { schema: 1, writer: 12, project_id: "p", project_slug: "s", digest: "d", built_at: "2026-01-01T00:00:00Z", repos: [{ repo: hosted, service: "api", commit: "1" }] };
+  const text = `${[header, row].map((l) => JSON.stringify(l)).join("\n")}\n`;
+  await buildFacts(text, factsPath(root), matchRepos([hosted], localRepos(root)), new Date().toISOString());
+  return root;
+}
+
+test("a checkout whose folder is not the repo's name gets its rows counted for the held engine; one named as the repo is unchanged", async (t) => {
+  const { createRuntime } = await import("../src/held/runtime.ts");
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-origin-name-")));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const remote = "https://github.com/acme/mono-ticket-a1.git";
+  const count = (root: string, repo: string) => createRuntime({ root, env: {} }).rowCount!({ repo, service: "api", repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root });
+  // (a) folder `fresh1`: the daemon keys the service by the folder's name.
+  const renamed = await renamedCheckout(path.join(base, "a"), "fresh1", "mono-ticket-a1", remote);
+  assert.equal(await count(renamed, "fresh1"), 1);
+  assert.equal(await count(renamed, "mono-ticket-a1"), 0, "the hosted name is not a local repo's name here");
+  // (b) folder named as the repo: keyed as it always was.
+  const same = await renamedCheckout(path.join(base, "b"), "mono-ticket-a1", "mono-ticket-a1", remote);
+  assert.equal(await count(same, "mono-ticket-a1"), 1);
+  // (c) two clones of one hosted repo, each its own workspace: each its own rows, none reads the other's.
+  const first = await renamedCheckout(path.join(base, "c1"), "clone-one", "mono-ticket-a1", remote);
+  const second = await renamedCheckout(path.join(base, "c2"), "clone-two", "mono-ticket-a1", remote);
+  assert.equal(await count(first, "clone-one"), 1);
+  assert.equal(await count(second, "clone-two"), 1);
+  assert.equal(await count(first, "clone-two"), 0);
+  assert.equal(await count(second, "clone-one"), 0);
+  const { openFacts } = await import("../src/facts/store.ts");
+  for (const [root] of [[first], [second]] as const) {
+    const store = (await openFacts(root!))!;
+    assert.deepEqual(store.repos, [{ repo: "mono-ticket-a1", path: root }]);
+    store.close();
+  }
+});
+
+test("two checkouts of one hosted repo in one index: neither is mapped, so neither is read", async (t) => {
+  const { createRuntime } = await import("../src/held/runtime.ts");
+  const { openFacts } = await import("../src/facts/store.ts");
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-origin-two-")));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const root = await renamedCheckout(base, "one", "mono-ticket-a1", "git@github.com:acme/mono-ticket-a1.git", ["two"]);
+  const store = (await openFacts(root))!;
+  assert.deepEqual(store.repos, []);
+  store.close();
+  const runtime = createRuntime({ root, env: {} });
+  for (const repo of ["one", "two"]) assert.equal(await runtime.rowCount!({ repo, service: "api", repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root }), 0);
+});
+
 test("R24.7: two header repos that map to one checkout are neither mapped", async () => {
-  const { matchRepos } = await import("../src/facts/fetch.ts");
+  const { matchRepos } = await import("../src/facts/repo-match.ts");
   const { locate } = await import("../src/facts/lines.ts");
   const local = [{ name: "api", path: "/w/api", remote: "https://github.com/zeta/api" }];
   assert.deepEqual(matchRepos(["api", "zeta/api"], local), []);

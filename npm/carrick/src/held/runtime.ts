@@ -22,7 +22,8 @@ import ts from "typescript";
 import { diffAgainst, textAtCommit } from "../facts/diff.ts";
 import { contractKey } from "../facts/lines.ts";
 import { commitsOf, indexedCommit, localCheckouts } from "../facts/peers.ts";
-import { factsPath, openFacts, type ContractGroup, type ContractRow, type GraphqlTypeTable } from "../facts/store.ts";
+import { localNames, localRepos } from "../facts/repo-match.ts";
+import { factsPath, openFacts, type ContractGroup, type ContractRow, type GraphqlTypeTable, type FactStore } from "../facts/store.ts";
 import { createLogger } from "../log.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit, ServiceRuntime, StartResult } from "./daemon.ts";
 import { StalePull, Ts7Lsp, type Diag as LspDiag, type Engine } from "./engine.ts";
@@ -880,11 +881,24 @@ function factStamp(root: string): string {
   }
 }
 
+/**
+ * The names this checkout calls the fact file's repos (`facts/repo-match.ts`):
+ * the daemon keys a service by its local name (the folder's), the fact file by
+ * the hosted one. Empty when every repo's folder is named as it is.
+ */
+function renames(root: string, store: FactStore, taken: ReadonlySet<string> = new Set()): Map<string, string> {
+  return localNames(store.repos, localRepos(root), taken);
+}
+
+const named = (names: ReadonlyMap<string, string>, repo: string): string => names.get(repo) ?? repo;
+
 async function factCommits(root: string): Promise<Record<string, string> | null> {
   const store = await openFacts(root);
   if (store === null) return null;
   try {
-    return commitsOf(store.meta);
+    const names = renames(root, store);
+    const commits = commitsOf(store.meta);
+    return commits === null ? null : Object.fromEntries(Object.entries(commits).map(([repo, commit]) => [named(names, repo), commit]));
   } finally {
     store.close();
   }
@@ -894,7 +908,8 @@ async function factRepoPaths(root: string): Promise<Record<string, string>> {
   const store = await openFacts(root);
   if (store === null) return {};
   try {
-    return Object.fromEntries(store.repos.map((entry) => [entry.repo, entry.path]));
+    const names = renames(root, store);
+    return Object.fromEntries(store.repos.map((entry) => [named(names, entry.repo), entry.path]));
   } finally {
     store.close();
   }
@@ -904,7 +919,17 @@ async function factRows(root: string): Promise<ContractRow[]> {
   const store = await openFacts(root);
   if (store === null) return [];
   try {
-    return [...store.producerResponses(), ...store.graphqlProducerResponses(), ...messageSendRows(store.messageRows())];
+    const rows = [...store.producerResponses(), ...store.graphqlProducerResponses(), ...messageSendRows(store.messageRows())];
+    // A local name another row already carries is not taken over (the rows would read as one repo's).
+    const names = renames(root, store, new Set(rows.map((row) => row.repo)));
+    if (names.size === 0) return rows;
+    const at = (repo: string) => named(names, repo);
+    return rows.map((row) => ({
+      ...row,
+      repo: at(row.repo),
+      groups: row.groups.map((group) => ({ ...group, places: group.places.map((place) => ({ ...place, repo: at(place.repo) })) })),
+      untyped: row.untyped.map((entry) => ({ ...entry, repo: at(entry.repo) })),
+    }));
   } finally {
     store.close();
   }
@@ -914,7 +939,8 @@ async function factTable(root: string, repo: string, service: string): Promise<G
   const store = await openFacts(root);
   if (store === null) return null;
   try {
-    return store.graphqlTypes(repo, service);
+    const hosted = [...renames(root, store)].find(([, local]) => local === repo)?.[0] ?? repo;
+    return store.graphqlTypes(hosted, service);
   } finally {
     store.close();
   }
