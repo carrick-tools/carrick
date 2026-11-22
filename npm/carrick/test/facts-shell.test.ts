@@ -47,6 +47,7 @@ async function workspace(t: { after: (fn: () => void) => void }, extra: string[]
   fs.cpSync(path.join(testDir, "fixtures", "facts"), root, { recursive: true });
   for (const [rel, text] of Object.entries(files)) fs.writeFileSync(path.join(root, rel), text);
   fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".carrick", "index.json"), "{}");
   fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo" }] } }));
   const wire = fs.readFileSync(WIRE, "utf8");
   const body = [header, ...wire.split("\n").slice(1).filter((line) => line.trim() !== ""), ...extra].join("\n");

@@ -292,7 +292,7 @@ describe('carrick#1748: a Deno capture writes only its documented cache', { skip
     fs.rmSync(base, { recursive: true, force: true });
   });
 
-  it('leaves every file outside the two .carrick/deno roots byte-identical', () => {
+  it('leaves every file outside the workspace root\'s .carrick/deno byte-identical, and the service folder untouched', () => {
     const root = path.join(base, 'repo');
     writeTree(root, {
       'deno.jsonc': `{
@@ -317,10 +317,11 @@ describe('carrick#1748: a Deno capture writes only its documented cache', { skip
       ].join('\n'),
     });
     const service = path.join(root, 'app');
-    // The workspace root keeps the runtime cache; the service keeps the graph
-    // root, so its import map scopes the graph. Nothing else is Carrick's.
-    const cacheRoots = ['.carrick/deno', 'app/.carrick/deno'];
-    const holders = ['.carrick/', 'app/.carrick/'];
+    // The workspace root keeps the runtime cache and the graph root; the
+    // service folder gets nothing. Its own self-ignore file sits beside the
+    // cache. Nothing else is Carrick's.
+    const cacheRoots = ['.carrick/deno'];
+    const holders = ['.carrick/', '.carrick/.gitignore'];
     const isCache = (rel: string) =>
       holders.includes(rel) || cacheRoots.some((cache) => rel === `${cache}/` || rel.startsWith(`${cache}/`));
     const before_ = snapshot(root);
@@ -351,5 +352,6 @@ describe('carrick#1748: a Deno capture writes only its documented cache', { skip
       []
     );
     assert.ok(Object.keys(after_).some((rel) => rel.startsWith('.carrick/deno/')), 'the fixture built no Deno cache');
+    assert.equal(Object.keys(after_).some((rel) => rel.startsWith('app/.carrick')), false, 'the service folder was written to');
   });
 });

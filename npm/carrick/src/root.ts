@@ -8,13 +8,19 @@
 // before the first edit moved it (runs/plugin-cd1, 2026-09-05).
 //
 // So the marker decides, not the client. Candidates are tried in order and the
-// first one holding `.carrick/` wins; when the winner is not the directory the
-// client sent, that is logged.
+// first one holding a set-up or indexed `.carrick/` wins; when the winner is not the
+// directory the client sent, that is logged. A `.carrick/` with
+// neither `index.json` nor `cli-version` (a Deno cache, a temp folder) is not a workspace and is walked
+// past: taking it made a worktree its own un-indexed root.
 
 import { defaultExists } from "./fs-util.ts";
 import path from "node:path";
 
 export const MARKER = ".carrick";
+/** The file whose presence says a workspace has an index (the Rust `index_file`, local_mode/workspace.rs). */
+export const INDEX_FILE = "index.json";
+/** The file `carrick init` and the self-update write, before any index exists; a stray `.carrick/` never holds one. */
+export const SET_UP_FILE = "cli-version";
 
 export type RootChoice = {
   root: string;
@@ -24,12 +30,12 @@ export type RootChoice = {
   clientRoot: string | null;
   /** True when the client's folder is not the directory we are using. */
   differs: boolean;
-  /** True when no candidate held `.carrick/`. */
+  /** True when no candidate held an indexed `.carrick/`. */
   markerFound: boolean;
 };
 
 export function hasMarker(dir: string, exists = defaultExists): boolean {
-  return exists(path.join(dir, MARKER));
+  return exists(path.join(dir, MARKER, INDEX_FILE)) || exists(path.join(dir, MARKER, SET_UP_FILE));
 }
 
 /** Every directory from `from` up to the filesystem root, nearest first. */

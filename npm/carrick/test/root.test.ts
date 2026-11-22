@@ -1,11 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { ancestors, resolveRoot, rootNote } from "../src/root.ts";
+import fs from "node:fs";
+import os from "node:os";
+import { ancestors, hasMarker, resolveRoot, rootNote } from "../src/root.ts";
 
-/** A fake filesystem where only these directories hold `.carrick/`. */
+/** A fake filesystem where only these directories hold an indexed `.carrick/`. */
 function marker(...dirs: string[]) {
-  const set = new Set(dirs.map((dir) => path.join(path.resolve(dir), ".carrick")));
+  const set = new Set(
+    dirs.flatMap((dir) => [path.join(path.resolve(dir), ".carrick"), path.join(path.resolve(dir), ".carrick", "index.json")]),
+  );
   return (target: string) => set.has(target);
 }
 
@@ -64,4 +68,61 @@ test("ancestors run from the directory to the filesystem root, nearest first", (
   const list = ancestors("/a/b/c");
   assert.equal(list[0], path.resolve("/a/b/c"));
   assert.equal(list.at(-1), path.parse(path.resolve("/a/b/c")).root);
+});
+
+/** A real tree: an indexed workspace with a nested checkout whose `.carrick/` holds only a Deno cache. */
+function strayTree() {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-root-")));
+  const root = path.join(base, "ws");
+  const nested = path.join(root, ".claude", "worktrees", "feat");
+  fs.mkdirSync(path.join(root, ".carrick"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".carrick", "index.json"), "{}");
+  fs.mkdirSync(path.join(nested, "apps", "api", ".carrick", "deno"), { recursive: true });
+  fs.mkdirSync(path.join(nested, ".carrick", "deno"), { recursive: true });
+  return { base, root, nested };
+}
+
+test("a .carrick/ that holds an index is a workspace root", () => {
+  const { base, root } = strayTree();
+  try {
+    assert.equal(hasMarker(root), true);
+    const choice = resolveRoot({ clientRoot: root, filePath: path.join(root, "a.ts") });
+    assert.equal(choice.root, root);
+    assert.equal(choice.markerFound, true);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("a .carrick/ holding only a Deno cache is walked past, up to the real root", () => {
+  const { base, root, nested } = strayTree();
+  try {
+    assert.equal(hasMarker(nested), false);
+    for (const clientRoot of [nested, path.join(nested, "apps", "api"), null]) {
+      const choice = resolveRoot({
+        clientRoot,
+        projectDir: nested,
+        filePath: path.join(nested, "apps", "api", "src", "a.ts"),
+      });
+      assert.equal(choice.root, root, `client ${clientRoot}`);
+      assert.equal(choice.markerFound, true);
+      assert.equal(choice.source, "ancestor");
+    }
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("a .carrick/ holding only the version init records is a root, indexed or not", () => {
+  const { base, root, nested } = strayTree();
+  try {
+    // `carrick init` has run in the nested checkout; the first index has not.
+    fs.writeFileSync(path.join(nested, ".carrick", "cli-version"), "1.2.3\n");
+    assert.equal(hasMarker(nested), true);
+    const choice = resolveRoot({ clientRoot: nested, projectDir: nested, filePath: path.join(nested, "a.ts") });
+    assert.equal(choice.root, nested);
+    assert.equal(choice.markerFound, true);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });

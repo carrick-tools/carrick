@@ -37,6 +37,8 @@ function repoWithWorktree(t: { after: (fn: () => void) => void }) {
   git(repo, "add", ".");
   git(repo, "commit", "-q", "-m", "init");
   fs.mkdirSync(path.join(repo, ".carrick"));
+  // A workspace root holds an index; a `.carrick/` without one is not a root.
+  fs.writeFileSync(path.join(repo, ".carrick", "index.json"), "{}");
   git(repo, "worktree", "add", "-q", ".claude/worktrees/wt", "-b", "wt");
   const worktree = path.join(repo, ".claude", "worktrees", "wt");
   return { base, home, repo, worktree, file: path.join(worktree, "src", "client.ts") };
