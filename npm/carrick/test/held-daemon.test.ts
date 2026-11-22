@@ -24,6 +24,7 @@ import { lockPath as heldLockPath, logPath, socketPath } from "../src/held/paths
 import { readState, writeState } from "../src/held/state.ts";
 import { compilerLinesEnabled } from "../src/facts/enabled.ts";
 import { takeLock } from "../src/hook/lock.ts";
+import { enqueue, readEarly } from "../src/hook/rechecks.ts";
 
 const MIN = 60_000;
 const ON = { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
@@ -755,6 +756,52 @@ test("a ready start's duration is kept in the state record", async () => {
     const record = readState(w.root, "a", w.home);
     assert.equal(record?.state, "ready");
     assert.equal(typeof record?.start_ms, "number");
+  } finally {
+    w.done();
+  }
+});
+
+test("an edit asked during the start is answered when the engine is ready", async () => {
+  const w = world(["api"]);
+  try {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const asked: string[] = [];
+    const file = w.file("api");
+    const engine: ServiceEngine = {
+      async answer(files) {
+        asked.push(...files);
+        return { lines: [{ ...LINE, file: "api/src/a.ts", row_file: "api/src/a.ts", row_path: file }] };
+      },
+      rss: () => 10,
+      async close() {},
+    };
+    const daemon = new HeldDaemon({
+      root: w.root, home: w.home, env: { ...ON }, totalmem: () => 16 * 1024 ** 3, clock: () => w.clock.now,
+      programs: async () => w.inits,
+      runtime: { start: async () => { await gate; return { engine }; } },
+    });
+    const other = path.join(w.root, "api", "src", "b.ts");
+    fs.writeFileSync(other, "export const b = 1;\n");
+    const entry = (f: string) => enqueue(w.root, "s1", [f], w.clock.now++, { home: w.home })[0]!;
+    const ask = (f: string, seq: string) => daemon.handle({ session: "s1", files: [f], kind: "edit", edited_at: w.clock.now, seq });
+
+    const older = entry(file);
+    assert.equal((await ask(file, older.seq)).state, "cold", "the first ask starts the engine");
+    const newer = entry(file);
+    assert.equal((await ask(file, newer.seq)).state, "cold");
+    const second = entry(other);
+    assert.equal((await ask(other, second.seq)).state, "cold");
+    assert.equal((await daemon.handle({ session: "s1", files: [file], kind: "read" })).state, "cold");
+    assert.equal(readEarly("s1", newer.seq, w.home), null, "nothing is filed while it starts");
+
+    release();
+    for (let i = 0; i < 50 && readEarly("s1", second.seq, w.home) === null; i += 1) await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(readEarly("s1", newer.seq, w.home)?.result.items?.length, 1, "the newest edit of the file is answered with the engine's line");
+    assert.ok(readEarly("s1", second.seq, w.home) !== null, "another file's edit is answered too");
+    assert.equal(readEarly("s1", older.seq, w.home), null, "an older ask for the same file is not filed");
+    assert.equal(asked.filter((f) => f === file).length, 1, "the engine was asked once for the file: older edit and the read are not asked again");
+    await daemon.close();
   } finally {
     w.done();
   }
