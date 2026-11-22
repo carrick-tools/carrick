@@ -155,8 +155,10 @@ export type ChainRow = {
   name: string;
   /** At most three, in the order the line tries them. */
   routes: ChainRoute[];
-  /** Every route reached, kept or not. */
+  /** Every route reached, kept or not: a floor (the walk is cut at its depth and its kept routes) unless `total_exact` says so. */
   total: number;
+  /** True only when the cloud states `total` as the whole reach; absent on a file that cannot tell, and then `total` is a floor. */
+  total_exact?: boolean;
 };
 
 /**

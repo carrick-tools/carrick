@@ -24,7 +24,7 @@ import { gapsOfLines, rangesOf, rangesOfLines, touched } from "./match.ts";
 import type { CallSpan, Range } from "./match.ts";
 import { factsEnabled } from "./enabled.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
-import type { ContractGroup, ContractRow, FactRow, FactStore, LocalRepo } from "./store.ts";
+import type { ChainRow, ContractGroup, ContractRow, FactRow, FactStore, LocalRepo } from "./store.ts";
 import { fileMemo, isJsx, SCANNED } from "./files.ts";
 import { commitsOf, indexedCommit, localCheckouts, peersUnchanged } from "./peers.ts";
 import type { PeerContext, PeerStop } from "./peers.ts";
@@ -269,9 +269,15 @@ const CONTRACT_GROUPS_PRINTED = 2;
 /** A request row prints one group: its line follows every response line, so it stays short. */
 const CONTRACT_REQUEST_GROUPS_PRINTED = 1;
 
-/** The routes beyond the one a chain line names, as a count only (the Edit line and the Read line say it the same way): "" for a function with one route. */
-function otherRoutes(total: number): string {
-  return total > 1 ? ` and ${total - 1} other route${total === 2 ? "" : "s"}` : "";
+/**
+ * The routes beyond the one a chain line names, as a count only (the Edit line
+ * and the Read line say it the same way): "" for a function with one route.
+ * The count is a floor ("at least") unless the row states it exact.
+ */
+function otherRoutes(row: Pick<ChainRow, "total" | "total_exact">): string {
+  if (row.total <= 1) return "";
+  const others = row.total - 1;
+  return ` and ${row.total_exact === true ? "" : "at least "}${others} other route${others === 1 ? "" : "s"}`;
 }
 
 /** The most callers a chain line names; the rest are counted. */
@@ -619,7 +625,7 @@ export async function factLines(
               callers: callers.length,
               candidate: {
                 key: `chain::${chain.repo}::${chain.file}::${chain.name}`,
-                text: `Carrick: ${chain.name} (${chain.file}:${chain.line}) runs in the handler of ${route.label}${route.depth === 1 ? " " : ""}${where}${otherRoutes(chain.total)}. Other services call that route: ${words.words}${rest}. If your change adds a side effect or changes what the route returns, open those callers first.`,
+                text: `Carrick: ${chain.name} (${chain.file}:${chain.line}) runs in the handler of ${route.label}${route.depth === 1 ? " " : ""}${where}${otherRoutes(chain)}. Other services call that route: ${words.words}${rest}. If your change adds a side effect or changes what the route returns, open those callers first.`,
                 named: pathsOf(others),
                 holds: peersHold(at, others),
                 skipIf: [groupKey],
