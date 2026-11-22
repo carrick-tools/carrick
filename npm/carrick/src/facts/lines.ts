@@ -511,37 +511,44 @@ export async function factLines(
     };
     // The callers of a route in services other than its own, from its
     // contract rows (response, then request): typed places, then untyped ones.
-    const callerPlaces = (rows: readonly ContractRow[], service: string): Array<{ repo: string; loc: string }> => {
-      const out = new Map<string, { repo: string; loc: string }>();
-      const add = (repo: string, owner: string, file: string, line: number | null, loc?: string) => {
+    // A place a response group holds keeps that group's `tail` (", which
+    // expects: <type>", worded and shortened by the cloud: the one way the
+    // type is composed); any other place has none.
+    const callerPlaces = (rows: readonly ContractRow[], service: string): Array<{ repo: string; loc: string; tail: string }> => {
+      const out = new Map<string, { repo: string; loc: string; tail: string }>();
+      const add = (repo: string, owner: string, file: string, line: number | null, tail: string, loc?: string) => {
         if (owner === service) return;
         const at = loc ?? (line === null ? `${repo}/${file}` : `${repo}/${file}:${line}`);
-        out.set(at, { repo, loc: at });
+        if (!out.has(at) || (out.get(at)!.tail === "" && tail !== "")) out.set(at, { repo, loc: at, tail });
       };
       const ordered = [...rows].sort((a, b) => (a.direction === b.direction ? 0 : a.direction === "response" ? -1 : 1));
       for (const row of ordered) {
-        for (const group of row.groups) for (const one of group.places.slice(0, group.shown)) add(one.repo, one.service, one.file, one.line, one.loc);
+        for (const group of row.groups) {
+          const tail = row.direction === "response" && typeof group.tail === "string" ? group.tail : "";
+          for (const one of group.places.slice(0, group.shown)) add(one.repo, one.service, one.file, one.line, tail, one.loc);
+        }
       }
-      for (const row of ordered) for (const one of row.untyped) add(one.repo, one.service, one.file, one.line);
+      for (const row of ordered) for (const one of row.untyped) add(one.repo, one.service, one.file, one.line, "");
       return [...out.values()];
     };
     // `places` as the line words them: a place on disk by its place, one off
-    // disk with the note (null when its repo has no full commit in the file).
-    const callerWords = (at: { repo: string; top: string }, places: ReadonlyArray<{ repo: string; loc: string }>): { words: string; onDisk: Array<{ repo: string; file: string }> } | null => {
+    // disk with the note (null when its repo has no full commit in the file),
+    // each followed by its type words; callers are split by ";" when any has them.
+    const callerWords = (at: { repo: string; top: string }, places: ReadonlyArray<{ repo: string; loc: string; tail: string }>): { words: string; onDisk: Array<{ repo: string; file: string }> } | null => {
       const onDisk: Array<{ repo: string; file: string }> = [];
       const parts: string[] = [];
       for (const place of places) {
         const local = checkouts.place(place.repo, at);
         if (local !== null) {
           onDisk.push({ repo: place.repo, file: place.loc.slice(place.repo.length + 1).replace(/:\d+$/, "") });
-          parts.push(place.loc);
+          parts.push(`${place.loc}${place.tail}`);
           continue;
         }
         const commit = indexedCommit(commits, place.repo);
         if (commit === null) return null;
-        parts.push(`${place.loc} (another repo, indexed at ${commit.slice(0, 8)}, not checked out here)`);
+        parts.push(`${place.loc} (another repo, indexed at ${commit.slice(0, 8)}, not checked out here)${place.tail}`);
       }
-      return { words: parts.join(", "), onDisk };
+      return { words: parts.join(places.some((place) => place.tail !== "") ? "; " : ", "), onDisk };
     };
     // The contract candidates of one row: its first two groups (a request row: its first), each a line.
     const contractCandidates = (at: { repo: string; top: string }, row: ContractRow): Candidate[] =>

@@ -159,8 +159,8 @@ function baseRows(): Array<Record<string, unknown>> {
 }
 
 const ASK = "If your change adds a side effect or changes what the route returns, open those callers first.";
-const BUILD_GET = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) runs in the handler of ${GET}, through formatOrder (src/services/format.ts:3). Other services call that route: web-app/src/api.ts:4${NOTE}. ${ASK}`;
-const BUILD_POST = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) runs in the handler of ${POST}, through formatOrder (src/services/format.ts:3). Other services call that route: web-app/src/api.ts:9${NOTE}. ${ASK}`;
+const BUILD_GET = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) runs in the handler of ${GET}, through formatOrder (src/services/format.ts:3). Other services call that route: web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}. ${ASK}`;
+const BUILD_POST = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) runs in the handler of ${POST}, through formatOrder (src/services/format.ts:3). Other services call that route: web-app/src/api.ts:9${NOTE}, which expects: ${TYPE}. ${ASK}`;
 
 /** A workspace with `orders-api` committed from `files` and a fact file of `rows` naming `web-app`'s full commit. */
 async function workspace(t: { after: (fn: () => void) => void }, rows: Array<Record<string, unknown>>, files: Record<string, string> = FILES): Promise<Ws> {
@@ -225,7 +225,7 @@ test("the depth 1 wording, and a hop with no call line names the file alone", as
   const route: RouteSpec = { ...GET_ROUTE, path: [{ file: "src/routes/orders.ts", line: 3, name: "get_orderId_handler", call: null }] };
   const ws = await workspace(t, [contractRow(GET, "src/routes/orders.ts", 3, 4), chainRow("formatOrder", "src/services/format.ts", 2, [route])]);
   const out = await run(ws, { file: ws.at("orders-api/src/services/format.ts"), snippets: ["return { id: order.id"] });
-  assert.deepEqual(out.lines, [`Carrick: formatOrder (src/services/format.ts:2) runs in the handler of ${GET} (src/routes/orders.ts). Other services call that route: web-app/src/api.ts:4${NOTE}. ${ASK}`]);
+  assert.deepEqual(out.lines, [`Carrick: formatOrder (src/services/format.ts:2) runs in the handler of ${GET} (src/routes/orders.ts). Other services call that route: web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}. ${ASK}`]);
 });
 
 test("a hop file both routes share, changed since the index, makes the line silent", async (t) => {
@@ -608,7 +608,7 @@ function intakeRows(extra: Array<Record<string, unknown>> = []): Array<Record<st
   return [response, request, chainRow("InvoiceIntake.accept", "src/services/intake.ts", 2, [{ label: UPLOAD, file: "src/routes/intake.ts", line: 2, path }]), ...extra];
 }
 const OFF = (file: string, line: number) => `web-app/${file}:${line}${NOTE}`;
-const INTAKE_LINE = `Carrick: InvoiceIntake.accept (src/services/intake.ts:2) runs in the handler of ${UPLOAD} (src/routes/intake.ts:3). Other services call that route: ${OFF("src/IntakePage.tsx", 118)}, ${OFF("src/UploadDialog.tsx", 90)}. If your change adds a side effect or changes what the route returns, open those callers first.`;
+const INTAKE_LINE = `Carrick: InvoiceIntake.accept (src/services/intake.ts:2) runs in the handler of ${UPLOAD} (src/routes/intake.ts:3). Other services call that route: ${OFF("src/IntakePage.tsx", 118)}, which expects: ${TYPE}; ${OFF("src/UploadDialog.tsx", 90)}. If your change adds a side effect or changes what the route returns, open those callers first.`;
 const inAccept = (ws: Ws): Edit => ({ file: ws.at("orders-api/src/services/intake.ts"), snippets: ["return this.store(file).andThen(finish);"] });
 const inCallback = (ws: Ws): Edit => ({ file: ws.at("orders-api/src/services/intake.ts"), snippets: ["return this.notify(file.id);"] });
 
