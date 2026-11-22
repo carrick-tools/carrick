@@ -95,4 +95,18 @@ describe('Deno project writes', { skip: !hasDeno }, () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('leaves a .gitignore the workspace root already has in .carrick/ as it is', () => {
+    const { root, service } = workspace();
+    try {
+      fs.mkdirSync(path.join(root, '.carrick'));
+      const own = '# the user\'s own rules\nhosted/\n';
+      fs.writeFileSync(path.join(root, '.carrick', '.gitignore'), own);
+      const project = new DenoProject(findDenoConfig(service)!, service);
+      assert.deepEqual(project.diagnostics, []);
+      assert.equal(fs.readFileSync(path.join(root, '.carrick', '.gitignore'), 'utf8'), own);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

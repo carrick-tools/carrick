@@ -351,3 +351,18 @@ test("a folder carrick was never set up in has no install to speak for", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a workspace init set up but has not indexed yet still has an install to speak for", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-set-up-"));
+  try {
+    fs.mkdirSync(path.join(dir, ".carrick"), { recursive: true });
+    assert.equal(initialisedRoot(dir), null);
+    // `carrick init` has written the version and no index exists yet.
+    assert.equal(recordCliVersion(dir, "0.3.84"), true);
+    assert.equal(initialisedRoot(dir), path.resolve(dir));
+    assert.equal(initialisedRoot(path.join(dir, "service")), path.resolve(dir));
+    assert.match(versionMismatch(dir, "0.3.81")!, /0\.3\.84 set this workspace up/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

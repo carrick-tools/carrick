@@ -1,6 +1,7 @@
 /** Deno owns module resolution; both compiler frontends consume its graph. */
 import ts from 'typescript';
 import * as fs from 'node:fs';
+import { realpathSync } from 'node:fs';
 import * as path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
@@ -13,7 +14,6 @@ import { realOf, sidecarInstallDir, untrustedTree, type ReadBound } from './chec
 
 interface Config {
   workspace?: string[];
-  imports?: Record<string, string>;
   compilerOptions?: Record<string, unknown>;
   exclude?: string[];
 }
@@ -69,16 +69,44 @@ function jsrPackageName(specifier: string): string | undefined {
   return `${scope}/${name.split('@')[0]}`;
 }
 
-/** `spec` through the first import map that names it (exact key, or a `prefix/` key); a value that is a path becomes a file URL. */
-function mapBare(spec: string, scopes: { file: string; config: Config }[]): string {
-  for (const { file, config } of scopes) {
-    for (const [key, value] of Object.entries(config.imports ?? {})) {
-      const mapped = key === spec ? value : key.endsWith('/') && spec.startsWith(key) ? value + spec.slice(key.length) : undefined;
-      if (mapped === undefined) continue;
-      return mapped.startsWith('.') || path.isAbsolute(mapped) ? pathToFileURL(path.resolve(path.dirname(file), mapped)).href : mapped;
-    }
-  }
-  return spec;
+/**
+ * Each bare name in `compilerOptions.types` as Deno resolves it from the
+ * service folder: its import map and the workspace's, a root `scopes` entry for
+ * the folder, its package.json, the longest `prefix/` key. Deno is asked once,
+ * from the service folder with its config, and nothing is written there. A
+ * name Deno cannot resolve is kept as written, so the graph reports it.
+ */
+export function resolveTypeRoots(types: string[], configPath: string, serviceRoot: string): string[] {
+  const bare = types.filter(spec => !/^[a-z][a-z0-9+.-]*:/i.test(spec));
+  if (!bare.length) return types;
+  let resolved: Record<string, string | null> = {};
+  try {
+    // Deno runs from the folder's real path, so the config is named by its
+    // real path too, or a tree reached through a link finds no import map; the
+    // answer is put back under the path the engine was given.
+    const out = runDeno(['eval', '--config', realpathSync(configPath), '--node-modules-dir=none',
+      'const r = {}; for (const s of JSON.parse(Deno.args[0])) { try { r[s] = import.meta.resolve(s); } catch { r[s] = null; } } console.log(JSON.stringify(r));',
+      '--', JSON.stringify(bare)], realpathSync(serviceRoot));
+    resolved = JSON.parse(out.trim().split('\n').pop() ?? '{}') as Record<string, string | null>;
+  } catch { /* each name stays as written */ }
+  const link = linkPrefix(serviceRoot);
+  return types.map(spec => {
+    const url = resolved[spec];
+    if (!url) return spec;
+    if (!link || !url.startsWith('file:')) return url;
+    const file = fileURLToPath(url);
+    return file.startsWith(link.real + path.sep) ? pathToFileURL(link.given + file.slice(link.real.length)).href : url;
+  });
+}
+
+/** Where a folder reached through a link differs from its real path: the leading parts that differ, as given and as real. */
+function linkPrefix(folder: string): { given: string; real: string } | undefined {
+  const given = path.resolve(folder).split(path.sep);
+  const real = realpathSync(folder).split(path.sep);
+  let tail = 0;
+  while (tail < given.length && tail < real.length && given[given.length - 1 - tail] === real[real.length - 1 - tail]) tail++;
+  const base = (parts: string[]) => parts.slice(0, parts.length - tail).join(path.sep);
+  return base(given) === base(real) ? undefined : { given: base(given), real: base(real) };
 }
 
 /** Explicit TS configs keep their existing behaviour, including mixed repos. */
@@ -108,15 +136,8 @@ export function findDenoConfig(repoRoot: string, explicit?: string): DenoConfig 
   const opts = { ...workspace.config.compilerOptions, ...nearest.config.compilerOptions };
   const typesOwner = nearest.config.compilerOptions?.types !== undefined ? nearest.file : workspace.file;
   if (Array.isArray(opts.types)) {
-    // The graph root Deno reads sits outside the service, so a bare name is
-    // resolved here, through the nearest import map and then the workspace's,
-    // the way Deno would from inside the service.
-    const scopes = [nearest, workspace].filter((c, i, all) => all.indexOf(c) === i);
-    opts.types = opts.types.map((spec: unknown) => {
-      if (typeof spec !== 'string') return spec;
-      if (spec.startsWith('.') || path.isAbsolute(spec)) return pathToFileURL(path.resolve(path.dirname(typesOwner), spec)).href;
-      return mapBare(spec, scopes);
-    });
+    opts.types = opts.types.map((spec: unknown) => typeof spec === 'string' && (spec.startsWith('.') || path.isAbsolute(spec))
+      ? pathToFileURL(path.resolve(path.dirname(typesOwner), spec)).href : spec);
   }
   return {
     configPath: explicit ? path.resolve(repoRoot, explicit) : nearest.file,
@@ -244,8 +265,13 @@ export class DenoProject {
       this.globals.push(globalPath);
     }
     const roots = this.parsed.fileNames.map(f => pathToFileURL(f).href);
-    const extraTypes = config.compilerOptions.types;
-    if (Array.isArray(extraTypes)) roots.push(...extraTypes.filter((t): t is string => typeof t === 'string'));
+    // The graph root sits outside the service, so a bare name is resolved
+    // here by Deno from the service folder, not by the entry's own scope.
+    const declared = config.compilerOptions.types;
+    const extraTypes = Array.isArray(declared)
+      ? resolveTypeRoots(declared.filter((t): t is string => typeof t === 'string'), config.configPath, repoRoot)
+      : undefined;
+    if (extraTypes) roots.push(...extraTypes);
     guard.writeFile(entry, roots.map(s => `import ${JSON.stringify(s)};`).join('\n'));
     let graph: Graph;
     try {
@@ -290,7 +316,7 @@ export class DenoProject {
     // Deno's extra type roots must participate in both compiler programs.
     const entryModule = this.modules.get(pathToFileURL(entry).href);
     for (const dep of entryModule?.dependencies ?? []) {
-      if (Array.isArray(extraTypes) && extraTypes.includes(dep.specifier)) {
+      if (extraTypes?.includes(dep.specifier)) {
         const local = this.targetPath(dep.type ?? dep.code);
         if (local) this.globals.push(local);
       }

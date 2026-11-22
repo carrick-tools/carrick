@@ -139,8 +139,9 @@ export function outdatedInstall(workspace: string): Outdated {
 /**
  * The nearest folder at or above this one that `carrick init` has run in.
  *
- * The same marker every other surface roots on — the `.carrick` directory, not
- * a settings file or a git repository — so a command typed inside one repo of
+ * The same marker every other surface roots on — a `.carrick` directory holding
+ * an index or the version `carrick init` records, not a settings file or a git
+ * repository, so a folder set up but not yet indexed counts — so a command typed inside one repo of
  * a folder asks about the folder's install, which is the install there is.
  * Null where there is none, and a machine that never ran init never hears from
  * this.

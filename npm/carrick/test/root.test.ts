@@ -112,3 +112,17 @@ test("a .carrick/ holding only a Deno cache is walked past, up to the real root"
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("a .carrick/ holding only the version init records is a root, indexed or not", () => {
+  const { base, root, nested } = strayTree();
+  try {
+    // `carrick init` has run in the nested checkout; the first index has not.
+    fs.writeFileSync(path.join(nested, ".carrick", "cli-version"), "1.2.3\n");
+    assert.equal(hasMarker(nested), true);
+    const choice = resolveRoot({ clientRoot: nested, projectDir: nested, filePath: path.join(nested, "a.ts") });
+    assert.equal(choice.root, nested);
+    assert.equal(choice.markerFound, true);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
