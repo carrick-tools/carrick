@@ -63,7 +63,10 @@ fn compute_intent_hash(body: &str, called_intents: &[String]) -> String {
 /// key names the same symbol on both scans.
 #[derive(Debug, Clone, Default)]
 pub struct PreviousIntents {
-    by_hash: HashMap<String, String>,
+    /// The sentence every previous entry with this hash carries, or `None`
+    /// when entries with this hash carry different sentences (identical bodies
+    /// in different owners, each worded for its own owner).
+    by_hash: HashMap<String, Option<String>>,
     by_key: HashMap<String, PreviousIntent>,
 }
 
@@ -82,7 +85,15 @@ impl PreviousIntents {
                 continue;
             };
             if let Some(hash) = &def.intent_input_hash {
-                previous.by_hash.insert(hash.clone(), intent.clone());
+                previous
+                    .by_hash
+                    .entry(hash.clone())
+                    .and_modify(|held| {
+                        if held.as_deref() != Some(intent.as_str()) {
+                            *held = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(intent.clone()));
             }
             previous.by_key.insert(
                 key.clone(),
@@ -95,9 +106,24 @@ impl PreviousIntents {
         previous
     }
 
-    /// The intent a previous scan generated from exactly these inputs.
-    pub fn for_hash(&self, hash: &str) -> Option<&str> {
-        self.by_hash.get(hash).map(String::as_str)
+    /// The intent a previous scan generated for the function at `key` from
+    /// exactly these inputs.
+    ///
+    /// Identical bodies in different owners share one hash and each was worded
+    /// for its own owner, so the hash alone must never pick one of them:
+    /// 1. the function's own previous entry, when it carries this hash;
+    /// 2. when the function has no previous entry with a hash (it moved or was
+    ///    renamed), the hash's sentence, only if every previous entry with
+    ///    that hash carries the same one;
+    /// 3. otherwise `None`, and the function is asked again.
+    pub fn for_function_hash(&self, key: &str, hash: &str) -> Option<&str> {
+        match self.by_key.get(key) {
+            Some(PreviousIntent {
+                intent,
+                hash: Some(own),
+            }) => (own == hash).then_some(intent.as_str()),
+            _ => self.by_hash.get(hash)?.as_deref(),
+        }
     }
 
     /// The previous intent of the function at `key`, with the hash that
@@ -879,7 +905,7 @@ async fn describe_functions<S, SFut>(
 
             let hash = compute_intent_hash(body, &called_intents);
 
-            if let Some(prev_intent) = previous.for_hash(&hash) {
+            if let Some(prev_intent) = previous.for_function_hash(name, &hash) {
                 // Identical body + callee context as a prior scan — reuse.
                 memo.record(name, &hash, prev_intent);
                 intents.insert(name.clone(), prev_intent.to_string());
@@ -1513,7 +1539,10 @@ mod tests {
 
         let previous = PreviousIntents::from_definitions(&defs);
         assert_eq!(previous.by_hash.len(), 1);
-        assert_eq!(previous.for_hash("abc123"), Some("does the thing"));
+        assert_eq!(
+            previous.for_function_hash("moved", "abc123"),
+            Some("does the thing")
+        );
 
         // By function, an intent is kept with or without its hash.
         assert_eq!(previous.by_key.len(), 2);
@@ -1536,7 +1565,7 @@ mod tests {
     /// A previous scan that holds only these content hashes.
     fn previous_by_hash(by_hash: HashMap<String, String>) -> PreviousIntents {
         PreviousIntents {
-            by_hash,
+            by_hash: by_hash.into_iter().map(|(h, i)| (h, Some(i))).collect(),
             by_key: HashMap::new(),
         }
     }
@@ -2573,6 +2602,131 @@ mod tests {
     /// already stripped, which is all [`PreviousIntents`] reads.
     fn previous_scan(defs: &HashMap<String, FunctionDefinition>) -> PreviousIntents {
         PreviousIntents::from_definitions(defs)
+    }
+
+    const SHARED_BODY: &str = "const state = this.lit;\nreturn state === true;";
+
+    /// A previous scan holding `(key, sentence)` rows, all of one body.
+    fn previous_rows(rows: &[(&str, &str)]) -> PreviousIntents {
+        let hash = compute_intent_hash(SHARED_BODY, &[]);
+        let defs: HashMap<String, FunctionDefinition> = rows
+            .iter()
+            .map(|(key, sentence)| {
+                (
+                    key.to_string(),
+                    FunctionDefinition {
+                        intent: Some(sentence.to_string()),
+                        intent_input_hash: Some(hash.clone()),
+                        ..def_with_body(key, SHARED_BODY)
+                    },
+                )
+            })
+            .collect();
+        previous_scan(&defs)
+    }
+
+    /// Run a warm scan over functions of the shared body under `keys`;
+    /// returns the intents each got and the names that were asked.
+    async fn warm_scan(
+        previous: &PreviousIntents,
+        keys: &[&str],
+    ) -> (HashMap<String, Option<String>>, Vec<String>) {
+        let mut defs: HashMap<String, FunctionDefinition> = keys
+            .iter()
+            .map(|key| (key.to_string(), def_with_body(key, SHARED_BODY)))
+            .collect();
+        let recorder = Recorder::default();
+        describe_functions(&mut defs, previous, &RunIntentMemo::default(), |p| {
+            recorder.send(p)
+        })
+        .await;
+        let intents = defs
+            .iter()
+            .map(|(key, def)| (key.clone(), def.intent.clone()))
+            .collect();
+        (intents, recorder.asked())
+    }
+
+    /// Identical bodies in two owners keep their own sentence on a warm run:
+    /// nothing is asked, and neither takes the other's.
+    #[tokio::test]
+    async fn identical_bodies_in_two_owners_keep_their_own_sentence() {
+        let _env = ENV_LOCK.lock().await;
+        let hash = compute_intent_hash(SHARED_BODY, &[]);
+        for _ in 0..20 {
+            let previous = previous_rows(&[
+                ("Kiln.isLit", "Reports whether the kiln is lit."),
+                ("Oven.isLit", "Reports whether the oven is lit."),
+            ]);
+            assert_eq!(
+                previous.for_function_hash("Oven.isLit", &hash),
+                Some("Reports whether the oven is lit.")
+            );
+            assert_eq!(
+                previous.for_function_hash("Kiln.isLit", &hash),
+                Some("Reports whether the kiln is lit.")
+            );
+        }
+        let previous = previous_rows(&[
+            ("Kiln.isLit", "Reports whether the kiln is lit."),
+            ("Oven.isLit", "Reports whether the oven is lit."),
+        ]);
+        let (intents, asked) = warm_scan(&previous, &["Kiln.isLit", "Oven.isLit"]).await;
+        assert!(asked.is_empty(), "asked {asked:?}");
+        assert_eq!(
+            intents["Kiln.isLit"].as_deref(),
+            Some("Reports whether the kiln is lit.")
+        );
+        assert_eq!(
+            intents["Oven.isLit"].as_deref(),
+            Some("Reports whether the oven is lit.")
+        );
+    }
+
+    /// A renamed function whose hash is unique reuses its sentence.
+    #[tokio::test]
+    async fn a_renamed_function_with_a_unique_hash_reuses_its_sentence() {
+        let _env = ENV_LOCK.lock().await;
+        let previous = previous_rows(&[("Kiln.isLit", "Reports whether the kiln is lit.")]);
+        let (intents, asked) = warm_scan(&previous, &["Furnace.isLit"]).await;
+        assert!(asked.is_empty(), "asked {asked:?}");
+        assert_eq!(
+            intents["Furnace.isLit"].as_deref(),
+            Some("Reports whether the kiln is lit.")
+        );
+    }
+
+    /// A moved function whose hash is shared by entries with different
+    /// sentences is asked again, and takes neither sibling's sentence.
+    #[tokio::test]
+    async fn a_moved_function_with_a_contested_hash_is_asked_again() {
+        let _env = ENV_LOCK.lock().await;
+        let previous = previous_rows(&[
+            ("Kiln.isLit", "Reports whether the kiln is lit."),
+            ("Oven.isLit", "Reports whether the oven is lit."),
+        ]);
+        let (intents, asked) = warm_scan(&previous, &["Furnace.isLit"]).await;
+        assert_eq!(asked, vec!["Furnace.isLit"]);
+        assert_eq!(
+            intents["Furnace.isLit"].as_deref(),
+            Some("describes Furnace.isLit")
+        );
+    }
+
+    /// Entries that agree on one sentence reuse it for a moved function.
+    #[tokio::test]
+    async fn a_moved_function_reuses_a_sentence_every_entry_agrees_on() {
+        let _env = ENV_LOCK.lock().await;
+        let previous = previous_rows(&[
+            ("Kiln.isLit", "Reports whether the burner is lit."),
+            ("Oven.isLit", "Reports whether the burner is lit."),
+        ]);
+        let (intents, asked) = warm_scan(&previous, &["Furnace.isLit"]).await;
+        assert!(asked.is_empty(), "asked {asked:?}");
+        assert_eq!(
+            intents["Furnace.isLit"].as_deref(),
+            Some("Reports whether the burner is lit.")
+        );
     }
 
     /// carrick#1080 D7. `a1` fails. `mid` calls it and `top` calls `mid`, so
