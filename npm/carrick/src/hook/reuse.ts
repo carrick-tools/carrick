@@ -60,6 +60,12 @@ export type SessionRecord = {
    */
   stated: Record<string, number>;
   /**
+   * Workspace root -> the newest edit there that Stop saw with every gap still
+   * running. Not stated: a later Stop names a gap that landed since, and says
+   * nothing of one that answered clean (`stopAnswers`).
+   */
+  waiting: Record<string, number>;
+  /**
    * Workspace root -> the newest edit there whose every file the per-file
    * re-checks answered, as Stop stated it. `checked.ts` reads it like a clean
    * `check --changed` marker.
@@ -118,6 +124,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     edited: {},
     files: {},
     stated: {},
+    waiting: {},
     covered: {},
     said: [],
     facts: {},
@@ -157,6 +164,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
         ),
       ),
       stated: stamps(record.stated),
+      waiting: stamps(record.waiting),
       covered: stamps(record.covered),
       said: Array.isArray(record.said) ? record.said.filter((entry): entry is string => typeof entry === "string") : [],
       facts: Object.fromEntries(
@@ -390,6 +398,14 @@ export function markStated(sessionId: string, root: string, upTo: number, covere
   const current = readSession(sessionId, home);
   current.stated[root] = Math.max(upTo, current.stated[root] ?? 0);
   if (covered) current.covered[root] = Math.max(upTo, current.covered[root] ?? 0);
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** Remember that Stop saw the change in `root` up to `upTo` with every gap still running. */
+export function markWaiting(sessionId: string, root: string, upTo: number, home?: string): void {
+  const current = readSession(sessionId, home);
+  current.waiting[root] = Math.max(upTo, current.waiting[root] ?? 0);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

@@ -54,7 +54,7 @@ import {
   readEarly,
   type Answer,
 } from "./rechecks.ts";
-import { markSaid, markStated, readSession, wasSaid } from "./reuse.ts";
+import { markSaid, markStated, markWaiting, readSession, wasSaid } from "./reuse.ts";
 import { worktreeGone } from "./worktree.ts";
 
 const log = createLogger("carrick-stop");
@@ -281,10 +281,17 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     if (coverage.files === 0) continue;
     // A re-check still running is neither a finding nor a named clean result:
     // Stop says nothing about it, and its answer rides the agent's next hook
-    // event (late.ts). The change is recorded as stated, as for a gap, so a
-    // later Stop does not restate what that event delivered.
+    // event (late.ts). The change is recorded as waiting, not stated: that
+    // event prints nothing for an answer that ran out of time, so a later Stop
+    // must still name it.
     const named = coverage.gaps.filter((gap) => gap.running !== true);
     if (named.length === 0 && coverage.gaps.length > 0) {
+      markWaiting(session, root, coverage.upTo, home);
+      continue;
+    }
+    // Everything a waiting Stop saw running is covered now: its answer was
+    // delivered by a carrier, so it is stated silently, as before.
+    if (coverage.gaps.length === 0 && (record.waiting[root] ?? -1) >= upTo) {
       markStated(session, root, coverage.upTo, false, home);
       continue;
     }

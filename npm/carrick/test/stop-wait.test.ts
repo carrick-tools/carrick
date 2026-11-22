@@ -1339,3 +1339,54 @@ test("T4 P4.2 (#4786): a clean check --changed for a file whose early break stan
   const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
   assert.doesNotMatch(text, /found no contract problem/, text);
 });
+
+// A Stop that saw every re-check still running records the change as waiting,
+// not stated: the carrier that later delivers the answer prints nothing for a
+// re-check that ran out of time, so the next Stop names that gap.
+
+/** A re-check that gave up before it read the edited service, as the CLI writes it. */
+function overran(reason: string, over: Record<string, unknown> = {}): CheckResult {
+  return {
+    ...clean(),
+    stale: true,
+    recheck: { ran: "none", elapsed_ms: 180_000, reason, ...over },
+  } as CheckResult;
+}
+
+test("a gap that lands after a Stop saw it running is named by the next Stop", (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  const first = queue(workspace.root, home, workspace.file);
+  const second = queue(workspace.root, home, workspace.file);
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, [], "running: nothing");
+
+  answer(home, first, overran("the re-scan ran past the budget", { deadline: true }));
+  answer(home, second, overran("re-reading shop-api (74 indexed files) took longer than 180 s against this index, so edits in shop-api are not re-checked until `carrick refresh`.", { known_miss: true }));
+  const lines = stopAnswers(SESSION, { home, ensure: () => false }).lines;
+  assert.equal(lines.length, 1, lines.join("\n"));
+  assert.match(lines[0]!, /^Carrick did not check the whole change: /);
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, [], "said once");
+});
+
+test("a finding a carrier already printed is not restated by the Stop after a running one", (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  const entry = queue(workspace.root, home, workspace.file);
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, [], "running: nothing");
+  answer(home, entry, problem());
+  assert.ok(deliverLate(SESSION, Date.now(), new Set(), home).length > 0, "the carrier prints the finding");
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, [], "not restated");
+});
+
+test("a Stop that still sees the re-check running keeps waiting and says nothing", (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  const entry = queue(workspace.root, home, workspace.file);
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, []);
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, []);
+  answer(home, entry, overran("re-reading shop-api took longer than 180 s", { known_miss: true }));
+  assert.equal(stopAnswers(SESSION, { home, ensure: () => false }).lines.length, 1, "named once it lands");
+});
