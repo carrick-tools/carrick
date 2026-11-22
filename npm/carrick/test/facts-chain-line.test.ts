@@ -158,8 +158,9 @@ function baseRows(): Array<Record<string, unknown>> {
   ];
 }
 
-const BUILD_GET = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) is called by formatOrder (src/services/format.ts:3), which is called by the handler of ${GET}. ${GET} is called from web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}`;
-const BUILD_POST = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) is called by formatOrder (src/services/format.ts:3), which is called by the handler of ${POST}. ${POST} is called from web-app/src/api.ts:9${NOTE}, which expects: ${TYPE}`;
+const ASK = "If your change adds a side effect or changes what the route returns, open those callers first.";
+const BUILD_GET = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) runs in the handler of ${GET}, through formatOrder (src/services/format.ts:3). Other services call that route: web-app/src/api.ts:4${NOTE}. ${ASK}`;
+const BUILD_POST = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) runs in the handler of ${POST}, through formatOrder (src/services/format.ts:3). Other services call that route: web-app/src/api.ts:9${NOTE}. ${ASK}`;
 
 /** A workspace with `orders-api` committed from `files` and a fact file of `rows` naming `web-app`'s full commit. */
 async function workspace(t: { after: (fn: () => void) => void }, rows: Array<Record<string, unknown>>, files: Record<string, string> = FILES): Promise<Ws> {
@@ -224,7 +225,7 @@ test("the depth 1 wording, and a hop with no call line names the file alone", as
   const route: RouteSpec = { ...GET_ROUTE, path: [{ file: "src/routes/orders.ts", line: 3, name: "get_orderId_handler", call: null }] };
   const ws = await workspace(t, [contractRow(GET, "src/routes/orders.ts", 3, 4), chainRow("formatOrder", "src/services/format.ts", 2, [route])]);
   const out = await run(ws, { file: ws.at("orders-api/src/services/format.ts"), snippets: ["return { id: order.id"] });
-  assert.deepEqual(out.lines, [`Carrick: formatOrder (src/services/format.ts:2) is called from src/routes/orders.ts in the handler of ${GET}. ${GET} is called from web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}`]);
+  assert.deepEqual(out.lines, [`Carrick: formatOrder (src/services/format.ts:2) runs in the handler of ${GET} (src/routes/orders.ts). Other services call that route: web-app/src/api.ts:4${NOTE}. ${ASK}`]);
 });
 
 test("a hop file both routes share, changed since the index, makes the line silent", async (t) => {
@@ -287,8 +288,8 @@ test("two changed functions reaching one route in one action: the second falls t
   const both = await run(ws, [linesEdit(ws), linesEdit(ws, "return items.length;")], { session: "both" });
   assert.equal(out.lines.length, 1);
   assert.equal(both.lines.length, 2);
-  assert.ok(both.lines[0]!.startsWith("Carrick: buildLines") && both.lines[0]!.includes(`handler of ${GET}.`), both.lines[0]);
-  assert.ok(both.lines[1]!.startsWith("Carrick: sumLines") && both.lines[1]!.includes(`handler of ${POST}.`), both.lines[1]);
+  assert.ok(both.lines[0]!.startsWith("Carrick: buildLines") && both.lines[0]!.includes(`handler of ${GET}`), both.lines[0]);
+  assert.ok(both.lines[1]!.startsWith("Carrick: sumLines") && both.lines[1]!.includes(`handler of ${POST}`), both.lines[1]);
 });
 
 test("chain lines share the cap of MAX_FACT_LINES", async (t) => {
@@ -558,4 +559,86 @@ test("with the chain switch on (the default), a file without the chains table is
   const withTable = await workspace(t, baseRows());
   await refreshFacts(withTable.root, { request, env: { ...env, CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "1" } });
   assert.equal(known(4), true, "chain on, table present: known");
+});
+
+// The callers a chain line names (request and response rows together) and the
+// next named thing out when the edited one has no chain row.
+
+const INTAKE_ROUTE = `import { InvoiceIntake } from "../services/intake";
+router.post("/intake/upload", async (req, res) => {
+  res.json(await intake.accept(req.file));
+});
+`;
+const INTAKE_SERVICE = `export class InvoiceIntake {
+  accept(file) {
+    const finish = () => {
+      return this.notify(file.id);
+    };
+    return this.store(file).andThen(finish);
+  }
+  store(file) {
+    return file;
+  }
+}
+`;
+const INTAKE_FILES: Record<string, string> = {
+  "orders-api/src/routes/intake.ts": INTAKE_ROUTE,
+  "orders-api/src/services/intake.ts": INTAKE_SERVICE,
+};
+const UPLOAD = "POST /intake/upload";
+const place = (file: string, line: number) => ({ service: "web-app", repo: "web-app", file, line, loc: `web-app/${file}:${line}` });
+const group = (places: Array<ReturnType<typeof place>>, lead: string, tail: string) => ({ type: TYPE, symbol: null, home: null, places, total: places.length, shown: places.length, lead, more: "", tail, shortened: false });
+
+/** The response row types only IntakePage; UploadDialog reads `.ok` alone, so it is untyped there. The request row types both. */
+function intakeRows(extra: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> {
+  const base = contractRow(UPLOAD, "src/routes/intake.ts", 2, 118);
+  const response = {
+    ...base,
+    groups: [group([place("src/IntakePage.tsx", 118)], `Carrick: ${UPLOAD} is called from `, `, which expects: ${TYPE}`)],
+    untyped: [{ service: "web-app", repo: "web-app", file: "src/UploadDialog.tsx", line: 90, reason: "no_text" }],
+    total: 2,
+  };
+  const request = {
+    ...base,
+    direction: "request",
+    groups: [group([place("src/UploadDialog.tsx", 90), place("src/IntakePage.tsx", 118)], `Carrick: ${UPLOAD} takes a body from `, ", which sends a request body: { file: string }")],
+    total: 2,
+  };
+  const path: Hop[] = [{ file: "src/routes/intake.ts", line: 2, name: "post_handler", call: 3 }];
+  return [response, request, chainRow("InvoiceIntake.accept", "src/services/intake.ts", 2, [{ label: UPLOAD, file: "src/routes/intake.ts", line: 2, path }]), ...extra];
+}
+const OFF = (file: string, line: number) => `web-app/${file}:${line}${NOTE}`;
+const INTAKE_LINE = `Carrick: InvoiceIntake.accept (src/services/intake.ts:2) runs in the handler of ${UPLOAD} (src/routes/intake.ts:3). Other services call that route: ${OFF("src/IntakePage.tsx", 118)}, ${OFF("src/UploadDialog.tsx", 90)}. If your change adds a side effect or changes what the route returns, open those callers first.`;
+const inAccept = (ws: Ws): Edit => ({ file: ws.at("orders-api/src/services/intake.ts"), snippets: ["return this.store(file).andThen(finish);"] });
+const inCallback = (ws: Ws): Edit => ({ file: ws.at("orders-api/src/services/intake.ts"), snippets: ["return this.notify(file.id);"] });
+
+test("the chain line names every other-service caller of the route: one typed on the reply, one that reads only .ok, both on the request row", async (t) => {
+  const ws = await workspace(t, intakeRows(), INTAKE_FILES);
+  assert.deepEqual((await run(ws, inAccept(ws))).lines, [INTAKE_LINE]);
+});
+
+test("a caller in the route's own service is not named", async (t) => {
+  const rows = intakeRows();
+  for (const row of rows) {
+    if (row["k"] !== "contract") continue;
+    for (const g of row["groups"] as Array<{ places: Array<{ service: string; file: string }> }>) for (const one of g.places) if (one.file.includes("UploadDialog")) one.service = "orders-api";
+    for (const u of row["untyped"] as Array<{ service: string }>) u.service = "orders-api";
+  }
+  const ws = await workspace(t, rows, INTAKE_FILES);
+  const [line] = (await run(ws, inAccept(ws))).lines;
+  assert.ok(line !== undefined && !line.includes("UploadDialog") && line.includes("call that route: web-app/src/IntakePage.tsx:118"), String(line));
+});
+
+test("more than three callers: the first three, then a count of the rest", async (t) => {
+  const rows = intakeRows();
+  const many = ["A", "B", "C", "D", "E"].map((n, i) => place(`src/Page${n}.tsx`, 10 + i));
+  (rows[1] as { groups: unknown[] }).groups = [group(many, `Carrick: ${UPLOAD} takes a body from `, ", which sends a request body: { file: string }")];
+  const ws = await workspace(t, rows, INTAKE_FILES);
+  const [line] = (await run(ws, inAccept(ws))).lines;
+  assert.ok(line !== undefined && line.includes("PageB.tsx:11") && !line.includes("PageC.tsx") && line.includes(" and 4 more."), String(line));
+});
+
+test("an edit inside a named inner function of the method, which has no chain row of its own, prints the method's chain line", async (t) => {
+  const ws = await workspace(t, intakeRows(), INTAKE_FILES);
+  assert.deepEqual((await run(ws, inCallback(ws))).lines, [INTAKE_LINE]);
 });

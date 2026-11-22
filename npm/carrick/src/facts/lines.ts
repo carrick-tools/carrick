@@ -269,6 +269,9 @@ const CONTRACT_GROUPS_PRINTED = 2;
 /** A request row prints one group: its line follows every response line, so it stays short. */
 const CONTRACT_REQUEST_GROUPS_PRINTED = 1;
 
+/** The most callers a chain line names; the rest are counted. */
+const CHAIN_CALLERS_PRINTED = 3;
+
 /** Whether `row` is one the laptop may print: its first group carries its wording (the cloud decides which rows are worded). */
 function printable(row: ContractRow): boolean {
   return typeof row.groups[0]?.lead === "string";
@@ -434,7 +437,7 @@ export async function factLines(
   const takenIds = new Set<string>();
   const rest: Array<{ at: NonNullable<ReturnType<typeof locate>>; rows: ContractRow[] }> = [];
   // The changed functions of each edited file whose chain rows are looked up after the loop, when every file's tiers 1-2 are known.
-  const chained: Array<{ at: NonNullable<ReturnType<typeof locate>>; names: string[] }> = [];
+  const chained: Array<{ at: NonNullable<ReturnType<typeof locate>>; names: string[]; outer: Map<string, string[]> }> = [];
   // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
   if (!factsEnabled(options.env)) {
     stale = false;
@@ -506,6 +509,40 @@ export async function factLines(
       }
       return { words: `${parts.join(", ")}${group.more}${group.tail}`, onDisk };
     };
+    // The callers of a route in services other than its own, from its
+    // contract rows (response, then request): typed places, then untyped ones.
+    const callerPlaces = (rows: readonly ContractRow[], service: string): Array<{ repo: string; loc: string }> => {
+      const out = new Map<string, { repo: string; loc: string }>();
+      const add = (repo: string, owner: string, file: string, line: number | null, loc?: string) => {
+        if (owner === service) return;
+        const at = loc ?? (line === null ? `${repo}/${file}` : `${repo}/${file}:${line}`);
+        out.set(at, { repo, loc: at });
+      };
+      const ordered = [...rows].sort((a, b) => (a.direction === b.direction ? 0 : a.direction === "response" ? -1 : 1));
+      for (const row of ordered) {
+        for (const group of row.groups) for (const one of group.places.slice(0, group.shown)) add(one.repo, one.service, one.file, one.line, one.loc);
+      }
+      for (const row of ordered) for (const one of row.untyped) add(one.repo, one.service, one.file, one.line);
+      return [...out.values()];
+    };
+    // `places` as the line words them: a place on disk by its place, one off
+    // disk with the note (null when its repo has no full commit in the file).
+    const callerWords = (at: { repo: string; top: string }, places: ReadonlyArray<{ repo: string; loc: string }>): { words: string; onDisk: Array<{ repo: string; file: string }> } | null => {
+      const onDisk: Array<{ repo: string; file: string }> = [];
+      const parts: string[] = [];
+      for (const place of places) {
+        const local = checkouts.place(place.repo, at);
+        if (local !== null) {
+          onDisk.push({ repo: place.repo, file: place.loc.slice(place.repo.length + 1).replace(/:\d+$/, "") });
+          parts.push(place.loc);
+          continue;
+        }
+        const commit = indexedCommit(commits, place.repo);
+        if (commit === null) return null;
+        parts.push(`${place.loc} (another repo, indexed at ${commit.slice(0, 8)}, not checked out here)`);
+      }
+      return { words: parts.join(", "), onDisk };
+    };
     // The contract candidates of one row: its first two groups (a request row: its first), each a line.
     const contractCandidates = (at: { repo: string; top: string }, row: ContractRow): Candidate[] =>
       row.groups.slice(0, row.direction === "request" ? CONTRACT_REQUEST_GROUPS_PRINTED : CONTRACT_GROUPS_PRINTED).flatMap((group, index) => {
@@ -524,40 +561,55 @@ export async function factLines(
     // The chain candidates of the changed functions `names` of the edited
     // file at `at`: per chain row, one candidate per kept route, all under
     // the row's one key, so `pickLines` prints the first that holds and the
-    // rest fall silent. A route is skipped when its contract row is gone or
-    // not printable, was taken by tier 1 or 2 in this action, or its group
-    // 0 was said (`skipIf`). The line names the route's hop files and its
-    // registration file (other than the edited file), and its group's places
-    // on disk: each must read as at the index commit.
-    const chainCandidates = (at: { repo: string; rel: string; top: string }, names: readonly string[]): Candidate[] =>
-      names.flatMap((name) =>
-        facts.chains(at.repo, at.rel, name).flatMap((chain) =>
+    // rest fall silent. A name with no chain row looks on the next named
+    // thing out (`outer`, innermost first). A route is skipped when neither
+    // its response nor its request contract row is printable, the response
+    // row was taken by tier 1 or 2 in this action, or its group 0 was said
+    // (`skipIf`). The line names the callers in other services from both
+    // rows (typed places and untyped ones: fact rows only, the cloud drops a
+    // model's reading), the route's hop files and its registration file
+    // (other than the edited file): each place on disk must read as at the
+    // index commit.
+    const chainCandidates = (at: { repo: string; rel: string; top: string }, names: readonly string[], outer: ReadonlyMap<string, readonly string[]>): Candidate[] =>
+      names.flatMap((name) => {
+        let rows = facts.chains(at.repo, at.rel, name);
+        for (const encloser of outer.get(name) ?? []) {
+          if (rows.length > 0) break;
+          rows = facts.chains(at.repo, at.rel, encloser);
+        }
+        return rows.flatMap((chain) =>
           chain.routes.flatMap((route) => {
-            const row = facts
-              .contracts(route.repo, route.file)
-              .find((one) => one.side === route.side && one.label === route.label && one.line === route.line && one.direction === "response" && printable(one));
-            if (row === undefined || takenIds.has(takenId(row))) return [];
-            const group = row.groups[0]!;
-            const composed = groupWords(at, group);
-            if (composed === null) return [];
+            const same = facts.contracts(route.repo, route.file).filter((one) => one.side === route.side && one.label === route.label && one.line === route.line && printable(one));
+            const response = same.find((one) => one.direction === "response");
+            const base = response ?? same[0];
+            if (base === undefined || (response !== undefined && takenIds.has(takenId(response)))) return [];
+            const callers = callerPlaces(same, route.service);
+            if (callers.length === 0) return [];
+            const words = callerWords(at, callers.slice(0, CHAIN_CALLERS_PRINTED));
+            if (words === null) return [];
             const peers = [...new Set([...route.path.map((hop) => hop.file), route.file])]
               .filter((file) => !(route.repo === at.repo && file === at.rel))
               .map((file) => ({ repo: route.repo, file }));
-            const others = [...peers, ...composed.onDisk];
-            const groupKey = contractKey(row, 0);
+            const others = [...peers, ...words.onDisk];
+            const groupKey = contractKey(base, 0);
+            const hop = route.path[0]!;
+            const hopAt = hop.call === null ? hop.file : `${hop.file}:${hop.call}`;
+            const count = chain.total > 1 ? `, reached by at least ${chain.total} operations` : "";
+            const where = route.depth === 1 ? `(${hopAt})` : `, through ${hop.name} (${hopAt})`;
+            const rest = callers.length > CHAIN_CALLERS_PRINTED ? ` and ${callers.length - CHAIN_CALLERS_PRINTED} more` : "";
             return [
               {
                 key: `chain::${chain.repo}::${chain.file}::${chain.name}`,
-                text: `${route.lead}${composed.words}`,
+                text: `Carrick: ${chain.name} (${chain.file}:${chain.line}${count}) runs in the handler of ${route.label}${route.depth === 1 ? " " : ""}${where}. Other services call that route: ${words.words}${rest}. If your change adds a side effect or changes what the route returns, open those callers first.`,
                 named: pathsOf(others),
                 holds: peersHold(at, others),
                 skipIf: [groupKey],
-                alsoClaims: [groupKey, rowKey(row)],
+                alsoClaims: [groupKey, ...(response !== undefined ? [rowKey(response)] : [])],
               },
             ];
           }),
-        ),
-      );
+        );
+      });
     for (const edit of edits) {
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
@@ -634,7 +686,14 @@ export async function factLines(
       // The chain kind's lookup, after every file's tiers 1-2 (a Read never says one).
       if (options.contract === true && options.chain === true && !edit.read && names.length > 0) {
         const start = new Map(scan.spans.map((span) => [span.name, span.start]));
-        chained.push({ at, names: [...names].sort((a, b) => start.get(a)! - start.get(b)!) });
+        // Each name's enclosing named things, innermost first (once-declared names only).
+        const outer = new Map<string, string[]>();
+        for (const name of names) {
+          const own = scan.spans.find((span) => span.name === name)!;
+          const around = scan.spans.filter((span) => span !== own && span.start <= own.start && span.end >= own.end && declared.get(span.name) === 1);
+          outer.set(name, around.sort((a, b) => a.end - a.start - (b.end - b.start)).map((span) => span.name));
+        }
+        chained.push({ at, names: [...names].sort((a, b) => start.get(a)! - start.get(b)!), outer });
       }
       // The op rows this edit reaches: tier 1 of the contract kind.
       const reachedOps: FactRow[] = [];
@@ -708,7 +767,7 @@ export async function factLines(
     }
     for (const one of chained) {
       try {
-        tiers[2]!.push(...chainCandidates(one.at, one.names));
+        tiers[2]!.push(...chainCandidates(one.at, one.names, one.outer));
       } catch (error) {
         log("chain fact lines failed", String(error));
         stopped("rule_failed");
