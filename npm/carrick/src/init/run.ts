@@ -61,7 +61,7 @@ import {
 import { mergeCarrickHooks, mergeHookSet, removeCarrickHooks, SHARED_SETTINGS } from "./settings.ts";
 import { LAUNCHER_FILE, writeLauncher } from "./launcher.ts";
 import { CODEX_DIR, CODEX_HOOKS_FILE, codexHooks, readHooksFile, writeCodexHooks } from "./codex.ts";
-import { AGENTS_FILE, CLAUDE_FILE, writeAgentsSection, writeClaudeSection } from "./agents-section.ts";
+import { AGENTS_FILE, CLAUDE_FILE, RULES_FILE, writeAgentsSection, writeClaudeSection, writeRules } from "./agents-section.ts";
 import { ignoredSkillRoots, skillRootsFor, taskSkillWarnings, writeTaskSkills } from "./task-skills.ts";
 import { recordCliVersion } from "./outdated.ts";
 import { offerGlobalInstall } from "../global-install.ts";
@@ -965,17 +965,23 @@ export async function initWith(
 
   }
 
+  // The rules the one-line section points at, in the ignored `.carrick/`.
+  try {
+    writeRules(workspace, { slug: project }, plan.counts);
+  } catch (error) {
+    out.refuse(`Could not write the Carrick rules in ${RULES_FILE}: ${(error as Error).message}`);
+  }
   // The check block in AGENTS.md (carrick#2828): only our marked section is
   // written, and every other line of the file is left as it is.
   try {
-    writeAgentsSection(workspace, { slug: project }, plan.counts);
+    writeAgentsSection(workspace);
   } catch (error) {
     out.refuse(`Could not write the Carrick check section in ${AGENTS_FILE}: ${(error as Error).message}`);
   }
   // The same block inline in a CLAUDE.md the folder already has (carrick#3515):
   // a session started in a subfolder does not follow an `@AGENTS.md` import.
   try {
-    writeClaudeSection(workspace, { slug: project }, plan.counts);
+    writeClaudeSection(workspace);
   } catch (error) {
     out.refuse(`Could not write the Carrick check section in ${CLAUDE_FILE}: ${(error as Error).message}`);
   }

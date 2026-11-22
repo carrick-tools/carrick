@@ -20,7 +20,8 @@
 //
 // * The Carrick rules section in the folder's `AGENTS.md`, between its two marker
 //   comments and nowhere else (`agents-section.ts`), rewritten to what this CLI
-//   renders for the scope and counts in `.carrick/hosted/snapshot.json`. Never
+//   renders, and the rules file `.carrick/RULES.md` it points at, written to the
+//   scope and counts in `.carrick/hosted/snapshot.json`. Never
 //   added where the markers are absent, and left alone when the snapshot is
 //   missing or does not name one project (a section that named a project is not
 //   downgraded).
@@ -47,7 +48,16 @@ import path from "node:path";
 
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 import { isNewer } from "../update.ts";
-import { AGENTS_FILE, CLAUDE_FILE, renderCheckSection, withCheckSection, type WorkspaceCounts } from "./agents-section.ts";
+import {
+  AGENTS_FILE,
+  CLAUDE_FILE,
+  RULES_FILE,
+  renderCheckSection,
+  renderRules,
+  sameExceptCounts,
+  withCheckSection,
+  type WorkspaceCounts,
+} from "./agents-section.ts";
 import {
   entriesAreStale,
   outdatedFiles,
@@ -283,7 +293,7 @@ function updateAgentsSection(
       log("AGENTS.md section left as it is: no readable snapshot naming one project");
       return null;
     }
-    const body = withCheckSection(existing, renderCheckSection({ slug }, counts));
+    const body = withCheckSection(existing, renderCheckSection());
     if (body === existing) return null;
     if (tracked.has(AGENTS_FILE)) {
       held.push(AGENTS_FILE);
@@ -291,6 +301,36 @@ function updateAgentsSection(
     }
     writeAtomic(target, body);
     return AGENTS_FILE;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `.carrick/RULES.md`, the rules the one-line section points at: written where it
+ * is missing and rewritten where it differs from what this CLI renders, except
+ * for its counts alone. Only in a workspace whose AGENTS.md holds our marker, and
+ * with a snapshot naming one project, like the section. A file git tracks is the
+ * team's and is left as it is. Returns the file written, or null.
+ */
+function updateRules(workspace: string, tracked: Set<string>, held: string[]): string | null {
+  const target = path.join(workspace, RULES_FILE);
+  try {
+    const agents = fs.readFileSync(path.join(workspace, AGENTS_FILE), "utf8");
+    if (!agents.includes("<!-- carrick:check start -->")) return null;
+    const slug = snapshotProjectSlug(workspace);
+    const counts = snapshotCounts(workspace);
+    if (slug === "" || counts === null) return null;
+    const body = renderRules({ slug }, counts);
+    const existing = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null;
+    if (existing !== null && sameExceptCounts(existing, body)) return null;
+    if (tracked.has(RULES_FILE)) {
+      held.push(RULES_FILE);
+      return null;
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    writeAtomic(target, body);
+    return RULES_FILE;
   } catch {
     return null;
   }
@@ -311,7 +351,7 @@ function updateClaudeSection(workspace: string, tracked: Set<string>, held: stri
     const slug = snapshotProjectSlug(workspace);
     const counts = snapshotCounts(workspace);
     if (slug === "" || counts === null) return null;
-    const body = withCheckSection(existing, renderCheckSection({ slug }, counts));
+    const body = withCheckSection(existing, renderCheckSection());
     if (body === existing) return null;
     if (tracked.has(CLAUDE_FILE)) {
       held.push(CLAUDE_FILE);
@@ -367,7 +407,7 @@ export function bringUpToDate(
     const named = listed(allowed.map((file) => path.relative(workspace, path.join(projectDir ?? workspace, file))));
     lines.push(`Carrick allowed its read-only MCP tools in ${named}, so headless runs (\`claude -p\`) can call them.`);
   }
-  const rootTracked = trackedPaths(workspace, [...SKILL_ROOTS, AGENTS_FILE, CLAUDE_FILE]) ?? new Set();
+  const rootTracked = trackedPaths(workspace, [...SKILL_ROOTS, AGENTS_FILE, CLAUDE_FILE, RULES_FILE]) ?? new Set();
   const rootHeld: string[] = [];
   const skills = updateSkills(workspace, rootTracked, rootHeld);
   if (skills.length > 0) {
@@ -398,6 +438,7 @@ export function bringUpToDate(
   const written = [
     updateAgentsSection(workspace, log, rootTracked, rootHeld),
     updateClaudeSection(workspace, rootTracked, rootHeld),
+    updateRules(workspace, rootTracked, rootHeld),
   ].filter((file): file is string => file !== null);
   if (written.length > 0) {
     lines.push(`Carrick brought its rules section in ${written.join(" and ")} up to date for ${running}.`);

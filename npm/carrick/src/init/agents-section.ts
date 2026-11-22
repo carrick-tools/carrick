@@ -9,6 +9,11 @@
 // when it is missing, and deleted again on remove only when our section was
 // all it held.
 //
+// The section is one line pointing at `.carrick/RULES.md`, where the rules
+// themselves live (`renderRules`). That file is derived, git-ignored and
+// rewritten by init and by the session-start self-update, so the rules move with
+// the package without touching a file a team may track.
+//
 // The same block goes into a CLAUDE.md the workspace already has (carrick#3515):
 // a Claude Code session started in a subfolder does not follow the `@AGENTS.md`
 // import, so the block is written inline there too. CLAUDE.md is never created,
@@ -22,6 +27,8 @@ import { scopeArgument, type SkillScope } from "./task-skills.ts";
 
 export const AGENTS_FILE = "AGENTS.md";
 export const CLAUDE_FILE = "CLAUDE.md";
+/** The rules file, relative to the workspace. `.carrick/.gitignore` ignores it. */
+export const RULES_FILE = path.join(".carrick", "RULES.md");
 
 const START = "<!-- carrick:check start -->";
 const END = "<!-- carrick:check end -->";
@@ -38,7 +45,7 @@ function countsPhrase(counts: WorkspaceCounts | null): string | null {
 }
 
 /**
- * The section as written, markers included. Ends in one newline.
+ * The rules `.carrick/RULES.md` holds, ending in one newline.
  *
  * The words are the rules block measured in carrick-cloud#2991 (21 graded runs
  * per arm on one build: reused 17/21 against 5/21), plus rule 5's contract
@@ -50,11 +57,10 @@ function countsPhrase(counts: WorkspaceCounts | null): string | null {
  * per-file calls (carrick-cloud#3068, D13). Only the counts and the scope clause
  * vary; edit nothing else without a new measurement.
  */
-export function renderCheckSection(scope: SkillScope, counts: WorkspaceCounts | null): string {
+export function renderRules(scope: SkillScope, counts: WorkspaceCounts | null): string {
   const phrase = countsPhrase(counts);
   const indexed = phrase === null ? "This workspace is indexed by Carrick." : `This workspace (${phrase}) is indexed by Carrick.`;
   return [
-    START,
     "## Carrick: use it while you work, not only at the end",
     "",
     `${indexed} The`,
@@ -88,6 +94,22 @@ export function renderCheckSection(scope: SkillScope, counts: WorkspaceCounts | 
     "   other service sees needs nothing more. If Carrick found a problem or changed",
     "   what you did, say so in one line in your final summary. Otherwise do not",
     "   mention it.",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The section as written, markers included. Ends in one newline.
+ *
+ * One line, measured on one build in a private monorepo (22 Nov 2026): asked to
+ * call `get_operation`, an agent with this line opened the rules file first in
+ * 6 of 6 sessions and the task passed in 5 of 6; the full section got 3 of 3 and
+ * 1 of 3. Do not reword it without a new measurement.
+ */
+export function renderCheckSection(): string {
+  return [
+    START,
+    "Carrick indexes every service in this workspace. Before you add or change a route, a call to another service, an event or a shared function, read `.carrick/RULES.md` (written by `carrick init`) and follow it.",
     END,
     "",
   ].join("\n");
@@ -106,10 +128,11 @@ function span(body: string): { from: number; to: number } | null {
 const COUNTS_CLAUSE = /This workspace \([^)]*\) is indexed by Carrick\./;
 
 /**
- * True where two sections differ at most in the counts phrase. The counts are
- * what the index held when a developer last ran init or a session started, so
- * they differ between developers and between re-indexes; a section that is
- * current in every word is not rewritten for them (carrick#4998).
+ * True where two copies of the rules differ at most in the counts phrase. The
+ * counts are what the index held when a developer last ran init or a session
+ * started, so they differ between re-indexes; a rules file that is current in
+ * every word is not rewritten for them by the session-start update
+ * (carrick#4998).
  */
 export function sameExceptCounts(existing: string, rendered: string): boolean {
   const bare = (text: string): string => text.replace(COUNTS_CLAUSE, "This workspace is indexed by Carrick.");
@@ -118,13 +141,13 @@ export function sameExceptCounts(existing: string, rendered: string): boolean {
 
 /**
  * The body with our section written in: replaced where it is, appended where it
- * is not, and kept as it is where it already says the same but for its counts.
+ * is not, and kept as it is where it already says the same.
  */
 export function withCheckSection(existing: string | null, section: string): string {
   if (existing === null || existing.trim() === "") return section;
   const found = span(existing);
   if (found !== null) {
-    if (sameExceptCounts(existing.slice(found.from, found.to), section)) return existing;
+    if (existing.slice(found.from, found.to) === section) return existing;
     return existing.slice(0, found.from) + section + existing.slice(found.to);
   }
   const lf = existing.endsWith("\n") ? existing : `${existing}\n`;
@@ -143,15 +166,16 @@ export function withoutCheckSection(existing: string): { body: string; changed: 
   return { body, changed: true, empty: body.trim() === "" };
 }
 
+/** Write the rules file, `.carrick/RULES.md`, where its text differs. */
+export function writeRules(workspace: string, scope: SkillScope, counts: WorkspaceCounts | null): "written" | "unchanged" {
+  return writeIfChanged(path.join(workspace, RULES_FILE), renderRules(scope, counts));
+}
+
 /** Write our section into the folder's AGENTS.md. */
-export function writeAgentsSection(
-  workspace: string,
-  scope: SkillScope,
-  counts: WorkspaceCounts | null,
-): "written" | "unchanged" {
+export function writeAgentsSection(workspace: string): "written" | "unchanged" {
   const target = path.join(workspace, AGENTS_FILE);
   const existing = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null;
-  return writeIfChanged(target, withCheckSection(existing, renderCheckSection(scope, counts)));
+  return writeIfChanged(target, withCheckSection(existing, renderCheckSection()));
 }
 
 /** True where the folder's AGENTS.md holds our section. */
@@ -178,14 +202,10 @@ export function removeAgentsSection(workspace: string): "section removed" | "fil
  * Write our section into the workspace's CLAUDE.md, only where that file exists.
  * Returns null where there is none: init never creates it (carrick#3515).
  */
-export function writeClaudeSection(
-  workspace: string,
-  scope: SkillScope,
-  counts: WorkspaceCounts | null,
-): "written" | "unchanged" | null {
+export function writeClaudeSection(workspace: string): "written" | "unchanged" | null {
   const target = path.join(workspace, CLAUDE_FILE);
   if (!fs.existsSync(target)) return null;
-  return writeIfChanged(target, withCheckSection(fs.readFileSync(target, "utf8"), renderCheckSection(scope, counts)));
+  return writeIfChanged(target, withCheckSection(fs.readFileSync(target, "utf8"), renderCheckSection()));
 }
 
 /** True where the workspace's CLAUDE.md holds our section. */
