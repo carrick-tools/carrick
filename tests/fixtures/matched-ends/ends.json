@@ -1,0 +1,106 @@
+{
+  "schema": "carrick.matched/2",
+  "repo": "example-org/orders",
+  "commit": "3333333333333333333333333333333333333333",
+  "run": {
+    "id": "run-0001",
+    "mode": "full",
+    "base_commit": null,
+    "model": "model-under-test",
+    "brief_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "started_at": "2026-11-22T10:00:00Z",
+    "finished_at": "2026-11-22T10:03:00Z"
+  },
+  "engine": {
+    "status": "not_run",
+    "ms": 0,
+    "scanner_version": ""
+  },
+  "ends": [
+    {
+      "id": "b2e2de89c1ff209d",
+      "side": "call",
+      "protocol": "http",
+      "kind": "route",
+      "method": "GET",
+      "path": "/orders",
+      "file": "apps/web/src/orders.ts",
+      "line": 15,
+      "line_sha256": "8f583d4aa2b8adec91630ecc6abbe66713dc180683319451836ba371d93c6220",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "792cfa44f49d7d69",
+      "side": "endpoint",
+      "protocol": "http",
+      "kind": "route",
+      "method": "GET",
+      "path": "/orders",
+      "file": "apps/api/src/orders.ts",
+      "line": 9,
+      "line_sha256": "247b539c0b16a1f0804698221230e4e7edcabc4928e7ba76feb412da2b6f76a0",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "55b953dda0526e76",
+      "side": "call",
+      "protocol": "http",
+      "kind": "route",
+      "method": "GET",
+      "path": "/orders",
+      "file": "apps/web/src/orders.ts",
+      "line": 20,
+      "line_sha256": "882cd53cddb95305b2c64723c98d40f81fc50e1208186db17067e79cc8560c2b",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "fdb63fcb369b46c6",
+      "side": "call",
+      "protocol": "http",
+      "kind": "route",
+      "method": "GET",
+      "path": "/stock",
+      "file": "apps/web/src/orders.ts",
+      "line": 20,
+      "line_sha256": "882cd53cddb95305b2c64723c98d40f81fc50e1208186db17067e79cc8560c2b",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "09bda1359ce69511",
+      "side": "call",
+      "protocol": "graphql",
+      "kind": "graphql_field",
+      "name": "orders",
+      "gql_kind": "query",
+      "file": "apps/web/src/orders.ts",
+      "line": 24,
+      "line_sha256": "48e4379e47245730f2480bba290e4f35936fd9f696711c874bfbd25c6129722c",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    },
+    {
+      "id": "21fdc1eac1c031a4",
+      "side": "endpoint",
+      "protocol": "http",
+      "kind": "table",
+      "method": "ALL",
+      "path": "/rest/v1/orders",
+      "file": "db/001_orders.sql",
+      "line": 1,
+      "line_sha256": "fe41be5f41e79c50001b47fff9263be023ab06cb546ea4e2bc16161f50c3639f",
+      "confidence": "stated",
+      "basis": "text",
+      "carried_from": null
+    }
+  ],
+  "dropped": {}
+}

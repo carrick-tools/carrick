@@ -24,6 +24,10 @@
 //! `procedure`, `event`, `topic`, `queue` or `other` pair at neither end in
 //! this build, each end saying `protocol_not_read`.
 //!
+//! A `carrick.matched/2` record (ends, not pairs) is read end by end
+//! ([`annotate_ends`]): each HTTP end gets a `type`, the response type the
+//! same type stage reads at its `file:line`, or the reason it has none.
+//!
 //! Nothing else in the record is changed. The pass writes no blob, rows file
 //! or store entry: those are read, never rewritten. The compiler processes
 //! it starts may leave their own caches under the repository root, as they
@@ -95,6 +99,8 @@ const NOT_IN_WRAPPER: &str = "not_in_wrapper";
 const ROWS_MISSING: &str = "rows_missing";
 const NOT_LOCATED: &str = "not_located";
 const SEVERAL_SITES_ON_LINE: &str = "several_sites_on_line";
+const PROTOCOL_NOT_READ: &str = "protocol_not_read";
+const NOT_TYPESCRIPT_SOURCE: &str = "not_typescript_source";
 
 /// A record's type text is at most this many UTF-8 bytes, and a verdict's
 /// `detail` at most this many UTF-16 units: the cloud refuses the whole record
@@ -912,9 +918,8 @@ fn graded(judged: &MatchedVerdict) -> Value {
 /// The record's schema word, the only one this pass annotates.
 const SCHEMA: &str = "carrick.matched/1";
 
-/// The model step's record since carrick-cloud MR-4: ends, not pairs. It holds
-/// no pair for this pass to type, so it passes through untouched until the
-/// pass reads ends (MR-T).
+/// The model step's record since carrick-cloud MR-4: ends, not pairs. Each end
+/// is typed on its own by [`annotate_ends`].
 const ENDS_SCHEMA: &str = "carrick.matched/2";
 
 /// The four sides of a pair.
@@ -969,8 +974,8 @@ fn server_reason(root: &Path, server_file: &str, kind: Reading) -> Option<&'stat
     // A table's or database function's server end is never asked: a schema
     // written in TypeScript is not a response body.
     match kind {
-        Reading::CallerOnly if !is_compiler_source(server_file) => Some("not_typescript_source"),
-        Reading::CallerOnly => Some("protocol_not_read"),
+        Reading::CallerOnly if !is_compiler_source(server_file) => Some(NOT_TYPESCRIPT_SOURCE),
+        Reading::CallerOnly => Some(PROTOCOL_NOT_READ),
         _ if !checked_path(root, server_file).is_ok_and(|path| path.is_file()) => Some(NOT_LOCATED),
         _ => None,
     }
@@ -989,43 +994,27 @@ pub struct Inputs<'a> {
     pub ceiling: Duration,
 }
 
-/// Annotate `record` in place. An error is a record this pass cannot read at
-/// all (no `pairs` array); everything else is stated in the record. A
-/// `carrick.matched/2` record holds no pairs and is left exactly as it came.
-pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
-    let started = Instant::now();
-    if record.get("schema").and_then(Value::as_str) == Some(ENDS_SCHEMA) {
-        return Ok(());
-    }
-    if record.get("schema").and_then(Value::as_str) != Some(SCHEMA) {
-        return Err(format!("the record's `schema` is not `{SCHEMA}`"));
-    }
-    let repo_name = record
-        .get("repo")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let raw_pairs = record
-        .get("pairs")
-        .and_then(Value::as_array)
-        .ok_or("the record has no `pairs` array")?;
-    if raw_pairs.len() > MAX_PAIRS {
-        return Err(format!(
-            "the record holds {} pairs, more than the {MAX_PAIRS} a record may hold",
-            raw_pairs.len()
-        ));
-    }
-    // A pair the pass cannot read, or one whose `sides`, a side or `verdicts`
-    // is not an object, is left exactly as it came and counted.
-    let pairs_in: Vec<Option<PairIn>> = raw_pairs
-        .iter()
-        .map(|pair| pair_in(pair).filter(|_| writable(pair)))
-        .collect();
-    let skipped = pairs_in.iter().filter(|pair| pair.is_none()).count();
-    if skipped > 0 {
-        crate::errln!("carrick {COMMAND}: {skipped} pair(s) left untouched: not readable");
-    }
+/// What both record formats read before any end is asked: the repository's
+/// services, what the scan stored for them, and the engine's service list.
+struct Prepared {
+    root: PathBuf,
+    services: Vec<Config>,
+    names: Vec<String>,
+    rows: Rows,
+    own: OwnCode,
+    engine_services: Vec<MatchedService>,
+}
 
+impl Prepared {
+    fn repo(&self) -> Repo<'_> {
+        Repo {
+            services: &self.services,
+            names: self.names.clone(),
+        }
+    }
+}
+
+fn prepare(repo_name: &str, inputs: &Inputs<'_>) -> Result<Prepared, String> {
     let root = inputs
         .repo
         .canonicalize()
@@ -1034,7 +1023,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
     let short = repo_name
         .rsplit('/')
         .next()
-        .unwrap_or(&repo_name)
+        .unwrap_or(repo_name)
         .to_string();
     let names: Vec<String> = services
         .iter()
@@ -1045,17 +1034,13 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
                 .unwrap_or_else(|| short.clone())
         })
         .collect();
-    let repo = Repo {
-        services: &services,
-        names: names.clone(),
-    };
 
     let stored = inputs
         .store
         .map(|store| {
             let service_names: Vec<Option<String>> =
                 services.iter().map(|s| s.service_name.clone()).collect();
-            read_store(store, &repo_name, &names, &service_names)
+            read_store(store, repo_name, &names, &service_names)
         })
         .unwrap_or_default();
     let mut row_paths: Vec<PathBuf> = stored.values().map(|s| s.rows.clone()).collect();
@@ -1091,6 +1076,82 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
             },
         );
     }
+
+    let engine_services: Vec<MatchedService> = services
+        .iter()
+        .zip(&names)
+        .map(|(service, name)| MatchedService {
+            service_id: name.clone(),
+            root: crate::engine::service_sidecar_root(&root.to_string_lossy(), service),
+            scan_root: root.clone(),
+            tsconfig: service.tsconfig.clone(),
+            extraction_config: stored
+                .get(name)
+                .and_then(|stored| stored.blob.as_ref()?.cached_extraction_config.clone()),
+            server_claims: None,
+            graphql_types: None,
+        })
+        .collect();
+
+    Ok(Prepared {
+        root,
+        services,
+        names,
+        rows,
+        own,
+        engine_services,
+    })
+}
+
+/// Annotate `record` in place. An error is a record this pass cannot read at
+/// all (no `pairs` array); everything else is stated in the record. A
+/// `carrick.matched/2` record holds no pairs and is left exactly as it came.
+pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
+    let started = Instant::now();
+    if record.get("schema").and_then(Value::as_str) == Some(ENDS_SCHEMA) {
+        return annotate_ends(record, inputs, started);
+    }
+    if record.get("schema").and_then(Value::as_str) != Some(SCHEMA) {
+        return Err(format!(
+            "the record's `schema` is not `{SCHEMA}` or `{ENDS_SCHEMA}`"
+        ));
+    }
+    let repo_name = record
+        .get("repo")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let raw_pairs = record
+        .get("pairs")
+        .and_then(Value::as_array)
+        .ok_or("the record has no `pairs` array")?;
+    if raw_pairs.len() > MAX_PAIRS {
+        return Err(format!(
+            "the record holds {} pairs, more than the {MAX_PAIRS} a record may hold",
+            raw_pairs.len()
+        ));
+    }
+    // A pair the pass cannot read, or one whose `sides`, a side or `verdicts`
+    // is not an object, is left exactly as it came and counted.
+    let pairs_in: Vec<Option<PairIn>> = raw_pairs
+        .iter()
+        .map(|pair| pair_in(pair).filter(|_| writable(pair)))
+        .collect();
+    let skipped = pairs_in.iter().filter(|pair| pair.is_none()).count();
+    if skipped > 0 {
+        crate::errln!("carrick {COMMAND}: {skipped} pair(s) left untouched: not readable");
+    }
+
+    let prepared = prepare(&repo_name, inputs)?;
+    let Prepared {
+        root,
+        names: _,
+        rows,
+        own,
+        engine_services,
+        ..
+    } = &prepared;
+    let repo = prepared.repo();
 
     // A caller line two pairs name with different operations names no one
     // call.
@@ -1148,22 +1209,6 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
             },
         });
     }
-    let engine_services: Vec<MatchedService> = services
-        .iter()
-        .zip(&names)
-        .map(|(service, name)| MatchedService {
-            service_id: name.clone(),
-            root: crate::engine::service_sidecar_root(&root.to_string_lossy(), service),
-            scan_root: root.clone(),
-            tsconfig: service.tsconfig.clone(),
-            extraction_config: stored
-                .get(name)
-                .and_then(|stored| stored.blob.as_ref()?.cached_extraction_config.clone()),
-            server_claims: None,
-            graphql_types: None,
-        })
-        .collect();
-
     let (types, status): (Option<Vec<MatchedPairTypes>>, (&str, Option<&str>)) =
         match inputs.sidecar {
             None => (None, ("failed", Some("engine_not_found"))),
@@ -1174,16 +1219,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
                     &matched,
                     inputs.ceiling.saturating_sub(started.elapsed()),
                 );
-                let cut = rows.iter().any(|row| {
-                    [&row.caller, &row.server]
-                        .iter()
-                        .any(|end| end.reason.as_deref() == Some("budget_exhausted"))
-                });
-                let status = if cut {
-                    ("partial", Some("budget_exhausted"))
-                } else {
-                    ("done", None)
-                };
+                let status = status_of(&rows);
                 (Some(rows), status)
             }
         };
@@ -1231,6 +1267,15 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
         put_verdict(out, verdict(row, caller.callee_unread));
     }
 
+    record
+        .as_object_mut()
+        .ok_or("the record is not an object")?
+        .insert("engine".to_string(), engine_block(started, status));
+    Ok(())
+}
+
+/// The record's top-level `engine` block.
+fn engine_block(started: Instant, status: (&str, Option<&str>)) -> Value {
     let mut engine = json!({
         "status": status.0,
         "ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1239,10 +1284,332 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
     if let Some(reason) = status.1 {
         engine["reason"] = Value::String(reason.to_string());
     }
+    engine
+}
+
+/// `done`, or `partial` when a service's time ran out before it started.
+fn status_of(types: &[MatchedPairTypes]) -> (&'static str, Option<&'static str>) {
+    let cut = types.iter().any(|row| {
+        [&row.caller, &row.server]
+            .iter()
+            .any(|end| end.reason.as_deref() == Some("budget_exhausted"))
+    });
+    if cut {
+        ("partial", Some("budget_exhausted"))
+    } else {
+        ("done", None)
+    }
+}
+
+/// One end of a `carrick.matched/2` record as the pass reads it.
+#[derive(Debug, Clone)]
+struct EndIn {
+    /// A call site (`call`) or a serving side (`endpoint`).
+    call: bool,
+    http: bool,
+    kind: String,
+    method: String,
+    /// The key's name: an http end's path, any other protocol's name.
+    name: String,
+    file: String,
+    line: u32,
+}
+
+fn end_in(end: &Value) -> Option<EndIn> {
+    let call = match end.get("side")?.as_str()? {
+        "call" => true,
+        "endpoint" => false,
+        _ => return None,
+    };
+    let line = u32::try_from(end.get("line")?.as_u64()?).ok()?;
+    let text = |key: &str| end.get(key).and_then(Value::as_str).map(str::to_string);
+    (line >= 1)
+        .then(|| EndIn {
+            call,
+            http: end.get("protocol").and_then(Value::as_str) == Some("http"),
+            kind: text("kind").unwrap_or_default(),
+            method: text("method").unwrap_or_default(),
+            name: text("path").or_else(|| text("name")).unwrap_or_default(),
+            file: text("file").unwrap_or_default(),
+            line,
+        })
+        .filter(|end| !end.file.is_empty())
+}
+
+/// What is decided about an end before the engine is asked: a reason it is
+/// not asked, or (a call end) where its call sits.
+fn end_decided(
+    root: &Path,
+    end: &EndIn,
+    several: bool,
+    rows: &Rows,
+    own: &OwnCode,
+    parsed: &mut HashMap<String, Option<ParsedFile>>,
+) -> (Option<&'static str>, Option<(u32, u32)>) {
+    let reading = if end.http {
+        reading_of(&end.kind)
+    } else {
+        Reading::Neither
+    };
+    if reading == Reading::Neither {
+        return (Some(PROTOCOL_NOT_READ), None);
+    }
+    if !end.call {
+        return (server_reason(root, &end.file, reading), None);
+    }
+    if !is_compiler_source(&end.file) {
+        return (Some(NOT_TYPESCRIPT_SOURCE), None);
+    }
+    let pair = PairIn {
+        caller_file: end.file.clone(),
+        caller_line: end.line,
+        server_file: end.file.clone(),
+        server_line: end.line,
+        kind: end.kind.clone(),
+        method: end.method.clone(),
+        name: end.name.clone(),
+    };
+    let read = read_caller(root, &pair, several, rows, own, parsed);
+    match read.span {
+        Ok(span) => (None, Some(span)),
+        Err(reason) => (Some(reason), None),
+    }
+}
+
+/// The longest type text, in characters, the cloud stores on an end
+/// (carrick-cloud `model_record_core.ts`).
+const MAX_END_TYPE_CHARS: usize = 16_000;
+
+/// Whether an end may carry a `type`: an HTTP end with no procedure. The
+/// cloud refuses any other end that carries one.
+fn takes_type(end: &Value) -> bool {
+    end.get("protocol").and_then(Value::as_str) == Some("http") && end.get("procedure").is_none()
+}
+
+/// Text the cloud accepts: no control character but newline and tab, and at
+/// most [`MAX_END_TYPE_CHARS`] characters.
+fn storable(text: &str) -> bool {
+    text.chars().count() <= MAX_END_TYPE_CHARS
+        && !text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+}
+
+/// An alias the cloud accepts as a manifest type alias.
+fn storable_alias(alias: &str) -> bool {
+    let mut chars = alias.chars();
+    alias.len() <= 200
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// The `type` of one end, in the shape the cloud's record validator enforces:
+/// a read (`basis`, `type_kind`, `alias`, `resolved_definition`, optional
+/// `expanded_definition`, `read_at`), or `basis`, `type_kind` and `reason`
+/// alone. The reader stamps key, file and line from the end. The side is read
+/// by [`reading`], the rule the pairs path uses, so both formats state the
+/// same type. Nothing is cut: a text the cloud would refuse is a reason.
+fn type_of(read: &MatchedEndTypes, file: &str, line: u32) -> Value {
+    let unread =
+        |reason: &str| json!({ "basis": "compiler", "type_kind": "response", "reason": reason });
+    let side = reading(read, file, line);
+    let (Some(text), Some(type_read)) = (side.get("text").and_then(Value::as_str), &read.type_read)
+    else {
+        let reason = side["reason"].as_str().unwrap_or("not_recorded");
+        let valid = !reason.is_empty()
+            && reason.len() <= 64
+            && reason.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+        return unread(if valid { reason } else { "not_recorded" });
+    };
+    if !storable_alias(&type_read.alias) {
+        return unread("site_unreadable");
+    }
+    if !storable(text) || !storable(&type_read.definition) {
+        return unread("type_text_over_limit");
+    }
+    json!({
+        "basis": "compiler",
+        "type_kind": "response",
+        "alias": type_read.alias,
+        "resolved_definition": type_read.definition,
+        "expanded_definition": text,
+        "read_at": { "file": file, "line": line },
+    })
+}
+
+/// Type each end of a `carrick.matched/2` record on its own: a call end gets
+/// the type the call's result has, a serving end the type its handler
+/// responds with, both read by the scan's own type stage at the end's
+/// `file:line` ([`type_matched_pairs`], with the other half of each pair left
+/// unasked). Writes `ends[i].type` and the top-level `engine` block;
+/// nothing else in the record changes. The cloud accepts a `type` on an HTTP
+/// end with no procedure only: any other end (GraphQL, socket, pub/sub, a
+/// procedure) gets none, and its stop reason (`protocol_not_read`) goes to
+/// stderr. An HTTP end this build does not read says why in its `type`
+/// (`protocol_not_read` for a kind other than route, function, table and
+/// database function; `not_typescript_source` for a serving end in a
+/// table's or function's schema file; `not_located`,
+/// `several_sites_on_line`, the type stage's own words). A request side is
+/// not an end and is not read here (carrick#4996). Every end is read on every
+/// run: a carried end's type is never kept.
+fn annotate_ends(record: &mut Value, inputs: &Inputs<'_>, started: Instant) -> Result<(), String> {
+    let repo_name = record
+        .get("repo")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let raw = record
+        .get("ends")
+        .and_then(Value::as_array)
+        .ok_or("the record has no `ends` array")?;
+    if raw.len() > MAX_PAIRS {
+        return Err(format!(
+            "the record holds {} ends, more than the {MAX_PAIRS} a record may hold",
+            raw.len()
+        ));
+    }
+    let ends_in: Vec<Option<EndIn>> = raw
+        .iter()
+        .map(|end| end_in(end).filter(|_| end.is_object()))
+        .collect();
+    let skipped = ends_in.iter().filter(|end| end.is_none()).count();
+    if skipped > 0 {
+        crate::errln!("carrick {COMMAND}: {skipped} end(s) left untouched: not readable");
+    }
+
+    let prepared = prepare(&repo_name, inputs)?;
+    let repo = prepared.repo();
+
+    // A call line two ends name with different operations names no one call.
+    let mut operations_on_line: HashMap<(&str, u32), BTreeSet<Operation<'_>>> = HashMap::new();
+    for end in ends_in.iter().flatten().filter(|end| end.call) {
+        operations_on_line
+            .entry((end.file.as_str(), end.line))
+            .or_default()
+            .insert((&end.kind, &end.method, &end.name));
+    }
+
+    let mut parsed = HashMap::new();
+    let mut indexes: Vec<usize> = Vec::new();
+    let mut matched: Vec<MatchedPair> = Vec::new();
+    let mut stated: Vec<(usize, &'static str)> = Vec::new();
+    for (index, end) in ends_in.iter().enumerate() {
+        let Some(end) = end else { continue };
+        let several = end.call && operations_on_line[&(end.file.as_str(), end.line)].len() > 1;
+        let (reason, span) = end_decided(
+            &prepared.root,
+            end,
+            several,
+            &prepared.rows,
+            &prepared.own,
+            &mut parsed,
+        );
+        let this = MatchedEnd {
+            service: repo.service_of(&end.file),
+            file: end.file.clone(),
+            line: end.line,
+            span,
+            reason,
+            hands_back_body: None,
+        };
+        // The pair's other half is never asked, so no verdict is judged.
+        let other = MatchedEnd {
+            service: this.service.clone(),
+            file: end.file.clone(),
+            line: end.line,
+            span: None,
+            reason: Some(PROTOCOL_NOT_READ),
+            hands_back_body: None,
+        };
+        let (caller, server) = if end.call {
+            (this, other)
+        } else {
+            (other, this)
+        };
+        indexes.push(index);
+        matched.push(MatchedPair {
+            pair_id: index.to_string(),
+            verb: end.method.clone(),
+            operation: end.name.clone(),
+            protocol: MatchedProtocol::default(),
+            asked: true,
+            caller,
+            server,
+        });
+        if let Some(reason) = reason {
+            stated.push((index, reason));
+        }
+    }
+
+    let (types, status): (Option<Vec<MatchedPairTypes>>, (&str, Option<&str>)) =
+        match inputs.sidecar {
+            None => (None, ("failed", Some("engine_not_found"))),
+            Some(sidecar) => {
+                let rows = type_matched_pairs(
+                    sidecar,
+                    &prepared.engine_services,
+                    &matched,
+                    inputs.ceiling.saturating_sub(started.elapsed()),
+                );
+                let status = status_of(&rows);
+                (Some(rows), status)
+            }
+        };
+
+    let out = record
+        .get_mut("ends")
+        .and_then(Value::as_array_mut)
+        .expect("checked above");
+    for (position, &index) in indexes.iter().enumerate() {
+        let Some(end) = &ends_in[index] else { continue };
+        let takes = takes_type(&out[index]);
+        let Some(slot) = out[index].as_object_mut() else {
+            continue;
+        };
+        // A type from an earlier run is never kept: the pass reads every end
+        // again, since a type depends on other files.
+        slot.remove("type");
+        if !takes {
+            // The cloud refuses a `type` on any other end: the stop reason
+            // stays in the log.
+            if let Some((_, reason)) = stated.iter().find(|(at, _)| *at == index) {
+                crate::errln!(
+                    "carrick {COMMAND}: end {}:{} not typed: {reason}",
+                    end.file,
+                    end.line
+                );
+            }
+            continue;
+        }
+        let value = match &types {
+            Some(types) => {
+                let row = &types[position];
+                let read = if end.call { &row.caller } else { &row.server };
+                type_of(read, &end.file, end.line)
+            }
+            // No engine: only what was decided without it is stated.
+            None => match stated.iter().find(|(at, _)| *at == index) {
+                Some((_, reason)) => type_of(
+                    &MatchedEndTypes {
+                        service: String::new(),
+                        alias: None,
+                        type_read: None,
+                        reason: Some((*reason).to_string()),
+                    },
+                    &end.file,
+                    end.line,
+                ),
+                None => continue,
+            },
+        };
+        slot.insert("type".to_string(), value);
+    }
     record
         .as_object_mut()
         .ok_or("the record is not an object")?
-        .insert("engine".to_string(), engine);
+        .insert("engine".to_string(), engine_block(started, status));
     Ok(())
 }
 
@@ -1884,21 +2251,99 @@ await fetch('/top');
         assert_eq!(server_reason(&repo, "a.ts", Reading::BothEnds), None);
     }
 
+    fn end_of(side: &str, protocol: &str, kind: &str, file: &str, line: u32) -> Value {
+        json!({
+            "id": format!("e{line}"),
+            "side": side,
+            "protocol": protocol,
+            "kind": kind,
+            "method": "GET",
+            "path": "/x",
+            "file": file,
+            "line": line,
+            "line_sha256": "x",
+            "confidence": "stated",
+            "basis": "text",
+            "carried_from": null,
+            "unknown_end_field": { "keep": true },
+        })
+    }
+
+    fn ends_record(ends: Vec<Value>) -> Value {
+        json!({
+            "schema": ENDS_SCHEMA,
+            "repo": "example-org/sample",
+            "commit": "0".repeat(40),
+            "run": { "id": "r1", "mode": "full" },
+            "ends": ends,
+            "dropped": {},
+        })
+    }
+
+    /// `record` with the two things the pass inserts taken out.
+    fn without_end_insertions(record: &Value) -> Value {
+        let mut stripped = record.clone();
+        stripped.as_object_mut().unwrap().remove("engine");
+        for end in stripped["ends"].as_array_mut().unwrap() {
+            end.as_object_mut().unwrap().remove("type");
+        }
+        stripped
+    }
+
+    /// Without an engine, what each end states is what is decided before the
+    /// engine is asked, and the record says the engine was not found.
     #[test]
-    fn an_ends_record_has_no_pairs_and_passes_through_untouched() {
+    fn an_end_the_build_does_not_read_states_why() {
+        let (_dir, repo, _outside) = sandbox();
+        std::fs::write(repo.join("m.sql"), "create table t (id int);\n").unwrap();
+        let mut two = end_of("call", "http", "route", "a.ts", 1);
+        two["path"] = json!("/other");
+        let ends = vec![
+            end_of("call", "graphql", "graphql_field", "a.ts", 1),
+            end_of("endpoint", "http", "table", "m.sql", 1),
+            end_of("call", "http", "route", "a.ts", 1),
+            two,
+            end_of("call", "pubsub", "topic", "a.ts", 1),
+            end_of("endpoint", "http", "route", "gone.ts", 1),
+        ];
+        let input = ends_record(ends);
+        let mut record = input.clone();
+        annotate_offline(&repo, &mut record).unwrap();
+        let reason = |i: usize| record["ends"][i]["type"]["reason"].clone();
+        assert!(
+            record["ends"][0]["type"].is_null(),
+            "a GraphQL end takes no type"
+        );
+        assert_eq!(reason(1), "not_typescript_source", "a table's .sql end");
+        assert_eq!(reason(2), "several_sites_on_line");
+        assert_eq!(reason(3), "several_sites_on_line");
+        assert!(
+            record["ends"][4]["type"].is_null(),
+            "a pub/sub end takes no type"
+        );
+        assert_eq!(reason(5), "not_located", "a serving end with no file");
+        assert_eq!(record["ends"][1]["type"]["basis"], "compiler");
+        assert_eq!(record["ends"][1]["type"]["type_kind"], "response");
+        assert_eq!(
+            record["ends"][1]["type"].as_object().unwrap().len(),
+            3,
+            "a type not read holds basis, type_kind and reason only"
+        );
+        assert_eq!(record["engine"]["status"], "failed");
+        assert_eq!(without_end_insertions(&record), input);
+    }
+
+    #[test]
+    fn an_ends_record_with_no_ends_array_is_refused_and_written_nowhere() {
         let (dir, repo, _outside) = sandbox();
-        let contract: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/matched-record/contract.json"
-        ))
-        .unwrap();
-        assert_eq!(contract["schema"], ENDS_SCHEMA);
-        let mut record = contract.clone();
-        annotate_offline(&repo, &mut record).expect("a v2 record is read as no pairs");
-        assert_eq!(record, contract, "nothing is added to a v2 record");
-        // `run` writes it back as it came and exits 0.
+        let mut record = ends_record(vec![]);
+        record.as_object_mut().unwrap().remove("ends");
+        let before = record.clone();
+        assert!(annotate_offline(&repo, &mut record).is_err());
+        assert_eq!(record, before);
         let input = dir.path().join("in.json");
         let out = dir.path().join("out.json");
-        std::fs::write(&input, contract.to_string()).unwrap();
+        std::fs::write(&input, record.to_string()).unwrap();
         let args: Vec<String> = [
             input.to_str().unwrap(),
             "--repo",
@@ -1908,9 +2353,37 @@ await fetch('/top');
         ]
         .map(String::from)
         .to_vec();
-        assert_eq!(run(&args, None), 0);
-        let written: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
-        assert_eq!(written, contract);
+        assert_eq!(run(&args, None), 1);
+        assert!(!out.exists());
+    }
+
+    /// The cloud's contract record is read end by end: every end it holds is
+    /// kept and the pass adds only `compiler` and `engine`.
+    #[test]
+    fn the_contract_record_is_read_end_by_end() {
+        let (_dir, repo, _outside) = sandbox();
+        let contract: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/matched-record/contract.json"
+        ))
+        .unwrap();
+        assert_eq!(contract["schema"], ENDS_SCHEMA);
+        let mut record = contract.clone();
+        annotate_offline(&repo, &mut record).expect("a v2 record is read");
+        // The contract carries an `engine` block of its own (`not_run`); the
+        // pass replaces it.
+        assert_eq!(
+            without_end_insertions(&record),
+            without_end_insertions(&contract)
+        );
+        assert_ne!(record["engine"], contract["engine"]);
+        // The cloud refuses a `type` on a GraphQL end: none is written, and
+        // a type the contract holds on an end the pass could not read again
+        // is not kept.
+        for end in record["ends"].as_array().unwrap() {
+            if end["protocol"] != "http" || end.get("procedure").is_some() {
+                assert!(end.get("type").is_none(), "{end}");
+            }
+        }
     }
 
     #[test]
@@ -1922,6 +2395,7 @@ await fetch('/top');
             let before = record.clone();
             let error = annotate_offline(&repo, &mut record).unwrap_err();
             assert!(error.contains("carrick.matched/1"), "{error}");
+            assert!(error.contains("carrick.matched/2"), "{error}");
             assert_eq!(record, before, "a refused record is not touched");
         }
         // `run` writes nothing for it and exits non-zero.

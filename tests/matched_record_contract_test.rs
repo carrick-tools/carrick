@@ -8,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const CONTRACT: &str = include_str!("fixtures/matched-record/contract.json");
-const CONTRACT_SHA256: &str = "9c45f54cdf16551799245b5f73c9df09ecd80b1cc82a71d65e3b329e99b77a08";
+const CONTRACT_SHA256: &str = "b7f18cf699cc7619fe0b531f08cb5d6444544409ce105b2d2dab0c98382c8a4e";
 
 const KINDS: &[&str] = &[
     "route",
@@ -59,7 +59,7 @@ fn the_model_record_contract_is_the_one_the_cloud_pins() {
     assert!(record.get("pairs").is_none(), "a v2 record holds no pairs");
 
     let ends = record["ends"].as_array().expect("ends is an array");
-    assert_eq!(ends.len(), 7);
+    assert_eq!(ends.len(), 8);
     let mut protocols: Vec<&str> = Vec::new();
     for end in ends {
         for key in REQUIRED_END_KEYS {
