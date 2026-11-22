@@ -770,21 +770,21 @@ test("a fact file's repo maps to a checkout by its exact remote, else its exact 
 
 test("a bare repo name maps to a renamed checkout by its origin, and two such checkouts in one index are neither read", async () => {
   const { matchRepos } = await import("../src/facts/repo-match.ts");
-  const one = [{ name: "fresh1", path: "/w/fresh1", remote: "https://github.com/acme/mono-ticket-a1.git" }];
-  assert.deepEqual(matchRepos(["mono-ticket-a1"], one), [{ repo: "mono-ticket-a1", path: "/w/fresh1" }]);
-  assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: "git@github.com:acme/Mono-Ticket-A1.git" }]), [{ repo: "mono-ticket-a1", path: "/w/fresh1" }]);
+  const one = [{ name: "fresh1", path: "/w/fresh1", remote: "https://github.com/acme/shop-api.git" }];
+  assert.deepEqual(matchRepos(["shop-api"], one), [{ repo: "shop-api", path: "/w/fresh1" }]);
+  assert.deepEqual(matchRepos(["shop-api"], [{ ...one[0]!, remote: "git@github.com:acme/Shop-Api.git" }]), [{ repo: "shop-api", path: "/w/fresh1" }]);
   // The index's own spelling of a GitHub origin, `owner/name`.
-  assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: "acme/mono-ticket-a1" }]), [{ repo: "mono-ticket-a1", path: "/w/fresh1" }]);
-  assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: null }]), []);
+  assert.deepEqual(matchRepos(["shop-api"], [{ ...one[0]!, remote: "acme/shop-api" }]), [{ repo: "shop-api", path: "/w/fresh1" }]);
+  assert.deepEqual(matchRepos(["shop-api"], [{ ...one[0]!, remote: null }]), []);
   // A folder-of-repos index: a folder named as a header repo is that repo's, and is never another repo's by its origin.
   const folders = [{ name: "api", path: "/w/api", remote: "acme/api-server" }, { name: "web", path: "/w/web", remote: "acme/web" }];
   assert.deepEqual(matchRepos(["api", "api-server", "web"], folders), [{ repo: "api", path: "/w/api" }, { repo: "web", path: "/w/web" }]);
-  assert.deepEqual(matchRepos(["mono-ticket-a1"], [{ ...one[0]!, remote: "not a remote" }]), []);
-  const two = [...one, { name: "copy", path: "/w/copy", remote: "git@github.com:acme/mono-ticket-a1" }];
-  assert.deepEqual(matchRepos(["mono-ticket-a1"], two), []);
+  assert.deepEqual(matchRepos(["shop-api"], [{ ...one[0]!, remote: "not a remote" }]), []);
+  const two = [...one, { name: "copy", path: "/w/copy", remote: "git@github.com:acme/shop-api" }];
+  assert.deepEqual(matchRepos(["shop-api"], two), []);
   // The folder named as the repo: the same answer as before the origin was read.
-  const named = [{ name: "mono-ticket-a1", path: "/w/mono-ticket-a1", remote: "https://github.com/acme/mono-ticket-a1.git" }, ...one];
-  assert.deepEqual(matchRepos(["mono-ticket-a1"], named), [{ repo: "mono-ticket-a1", path: "/w/mono-ticket-a1" }]);
+  const named = [{ name: "shop-api", path: "/w/shop-api", remote: "https://github.com/acme/shop-api.git" }, ...one];
+  assert.deepEqual(matchRepos(["shop-api"], named), [{ repo: "shop-api", path: "/w/shop-api" }]);
 });
 
 /** A checkout `dir/<folder>` whose index names it `folder` and its origin `remote`; a fact file naming `hosted` built from it. */
@@ -797,7 +797,7 @@ async function renamedCheckout(base: string, folder: string, hosted: string, rem
   fs.writeFileSync(path.join(root, ".carrick", "index.json"), JSON.stringify({ repos: [folder, ...siblings].map((name) => ({ name, path: path.join(base, name), services: [{ enrichment: { remote } }] })) }));
   const place = { service: "web", repo: "web-peer", file: "src/c.ts", line: 4, loc: "web-peer/src/c.ts:4" };
   const row = {
-    k: "contract", side: "producer", protocol: "http", label: "POST /v1/payments/calculate", direction: "response", service: "api", repo: hosted, file: "src/a.ts", line: 1,
+    k: "contract", side: "producer", protocol: "http", label: "POST /v1/orders/total", direction: "response", service: "api", repo: hosted, file: "src/a.ts", line: 1,
     name: null, site: null, locator: "registration", values: [{ file: "src/a.ts", span: [0, 5] }], untyped: [], total: 1,
     groups: [{ type: "{ total: number }", symbol: null, home: null, places: [place], total: 1, shown: 1, lead: "", more: "", tail: "", shortened: false }],
   };
@@ -811,18 +811,18 @@ test("a checkout whose folder is not the repo's name gets its rows counted for t
   const { createRuntime } = await import("../src/held/runtime.ts");
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-origin-name-")));
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
-  const remote = "https://github.com/acme/mono-ticket-a1.git";
+  const remote = "https://github.com/acme/shop-api.git";
   const count = (root: string, repo: string) => createRuntime({ root, env: {} }).rowCount!({ repo, service: "api", repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root });
   // (a) folder `fresh1`: the daemon keys the service by the folder's name.
-  const renamed = await renamedCheckout(path.join(base, "a"), "fresh1", "mono-ticket-a1", remote);
+  const renamed = await renamedCheckout(path.join(base, "a"), "fresh1", "shop-api", remote);
   assert.equal(await count(renamed, "fresh1"), 1);
-  assert.equal(await count(renamed, "mono-ticket-a1"), 0, "the hosted name is not a local repo's name here");
+  assert.equal(await count(renamed, "shop-api"), 0, "the hosted name is not a local repo's name here");
   // (b) folder named as the repo: keyed as it always was.
-  const same = await renamedCheckout(path.join(base, "b"), "mono-ticket-a1", "mono-ticket-a1", remote);
-  assert.equal(await count(same, "mono-ticket-a1"), 1);
+  const same = await renamedCheckout(path.join(base, "b"), "shop-api", "shop-api", remote);
+  assert.equal(await count(same, "shop-api"), 1);
   // (c) two clones of one hosted repo, each its own workspace: each its own rows, none reads the other's.
-  const first = await renamedCheckout(path.join(base, "c1"), "clone-one", "mono-ticket-a1", remote);
-  const second = await renamedCheckout(path.join(base, "c2"), "clone-two", "mono-ticket-a1", remote);
+  const first = await renamedCheckout(path.join(base, "c1"), "clone-one", "shop-api", remote);
+  const second = await renamedCheckout(path.join(base, "c2"), "clone-two", "shop-api", remote);
   assert.equal(await count(first, "clone-one"), 1);
   assert.equal(await count(second, "clone-two"), 1);
   assert.equal(await count(first, "clone-two"), 0);
@@ -831,9 +831,9 @@ test("a checkout whose folder is not the repo's name gets its rows counted for t
   const { locate } = await import("../src/facts/lines.ts");
   for (const [root] of [[first], [second]] as const) {
     const store = (await openFacts(root!))!;
-    assert.deepEqual(store.repos, [{ repo: "mono-ticket-a1", path: root }]);
+    assert.deepEqual(store.repos, [{ repo: "shop-api", path: root }]);
     // The edit lines place a file of the renamed checkout in the hosted repo.
-    assert.deepEqual(locate(path.join(root!, "src", "a.ts"), store.repos), { repo: "mono-ticket-a1", rel: path.join("src", "a.ts"), top: root });
+    assert.deepEqual(locate(path.join(root!, "src", "a.ts"), store.repos), { repo: "shop-api", rel: path.join("src", "a.ts"), top: root });
     store.close();
   }
 });
@@ -841,7 +841,7 @@ test("a checkout whose folder is not the repo's name gets its rows counted for t
 test("a fact file built before the origin was read, with no repo mapped for a renamed checkout, is asked for again", async (t) => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-origin-stale-")));
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
-  const root = await renamedCheckout(base, "fresh1", "mono-ticket-a1", "carrick-tools/mono-ticket-a1");
+  const root = await renamedCheckout(base, "fresh1", "shop-api", "carrick-tools/shop-api");
   const bodies: Array<Record<string, unknown>> = [];
   const request = (async (_url: string, init?: RequestInit) => {
     bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -863,7 +863,7 @@ test("two checkouts of one hosted repo in one index: neither is mapped, so neith
   const { openFacts } = await import("../src/facts/store.ts");
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-origin-two-")));
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
-  const root = await renamedCheckout(base, "one", "mono-ticket-a1", "git@github.com:acme/mono-ticket-a1.git", ["two"]);
+  const root = await renamedCheckout(base, "one", "shop-api", "git@github.com:acme/shop-api.git", ["two"]);
   const store = (await openFacts(root))!;
   assert.deepEqual(store.repos, []);
   store.close();
