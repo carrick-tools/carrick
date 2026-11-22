@@ -50,11 +50,12 @@ const log = createLogger("carrick-recheck");
 
 /**
  * How long a background re-check may run, in ms: what the binary is given as
- * `CARRICK_RECHECK_BUDGET_MS`. 180 s until the route package's uncapped time
- * is measured (C0), then min(300 s, 2 x its slowest uncapped E2): change this
- * one constant.
+ * `CARRICK_RECHECK_BUDGET_MS`. The rule is min(300 s, 2 x the slowest uncapped
+ * re-check): on a large API service the uncapped re-check measured 200 s, and
+ * at 180 s it was ended before it could answer. `check --changed` has the same
+ * 300 s. Change this one constant.
  */
-export const BACKGROUND_CAP_MS = 180_000;
+export const BACKGROUND_CAP_MS = 300_000;
 
 /**
  * The Stop entry's timeout, in seconds. Stop never waits for a re-check
