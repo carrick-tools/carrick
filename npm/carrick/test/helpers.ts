@@ -110,6 +110,8 @@ export function makeWorkspace(): Workspace {
   // hazard in a symlinked workspace and not the one under test here.
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-plugin-")));
   fs.mkdirSync(path.join(root, ".carrick"), { recursive: true });
+  // A workspace root holds an index; a `.carrick/` without one is not a root.
+  fs.writeFileSync(path.join(root, ".carrick", "index.json"), "{}");
   const service = path.join(root, "user-service");
   fs.mkdirSync(path.join(service, "src", "routes"), { recursive: true });
   const file = path.join(service, "src", "routes", "users.ts");
