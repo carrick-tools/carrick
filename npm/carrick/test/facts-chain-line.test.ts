@@ -159,8 +159,8 @@ function baseRows(): Array<Record<string, unknown>> {
 }
 
 const ASK = "If your change adds a side effect or changes what the route returns, open those callers first.";
-const BUILD_GET = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) runs in the handler of ${GET}, through formatOrder (src/services/format.ts:3). Other services call that route: web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}. ${ASK}`;
-const BUILD_POST = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) runs in the handler of ${POST}, through formatOrder (src/services/format.ts:3). Other services call that route: web-app/src/api.ts:9${NOTE}, which expects: ${TYPE}. ${ASK}`;
+const BUILD_GET = `Carrick: buildLines (src/services/lines.ts:1) runs in the handler of ${GET}, through formatOrder (src/services/format.ts:3) and 1 other route. Other services call that route: web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}. ${ASK}`;
+const BUILD_POST = `Carrick: buildLines (src/services/lines.ts:1) runs in the handler of ${POST}, through formatOrder (src/services/format.ts:3) and 1 other route. Other services call that route: web-app/src/api.ts:9${NOTE}, which expects: ${TYPE}. ${ASK}`;
 
 /** A workspace with `orders-api` committed from `files` and a fact file of `rows` naming `web-app`'s full commit. */
 async function workspace(t: { after: (fn: () => void) => void }, rows: Array<Record<string, unknown>>, files: Record<string, string> = FILES): Promise<Ws> {
@@ -246,7 +246,7 @@ test("the first route's contract line said earlier in the session: the second ro
   markFacts("s1", { [groupKey(GET, "src/routes/orders.ts")]: { at: 1, named: [] } }, ws.home);
   const out = await run(ws, linesEdit(ws));
   assert.deepEqual(out.lines, [BUILD_POST]);
-  assert.ok(out.lines[0]!.includes("reached by at least 2 operations"));
+  assert.ok(out.lines[0]!.includes("and 1 other route."));
 });
 
 test("every route's contract line said: silent", async (t) => {
@@ -701,4 +701,19 @@ test("more than three callers: the first three, then a count of the rest", async
 test("an edit inside a named inner function of the method, which has no chain row of its own, prints the method's chain line", async (t) => {
   const ws = await workspace(t, intakeRows(), INTAKE_FILES);
   assert.deepEqual((await run(ws, inCallback(ws))).lines, [INTAKE_LINE]);
+});
+
+test("a function reached from 60 operations says one route and a count of the other 59, at an Edit and at a Read; one route says no count", async (t) => {
+  const many = [...baseRows().slice(0, 2), chainRow("buildLines", "src/services/lines.ts", 1, [viaFormat(GET_ROUTE)], 60)];
+  const ws = await workspace(t, many);
+  const edit = await run(ws, linesEdit(ws), { session: "many-edit" });
+  const read = await run(ws, READ_LINES(ws), { session: "many-read" });
+  for (const line of [edit.lines[0], read.lines[0]]) {
+    assert.ok(line !== undefined && line.includes(`through formatOrder (src/services/format.ts:3) and 59 other routes. Other services`), String(line));
+    assert.ok(!line.includes(POST), "no list of the other routes");
+  }
+  const one = await workspace(t, [...baseRows().slice(0, 1), chainRow("buildLines", "src/services/lines.ts", 1, [viaFormat(GET_ROUTE)])]);
+  for (const out of [await run(one, linesEdit(one), { session: "one-edit" }), await run(one, READ_LINES(one), { session: "one-read" })]) {
+    assert.ok(out.lines[0] !== undefined && !out.lines[0].includes("other route"), String(out.lines[0]));
+  }
 });

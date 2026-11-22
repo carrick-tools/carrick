@@ -269,6 +269,11 @@ const CONTRACT_GROUPS_PRINTED = 2;
 /** A request row prints one group: its line follows every response line, so it stays short. */
 const CONTRACT_REQUEST_GROUPS_PRINTED = 1;
 
+/** The routes beyond the one a chain line names, as a count only (the Edit line and the Read line say it the same way): "" for a function with one route. */
+function otherRoutes(total: number): string {
+  return total > 1 ? ` and ${total - 1} other route${total === 2 ? "" : "s"}` : "";
+}
+
 /** The most callers a chain line names; the rest are counted. */
 const CHAIN_CALLERS_PRINTED = 3;
 
@@ -607,7 +612,6 @@ export async function factLines(
             const groupKey = contractKey(base, 0);
             const hop = route.path[0]!;
             const hopAt = hop.call === null ? hop.file : `${hop.file}:${hop.call}`;
-            const count = chain.total > 1 ? `, reached by at least ${chain.total} operations` : "";
             const where = route.depth === 1 ? `(${hopAt})` : `, through ${hop.name} (${hopAt})`;
             const rest = callers.length > CHAIN_CALLERS_PRINTED ? ` and ${callers.length - CHAIN_CALLERS_PRINTED} more` : "";
             ranked.push({
@@ -615,7 +619,7 @@ export async function factLines(
               callers: callers.length,
               candidate: {
                 key: `chain::${chain.repo}::${chain.file}::${chain.name}`,
-                text: `Carrick: ${chain.name} (${chain.file}:${chain.line}${count}) runs in the handler of ${route.label}${route.depth === 1 ? " " : ""}${where}. Other services call that route: ${words.words}${rest}. If your change adds a side effect or changes what the route returns, open those callers first.`,
+                text: `Carrick: ${chain.name} (${chain.file}:${chain.line}) runs in the handler of ${route.label}${route.depth === 1 ? " " : ""}${where}${otherRoutes(chain.total)}. Other services call that route: ${words.words}${rest}. If your change adds a side effect or changes what the route returns, open those callers first.`,
                 named: pathsOf(others),
                 holds: peersHold(at, others),
                 skipIf: [groupKey],
