@@ -766,13 +766,13 @@ fn miss_reason_in(owner: &Owner, miss: &Miss, worktree: bool) -> String {
     match owner {
         Owner::Service(service) => format!(
             "re-reading {service} ({} indexed files) took longer than {took} against this index, so \
-             edits in {service}{place} are not re-checked until `carrick refresh`. Run `carrick check \
+             edits in {service} are not re-checked{place} until `carrick refresh`. Run `carrick check \
              --changed` before you finish.",
             miss.files
         ),
         Owner::File { file, .. } => format!(
             "re-reading services that read {file} ({} indexed files) took longer than {took} \
-             against this index, so edits to {file}{place} are not re-checked until `carrick refresh`. \
+             against this index, so edits to {file} are not re-checked{place} until `carrick refresh`. \
              Run `carrick check --changed` before you finish.",
             miss.files
         ),
