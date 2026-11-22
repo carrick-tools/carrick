@@ -22,7 +22,7 @@ function why(note: NotChecked): string {
     case "error":
       return note.reason === undefined ? "it could not start" : `it could not start: ${note.reason.replace(/[.\s]+$/, "")}`;
     case "worktree":
-      return "the file is in a git worktree, and the engine reads only the main checkout";
+      return "the file is in a git worktree and it reads only the main checkout";
   }
 }
 

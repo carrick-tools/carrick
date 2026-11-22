@@ -391,7 +391,7 @@ test("the worktree line has no doctor tail and comes once per session, service a
   const daemon = await fakeDaemon(ws, { state: "worktree", lines: [], ms: 1, not_checked: [note("worktree", { checkout })] });
   t.after(() => daemon.close());
   const WANT =
-    "Carrick: the compiler engine did not check this edit of api: the file is in a git worktree, and the engine reads only the main checkout.";
+    "Carrick: the compiler engine did not check this edit of api: the file is in a git worktree and it reads only the main checkout.";
   const first = context((await edit(ws, "n-wt")).stdout);
   assert.ok(first.includes(WANT), first);
   assert.ok(!first.includes("doctor"), first);
