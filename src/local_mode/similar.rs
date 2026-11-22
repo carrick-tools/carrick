@@ -131,7 +131,7 @@ impl Similar {
         for (repo, blob) in blobs {
             let repo_key = repo.to_lowercase();
             for definition in blob.function_definitions.values() {
-                if !is_candidate(definition) {
+                if !has_place(definition) {
                     continue;
                 }
                 let file = path_of(definition);
@@ -140,6 +140,9 @@ impl Similar {
                     continue;
                 }
                 let key = file_key(&repo, &file);
+                // A call counts wherever it is written, as in `uses.rs`: a
+                // top-level (`<module>`) or callback definition is a caller
+                // even though it is never offered as a row.
                 for call in &definition.calls {
                     callers
                         .entry((
@@ -149,6 +152,9 @@ impl Similar {
                         ))
                         .or_default()
                         .insert(key.clone());
+                }
+                if !is_candidate(definition) {
+                    continue;
                 }
                 entries.push(Entry {
                     repo: repo.clone(),
@@ -242,10 +248,14 @@ impl Similar {
 /// A function somebody wrote and can import: not the module-scope row, not a
 /// callback the extractor named for itself.
 fn is_candidate(definition: &FunctionDefinition) -> bool {
-    !definition.name.is_empty()
+    has_place(definition)
         && definition.name != MODULE_SCOPE_KEY
         && !definition.name.ends_with(SYNTHETIC_SUFFIX)
-        && !definition.file_path.as_os_str().is_empty()
+}
+
+/// A definition with a name and a file: enough to count its calls.
+fn has_place(definition: &FunctionDefinition) -> bool {
+    !definition.name.is_empty() && !definition.file_path.as_os_str().is_empty()
 }
 
 fn path_of(definition: &FunctionDefinition) -> String {
@@ -255,4 +265,114 @@ fn path_of(definition: &FunctionDefinition) -> String {
 /// The part after any `Class.`.
 fn member(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
+}
+
+/// `called_from` counts the callers `uses.rs` counts (carrick#5041): a call
+/// written at the top of a file or in a callback is a caller like any other.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn blob(functions: Value) -> CloudRepoData {
+        serde_json::from_value(json!({
+            "repo_name": "shop",
+            "endpoints": [],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": functions,
+            "config_json": null,
+            "package_json": null,
+            "packages": null,
+            "last_updated": "2026-11-22T00:00:00Z",
+            "commit_hash": "abc",
+        }))
+        .expect("a blob")
+    }
+
+    fn function(name: &str, file: &str, line: u32, calls: Value) -> Value {
+        json!({
+            "name": name,
+            "file_path": file,
+            "node_type": "FunctionDeclaration",
+            "arguments": [],
+            "line_number": line,
+            "calls": calls,
+        })
+    }
+
+    fn call(name: &str, file: &str, line: u32, site: u32) -> Value {
+        json!({ "name": name, "file_path": file, "line_number": line, "call_site_line": site })
+    }
+
+    /// `called_from` of each named function, and the count `uses.rs` gives it.
+    fn counts(blob: &CloudRepoData, names: &[&str]) -> Vec<(usize, usize)> {
+        let similar = Similar::build([("shop".to_string(), blob)]);
+        let uses = super::super::uses::fold(&[blob], &Default::default());
+        names
+            .iter()
+            .map(|name| {
+                let entry = similar
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == *name)
+                    .expect("an offered function");
+                let files: HashSet<&str> = uses
+                    .get(&entry.file)
+                    .into_iter()
+                    .flat_map(|file| &file.functions)
+                    .filter(|used| used.name == *name)
+                    .flat_map(|used| &used.callers)
+                    .map(|caller| caller.file.as_str())
+                    .collect();
+                (entry.called_from, files.len())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_at_the_top_of_a_file_counts() {
+        let held = blob(json!({
+            "a": function("makeLedger", "src/ledger.ts", 3, json!([])),
+            "b": function(MODULE_SCOPE_KEY, "src/boot.ts", 1,
+                json!([call("makeLedger", "src/ledger.ts", 3, 9)])),
+        }));
+        assert_eq!(counts(&held, &["makeLedger"]), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn a_call_in_a_callback_and_one_in_a_function_both_count() {
+        let held = blob(json!({
+            "a": function("formatMoney", "src/money.ts", 2, json!([])),
+            "b": function("renderTotal", "src/a.ts", 5,
+                json!([call("formatMoney", "src/money.ts", 2, 6)])),
+            "c": function("render_handler", "src/b.ts", 8,
+                json!([call("formatMoney", "src/money.ts", 2, 9)])),
+        }));
+        assert_eq!(counts(&held, &["formatMoney"]), vec![(2, 2)]);
+    }
+
+    #[test]
+    fn a_function_nothing_calls_stays_at_zero() {
+        let held = blob(json!({
+            "a": function("lonely", "src/lonely.ts", 2, json!([])),
+            "b": function(MODULE_SCOPE_KEY, "src/boot.ts", 1, json!([])),
+        }));
+        assert_eq!(counts(&held, &["lonely"]), vec![(0, 0)]);
+    }
+
+    /// Only what a person can import is offered as a row.
+    #[test]
+    fn a_top_level_or_callback_definition_is_still_not_offered() {
+        let held = blob(json!({
+            "a": function(MODULE_SCOPE_KEY, "src/boot.ts", 1, json!([])),
+            "b": function("x_handler", "src/b.ts", 8, json!([])),
+            "c": function("real", "src/c.ts", 2, json!([])),
+        }));
+        let similar = Similar::build([("shop".to_string(), &held)]);
+        let names: Vec<_> = similar.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+    }
 }
