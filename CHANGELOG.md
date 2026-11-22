@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.175](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.174...carrick-v0.3.175) (2026-11-22)
+
+
+### Features
+
+* **npm:** chain line (Edit and Read) names every other-service caller with its expected type ([#5044](https://github.com/carrick-tools/carrick/issues/5044)) ([a03c20c](https://github.com/carrick-tools/carrick/commit/a03c20c1e58aff8e2d0af69c7efb3ea6fe0f9484))
+
+
+### Bug Fixes
+
+* "called from N other files" counts calls written at the top of a file or in a callback ([#5050](https://github.com/carrick-tools/carrick/issues/5050)) ([988391b](https://github.com/carrick-tools/carrick/commit/988391b7843ffdeccbc36a316e9b8cbcb3c2c6eb)), closes [#5041](https://github.com/carrick-tools/carrick/issues/5041)
+* a file in a git worktree is never judged by the main checkout's compiler engine, and the session is told once ([#5040](https://github.com/carrick-tools/carrick/issues/5040)) ([b28495b](https://github.com/carrick-tools/carrick/commit/b28495b40035d280e15299b2d014443926b8d537))
+* a re-check started in a git worktree records its budget miss under that worktree, not the main checkout ([#5049](https://github.com/carrick-tools/carrick/issues/5049)) ([1401c88](https://github.com/carrick-tools/carrick/commit/1401c88a04c410402982d1b06de734b88e9389e0))
+* carrick init downloads the fact file, and a file read before it lands gets its fact lines at the next hook ([#5058](https://github.com/carrick-tools/carrick/issues/5058)) ([a9c1300](https://github.com/carrick-tools/carrick/commit/a9c1300610066efffba45cee00895f123d618882))
+* Stop names files that share a reason in one clause, not one sentence per file ([#5059](https://github.com/carrick-tools/carrick/issues/5059)) ([59b310a](https://github.com/carrick-tools/carrick/commit/59b310a6ea86c1a370784a21db6e1e149fbeda89))
+
 ## [0.3.174](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.173...carrick-v0.3.174) (2026-11-22)
 
 
