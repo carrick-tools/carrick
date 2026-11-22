@@ -538,9 +538,14 @@ pub fn run(
     let misses = ServiceMisses::path(workspace);
     let known = ServiceMisses::read(&misses);
     took("known-miss-read", began);
-    if let Some(miss) = known.holds(index_generation, &reach.owner, budget) {
+    // A re-check started from a linked worktree keeps its misses under that
+    // worktree, so a slow worktree never switches the main checkout off and
+    // the reverse (carrick#5039).
+    let linked =
+        (!super::checkout::same_dir(&tree.checkout, &tree.repo)).then_some(tree.checkout.as_path());
+    if let Some(miss) = known.holds(index_generation, &reach.owner, budget, linked) {
         return Err(Box::new(Degraded {
-            reason: miss_reason(&reach.owner, miss),
+            reason: miss_reason_in(&reach.owner, miss, linked.is_some()),
             new_functions,
             elapsed: started.elapsed(),
             known_miss: true,
@@ -601,7 +606,7 @@ pub fn run(
             // switches a service off for the whole index.
             let missed = Instant::now() >= deadline;
             if missed && let Some(miss) = plan.miss_of(&reach.owner, started.elapsed(), budget) {
-                ServiceMisses::record(&misses, index_generation, &reach.owner, miss);
+                ServiceMisses::record(&misses, index_generation, &reach.owner, miss, linked);
             }
             Err(Box::new(Degraded {
                 reason,
@@ -743,8 +748,16 @@ fn deferred(new_functions: Vec<super::contract::NewFunction>, started: Instant) 
 /// a caller that asked for the probe replaces it with its own line.
 const DEFERRED_REASON: &str = "this edit needs a re-scan, which this call was asked not to start";
 
-/// The reason a re-check that skipped its re-scan gives.
+/// The reason a main-checkout re-check that skipped its re-scan gives.
+#[cfg(test)]
 fn miss_reason(owner: &Owner, miss: &Miss) -> String {
+    miss_reason_in(owner, miss, false)
+}
+
+/// The same, for a re-check started in a linked worktree when `worktree` is
+/// set: the sentence says the miss is that worktree's, as main's is not.
+fn miss_reason_in(owner: &Owner, miss: &Miss, worktree: bool) -> String {
+    let place = if worktree { " in this worktree" } else { "" };
     let took = if miss.elapsed_ms >= 1000 {
         format!("{} s", miss.elapsed_ms / 1000)
     } else {
@@ -753,13 +766,13 @@ fn miss_reason(owner: &Owner, miss: &Miss) -> String {
     match owner {
         Owner::Service(service) => format!(
             "re-reading {service} ({} indexed files) took longer than {took} against this index, so \
-             edits in {service} are not re-checked until `carrick refresh`. Run `carrick check \
+             edits in {service} are not re-checked{place} until `carrick refresh`. Run `carrick check \
              --changed` before you finish.",
             miss.files
         ),
         Owner::File { file, .. } => format!(
             "re-reading services that read {file} ({} indexed files) took longer than {took} \
-             against this index, so edits to {file} are not re-checked until `carrick refresh`. \
+             against this index, so edits to {file} are not re-checked{place} until `carrick refresh`. \
              Run `carrick check --changed` before you finish.",
             miss.files
         ),
@@ -803,6 +816,30 @@ struct ServiceMisses {
     /// Absent from a misses file written before it existed: no file misses.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     files: std::collections::BTreeMap<String, Miss>,
+    /// Misses of re-checks started from a linked worktree, keyed by the
+    /// worktree's canonical path (carrick#5039). Absent when no worktree
+    /// missed, so main's file is unchanged then. A main miss never holds for a
+    /// worktree and a worktree miss never holds for main.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    checkouts: std::collections::BTreeMap<String, CheckoutMisses>,
+}
+
+/// One linked worktree's misses: the same two maps main keeps.
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq, Eq)]
+struct CheckoutMisses {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    services: std::collections::BTreeMap<String, Miss>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    files: std::collections::BTreeMap<String, Miss>,
+}
+
+/// The key a worktree's misses are filed under.
+fn checkout_key(checkout: &Path) -> String {
+    checkout
+        .canonicalize()
+        .unwrap_or_else(|_| checkout.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 impl ServiceMisses {
@@ -822,20 +859,36 @@ impl ServiceMisses {
     /// The miss that silences a re-check under `budget`: one recorded under
     /// a budget at least as long. A miss at 10 s says nothing about a call
     /// that has 180 s.
-    fn holds(&self, generation: &str, owner: &Owner, budget: Duration) -> Option<&Miss> {
+    ///
+    /// `checkout` is `Some` for a re-check started in a linked worktree: only
+    /// that worktree's own misses count.
+    fn holds(
+        &self,
+        generation: &str,
+        owner: &Owner,
+        budget: Duration,
+        checkout: Option<&Path>,
+    ) -> Option<&Miss> {
         if generation.is_empty() || self.generation != generation {
             return None;
         }
+        let (services, files) = match checkout {
+            None => (&self.services, &self.files),
+            Some(checkout) => {
+                let held = self.checkouts.get(&checkout_key(checkout))?;
+                (&held.services, &held.files)
+            }
+        };
         match owner {
-            Owner::Service(service) => self.services.get(service),
-            Owner::File { repo, file } => self.files.get(&Owner::file_key(repo, file)),
+            Owner::Service(service) => services.get(service),
+            Owner::File { repo, file } => files.get(&Owner::file_key(repo, file)),
         }
         .filter(|miss| u128::from(miss.budget_ms) >= budget.as_millis())
     }
 
     /// Add the miss of `owner` for `generation`, dropping the misses of any
     /// older one.
-    fn record(path: &Path, generation: &str, owner: &Owner, miss: Miss) {
+    fn record(path: &Path, generation: &str, owner: &Owner, miss: Miss, checkout: Option<&Path>) {
         if generation.is_empty() {
             return;
         }
@@ -846,9 +899,16 @@ impl ServiceMisses {
                 ..Default::default()
             };
         }
+        let (services, files) = match checkout {
+            None => (&mut held.services, &mut held.files),
+            Some(checkout) => {
+                let entry = held.checkouts.entry(checkout_key(checkout)).or_default();
+                (&mut entry.services, &mut entry.files)
+            }
+        };
         match owner {
-            Owner::Service(service) => held.services.insert(service.clone(), miss),
-            Owner::File { repo, file } => held.files.insert(Owner::file_key(repo, file), miss),
+            Owner::Service(service) => services.insert(service.clone(), miss),
+            Owner::File { repo, file } => files.insert(Owner::file_key(repo, file), miss),
         };
         if let Ok(text) = serde_json::to_string_pretty(&held) {
             let _ = std::fs::write(path, text);
@@ -3710,41 +3770,81 @@ mod tests {
     }
 
     #[test]
+    fn a_worktrees_miss_never_holds_for_main_and_the_reverse() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("recheck-misses.json");
+        let worktree = dir.path().join("wt");
+        let other = dir.path().join("other-wt");
+        std::fs::create_dir_all(&worktree).expect("a worktree folder");
+        std::fs::create_dir_all(&other).expect("a second worktree folder");
+
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40), Some(&worktree));
+        let read = ServiceMisses::read(&path);
+        assert!(
+            read.holds("g1", &svc("big"), TEN_S, None).is_none(),
+            "a worktree's miss must not switch main off"
+        );
+        assert_eq!(
+            read.holds("g1", &svc("big"), TEN_S, Some(&worktree)),
+            Some(&miss(40))
+        );
+        assert!(
+            read.holds("g1", &svc("big"), TEN_S, Some(&other)).is_none(),
+            "nor another worktree"
+        );
+
+        let main_only = dir.path().join("main-only.json");
+        ServiceMisses::record(&main_only, "g1", &svc("big"), miss(40), None);
+        let read = ServiceMisses::read(&main_only);
+        assert!(
+            read.holds("g1", &svc("big"), TEN_S, Some(&worktree))
+                .is_none()
+        );
+        assert!(read.holds("g1", &svc("big"), TEN_S, None).is_some());
+        assert!(
+            !std::fs::read_to_string(&main_only)
+                .expect("the file")
+                .contains("checkouts"),
+            "main's file is unchanged when only main missed"
+        );
+    }
+
+    #[test]
     fn a_service_miss_holds_for_its_service_and_generation_only() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("recheck-misses.json");
 
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", &svc("big"), TEN_S)
+                .holds("g1", &svc("big"), TEN_S, None)
                 .is_none()
         );
-        ServiceMisses::record(&path, "g1", &svc("big"), miss(40));
-        ServiceMisses::record(&path, "g1", &svc("big"), miss(40));
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40), None);
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40), None);
         let read = ServiceMisses::read(&path);
-        assert_eq!(read.holds("g1", &svc("big"), TEN_S), Some(&miss(40)));
+        assert_eq!(read.holds("g1", &svc("big"), TEN_S, None), Some(&miss(40)));
         assert_eq!(read.services.len(), 1, "recorded once");
         assert!(
-            read.holds("g1", &svc("small"), TEN_S).is_none(),
+            read.holds("g1", &svc("small"), TEN_S, None).is_none(),
             "a sibling service of the same repo still re-checks"
         );
         assert!(
-            read.holds("g2", &svc("big"), TEN_S).is_none(),
+            read.holds("g2", &svc("big"), TEN_S, None).is_none(),
             "a new index tries again"
         );
 
         // A miss against a newer index replaces the older generation's.
-        ServiceMisses::record(&path, "g2", &svc("small"), miss(3));
+        ServiceMisses::record(&path, "g2", &svc("small"), miss(3), None);
         let read = ServiceMisses::read(&path);
-        assert!(read.holds("g2", &svc("small"), TEN_S).is_some());
-        assert!(read.holds("g2", &svc("big"), TEN_S).is_none());
-        assert!(read.holds("g1", &svc("big"), TEN_S).is_none());
+        assert!(read.holds("g2", &svc("small"), TEN_S, None).is_some());
+        assert!(read.holds("g2", &svc("big"), TEN_S, None).is_none());
+        assert!(read.holds("g1", &svc("big"), TEN_S, None).is_none());
 
         // No generation means no record either way.
-        ServiceMisses::record(&path, "", &svc("big"), miss(40));
+        ServiceMisses::record(&path, "", &svc("big"), miss(40), None);
         assert!(
             ServiceMisses::read(&path)
-                .holds("", &svc("big"), TEN_S)
+                .holds("", &svc("big"), TEN_S, None)
                 .is_none()
         );
 
@@ -3752,7 +3852,7 @@ mod tests {
         std::fs::write(&path, r#"{"generation":"g2","repos":["/w/big"]}"#).unwrap();
         assert!(
             ServiceMisses::read(&path)
-                .holds("g2", &svc("big"), TEN_S)
+                .holds("g2", &svc("big"), TEN_S, None)
                 .is_none()
         );
     }
@@ -3764,30 +3864,30 @@ mod tests {
         let long = Duration::from_millis(180_000);
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("recheck-misses.json");
-        ServiceMisses::record(&path, "g1", &svc("big"), miss(40));
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40), None);
         let read = ServiceMisses::read(&path);
-        assert!(read.holds("g1", &svc("big"), TEN_S).is_some());
+        assert!(read.holds("g1", &svc("big"), TEN_S, None).is_some());
         assert!(
-            read.holds("g1", &svc("big"), Duration::from_millis(5_000))
+            read.holds("g1", &svc("big"), Duration::from_millis(5_000), None)
                 .is_some()
         );
         assert!(
-            read.holds("g1", &svc("big"), long).is_none(),
+            read.holds("g1", &svc("big"), long, None).is_none(),
             "a miss at 10 s says nothing about a call with 180 s"
         );
         let at_cap = Miss {
             budget_ms: 180_000,
             ..miss(40)
         };
-        ServiceMisses::record(&path, "g1", &svc("big"), at_cap);
+        ServiceMisses::record(&path, "g1", &svc("big"), at_cap, None);
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", &svc("big"), long)
+                .holds("g1", &svc("big"), long, None)
                 .is_some()
         );
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", &svc("big"), TEN_S)
+                .holds("g1", &svc("big"), TEN_S, None)
                 .is_some()
         );
     }
@@ -3805,7 +3905,7 @@ mod tests {
         .unwrap();
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", &svc("big"), TEN_S)
+                .holds("g1", &svc("big"), TEN_S, None)
                 .is_none()
         );
     }
@@ -3893,16 +3993,16 @@ mod tests {
     fn a_shared_files_miss_holds_for_that_file_and_silences_no_service() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("recheck-misses.json");
-        ServiceMisses::record(&path, "g1", &shared(), miss(5));
+        ServiceMisses::record(&path, "g1", &shared(), miss(5), None);
         let read = ServiceMisses::read(&path);
-        assert_eq!(read.holds("g1", &shared(), TEN_S), Some(&miss(5)));
+        assert_eq!(read.holds("g1", &shared(), TEN_S, None), Some(&miss(5)));
         let other = Owner::File {
             repo: "shop".to_string(),
             file: "shared/other.ts".to_string(),
         };
-        assert!(read.holds("g1", &other, TEN_S).is_none());
-        assert!(read.holds("g1", &svc("catalog"), TEN_S).is_none());
-        assert!(read.holds("g2", &shared(), TEN_S).is_none());
+        assert!(read.holds("g1", &other, TEN_S, None).is_none());
+        assert!(read.holds("g1", &svc("catalog"), TEN_S, None).is_none());
+        assert!(read.holds("g2", &shared(), TEN_S, None).is_none());
         assert!(read.services.is_empty());
     }
 
@@ -3952,7 +4052,7 @@ mod tests {
         .unwrap();
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", &svc("big"), TEN_S)
+                .holds("g1", &svc("big"), TEN_S, None)
                 .is_some()
         );
     }

@@ -764,6 +764,71 @@ fn a_file_in_a_linked_worktree_is_checked_as_its_repos_file() {
     );
 }
 
+/// A re-check started in a linked worktree that runs past its budget is
+/// remembered under that worktree: the main checkout's re-check of the same
+/// service still runs, and a repeat in the worktree is the known miss
+/// (carrick#5039).
+#[test]
+#[serial]
+fn a_worktree_re_check_miss_does_not_switch_the_main_checkouts_re_check_off() {
+    let workspace = workspace_ignoring_worktrees();
+    let root = workspace.path();
+    let route = "app/routes/api.v1.widgets.$widgetId.ts";
+    let main_route = format!("catalog-web/{route}");
+    let worktree = indexed_with_a_worktree(root);
+    let worktree_route = worktree.join(route);
+    let shown = worktree_route.to_string_lossy().to_string();
+    let one = [("CARRICK_RECHECK_BUDGET_MS", "1")];
+    let ask = |dir: &Path, file: &str| -> serde_json::Value {
+        json_of(&run_from(
+            dir,
+            root,
+            &["check", file, "--recheck", "--json"],
+            &one,
+        ))
+    };
+    for file in [worktree_route.clone(), root.join(&main_route)] {
+        let text = std::fs::read_to_string(&file).expect("read the route");
+        std::fs::write(
+            &file,
+            format!(
+                "{text}\nexport function widgetLabel(name: string): string {{\n  return name;\n}}\n"
+            ),
+        )
+        .expect("write the edit");
+    }
+
+    let in_worktree = ask(&worktree, &shown);
+    assert_eq!(
+        in_worktree["recheck"]["deadline"],
+        serde_json::json!(true),
+        "the worktree's first re-check misses on its own:\n{in_worktree:#}"
+    );
+    let main = ask(root, &main_route);
+    assert_ne!(
+        main["recheck"]["known_miss"],
+        serde_json::json!(true),
+        "a worktree's miss must not switch main off:\n{main:#}"
+    );
+    assert_eq!(
+        main["recheck"]["deadline"],
+        serde_json::json!(true),
+        "main's re-check ran and missed on its own:\n{main:#}"
+    );
+    let again = ask(&worktree, &shown);
+    assert_eq!(
+        again["recheck"]["known_miss"],
+        serde_json::json!(true),
+        "the worktree's own miss holds for the worktree:\n{again:#}"
+    );
+    assert!(
+        again["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("in this worktree")),
+        "and its sentence names the worktree:\n{again:#}"
+    );
+}
+
 /// `check --changed` run inside a linked worktree lists the worktree's own
 /// changes, because git runs in the worktree; run from the main checkout it
 /// lists none of them (carrick#3595).

@@ -83,7 +83,9 @@ and `check <file> --recheck` exits 2, as a check that covered nothing does. A
 A re-check that missed its budget is remembered in
 `.carrick/recheck-misses.json`, per service and against the index it ran on
 (its `indexed_at`). Until `refresh` or `index` writes a new index, a later
-`--recheck` of a file in that service starts no re-scan: it answers at once with
+`--recheck` of a file in that service starts no re-scan (a re-check started in a
+linked worktree files its miss under that worktree, so it never silences the
+main checkout, and the reverse): it answers at once with
 the indexed verdicts and the new functions from the parse, and its block
 carries `known_miss: true`. A miss on a file in no service's directory is
 recorded under `files`, keyed by repo and path. It silences later re-checks of
