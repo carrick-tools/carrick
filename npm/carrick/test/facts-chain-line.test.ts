@@ -158,8 +158,9 @@ function baseRows(): Array<Record<string, unknown>> {
   ];
 }
 
-const BUILD_GET = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) is called by formatOrder (src/services/format.ts:3), which is called by the handler of ${GET}. ${GET} is called from web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}`;
-const BUILD_POST = `Carrick: buildLines (src/services/lines.ts:1, reached by at least 2 operations) is called by formatOrder (src/services/format.ts:3), which is called by the handler of ${POST}. ${POST} is called from web-app/src/api.ts:9${NOTE}, which expects: ${TYPE}`;
+const ASK = "If your change adds a side effect or changes what the route returns, open those callers first.";
+const BUILD_GET = `Carrick: buildLines (src/services/lines.ts:1) runs in the handler of ${GET}, through formatOrder (src/services/format.ts:3) and at least 1 other route. Other services call that route: web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}. ${ASK}`;
+const BUILD_POST = `Carrick: buildLines (src/services/lines.ts:1) runs in the handler of ${POST}, through formatOrder (src/services/format.ts:3) and at least 1 other route. Other services call that route: web-app/src/api.ts:9${NOTE}, which expects: ${TYPE}. ${ASK}`;
 
 /** A workspace with `orders-api` committed from `files` and a fact file of `rows` naming `web-app`'s full commit. */
 async function workspace(t: { after: (fn: () => void) => void }, rows: Array<Record<string, unknown>>, files: Record<string, string> = FILES): Promise<Ws> {
@@ -224,7 +225,7 @@ test("the depth 1 wording, and a hop with no call line names the file alone", as
   const route: RouteSpec = { ...GET_ROUTE, path: [{ file: "src/routes/orders.ts", line: 3, name: "get_orderId_handler", call: null }] };
   const ws = await workspace(t, [contractRow(GET, "src/routes/orders.ts", 3, 4), chainRow("formatOrder", "src/services/format.ts", 2, [route])]);
   const out = await run(ws, { file: ws.at("orders-api/src/services/format.ts"), snippets: ["return { id: order.id"] });
-  assert.deepEqual(out.lines, [`Carrick: formatOrder (src/services/format.ts:2) is called from src/routes/orders.ts in the handler of ${GET}. ${GET} is called from web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}`]);
+  assert.deepEqual(out.lines, [`Carrick: formatOrder (src/services/format.ts:2) runs in the handler of ${GET} (src/routes/orders.ts). Other services call that route: web-app/src/api.ts:4${NOTE}, which expects: ${TYPE}. ${ASK}`]);
 });
 
 test("a hop file both routes share, changed since the index, makes the line silent", async (t) => {
@@ -245,7 +246,7 @@ test("the first route's contract line said earlier in the session: the second ro
   markFacts("s1", { [groupKey(GET, "src/routes/orders.ts")]: { at: 1, named: [] } }, ws.home);
   const out = await run(ws, linesEdit(ws));
   assert.deepEqual(out.lines, [BUILD_POST]);
-  assert.ok(out.lines[0]!.includes("reached by at least 2 operations"));
+  assert.ok(out.lines[0]!.includes("and at least 1 other route."));
 });
 
 test("every route's contract line said: silent", async (t) => {
@@ -287,8 +288,8 @@ test("two changed functions reaching one route in one action: the second falls t
   const both = await run(ws, [linesEdit(ws), linesEdit(ws, "return items.length;")], { session: "both" });
   assert.equal(out.lines.length, 1);
   assert.equal(both.lines.length, 2);
-  assert.ok(both.lines[0]!.startsWith("Carrick: buildLines") && both.lines[0]!.includes(`handler of ${GET}.`), both.lines[0]);
-  assert.ok(both.lines[1]!.startsWith("Carrick: sumLines") && both.lines[1]!.includes(`handler of ${POST}.`), both.lines[1]);
+  assert.ok(both.lines[0]!.startsWith("Carrick: buildLines") && both.lines[0]!.includes(`handler of ${GET}`), both.lines[0]);
+  assert.ok(both.lines[1]!.startsWith("Carrick: sumLines") && both.lines[1]!.includes(`handler of ${POST}`), both.lines[1]);
 });
 
 test("chain lines share the cap of MAX_FACT_LINES", async (t) => {
@@ -339,33 +340,93 @@ test("an edit of a function its routes' own code calls prints their contract lin
   ]);
 });
 
-// Reads never say a chain line.
+// A Read says the chain line too: the best one for the file, once per session.
 
-test("a Read prints no chain line even when the caller asks for the contract and chain kinds", async (t) => {
+const READ_LINES = (ws: Ws) => ({ file: ws.at("orders-api/src/services/lines.ts"), read: true });
+
+test("a Read of a function a route's handler reaches prints the chain line and claims it", async (t) => {
   const ws = await workspace(t, baseRows());
-  const read = await run(ws, { file: ws.at("orders-api/src/services/lines.ts"), read: true }, { session: "read" });
-  assert.deepEqual(read.lines, []);
-  assert.deepEqual(Object.keys(read.claims), []);
-  // Not vacuous: an edit of the same file prints the chain line.
-  const edit = await run(ws, { file: ws.at("orders-api/src/services/lines.ts"), whole: true }, { session: "edit" });
-  assert.deepEqual(edit.lines, [BUILD_GET]);
+  const read = await run(ws, READ_LINES(ws), { session: "read" });
+  assert.deepEqual(read.lines, [BUILD_GET]);
+  assert.ok("chain::orders-api::src/services/lines.ts::buildLines" in read.claims);
+  assert.deepEqual(read.answered, [], "the chain kind alone never answers the file");
 });
 
-test("with every switch on, the Read hook prints no chain line", async (t) => {
+test("the chain line said at a Read is silent at the Edit and at a second Read of the same session, and says once in another session", async (t) => {
   const ws = await workspace(t, baseRows());
-  const read = await runHook("post-read.ts", {
+  const read = await run(ws, READ_LINES(ws), { session: "s1" });
+  assert.deepEqual(read.lines, [BUILD_GET]);
+  markFacts("s1", read.claims, ws.home);
+  assert.deepEqual((await run(ws, READ_LINES(ws), { session: "s1" })).lines, []);
+  assert.deepEqual((await run(ws, linesEdit(ws), { session: "s1" })).lines, []);
+  assert.deepEqual((await run(ws, READ_LINES(ws), { session: "s2" })).lines, [BUILD_GET]);
+});
+
+test("a Read says one chain line for the file: the route with the fewest hops, then the most callers", async (t) => {
+  const direct: RouteSpec = { ...POST_ROUTE, path: [{ file: "src/routes/refunds.ts", line: 3, name: "post_handler", call: 4 }] };
+  const rows = [
+    contractRow(GET, "src/routes/orders.ts", 3, 4),
+    contractRow(POST, "src/routes/refunds.ts", 3, 9),
+    // buildLines reaches GET in two hops and POST in one: POST is said although GET is stored first.
+    chainRow("buildLines", "src/services/lines.ts", 1, [viaFormat(GET_ROUTE), direct]),
+    chainRow("sumLines", "src/services/lines.ts", 4, [viaFormat(GET_ROUTE)]),
+  ];
+  const ws = await workspace(t, rows);
+  const read = await run(ws, READ_LINES(ws), { session: "rank" });
+  assert.equal(read.lines.length, 1);
+  assert.ok(read.lines[0]!.startsWith("Carrick: buildLines") && read.lines[0]!.includes(`handler of ${POST}`), read.lines[0]);
+});
+
+test("a Read skips a route the read file registers itself, and one whose caller is in its own service", async (t) => {
+  const hop = (line: number, name: string, call: number): RouteSpec => ({ label: GET, file: "src/routes/orders.ts", line, path: [{ file: "src/routes/orders.ts", line, name, call }] });
+  const rows = [contractRow(GET, "src/routes/orders.ts", 5, 4, "/orders/:orderId"), chainRow("formatOrder", "src/routes/orders.ts", 2, [hop(5, "get_orderId_handler", 6)])];
+  const ws = await workspace(t, rows, { "orders-api/src/routes/orders.ts": ORDERS_B });
+  const read = await run(ws, { file: ws.at("orders-api/src/routes/orders.ts"), read: true }, { session: "own" });
+  assert.deepEqual(read.lines, []);
+  // Not vacuous: an Edit of the same function prints the route's contract line.
+  const edit = await run(ws, { file: ws.at("orders-api/src/routes/orders.ts"), snippets: ["return { id: order.id };"] }, { session: "own-edit" });
+  assert.ok(edit.lines.length > 0);
+});
+
+test("chainOnly: the Read prints the chain line and no op, fn or name line, and answers no file", async (t) => {
+  const ws = await workspace(t, baseRows());
+  const out = await factLines(ws.root, [READ_LINES(ws)], "only", { home: ws.home, contract: true, chain: true, chainOnly: true });
+  assert.deepEqual(out.lines, [BUILD_GET]);
+  assert.deepEqual(out.answered, []);
+});
+
+test("a Read with the chain kind off prints no chain line", async (t) => {
+  const ws = await workspace(t, baseRows());
+  assert.deepEqual((await run(ws, READ_LINES(ws), { session: "off", chain: false })).lines, []);
+});
+
+const readHook = (ws: Ws, session: string, env: Record<string, string>) =>
+  runHook("post-read.ts", {
     payload: {
       hook_event_name: "PostToolUse",
       tool_name: "Read",
-      session_id: "hook-read-all-on",
+      session_id: session,
       cwd: ws.root,
       tool_input: { file_path: ws.at("orders-api/src/services/lines.ts") },
       tool_response: { file: { filePath: ws.at("orders-api/src/services/lines.ts"), content: LINES } },
     },
-    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_READ_LINES: "1", CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "1", CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...env }),
   });
-  assert.equal(read.code, 0);
-  assert.ok(!read.stdout.includes("buildLines ("), read.stdout);
+
+test("the Read hook prints the chain line with the Read switch off and with it on, and not with the chain switch off", async (t) => {
+  const ws = await workspace(t, baseRows());
+  const cases: Array<[Record<string, string>, boolean]> = [
+    [{}, true],
+    [{ CARRICK_READ_LINES: "1" }, true],
+    [{ CARRICK_CHAIN_LINES: "0" }, false],
+    [{ CARRICK_READ_LINES: "1", CARRICK_CHAIN_LINES: "0" }, false],
+    [{ CARRICK_FACT_LINES: "0" }, false],
+  ];
+  for (const [i, [env, prints]] of cases.entries()) {
+    const out = await readHook(ws, `read-hook-${i}`, env);
+    assert.equal(out.code, 0);
+    assert.equal(out.stdout.includes("buildLines (src/services/lines.ts:1"), prints, `${JSON.stringify(env)}: ${out.stdout}`);
+  }
 });
 
 // The switch, through the post-edit hook.
@@ -558,4 +619,111 @@ test("with the chain switch on (the default), a file without the chains table is
   const withTable = await workspace(t, baseRows());
   await refreshFacts(withTable.root, { request, env: { ...env, CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "1" } });
   assert.equal(known(4), true, "chain on, table present: known");
+});
+
+// The callers a chain line names (request and response rows together) and the
+// next named thing out when the edited one has no chain row.
+
+const INTAKE_ROUTE = `import { InvoiceIntake } from "../services/intake";
+router.post("/intake/upload", async (req, res) => {
+  res.json(await intake.accept(req.file));
+});
+`;
+const INTAKE_SERVICE = `export class InvoiceIntake {
+  accept(file) {
+    const finish = () => {
+      return this.notify(file.id);
+    };
+    return this.store(file).andThen(finish);
+  }
+  store(file) {
+    return file;
+  }
+}
+`;
+const INTAKE_FILES: Record<string, string> = {
+  "orders-api/src/routes/intake.ts": INTAKE_ROUTE,
+  "orders-api/src/services/intake.ts": INTAKE_SERVICE,
+};
+const UPLOAD = "POST /intake/upload";
+const place = (file: string, line: number) => ({ service: "web-app", repo: "web-app", file, line, loc: `web-app/${file}:${line}` });
+const group = (places: Array<ReturnType<typeof place>>, lead: string, tail: string) => ({ type: TYPE, symbol: null, home: null, places, total: places.length, shown: places.length, lead, more: "", tail, shortened: false });
+
+/** The response row types only IntakePage; UploadDialog reads `.ok` alone, so it is untyped there. The request row types both. */
+function intakeRows(extra: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> {
+  const base = contractRow(UPLOAD, "src/routes/intake.ts", 2, 118);
+  const response = {
+    ...base,
+    groups: [group([place("src/IntakePage.tsx", 118)], `Carrick: ${UPLOAD} is called from `, `, which expects: ${TYPE}`)],
+    untyped: [{ service: "web-app", repo: "web-app", file: "src/UploadDialog.tsx", line: 90, reason: "no_text" }],
+    total: 2,
+  };
+  const request = {
+    ...base,
+    direction: "request",
+    groups: [group([place("src/UploadDialog.tsx", 90), place("src/IntakePage.tsx", 118)], `Carrick: ${UPLOAD} takes a body from `, ", which sends a request body: { file: string }")],
+    total: 2,
+  };
+  const path: Hop[] = [{ file: "src/routes/intake.ts", line: 2, name: "post_handler", call: 3 }];
+  return [response, request, chainRow("InvoiceIntake.accept", "src/services/intake.ts", 2, [{ label: UPLOAD, file: "src/routes/intake.ts", line: 2, path }]), ...extra];
+}
+const OFF = (file: string, line: number) => `web-app/${file}:${line}${NOTE}`;
+const INTAKE_LINE = `Carrick: InvoiceIntake.accept (src/services/intake.ts:2) runs in the handler of ${UPLOAD} (src/routes/intake.ts:3). Other services call that route: ${OFF("src/IntakePage.tsx", 118)}, which expects: ${TYPE}; ${OFF("src/UploadDialog.tsx", 90)}. If your change adds a side effect or changes what the route returns, open those callers first.`;
+const inAccept = (ws: Ws): Edit => ({ file: ws.at("orders-api/src/services/intake.ts"), snippets: ["return this.store(file).andThen(finish);"] });
+const inCallback = (ws: Ws): Edit => ({ file: ws.at("orders-api/src/services/intake.ts"), snippets: ["return this.notify(file.id);"] });
+
+test("the chain line names every other-service caller of the route: one typed on the reply, one that reads only .ok, both on the request row", async (t) => {
+  const ws = await workspace(t, intakeRows(), INTAKE_FILES);
+  assert.deepEqual((await run(ws, inAccept(ws))).lines, [INTAKE_LINE]);
+});
+
+test("a caller in the route's own service is not named", async (t) => {
+  const rows = intakeRows();
+  for (const row of rows) {
+    if (row["k"] !== "contract") continue;
+    for (const g of row["groups"] as Array<{ places: Array<{ service: string; file: string }> }>) for (const one of g.places) if (one.file.includes("UploadDialog")) one.service = "orders-api";
+    for (const u of row["untyped"] as Array<{ service: string }>) u.service = "orders-api";
+  }
+  const ws = await workspace(t, rows, INTAKE_FILES);
+  const [line] = (await run(ws, inAccept(ws))).lines;
+  assert.ok(line !== undefined && !line.includes("UploadDialog") && line.includes("call that route: web-app/src/IntakePage.tsx:118"), String(line));
+});
+
+test("more than three callers: the first three, then a count of the rest", async (t) => {
+  const rows = intakeRows();
+  const many = ["A", "B", "C", "D", "E"].map((n, i) => place(`src/Page${n}.tsx`, 10 + i));
+  (rows[1] as { groups: unknown[] }).groups = [group(many, `Carrick: ${UPLOAD} takes a body from `, ", which sends a request body: { file: string }")];
+  const ws = await workspace(t, rows, INTAKE_FILES);
+  const [line] = (await run(ws, inAccept(ws))).lines;
+  assert.ok(line !== undefined && line.includes("PageB.tsx:11") && !line.includes("PageC.tsx") && line.includes(" and 4 more."), String(line));
+});
+
+test("an edit inside a named inner function of the method, which has no chain row of its own, prints the method's chain line", async (t) => {
+  const ws = await workspace(t, intakeRows(), INTAKE_FILES);
+  assert.deepEqual((await run(ws, inCallback(ws))).lines, [INTAKE_LINE]);
+});
+
+test("a function reached from 60 operations (a floor: the row carries no exact flag) says one route and \"at least\" 59 other routes, at an Edit and at a Read; one route says no count", async (t) => {
+  const many = [...baseRows().slice(0, 2), chainRow("buildLines", "src/services/lines.ts", 1, [viaFormat(GET_ROUTE)], 60)];
+  const ws = await workspace(t, many);
+  const edit = await run(ws, linesEdit(ws), { session: "many-edit" });
+  const read = await run(ws, READ_LINES(ws), { session: "many-read" });
+  for (const line of [edit.lines[0], read.lines[0]]) {
+    assert.ok(line !== undefined && line.includes(`through formatOrder (src/services/format.ts:3) and at least 59 other routes. Other services`), String(line));
+    assert.ok(!line.includes(POST), "no list of the other routes");
+  }
+  const one = await workspace(t, [...baseRows().slice(0, 1), chainRow("buildLines", "src/services/lines.ts", 1, [viaFormat(GET_ROUTE)])]);
+  for (const out of [await run(one, linesEdit(one), { session: "one-edit" }), await run(one, READ_LINES(one), { session: "one-read" })]) {
+    assert.ok(out.lines[0] !== undefined && !out.lines[0].includes("other route"), String(out.lines[0]));
+  }
+});
+
+test("a chain row that states its total exact says \"and N other routes\" without \"at least\", at an Edit and at a Read", async (t) => {
+  const exact = { ...chainRow("buildLines", "src/services/lines.ts", 1, [viaFormat(GET_ROUTE)], 3), total_exact: true };
+  const ws = await workspace(t, [...baseRows().slice(0, 2), exact]);
+  const edit = await run(ws, linesEdit(ws), { session: "exact-edit" });
+  const read = await run(ws, READ_LINES(ws), { session: "exact-read" });
+  for (const line of [edit.lines[0], read.lines[0]]) {
+    assert.ok(line !== undefined && line.includes("(src/services/format.ts:3) and 2 other routes. Other services"), String(line));
+  }
 });
