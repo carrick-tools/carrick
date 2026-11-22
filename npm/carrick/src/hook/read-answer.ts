@@ -15,7 +15,7 @@ import path from "node:path";
 import { createLogger } from "../log.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { chainLinesEnabled, contractLinesEnabled, readLinesEnabled } from "../facts/enabled.ts";
-import { markRead, markTold, toldKey } from "./reuse.ts";
+import { markOwed, markRead, markTold, owedRoots, toldKey } from "./reuse.ts";
 import { stampOf } from "./generation.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
 
@@ -70,7 +70,10 @@ async function checkRead(file: string, root: string, session: string | undefined
  * `options.limit` fact lines, default `MAX_FACT_LINES`, skipping the keys in
  * `options.exclude`; `options.facts: false` skips the fact file, for a command
  * that also writes, P9). Each file the fact file answered is marked read and
- * starts no process; every other file takes the binary's `check`.
+ * starts no process; every other file takes the binary's `check`. A file read
+ * while the workspace has no fact file is owed its fact lines, and the first
+ * call after the file lands says them (`owed.ts`); `files` may be empty for
+ * that.
  */
 export async function answerReads(
   files: readonly string[],
@@ -118,12 +121,28 @@ export async function answerReads(
       used.push(...outcome.used);
       Object.assign(claims, outcome.claims);
     }
+    // No fact file yet (a new workspace before its first refresh lands): these
+    // files take the binary's answer below and are owed their fact lines.
+    if (session && outcome !== null && !outcome.present && outcome.stale) markOwed(session, group, root);
     for (const file of group) {
       if (outcome?.answered.includes(file)) {
         if (session) markRead(session, file);
       } else {
         unanswered.push({ file, root });
       }
+    }
+  }
+  // Files read before the fact file landed get their lines now that it has,
+  // once, after this action's own and under the same cap (`owed.ts`).
+  if (session && factLines !== null) {
+    const { owedLines } = await import("./owed.ts");
+    for (const root of owedRoots(session)) {
+      const owed = await owedLines(root, session, { limit: (options.limit ?? MAX_FACT_LINES) - used.length, exclude: new Set([...(options.exclude ?? []), ...used]), skip: files });
+      if (owed === null) continue;
+      factsMs = (factsMs ?? 0) + owed.ms;
+      contexts.push(...owed.lines);
+      used.push(...owed.used);
+      Object.assign(claims, owed.claims);
     }
   }
   const checked = await Promise.all(unanswered.map((entry) => checkRead(entry.file, entry.root, session)));
