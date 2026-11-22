@@ -1182,7 +1182,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
             continue;
         };
         let kind = reading_of(&pair.kind);
-        let server_reason = server_reason(&root, &pair.server_file, kind);
+        let server_reason = server_reason(root, &pair.server_file, kind);
         indexes.push(index);
         matched.push(MatchedPair {
             pair_id: index.to_string(),
@@ -1215,7 +1215,7 @@ pub fn annotate(record: &mut Value, inputs: &Inputs<'_>) -> Result<(), String> {
             Some(sidecar) => {
                 let rows = type_matched_pairs(
                     sidecar,
-                    &engine_services,
+                    engine_services,
                     &matched,
                     inputs.ceiling.saturating_sub(started.elapsed()),
                 );
