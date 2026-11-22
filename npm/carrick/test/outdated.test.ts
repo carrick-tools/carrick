@@ -35,6 +35,8 @@ const posix = { skip: process.platform === "win32" ? "the fake scanner needs a P
 function workspace(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-outdated-"));
   fs.mkdirSync(path.join(dir, ".carrick"), { recursive: true });
+  // A workspace root holds an index; a `.carrick/` without one is not a root.
+  fs.writeFileSync(path.join(dir, ".carrick", "index.json"), "{}");
   return dir;
 }
 

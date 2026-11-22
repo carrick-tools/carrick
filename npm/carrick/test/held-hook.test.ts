@@ -83,6 +83,8 @@ async function workspace(t: { after: (fn: () => void) => void }): Promise<Ws> {
   fs.mkdirSync(path.join(root, "api", "src"), { recursive: true });
   fs.writeFileSync(path.join(root, "api", "src", "tasks.ts"), TASKS);
   fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
+  // A workspace root holds an index; a `.carrick/` without one is not a root.
+  fs.writeFileSync(path.join(root, ".carrick", "index.json"), "{}");
   fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: SLUG }] } }));
   const header = JSON.stringify({
     schema: 1,
