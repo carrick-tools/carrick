@@ -17,7 +17,7 @@ import { readStdin } from "./stdin.ts";
 import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { markFacts, wasRead } from "./reuse.ts";
+import { hasOwed, markFacts, wasRead } from "./reuse.ts";
 import { sessionKey } from "./session-key.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLateFirst, emitPostToolUse as emit } from "./late.ts";
@@ -66,17 +66,20 @@ async function main(timing: Timing): Promise<void> {
   const named = payload.tool_input?.file_path;
   if (!named || !CHECKED.test(named)) return emit(late);
   const file = path.isAbsolute(named) ? named : path.resolve(payload.cwd ?? process.cwd(), named);
-  if (session && wasRead(session, file)) return emit(late);
+  // A file already asked about is not asked about again, but a Read is still
+  // the moment to say the lines owed from before the fact file landed.
+  const seen = session !== undefined && wasRead(session, file);
+  if (seen && !hasOwed(session!)) return emit(late);
 
   const waitStarted = Date.now();
   // Part 3: tell the daemon this file was read so it can start the service's
   // compiler. Nothing is printed from the answer; it runs beside the read's own
   // work and is only joined so the request is sent before the hook exits.
-  const heldRoot = compilerLinesEnabled() && session && !inOtherWorktree(file, payload.cwd ?? process.cwd())
+  const heldRoot = compilerLinesEnabled() && session && !seen && !inOtherWorktree(file, payload.cwd ?? process.cwd())
     ? resolveRoot({ clientRoot: payload.cwd ?? null, projectDir: process.env["CLAUDE_PROJECT_DIR"] ?? null, filePath: file }).root
     : null;
   const heldAsked = heldRoot && session ? askHeld(heldRoot, [file], { session, kind: "read", waitMs: HELD_READ_WAIT_MS }) : null;
-  const answers = await answerReads([file], payload.cwd, session);
+  const answers = await answerReads(seen ? [] : [file], payload.cwd, session);
   await heldAsked;
   timing.waitedMs = Date.now() - waitStarted;
   if (answers.factsMs !== undefined) timing.factsMs = answers.factsMs;

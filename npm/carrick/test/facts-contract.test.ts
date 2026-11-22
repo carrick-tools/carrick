@@ -11,7 +11,7 @@ import path from "node:path";
 import { fixturePath } from "./helpers.ts";
 import { buildFacts, factsPath, loadSqlite, openFacts, LOCAL_LAYOUT } from "../src/facts/store.ts";
 import { contractLinesEnabled } from "../src/facts/enabled.ts";
-import { refreshFacts } from "../src/facts/fetch.ts";
+import { fetchFactsNow, refreshFacts } from "../src/facts/fetch.ts";
 
 const WIRE = fixturePath("edit-facts.s1.ndjson");
 const SLUG = "demo-shop";
@@ -181,4 +181,43 @@ test("with the switch on (the default), a file without the contracts table is no
   const withTable = await workspace(t, wireText());
   await refreshFacts(withTable, { request, env: { ...env, CARRICK_CONTRACT_LINES: "1" } });
   assert.equal(bodies[2]!["known_digest"] !== undefined, true, "switch on, table present: known");
+});
+
+test("a waited fetch asks again while the cloud is building the file, and stops at its limit", async (t) => {
+  const building = () => new Response(JSON.stringify({ success: false, error: { code: "facts_building", message: "building", retriable: true } }), { status: 409 });
+  const env = { ...process.env, CARRICK_TOKEN: "t", CARRICK_NO_FACTS_REFRESH: "" };
+  // Two asks find the build in flight, the third finds the file.
+  const root = await workspace(t, null);
+  let asks = 0;
+  const pauses: number[] = [];
+  const request = (async (url: string) => {
+    if (String(url).includes("amazonaws.com")) return new Response(wireText());
+    asks += 1;
+    return asks < 3 ? building() : answer({ staged_url: "https://bucket.s3.amazonaws.com/f.ndjson" });
+  }) as typeof fetch;
+  const sleep = async (ms: number) => void pauses.push(ms);
+  assert.equal(await fetchFactsNow(root, { request, env, sleep, pauseMs: 10, waitMs: 100 }), "written");
+  assert.equal(asks, 3);
+  assert.deepEqual(pauses, [10, 10]);
+  assert.notEqual(await openFacts(root), null, "the file is on this machine when the call returns");
+  // A build that never finishes is asked about for the limit and no longer.
+  const stuck = await workspace(t, null);
+  let stuckAsks = 0;
+  const never = (async () => {
+    stuckAsks += 1;
+    return building();
+  }) as typeof fetch;
+  assert.equal(await fetchFactsNow(stuck, { request: never, env, sleep, pauseMs: 10, waitMs: 30 }), "retry");
+  assert.equal(stuckAsks, 3);
+  // An answer that is not a build in flight is not asked for again.
+  let refused = 0;
+  const none = (async () => {
+    refused += 1;
+    return new Response(JSON.stringify({ success: false, error: { code: "facts_unavailable", retriable: false } }), { status: 503 });
+  }) as typeof fetch;
+  assert.equal(await fetchFactsNow(stuck, { request: none, env, sleep, pauseMs: 10, waitMs: 100 }), "none");
+  assert.equal(refused, 1);
+  // The tests' own switch keeps it off the network.
+  assert.equal(await fetchFactsNow(stuck, { request: never, env: { ...env, CARRICK_NO_FACTS_REFRESH: "1" }, sleep }), "none");
+  assert.equal(stuckAsks, 3);
 });

@@ -179,6 +179,38 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
 }
 
 /**
+ * How long `fetchFactsNow` waits on a fact file the cloud is building. The
+ * cloud builds a missing file on the first ask, within 25 s
+ * (carrick-cloud `docs/internal/reference/edit-facts-wire.md`).
+ */
+export const FACTS_FIRST_WAIT_MS = 40_000;
+/** The pause between two asks while the cloud is building. */
+export const FACTS_FIRST_PAUSE_MS = 3_000;
+
+/**
+ * Bring the fact file here now, asking again while the cloud is still building
+ * it, for at most `waitMs`. `carrick init` runs this so that the first session
+ * starts with a fact file: started only by the first session's hooks, the file
+ * landed up to a minute into that session, after the agent's first reads and
+ * edits. Never throws; a workspace left without a file gets it from the
+ * session-start refresh as before.
+ */
+export async function fetchFactsNow(
+  root: string,
+  options: FactsRefreshOptions & { waitMs?: number; pauseMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<RefreshOutcome> {
+  const env = options.env ?? process.env;
+  if (env["CARRICK_NO_FACTS_REFRESH"]) return "none";
+  const pause = options.pauseMs ?? FACTS_FIRST_PAUSE_MS;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let asked = 1; ; asked += 1) {
+    const outcome = await refreshFacts(root, options);
+    if (outcome !== "retry" || asked * pause >= (options.waitMs ?? FACTS_FIRST_WAIT_MS)) return outcome;
+    await sleep(pause);
+  }
+}
+
+/**
  * Start the refresh for `root` detached, at most once per `FACTS_STALE_MS`
  * across every hook and session. Returns whether it started. Never throws.
  */

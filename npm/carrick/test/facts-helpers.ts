@@ -53,13 +53,16 @@ export async function workspace(
   }
   fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
   fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: SLUG }] } }));
-  if (rows !== null) {
-    // Only a repo folder the test wrote is a checkout here, as `matchRepos`
-    // maps only what it finds; each is committed and the header names it.
-    const local = REPOS.filter((repo) => fs.existsSync(path.join(root, repo)));
-    await buildFacts(commitRepos(root, ndjson(rows), local), factsPath(root), local.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
-  }
+  if (rows !== null) await landFacts(root, rows);
   return { root, home, at: (rel) => path.join(root, rel) };
+}
+
+/** Build the fact file of the workspace at `root` from `rows`: what a refresh leaves once it lands. */
+export async function landFacts(root: string, rows: Array<Record<string, unknown>>): Promise<void> {
+  // Only a repo folder the test wrote is a checkout here, as `matchRepos`
+  // maps only what it finds; each is committed and the header names it.
+  const local = REPOS.filter((repo) => fs.existsSync(path.join(root, repo)));
+  await buildFacts(commitRepos(root, ndjson(rows), local), factsPath(root), local.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
 }
 
 export type Hunk = { newStart: number; lines: string[] };
