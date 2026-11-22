@@ -140,6 +140,9 @@ function offsetDiags(text: string, diags: LspDiag[] | undefined): Diag[] {
     .map((d) => ({ start: at.offset(d.range.start.line, d.range.start.character), code: Number(d.code), message: d.message }));
 }
 
+/** A `sigs` value `sigOf` never returns: the file's disk text is newer than the engine's copy, so the next sweep applies it. */
+const SNAPSHOT_SIG = "snapshot";
+
 function readText(file: string): string | null {
   try {
     return fs.readFileSync(file, "utf8");
@@ -251,6 +254,7 @@ class HeldService implements ServiceEngine {
   private readonly gql: GraphqlChecks;
   /** The engine's message rules a file with a socket check appends; null when the engine gave none. */
   private readonly message: string[] | null;
+  private readonly snapshot: Map<string, string | null>;
 
   constructor(
     init: ServiceInit,
@@ -261,7 +265,10 @@ class HeldService implements ServiceEngine {
     wire: string[],
     gql: GraphqlChecks,
     message: string[] | null,
+    /** Each value file's text as it was when the start began (N2); the first gate arms on it, not on an edit made during the start. */
+    snapshot: Map<string, string | null>,
   ) {
+    this.snapshot = snapshot;
     this.init = init;
     this.deps = deps;
     this.engine = engine;
@@ -362,7 +369,12 @@ class HeldService implements ServiceEngine {
     };
     // A check can only sit in a file of the program the compiler engine loaded.
     if (!this.program.has(rel)) return noneFor("value_outside_service");
-    const text = readText(this.real(rel));
+    const disk = readText(this.real(rel));
+    // N2: the first gate of a file judges the text the start began with. The next ask applies the disk text as an edit.
+    const taken = this.known.has(rel) ? undefined : this.snapshot.get(rel);
+    this.snapshot.delete(rel);
+    const text = taken != null && taken !== disk ? taken : disk;
+    if (text !== disk) this.sigs.set(rel, SNAPSHOT_SIG);
     const held = this.known.get(rel);
     if (text !== null && held !== undefined && held !== text) return this.queue(rel, positions.map((p) => p.id));
     if (!onlyNew) {
@@ -958,6 +970,9 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       const out = shadowDir(options.root, init.service, options.home);
       fs.rmSync(out, { recursive: true, force: true });
       const mine = (await deps.rows()).filter((row) => row.repo === init.repo && row.service === init.service && row.direction === "response");
+      // N2: the value files as they are now, before the shadow is written and the engine starts; an edit made during the start is not in them.
+      const snapshot = new Map<string, string | null>();
+      for (const row of mine) for (const v of row.values ?? []) if (!snapshot.has(v.file)) snapshot.set(v.file, readText(path.join(init.scan_root, v.file)));
       // GraphQL rows (P5, P15): the engine is told the service's table and roots once, here. With no table, or one the
       // engine refuses, they stay unarmed with one reason, and the shadow is written as for HTTP alone.
       const table = mine.some(isGraphql) ? await deps.graphqlTypes(init.repo, init.service) : null;
@@ -998,10 +1013,11 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
         reason: graphqlReason,
         input: graphqlInput(mine, table),
       };
-      const service = new HeldService(init, { ...deps, site }, engine, w, shadow.own_files, wire, gql, message);
+      const service = new HeldService(init, { ...deps, site }, engine, w, shadow.own_files, wire, gql, message, snapshot);
       try {
         service.loadRows(mine);
         await service.gate(false);
+        snapshot.clear();
       } catch (error) {
         await engine.close();
         return { state: "error", reason: String(error) };

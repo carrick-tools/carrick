@@ -189,6 +189,8 @@ type Slot = {
   reason?: string;
   /** Engine calls run one at a time, in arrival order. */
   queue: Promise<void>;
+  /** The newest edit ask per session and file answered `cold` while the engine started (N2); each is asked again once it is ready. */
+  cold: Map<string, { request: HeldRequest; files: string[] }>;
 };
 
 /** A reason as one short line. */
@@ -294,14 +296,42 @@ export class HeldDaemon {
       if ((await this.deps.runtime.rowCount?.(init)) === 0) return { state: "none", lines: [], steps: {} };
       if (!(await this.makeRoom(init))) return this.notChecked(init, "capped");
       this.begin(init, now);
+      this.remember(this.slots.get(key(init)), files, request);
       return this.notChecked(init, "cold");
     }
     slot.lastUsed = now;
-    if (slot.status === "starting") return this.notChecked(init, "cold");
+    if (slot.status === "starting") {
+      this.remember(slot, files, request);
+      return this.notChecked(init, "cold");
+    }
     if (slot.status === "no_compiler") return this.notChecked(init, "no_compiler");
     if (slot.status === "failed" || slot.engine === null) return this.notChecked(init, "error", slot.reason);
     const asked = await this.ask(slot, slot.engine, files, request);
     return asked === null ? this.notChecked(init, "error", "the engine could not answer") : { state: "ready", ...asked };
+  }
+
+  /** N2: keep an edit ask that named its entry and was answered `cold`; a read, or an ask with no entry, files nothing to answer later. */
+  private remember(slot: Slot | undefined, files: string[], request: HeldRequest): void {
+    if (slot === undefined || request.kind !== "edit" || request.seq === undefined) return;
+    slot.cold.set(`${request.session}\0${files.join("\0")}`, { request, files });
+  }
+
+  /** N2: the engine is ready; answer each edit ask it missed, as `handle` files one. A newer edit's entry supersedes an older ask. */
+  private async askAgain(slot: Slot, engine: ServiceEngine): Promise<void> {
+    const owed = [...slot.cold.values()];
+    slot.cold.clear();
+    for (const { request, files } of owed) {
+      try {
+        const started = performance.now();
+        const asked = await this.ask(slot, engine, files, request);
+        if (asked === null) continue;
+        const ms = Math.round(performance.now() - started);
+        const filed = this.file(request, "ready", asked.lines, ms, { service: `${slot.init.repo}/${slot.init.service}`, engine: asked.engine });
+        if (filed) for (const commit of asked.commits ?? []) commit();
+      } catch (error) {
+        log("could not answer an ask made during the start", String(error));
+      }
+    }
   }
 
   /** An answer that did not check the edit, with the facts the hook's line and the doctor's read (T7). */
@@ -412,7 +442,7 @@ export class HeldDaemon {
 
   private begin(init: ServiceInit, now: number): void {
     const settledMb = readState(this.root, init.service, this.deps.home)?.settled_mb;
-    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), ...(settledMb === undefined ? {} : { settledMb }) };
+    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), cold: new Map(), ...(settledMb === undefined ? {} : { settledMb }) };
     this.slots.set(key(init), slot);
     this.keep(init, { state: "starting" });
     this.emptySince = null;
@@ -446,6 +476,7 @@ export class HeldDaemon {
       this.keep(slot.init, { state: "ready", start_ms: this.now() - slot.begunAt, ...(settled === undefined ? {} : { settled_mb: settled }) });
       // Give back the admission slot; the slot stays ready so its asks still answer.
       if (result.engine.holdsCompiler === false) removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
+      void this.askAgain(slot, result.engine);
       return;
     }
     log(`no engine for ${slot.init.service}: ${result.reason}`);
