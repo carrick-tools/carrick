@@ -11,7 +11,7 @@
 // a model turn on every reply.
 //
 // The session's check (carrick#3466, R1 of the hook-wording audit): Stop
-// speaks only when the check ran on something this session changed. No route
+// speaks only when the check ran on something this session edited. No route
 // or call in the edited files, or only files no service reads: nothing, and
 // the change is recorded as stated. Judged operations with no problem: one
 // line naming them, once per distinct set of operations. Problems: a header

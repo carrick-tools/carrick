@@ -167,6 +167,16 @@ test("T6: Stop never names a mismatch the judge did not state as agreeing", () =
   assert.doesNotMatch(text, /contract problem/);
 });
 
+test("the clean line names the files edited, never operations the session \"changed\"", () => {
+  const result = rechecked();
+  result.items = [{ ...judgedItem(), path: "/api/u0", line: 10 }];
+  const one = sessionCheckedLines([{ result, where: "api/users.ts" }], []).text;
+  assert.match(one, /^Carrick checked 1 operation in the file edited this session \(/);
+  const two = sessionCheckedLines([{ result, where: "api/users.ts" }, { result, where: "api/other.ts" }], []).text;
+  assert.match(two, /^Carrick checked 2 operations in files edited this session \(/);
+  assert.doesNotMatch(one + two, /changed/);
+});
+
 test("a re-checked edit with many problems prints three and counts the rest", () => {
   const result = rechecked();
   const mismatch = result.items![0]!;
@@ -1210,7 +1220,7 @@ test("judged operations with no problem are named, up to three, and the rest cou
   const result = rechecked();
   result.items = [0, 1, 2, 3, 4].map((n) => ({ ...judgedItem(), path: `/api/u${n}`, line: 10 + n }));
   const { text, key } = sessionCheckedLines([{ result, where: "api/users.ts" }], []);
-  assert.match(text, /^Carrick checked the 5 operations this session changed \(GET \/api\/u0 at api\/users\.ts:10; GET \/api\/u1 at api\/users\.ts:11; GET \/api\/u2 at api\/users\.ts:12; and 2 more\): both sides agree\.$/);
+  assert.match(text, /^Carrick checked 5 operations in the file edited this session \(GET \/api\/u0 at api\/users\.ts:10; GET \/api\/u1 at api\/users\.ts:11; GET \/api\/u2 at api\/users\.ts:12; and 2 more\): both sides agree\.$/);
   assert.ok(key !== null && key.split("\n").length === 5);
 });
 

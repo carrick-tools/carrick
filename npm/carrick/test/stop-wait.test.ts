@@ -631,7 +631,7 @@ test("a Stop over 2 judged operations with no problem names both and says both s
   assert.equal(first.lines.length, 1);
   assert.equal(
     first.lines[0],
-    "Carrick checked the 2 operations this session changed (GET /api/users at user-service/src/routes/users.ts:10; a call to POST /orders at user-service/src/routes/users.ts:40): both sides agree.",
+    "Carrick checked 2 operations in the file edited this session (GET /api/users at user-service/src/routes/users.ts:10; a call to POST /orders at user-service/src/routes/users.ts:40): both sides agree.",
   );
   assert.equal(changedQueued(workspace.root).length, 0);
 });
@@ -657,7 +657,7 @@ test("a second Stop over the same operations prints nothing, a new operation pri
   more.items = [judgedRoute("/api/users", 12), judgedRoute("/api/orders", 30)];
   answer(home, queue(workspace.root, home, workspace.file), more);
   const third = stopAnswers(SESSION, { home, ensure: () => false });
-  assert.match(third.lines.join("\n"), /^Carrick checked the 2 operations this session changed/);
+  assert.match(third.lines.join("\n"), /^Carrick checked 2 operations in the file edited this session/);
 });
 
 /** A clean answer that judged one operation of `relative` (a route at `line`). */
@@ -689,7 +689,7 @@ test("Stop counts two flagged clean answers as 2 operations when a carrier alrea
   recordEdit(SESSION, workspace.root, second, home, [other]);
   answer(home, b, cleanJudged("src/routes/orders.ts", "/api/orders", 5));
   const said = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n\n");
-  assert.match(said, /^Carrick checked the 2 operations this session changed \(.*\): both sides agree\.$/, said);
+  assert.match(said, /^Carrick checked 2 operations in files edited this session \(.*\): both sides agree\.$/, said);
 });
 
 test("Stop counts a flagged finding and a flagged clean answer as the 2 files this session edited", async (t) => {
@@ -715,7 +715,7 @@ test("Stop says both sides agree for one flagged clean answer with a judged oper
   const stop = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n\n");
   assert.equal(
     stop,
-    "Carrick checked the 1 operation this session changed (GET /api/users at user-service/src/routes/users.ts:10): both sides agree.",
+    "Carrick checked 1 operation in the file edited this session (GET /api/users at user-service/src/routes/users.ts:10): both sides agree.",
   );
   const next = context((await bashHook(home, workspace.root)).stdout);
   assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
@@ -1031,7 +1031,7 @@ test("the main Stop carries an ended sub-agent's problem answer, once, beside th
 
   const first = stopAnswers(SESSION, { home, ensure: () => false }).lines;
   const text = first.join("\n");
-  assert.match(first[0]!, /^Carrick checked the 1 operation this session changed \(GET \/api\/users at user-service\/src\/routes\/users\.ts:10\)/);
+  assert.match(first[0]!, /^Carrick checked 1 operation in the file edited this session \(GET \/api\/users at user-service\/src\/routes\/users\.ts:10\)/);
   assert.doesNotMatch(first[0]!, /orders\.ts/, "the sub-agent's file is not the session's own edit");
   assert.match(text, /orders\.ts/);
   assert.match(text, /contract problem/);

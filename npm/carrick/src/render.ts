@@ -407,7 +407,9 @@ function namedOperations(clauses: readonly string[]): string {
  * something to say:
  * - problems: a header and the problem and moved lines of `fresh` (the
  *   answers this Stop delivers; the others were printed when they landed);
- * - judged operations with no problem: one line naming them;
+ * - judged operations with no problem: one line naming them (the answer does
+ *   not say which operations the edit touched, so the line says they are in
+ *   the edited files, never that the session changed them);
  * - no route or call in any edited file: nothing.
  * `key` is the sorted list of the operations a clean or not-checked line
  * names, so the caller prints the same set once; null when problems print.
@@ -456,7 +458,7 @@ export function sessionCheckedLines(
   const noun = (n: number) => `${n} ${n === 1 ? "operation" : "operations"}`;
   if (judged.length > 0) {
     out.push(
-      `Carrick checked the ${noun(judged.length)} this session changed (${namedOperations(judged.map((n) => n.clause))}): both sides agree.`,
+      `Carrick checked ${noun(judged.length)} in ${files === 1 ? "the file" : "files"} edited this session (${namedOperations(judged.map((n) => n.clause))}): both sides agree.`,
     );
   }
   if (out.length === 0) return { text: "", key: null };
