@@ -324,6 +324,136 @@ fn deno_preparation_never_runs_declared_tasks_or_application_code() {
     );
 }
 
+/// A small Deno workspace: the root config lists two members, one member
+/// imports an npm package through its import map. Returns the repo root and a
+/// `deno` on `PATH` that records its arguments and the files it left behind.
+#[cfg(unix)]
+fn deno_workspace_with_stub(lockfile: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let base = scratch.path().canonicalize().expect("canonical scratch");
+    let repo = base.join("repo");
+    for dir in ["apps/api", "packages/types"] {
+        fs::create_dir_all(repo.join(dir)).expect("member dir");
+    }
+    fs::write(
+        repo.join("deno.json"),
+        r#"{"workspace":["./apps/api","./packages/types"]}"#,
+    )
+    .expect("root config");
+    fs::write(
+        repo.join("apps/api/deno.json"),
+        r#"{"name":"@bed/api","exports":"./main.ts","imports":{"pad":"npm:left-pad@1.3.0"}}"#,
+    )
+    .expect("api config");
+    fs::write(
+        repo.join("packages/types/deno.json"),
+        r#"{"name":"@bed/types","exports":"./mod.ts"}"#,
+    )
+    .expect("types config");
+    if lockfile {
+        fs::write(repo.join("deno.lock"), r#"{"version":"5"}"#).expect("lockfile");
+    }
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let calls = base.join("calls");
+    let stub = bin.join("deno");
+    fs::write(
+        &stub,
+        "#!/bin/bash\necho \"$*\" >> \"$STUB_CALLS\"\nexit 0\n",
+    )
+    .expect("stub");
+    make_executable(&stub);
+    (scratch, repo, calls)
+}
+
+#[cfg(unix)]
+fn tree_listing(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current).expect("read dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            found.push(format!("{} {}", path.display(), text));
+        }
+    }
+    found.sort();
+    found
+}
+
+#[cfg(unix)]
+fn run_deno_install(repo: &Path, calls: &Path, bin_of: &Path) -> Run {
+    let path = format!(
+        "{}:{}",
+        bin_of.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("bash")
+        .arg(script())
+        .args(["install-one", repo.to_str().expect("utf-8"), "deno"])
+        .env("PATH", path)
+        .env("STUB_CALLS", calls)
+        .output()
+        .expect("run install-scanned-deps.sh");
+    Run {
+        out: String::from_utf8_lossy(&output.stdout).into_owned(),
+        err: String::from_utf8_lossy(&output.stderr).into_owned(),
+        status: output.status.code().unwrap_or(-1),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_deno_repo_with_no_lockfile_installs_without_frozen_and_writes_nothing() {
+    let (scratch, repo, calls) = deno_workspace_with_stub(false);
+    let before = tree_listing(&repo);
+    let result = run_deno_install(
+        &repo,
+        &calls,
+        &scratch.path().canonicalize().unwrap().join("bin"),
+    );
+    assert_eq!(result.status, 0, "{}", result.text());
+    let recorded = fs::read_to_string(&calls).expect("deno was called");
+    assert_eq!(recorded.trim(), "install --no-lock --node-modules-dir=none");
+    assert_eq!(
+        before,
+        tree_listing(&repo),
+        "the repository tree is unchanged"
+    );
+    assert!(
+        result
+            .text()
+            .contains("deno install --no-lock --node-modules-dir=none"),
+        "the log names the form that ran: {}",
+        result.text()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_deno_repo_with_a_lockfile_still_installs_frozen() {
+    let (scratch, repo, calls) = deno_workspace_with_stub(true);
+    let bin = scratch.path().canonicalize().unwrap().join("bin");
+    // The root and a member share the root's lockfile.
+    for root in [repo.clone(), repo.join("apps/api")] {
+        let _ = fs::remove_file(&calls);
+        let result = run_deno_install(&root, &calls, &bin);
+        assert_eq!(result.status, 0, "{}", result.text());
+        let recorded = fs::read_to_string(&calls).expect("deno was called");
+        assert_eq!(recorded.trim(), "install --frozen --node-modules-dir=none");
+        assert!(
+            result
+                .text()
+                .contains("deno install --frozen --node-modules-dir=none"),
+            "{}",
+            result.text()
+        );
+    }
+}
+
 #[test]
 fn deno_action_suppresses_config_authorized_npm_lifecycle_scripts() {
     let output = Command::new("python3")

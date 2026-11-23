@@ -148,6 +148,21 @@ export function findDenoConfig(repoRoot: string, explicit?: string): DenoConfig 
   };
 }
 
+/**
+ * `--frozen` when a `deno.lock` covers the project (the workspace root's, which
+ * members share, or the service folder's own): the scan reads it and never
+ * rewrites it. With none, `--frozen` refuses to create one and `deno info`
+ * fails on any `npm:` import, so the graph is read with `--no-lock`: no
+ * lockfile is read or written. The install step makes the same choice
+ * (scripts/install-scanned-deps.sh, deno_has_lockfile).
+ */
+export function denoLockFlag(workspaceRoot: string, serviceRoot: string): '--frozen' | '--no-lock' {
+  for (const dir of [workspaceRoot, serviceRoot]) {
+    if (fs.existsSync(path.join(dir, 'deno.lock'))) return '--frozen';
+  }
+  return '--no-lock';
+}
+
 function runDeno(args: string[], cwd: string): string {
   try {
     return execFileSync('deno', args, {
@@ -275,7 +290,7 @@ export class DenoProject {
     guard.writeFile(entry, roots.map(s => `import ${JSON.stringify(s)};`).join('\n'));
     let graph: Graph;
     try {
-      graph = JSON.parse(runDeno(['info', '--json', '--frozen', '--node-modules-dir=none', '--config', config.configPath, entry], repoRoot)) as Graph;
+      graph = JSON.parse(runDeno(['info', '--json', denoLockFlag(config.workspaceRoot, repoRoot), '--node-modules-dir=none', '--config', config.configPath, entry], repoRoot)) as Graph;
     } finally { guard.remove(entry); }
     if (!Array.isArray(graph.modules)) throw new Error('Unsupported deno info JSON: missing modules array');
     this.redirects = graph.redirects ?? {};

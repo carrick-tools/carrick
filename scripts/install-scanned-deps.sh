@@ -141,6 +141,19 @@ deno_config() {
   fi
 }
 
+# Whether a `deno.lock` covers a directory: its own, or one above it up to the
+# repository root (a workspace member shares the root's lockfile). The walk
+# stops at the first directory holding `.git`, or at the filesystem root.
+deno_has_lockfile() {
+  local dir="$1"
+  while :; do
+    [ -f "$dir/deno.lock" ] && return 0
+    [ -e "$dir/.git" ] && return 1
+    [ "$dir" = "/" ] || [ "$dir" = "." ] && return 1
+    dir=$(dirname "$dir")
+  done
+}
+
 # Every service root the scan will visit, absolute, one per line.
 #
 # The scan root leads, and is emitted whatever the scanner answers: a checkout
@@ -494,7 +507,7 @@ yarn_is_berry() {
 }
 
 cmd_install_one() {
-  local root="$1" manager="$2" log status refusal strict_cmd="" no_retry="" snap="" before="" npm_error="" retry_error=""
+  local root="$1" manager="$2" log status refusal deno_form="" deno_lock_flag="" strict_cmd="" no_retry="" snap="" before="" npm_error="" retry_error=""
   if [ "$manager" != "deno" ] && { [ -f "$root/deno.json" ] || [ -f "$root/deno.jsonc" ]; }; then
     # Mixed roots need the global Deno cache AND the Node compiler's local
     # install. Neither preparation executes authorized project lifecycle code.
@@ -518,12 +531,23 @@ cmd_install_one() {
       # No retry: the pre-flight asks about a Deno service only when its config
       # sets `nodeModulesDir`, and no failing `deno install --frozen` has been seen.
       no_retry=1
-      strict_cmd="deno install --frozen"
       # A project can authorize lifecycle scripts through allowScripts in its
       # config. Deno has no --ignore-scripts: disabling node_modules is what
       # prevents those scripts from running, even for an authorizing config.
-      # Frozen mode also prevents rewriting the project's lockfile.
-      run_install "$root" "$log" deno install --frozen --node-modules-dir=none
+      # With a lockfile, frozen mode prevents rewriting the project's lockfile.
+      # With none, `--frozen` refuses to create one and fails ("The lockfile is
+      # out of date"), so the install runs `--no-lock`: no lockfile is read or
+      # written, and the packages land in Deno's own cache. The sidecar's
+      # `deno info` makes the same choice (deno-project.ts, denoLockFlag).
+      if deno_has_lockfile "$root"; then
+        strict_cmd="deno install --frozen"
+        deno_lock_flag="--frozen"
+      else
+        strict_cmd="deno install --no-lock"
+        deno_lock_flag="--no-lock"
+      fi
+      deno_form="$strict_cmd --node-modules-dir=none"
+      run_install "$root" "$log" deno install "$deno_lock_flag" --node-modules-dir=none
       status=$?
       ;;
     npm)
@@ -594,7 +618,7 @@ cmd_install_one() {
   esac
 
   if [ $status -eq 0 ]; then
-    echo "Installed $root dependencies with $manager (lifecycle scripts disabled)."
+    echo "Installed $root dependencies with ${deno_form:-$manager} (lifecycle scripts disabled)."
     [ -f "$log" ] && tail -n 3 "$log"
     [ -n "$before" ] && rm -f "$before"
     return 0
@@ -646,9 +670,9 @@ cmd_install_one() {
     rm -f "$before"
   fi
   if [ $status -eq 124 ] || [ $status -eq 137 ]; then
-    warn "Carrick's dependency install ($manager) in $root hit the ${INSTALL_TIMEOUT_SECONDS}s limit; the scan will refuse that service rather than index \`any\` through its packages."
+    warn "Carrick's dependency install (${deno_form:-$manager}) in $root hit the ${INSTALL_TIMEOUT_SECONDS}s limit; the scan will refuse that service rather than index \`any\` through its packages."
   else
-    warn "Carrick's dependency install ($manager) in $root failed (exit $status)${npm_error:+: $npm_error}; the scan will refuse that service rather than index \`any\` through its packages."
+    warn "Carrick's dependency install (${deno_form:-$manager}) in $root failed (exit $status)${npm_error:+: $npm_error}; the scan will refuse that service rather than index \`any\` through its packages."
   fi
   return 0
 }
