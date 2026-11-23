@@ -311,7 +311,6 @@ function extraHelp() {
     "                                 re-checks)",
     "    hook user-prompt             UserPromptSubmit hook (finished",
     "                                 re-checks, delivered on the next prompt)",
-    "    templates workflow           print the GitHub Actions workflow file",
     "    --version                    the version of this package",
     "",
     "ENVIRONMENT:",
@@ -327,9 +326,8 @@ function extraHelp() {
 }
 
 /**
- * `lsp --help` and `templates --help` print their own help and exit 0. Before
- * this, `lsp` started the language server on any argument and `templates`
- * read `--help` as a template name and refused it (carrick-cloud#2884).
+ * `lsp --help` prints its own help and exits 0. Before this, `lsp` started the
+ * language server on any argument (carrick-cloud#2884).
  */
 const SUBCOMMAND_HELP = {
   lsp: [
@@ -338,14 +336,6 @@ const SUBCOMMAND_HELP = {
     "Run the language server on stdin and stdout, for an editor or an agent that",
     "speaks LSP. It reads the index this folder already holds and writes nothing",
     "into the repository.",
-    "",
-  ],
-  templates: [
-    "carrick templates workflow [--variable value]...",
-    "",
-    "Print the GitHub Actions workflow file to stdout. Each --variable value pair",
-    "fills a placeholder of that name, for example `--default-branch trunk`. It",
-    "writes no file.",
     "",
   ],
   telemetry: [
@@ -409,7 +399,7 @@ switch (command) {
     const { uninstall } = await import("../dist/init/remove.js");
     process.exit(await uninstall(rest));
   }
-  // Also this package's own: the hook, MCP and workflow halves of the check
+  // Also this package's own: the hook and MCP halves of the check
   // are things this package wrote, and the binary answers for the rest of it
   // through `carrick status`.
   case "doctor": {
@@ -419,10 +409,6 @@ switch (command) {
   case "telemetry": {
     const { telemetry } = await import("../dist/init/telemetry.js");
     process.exit(telemetry(rest));
-  }
-  case "templates": {
-    const { templates } = await import("../dist/init/run.js");
-    process.exit(templates(rest));
   }
   case "--version":
   case "-V": {

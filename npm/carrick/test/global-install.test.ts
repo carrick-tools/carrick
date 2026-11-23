@@ -421,10 +421,10 @@ test("an npx run upgrades the older global it finds on PATH", posix, () => {
     '#!/bin/sh\necho "$@" >> "$CARRICK_ARGV_LOG"\nfor word in "$@"; do last=$word; done\necho "${last#carrick@}" > "$CARRICK_VERSION_FILE.version"\n',
   );
   try {
-    // `templates` because it is a command that does the sync and then answers
+    // `doctor --help` because it is a command that does the sync and then answers
     // without the scanner binary, an index or a network: what is under test is
     // the two lines on stderr in front of whatever the command does.
-    const answer = spawnSync(process.execPath, [fixture.entry, "templates", "workflow"], {
+    const answer = spawnSync(process.execPath, [fixture.entry, "doctor", "--help"], {
       encoding: "utf8",
       env: fixture.env,
       cwd: fixture.home,
@@ -450,7 +450,7 @@ test("an npx run that could not replace the older global still names it", posix,
     '#!/bin/sh\necho "$@" >> "$CARRICK_ARGV_LOG"\n',
   );
   try {
-    const answer = spawnSync(process.execPath, [fixture.entry, "templates", "workflow"], {
+    const answer = spawnSync(process.execPath, [fixture.entry, "doctor", "--help"], {
       encoding: "utf8",
       env: fixture.env,
       cwd: fixture.home,

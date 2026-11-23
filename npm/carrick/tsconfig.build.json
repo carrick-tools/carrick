@@ -4,11 +4,6 @@
   // and the checkout run directly — it ships this emit instead.
   // `rewriteRelativeImportExtensions` is what lets the source keep its `.ts`
   // specifiers and the emit resolve to `.js`.
-  //
-  // Declarations are emitted because a TypeScript consumer imports
-  // `carrick/templates`: without them the `types` condition on that export has
-  // no file to name, and the import is TS7016 under any strict config
-  // (carrick#845).
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,

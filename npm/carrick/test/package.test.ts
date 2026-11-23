@@ -118,32 +118,13 @@ test("the entry point imports the emit, never the TypeScript", () => {
   assert.doesNotMatch(hookTable, /\.ts"/);
 });
 
-test("the templates are importable by the tool that has to render the same bytes", () => {
-  // A consumer that renders from this package at a pinned version needs an
-  // export map; without one it would have to reach into dist/ by path, which
-  // is not a contract anyone should rely on.
-  //
-  // And it is a TypeScript consumer, so the export has to carry its types: a
-  // subpath with no `types` condition is TS7016 under any strict config, and
-  // the consumer's only way out is to hand-write a declaration of this
-  // module's surface — a second copy of the thing the shared template exists
-  // to remove (#845).
-  const templates = pkg["exports"]["./templates"] as Record<string, string>;
-  assert.equal(templates["default"], "./dist/templates.js");
-  assert.equal(templates["types"], "./dist/templates.d.ts");
-  assert.equal(
-    Object.keys(templates)[0],
-    "types",
-    "conditions resolve in order, so `types` has to come first",
-  );
-  // Read as text: the build config carries comments, so it is JSONC.
-  const build = fs.readFileSync(path.join(packageRoot, "tsconfig.build.json"), "utf8");
-  assert.match(
-    build,
-    /"declaration":\s*true/,
-    "the file the types condition names has to be emitted",
-  );
-  assert.ok(fs.existsSync(path.join(packageRoot, "src", "templates.ts")));
+test("the old build path is gone: no templates command, no workflow file", () => {
+  // Carrick's runners build the index, so the package neither prints a CI
+  // workflow nor ships one.
+  const entry = fs.readFileSync(path.join(packageRoot, "bin", "carrick.mjs"), "utf8");
+  assert.doesNotMatch(entry, /templates workflow|case "templates"/);
+  assert.equal(fs.existsSync(path.join(packageRoot, "templates", "carrick.yml")), false);
+  assert.equal(pkg["exports"]["./templates"], undefined);
 });
 
 test("the host manifests name this CLI's commands, and travel with the package", () => {

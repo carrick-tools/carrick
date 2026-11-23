@@ -172,8 +172,8 @@ test("a CLI slower than the limit is killed", async (t) => {
 });
 
 // carrick-cloud#2884: `--help` is an answer, not an argument. `lsp` used to
-// start the language server and `templates` refused `--help` as a name.
-for (const command of ["lsp", "templates"]) {
+// start the language server.
+for (const command of ["lsp"]) {
   for (const flag of ["--help", "-h"]) {
     test(`carrick ${command} ${flag} prints its help and exits 0`, () => {
       const run = spawnSync(
