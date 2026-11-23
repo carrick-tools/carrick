@@ -157,6 +157,14 @@ test("renderRules holds the heading, the intro and the five rules, and ends in o
   assert.ok(!rules.includes("carrick:check"));
 });
 
+test("renderRules never asks the agent to run a check or wait for one (carrick#5076)", () => {
+  const rules = renderRules(SCOPE, COUNTS);
+  assert.doesNotMatch(rules, /carrick check --changed/);
+  assert.doesNotMatch(rules, /before you say it is done/);
+  assert.ok(rules.includes("checked for you in the background"));
+  assert.ok(rules.includes("you do not need to\n   run a check yourself or wait for one."));
+});
+
 test("writeRules writes .carrick/RULES.md with the scope and counts, and a re-run changes nothing", () => {
   const { dir } = folder();
   try {
