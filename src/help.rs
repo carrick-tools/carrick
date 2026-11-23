@@ -117,6 +117,11 @@ ENVIRONMENT VARIABLES:
                                     types
 "#;
 
+/// Parsed and kept, but not offered: Carrick's runners build the index, so a
+/// person is not told to build one from this machine or from CI. Neither
+/// `--help` nor the unknown-command answer names them.
+pub const UNLISTED_COMMANDS: [&str; 2] = ["index", "resume"];
+
 /// The commands the `carrick` npm package adds on top of this binary's own
 /// (`npm/carrick/bin/carrick.mjs`). The binary cannot run them, and it must
 /// still be able to say where they are: `init` is where the first run starts,
@@ -138,11 +143,6 @@ pub const PACKAGE_COMMANDS: [&str; 9] = [
 mod tests {
     use super::*;
     use crate::local_mode::cli::LOCAL_COMMANDS;
-
-    /// Parsed and kept, but not offered: Carrick's runners build the index, so
-    /// a person is not told to build one from this machine or from CI. The
-    /// commands stay in the binary.
-    const UNLISTED_COMMANDS: [&str; 2] = ["index", "resume"];
 
     #[test]
     fn help_offers_no_way_to_build_an_index_here_or_in_ci() {

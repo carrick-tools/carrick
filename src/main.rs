@@ -621,7 +621,12 @@ fn unknown_command(argv: &[String]) -> Option<String> {
         "`{word}` is not a carrick command. Commands: {}, and {} from the npm package. To \
          scan a repository, pass a path that exists (`carrick .`). `carrick --help` lists \
          them all.",
-        local_mode::cli::LOCAL_COMMANDS.join(", "),
+        local_mode::cli::LOCAL_COMMANDS
+            .iter()
+            .filter(|command| !help::UNLISTED_COMMANDS.contains(command))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", "),
         help::PACKAGE_COMMANDS.join(", ")
     ))
 }
@@ -1175,6 +1180,10 @@ mod tests {
     fn a_bare_word_that_is_not_a_command_is_not_read_as_a_repository() {
         let problem = unknown_command(&args(&["whoami"])).expect("an unknown command");
         assert!(problem.contains("not a carrick command"), "{problem}");
+        // Only the commands --help offers are listed to a person.
+        for hidden in help::UNLISTED_COMMANDS {
+            assert!(!problem.contains(hidden), "{problem}");
+        }
         assert!(problem.contains("status"), "{problem}");
         assert!(problem.contains("pass a path that exists"), "{problem}");
     }
