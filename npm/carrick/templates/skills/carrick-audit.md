@@ -1,6 +1,6 @@
 ---
 name: carrick-audit
-description: Use when the ask is what is wrong in this codebase, what to clean up, or a health check of the project. Reads what the Carrick index already flags on main (type mismatches between endpoints and their callers, functions written twice), proves each item in source, and returns a fix list. It reads a lot of source, so it uses many tokens; narrow it to one service where you can.
+description: Use when the ask is what is wrong in this codebase, what to clean up, or a health check of the project. Reads what the Carrick index already flags on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice), proves each item in source, and returns a fix list. It reads a lot of source, so it uses many tokens; narrow it to one service where you can.
 ---
 
 # What the index flags on main, proven in source
@@ -23,8 +23,9 @@ get_project_map({{SCOPE}})
 ```
 
 Note the counts under FOUND ON MAIN: type mismatches and similar functions.
+Note also how many unmatched calls it says match no route.
 
-Your first words to the user are the two counts and the cap you will use,
+Your first words to the user are the three counts and the cap you will use,
 written before you open any source. Where
 you can ask, offer to narrow to one service or cap the count. Where you cannot
 wait for a reply, such as a non-interactive run, the run caps each section at
@@ -105,12 +106,44 @@ Where the members sit in separate apps, check their package.json files for a
 package they already share. Where one exists, the fix is to move the function
 there and import it; where none does, say so: the fix is a new shared package.
 
-## 4. Report
+## 4. Calls that reach no route
+
+```
+get_service_graph({{SCOPE}}, limit: 200)
+```
+
+Read `unmatched_by_reason`. Take only the rows of `unmatched_calls` whose
+`reason` is `no_matching_producer`, `no_case_answers` or `procedure_unserved`:
+each names an operation no indexed service serves. Page with `offset` until
+you hold as many as `unmatched_by_reason` counts for those reasons. This
+section has no cap: read every one. Leave the other reasons and the whole
+`model_calls_unplaced` list alone: they go to third parties or to a base
+Carrick has not placed, and are not evidence of a broken call.
+
+For each row, open the call site at its file and line. Then grep the whole
+workspace for the last two segments of the path, or for the operation, event or
+topic name, to find a route or handler that serves it under another prefix or
+in another router.
+
+Class each row:
+
+- **REAL**: the line makes this call, and nothing in the workspace serves it.
+  Say what the user sees when it fails, and name the nearest route that does
+  exist, such as the same handler mounted under another prefix.
+- **FALSE**: the line does not make this call (a `candidate: model` row whose
+  path is not in the source), or a route does serve it. Name the route's
+  file and line.
+- **OUTSIDE**: the call is meant for something this project does not hold, such
+  as a third party or a service that is not indexed. Say which.
+- **CAN'T TELL**: you cannot find what should serve it. Say what you looked for.
+
+## 5. Report
 
 One table per section, with the class column never empty, and the counts read
 against the counts from step 1 and any cap.
 
-Then a fix list: every REAL and DUPLICATE, most harmful first, each with
+Then a fix list: every REAL and DUPLICATE, most harmful first (a REAL call
+that reaches no route goes before a duplicate), each with
 file:line and the change in one line ("send createdAt from
 formatTaskResponse"; "move validateName into a shared package and delete the
 two copies"). TYPE-ONLY items go in a short list after it, as optional tidying.
@@ -122,10 +155,10 @@ List every refused call under the tables, including any you then worked around.
 Name the protocols the findings came from (HTTP, GraphQL, sockets, pub/sub,
 queues, RPC routers) and the ones that held none.
 
-Not covered yet: calls that reach no route, endpoints nobody calls, and routes
-that change data without an auth check. Say so in the report.
+Not covered yet: endpoints nobody calls, and routes that change data without
+an auth check. Say so in the report.
 
-## 5. Act
+## 6. Act
 
 Change nothing yet. Ask the user which items on the fix list to apply, and apply
 only those.

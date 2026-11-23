@@ -207,7 +207,7 @@ test("the audit skill renders for both scopes and names its two finding kinds an
     assert.match(audit, /No findings list has been built/);
     assert.match(audit, /caps each section at 10/);
     assert.match(audit, /refused:/);
-    assert.match(audit, /Your first words to the user are the two counts/);
+    assert.match(audit, /Your first words to the user are the three counts/);
     assert.match(audit, /one command per shell call/);
     assert.match(audit, /including any you then worked around/);
     assert.match(audit, /constants and helpers it reads/);
@@ -218,6 +218,19 @@ test("the audit skill renders for both scopes and names its two finding kinds an
     }
     assert.match(audit, /1,600 TypeScript files/);
     assert.doesNotMatch(audit, /2,200 files/);
+  }
+});
+
+test("the audit skill reads calls that reach no route, scoped, and no longer lists them as not covered", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    const argument = scope.slug === null ? 'repo: "<owner/repo>"' : 'project: "acme-index"';
+    assert.ok(audit.includes(`get_service_graph(${argument}, limit: 200)`), "the graph step is missing or unscoped");
+    assert.match(audit, /## 4\. Calls that reach no route/);
+    assert.match(audit, /no_matching_producer/);
+    const notCovered = /Not covered yet: ([^]*?) Say so in the report/.exec(audit);
+    assert.ok(notCovered, "the Not covered yet line is missing");
+    assert.doesNotMatch(notCovered[1], /calls that reach no route/);
   }
 });
 
