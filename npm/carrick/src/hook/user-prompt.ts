@@ -30,6 +30,7 @@ import { deliverLateFirst } from "./late.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 import { timed } from "./timings.ts";
+import { startUsageSend } from "./usage.ts";
 
 const log = createLogger("carrick-user-prompt");
 
@@ -77,6 +78,8 @@ async function main(): Promise<void> {
   // Finished background re-checks no hook has delivered yet.
   const parts: string[] = [...(await deliverLateFirst(session))];
   const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
+  // The daily usage counts: one marker read, and a detached child when an hour has passed. Never waited on.
+  if (root !== null) startUsageSend(root);
 
   // The same backstop the other hooks carry: this `carrick` is not the one
   // that set this workspace up (carrick#1372), once a day per workspace.

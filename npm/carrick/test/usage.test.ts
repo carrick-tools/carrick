@@ -156,7 +156,7 @@ test("4. the day is marked on 200 and 400 only, and kept on every other answer",
     const { calls, request } = recorder(status);
     await sendUsage(root, { env, home, now: NOW, request, version: "0.3.179" });
     assert.equal(fs.existsSync(path.join(root, ".carrick", "last-usage-final-day")), marked, `HTTP ${status}`);
-    await sendUsage(root, { env, home, now: NOW, request, version: "0.3.179" });
+    await sendUsage(root, { env, home, now: NOW + 61 * 60_000, request, version: "0.3.179" });
     const second = JSON.parse(calls[1]!.body);
     assert.equal(second.days.length, marked ? 1 : 2, `HTTP ${status}: the kept day rides the next send`);
   }
@@ -168,16 +168,32 @@ test("4. the day is marked on 200 and 400 only, and kept on every other answer",
   assert.ok(!fs.existsSync(path.join(root, ".carrick", "last-usage-final-day")));
 });
 
-test("4b. a second start within the hour starts nothing", () => {
+test("4b. one send an hour: a second send, and a start beside a fresh marker, do nothing", async () => {
   const { root, home, env } = setup();
   const started: string[][] = [];
   const start = (_command: string, args: string[]) => void started.push(args);
+  // A hook starts the child; the child, not the hook, claims the hour.
   assert.equal(startUsageSend(root, { env, home, now: NOW, start }), true);
-  assert.equal(startUsageSend(root, { env, home, now: NOW + 59 * 60_000, start }), false);
-  assert.equal(startUsageSend(root, { env, home, now: NOW + 61 * 60_000, start }), true);
-  assert.equal(started.length, 2);
+  assert.equal(startUsageSend(root, { env, home, now: NOW, start }), true);
   assert.ok(started[0]![0]!.includes("usage-run"));
   assert.equal(started[0]![1], root);
+  const { calls, request } = recorder(200);
+  assert.equal(await sendUsage(root, { env, home, now: NOW, request, version: "0.3.179" }), "sent");
+  assert.equal(await sendUsage(root, { env, home, now: NOW + 59 * 60_000, request, version: "0.3.179" }), "none");
+  assert.equal(calls.length, 1);
+  assert.equal(startUsageSend(root, { env, home, now: NOW + 59 * 60_000, start }), false);
+  assert.equal(startUsageSend(root, { env, home, now: NOW + 61 * 60_000, start }), true);
+  assert.equal(started.length, 3);
+});
+
+test("4c. a child with no counted rows sends nothing and claims nothing", async () => {
+  const { root, home, env } = setup();
+  const { calls, request } = recorder(200);
+  const later = Date.parse("2026-12-30T10:00:00Z");
+  assert.equal(await sendUsage(root, { env, home, now: later, request, version: "0.3.179" }), "none");
+  assert.equal(calls.length, 0);
+  assert.ok(!fs.existsSync(path.join(root, ".carrick", "usage-send")));
+  assert.equal(startUsageSend(root, { env, home, now: later, start: () => undefined }), true);
 });
 
 test("5. the first session start shows the notice once, then prints plain text", async () => {
@@ -218,6 +234,18 @@ test("6. the send never holds a hook: a silent server only costs the child its t
     new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted"))));
   assert.equal(await sendUsage(root, { env, home, now: NOW, request: silent, version: "0.3.179", timeoutMs: 50 }), "kept");
   assert.ok(!fs.existsSync(path.join(root, ".carrick", "last-usage-final-day")));
+});
+
+test("6b. Stop and prompt-submit start the child, and a fresh marker starts none", async () => {
+  for (const [script, payload] of [["stop.ts", { hook_event_name: "Stop", session_id: "usage-test-1" }], ["user-prompt.ts", { hook_event_name: "UserPromptSubmit", session_id: "usage-test-2", prompt: "x" }]] as const) {
+    const { root, home } = setup();
+    // A marker claimed a minute ago: nothing starts, and the hook is not held.
+    fs.writeFileSync(path.join(root, ".carrick", "usage-send"), `${new Date().toISOString()}\n`);
+    const env = fakeEnv({ CLAUDE_PROJECT_DIR: root, HOME: home, CARRICK_TELEMETRY: "1", DO_NOT_TRACK: "", CI: "", CARRICK_TOKEN: "" });
+    const fresh = await runHook(script, { cwd: root, payload, env });
+    assert.equal(fresh.code, 0, script);
+    assert.ok(fresh.ms < 5000, script);
+  }
 });
 
 test("7. carrick telemetry on, off and status", () => {

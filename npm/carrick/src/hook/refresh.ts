@@ -60,7 +60,7 @@ export function awaitingHostedIndex(status: StatusResult): boolean {
 }
 
 /** When the marker last recorded a claim, or null when there is none. */
-function claimedAt(marker: string): number | null {
+export function claimedAt(marker: string): number | null {
   try {
     const stamp = Date.parse(fs.readFileSync(marker, "utf8").trim());
     return Number.isFinite(stamp) ? stamp : null;

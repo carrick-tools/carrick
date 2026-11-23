@@ -24,7 +24,7 @@ import { createLogger } from "../log.ts";
 import { hasMarker } from "../root.ts";
 import { currentVersion } from "../update.ts";
 import { ensureInstallId, INSTALL_ID_PATTERN, readInstallId } from "../init/install-id.ts";
-import { claimRefresh, markerPath, scriptBeside, startDetached } from "./refresh.ts";
+import { claimedAt, claimRefresh, markerPath, scriptBeside, startDetached } from "./refresh.ts";
 import { writeAtomic } from "./reuse.ts";
 import { MAX_LINES, percentile, readTimings } from "./timings.ts";
 import type { Outcome, TimedHook, TimingRecord } from "./timings.ts";
@@ -284,6 +284,9 @@ export async function sendUsage(root: string, options: SendOptions = {}): Promis
       cli_version: version,
       days,
     };
+    // Claimed only now that there is something to send, so a child with no
+    // counted rows does not use up the hour for the next hook's child.
+    if (!claimRefresh(markerPath(root, USAGE_MARKER), now, USAGE_COOLDOWN_MS)) return "none";
     const text = JSON.stringify(body);
     fs.mkdirSync(path.dirname(lastBodyPath(root)), { recursive: true });
     writeAtomic(lastBodyPath(root), `${JSON.stringify(body, null, 2)}\n`);
@@ -321,13 +324,19 @@ export type StartOptions = {
   start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
 };
 
-/** Start the detached send for this folder, at most once an hour. True when it was started. Never throws, never waits. */
+/**
+ * Start the detached send for this folder unless one went out within the hour:
+ * one read of the marker, so the session start, Stop and prompt-submit hooks can
+ * all call it. The child claims the hour (`sendUsage`). True when it was started.
+ * Never throws, never waits.
+ */
 export function startUsageSend(root: string, options: StartOptions = {}): boolean {
   const env = options.env ?? process.env;
   try {
     if (!hasMarker(root)) return false;
     if (!usageGate(env, options.home).send) return false;
-    if (!claimRefresh(markerPath(root, USAGE_MARKER), options.now ?? Date.now(), USAGE_COOLDOWN_MS)) return false;
+    const held = claimedAt(markerPath(root, USAGE_MARKER));
+    if (held !== null && (options.now ?? Date.now()) - held < USAGE_COOLDOWN_MS) return false;
     const { command, args } = scriptBeside(import.meta.url, "usage-run", root);
     (options.start ?? startDetached)(command, args, { ...env, CARRICK_NO_KEEP_AWAKE: "1" });
     return true;
