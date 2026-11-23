@@ -618,9 +618,8 @@ fn unknown_command(argv: &[String]) -> Option<String> {
         ));
     }
     Some(format!(
-        "`{word}` is not a carrick command. Commands: {}, and {} from the npm package. To \
-         scan a repository, pass a path that exists (`carrick .`). `carrick --help` lists \
-         them all.",
+        "`{word}` is not a carrick command. Commands: {}, and {} from the npm package. \
+         `carrick --help` lists them all.",
         local_mode::cli::LOCAL_COMMANDS
             .iter()
             .filter(|command| !help::UNLISTED_COMMANDS.contains(command))
@@ -1185,7 +1184,8 @@ mod tests {
             assert!(!problem.contains(hidden), "{problem}");
         }
         assert!(problem.contains("status"), "{problem}");
-        assert!(problem.contains("pass a path that exists"), "{problem}");
+        assert!(!problem.contains("path"), "{problem}");
+        assert!(!problem.contains("carrick ."), "{problem}");
     }
 
     /// The package's own commands are named, not denied: the binary cannot run
