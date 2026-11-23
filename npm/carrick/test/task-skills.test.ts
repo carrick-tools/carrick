@@ -230,7 +230,7 @@ test("the audit skill reads calls that reach no route, scoped, and no longer lis
     assert.match(audit, /no_matching_producer/);
     const notCovered = /Not covered yet: ([^]*?) Say so in the report/.exec(audit);
     assert.ok(notCovered, "the Not covered yet line is missing");
-    assert.doesNotMatch(notCovered[1], /calls that reach no route/);
+    assert.doesNotMatch(notCovered[1] ?? "", /calls that reach no route/);
   }
 });
 
