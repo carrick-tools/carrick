@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.183](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.182...carrick-v0.3.183) (2026-11-23)
+
+
+### Bug Fixes
+
+* **install:** a Deno repo with no lockfile still gets its dependencies ([#5097](https://github.com/carrick-tools/carrick/issues/5097)) ([c30de5d](https://github.com/carrick-tools/carrick/commit/c30de5dfac0d6ae26b3863a39236e9e4bae7ca39))
+
 ## [0.3.182](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.181...carrick-v0.3.182) (2026-11-23)
 
 
