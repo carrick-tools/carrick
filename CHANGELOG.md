@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.182](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.181...carrick-v0.3.182) (2026-11-23)
+
+
+### Bug Fixes
+
+* **held:** an edit above and below a reply no longer moves its check onto another node ([#5099](https://github.com/carrick-tools/carrick/issues/5099)) ([b1a7071](https://github.com/carrick-tools/carrick/commit/b1a70719704ad959dff66298b1fdf7d5a9120666))
+* **init:** a second init re-reads the index when its project moved, and the fact file follows the project ([#5098](https://github.com/carrick-tools/carrick/issues/5098)) ([5e38bda](https://github.com/carrick-tools/carrick/commit/5e38bdaf89b503106ec5e566e9e0970978a8f1f8))
+
 ## [0.3.181](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.180...carrick-v0.3.181) (2026-11-23)
 
 
