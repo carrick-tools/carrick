@@ -1038,6 +1038,7 @@ export async function initWith(
         nativeRunner(out.quiet, progress),
         derived.repos.map((repo) => repo.path),
         progress,
+        project,
       );
       // The fact file the edit and Read hooks answer from is part of the index
       // on this machine. Fetched here, and waited for while the cloud builds

@@ -67,17 +67,28 @@ function stagedUrlAllowed(url: string): boolean {
  * The digest and writer of the local fact file, or null when there is no
  * readable file holding both. The cloud answers `unchanged` only when both
  * match, so a wording fix (a new writer) reaches this file without a new scan.
+ *
+ * A file for another project than `project` (a workspace moved since it was
+ * fetched) is taken away here, in the one read: no read trusts it
+ * (`openFacts`), and a digest it shared with the right project's file could
+ * keep it for good. What the cloud then sends is the only file left.
  */
-async function knownFile(root: string, env: NodeJS.ProcessEnv): Promise<{ digest: string; writer: number; contract: boolean } | null> {
+async function knownFile(root: string, env: NodeJS.ProcessEnv, project: string): Promise<{ digest: string; writer: number; contract: boolean } | null> {
   const file = factsPath(root);
   if (!fs.existsSync(file)) return null;
   const sqlite = await loadSqlite();
   if (!sqlite) return null;
   let db: { close: () => void } | null = null;
+  let otherProject = false;
   try {
     const open = new sqlite.DatabaseSync(file, { readOnly: true });
     db = open;
-    const meta = new Map(open.prepare("SELECT key, value FROM meta WHERE key IN ('digest', 'writer', 'contract', 'commits')").all().map((raw) => [String(raw["key"]), String(raw["value"])]));
+    const meta = new Map(open.prepare("SELECT key, value FROM meta WHERE key IN ('digest', 'writer', 'contract', 'commits', 'project')").all().map((raw) => [String(raw["key"]), String(raw["value"])]));
+    const held = meta.get("project");
+    if (held !== undefined && held !== project) {
+      otherProject = true;
+      return null;
+    }
     const digest = meta.get("digest");
     const writer = Number(meta.get("writer"));
     if (!digest || !Number.isInteger(writer)) return null;
@@ -99,6 +110,10 @@ async function knownFile(root: string, env: NodeJS.ProcessEnv): Promise<{ digest
     return null;
   } finally {
     closeQuietly(db);
+    if (otherProject) {
+      log(`fact file is for another project than ${project}; replaced`);
+      fs.rmSync(file, { force: true });
+    }
   }
 }
 
@@ -119,7 +134,7 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
       log("no single project for this workspace; no fact file");
       return "none";
     }
-    const known = await knownFile(root, env);
+    const known = await knownFile(root, env, project);
     const response = await request(`${API_BASE}/mcp/facts`, {
       method: "POST",
       redirect: "error",

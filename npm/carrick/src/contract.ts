@@ -606,6 +606,12 @@ export type StatusResult = {
    */
   type_check?: TypeCheckState;
   services: StatusService[];
+  /**
+   * Each repo whose local copy cannot move to the hosted index (a diverged
+   * history, a commit this clone lacks). Absent in the ordinary case. Only
+   * whether it is present is read here: its sentence is the CLI's.
+   */
+  kept_back?: Array<{ repo: string; path?: string; line?: string; reason_short?: string; behind?: number }>;
 };
 
 /**
@@ -750,6 +756,10 @@ export function parseStatusResult(stdout: string): StatusResult | null {
   const lastScan = parsed["last_scan"];
   if (isRecord(lastScan) && Array.isArray(lastScan["scans"])) {
     result.last_scan = lastScan as unknown as RunSpend;
+  }
+  const keptBack = Array.isArray(parsed["kept_back"]) ? parsed["kept_back"] : [];
+  for (const entry of keptBack) {
+    if (isRecord(entry) && typeof entry["repo"] === "string") (result.kept_back ??= []).push(entry as unknown as NonNullable<StatusResult["kept_back"]>[number]);
   }
   const statusCheck = parsed["type_check"];
   if (isRecord(statusCheck) && typeof statusCheck["pairs"] === "number") {
