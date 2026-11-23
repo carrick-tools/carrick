@@ -8,7 +8,6 @@ import { defaultExists } from "../fs-util.ts";
 import { packageRoot, resolveSidecarDir } from "../native.ts";
 import { askEngine } from "../engine-ask.ts";
 import { heldDir } from "./paths.ts";
-import type { SiteFinder, ValueReason } from "./place.ts";
 import type { ServiceInit } from "./daemon.ts";
 import type { GraphqlRootRef, GraphqlTypeTable } from "../facts/store.ts";
 
@@ -44,7 +43,6 @@ export type ShadowAnswer = {
 export type ShadowGraphql = { types: GraphqlTypeTable; roots: GraphqlRootRef[] };
 
 const SHADOW_TIMEOUT_MS = 10 * 60_000;
-const SITE_TIMEOUT_MS = 30_000;
 
 /** The built compiler engine's entry, or null when none is built. */
 export function engineEntry(env: NodeJS.ProcessEnv = process.env): string | null {
@@ -84,21 +82,4 @@ export async function writeShadow(entry: string, init: ServiceInit, out: string,
   if (answer === undefined) throw new Error("no write_shadow answer");
   if (answer.status !== "success") throw new Error(`write_shadow failed: ${(answer.errors ?? []).join("; ")}`);
   return answer as unknown as ShadowAnswer;
-}
-
-/**
- * The compiler engine's `find_site`: where the node a stale span named is in
- * the new text (it reads no program and no disk, so one short process answers).
- * A reason is a success answer that carries `reason` (S1).
- */
-export function engineSiteFinder(entry: string, env: NodeJS.ProcessEnv, home?: string): SiteFinder {
-  return async (query) => {
-    const cwd = heldDir(home);
-    fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
-    const frames = await askEngine(entry, [{ action: "find_site", request_id: "site", ...query }], { cwd, env, timeoutMs: SITE_TIMEOUT_MS });
-    const answer = frames.get("site");
-    if (answer === undefined || answer.status !== "success") throw new Error(`find_site failed: ${(answer?.errors ?? []).join("; ")}`);
-    if (typeof answer["reason"] === "string") return { reason: answer["reason"] as ValueReason };
-    return { start: Number(answer["start"]), end: Number(answer["end"]) };
-  };
 }

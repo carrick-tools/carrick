@@ -126,7 +126,7 @@ async function rig(t: { after: (fn: () => void | Promise<void>) => void }, more:
   fs.writeFileSync(entry, FAKE_ENGINE);
   const compiler = new FakeCompiler();
   const init: ServiceInit = { repo: REPO, service: SERVICE, repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
-  const runtime = createRuntime({ root, home, entry, env: { ...process.env }, site: async () => ({ reason: "value_edited" }), makeEngine: () => compiler, ...more });
+  const runtime = createRuntime({ root, home, entry, env: { ...process.env }, makeEngine: () => compiler, ...more });
   const started = await runtime.start(init);
   assert.ok("engine" in started, JSON.stringify(started));
   const service = started.engine;

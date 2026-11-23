@@ -57,6 +57,8 @@ function row(label: string, file: string, type: string, values: Value[] | undefi
 type Placed = { armed: Array<{ label: string; file: string; position: number }>; unarmed: Array<{ label: string; reason: string }> };
 
 type Rig = {
+  /** The first answer the ready engine gave. */
+  first: HeldAnswer;
   root: string;
   file: (rel: string) => string;
   text: (rel: string) => string;
@@ -82,12 +84,15 @@ async function rig(
   wrap: (engine: Engine) => Engine = (engine) => engine,
   /** Starts the held compiler (a test puts a relay in front of it). */
   lsp: (command: string, cwd: string) => Ts7Lsp = (command, cwd) => new Ts7Lsp(command, cwd),
+  /** Files added to the fixture before the index commit, by path from the root. */
+  files: Record<string, string> = {},
 ): Promise<Rig> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-e2e-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, "ws");
   const home = path.join(dir, "home");
   fs.cpSync(FIXTURE, root, { recursive: true, dereference: true });
+  for (const [rel, text] of Object.entries(files)) fs.writeFileSync(path.join(root, rel), text);
   // `total` takes its type from the helper, so a change to the helper alone reaches the route.
   const orders = path.join(root, "src", "orders.ts");
   fs.writeFileSync(orders, fs.readFileSync(orders, "utf8").replace("const total: number =", "const total ="));
@@ -132,6 +137,7 @@ async function rig(
   }
   assert.ok(ready, "the engine never became ready");
   return {
+    first: ready,
     root,
     file,
     text: (rel) => fs.readFileSync(file(rel), "utf8"),
@@ -241,8 +247,8 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
   assert.equal(movedBroken.lines[0]!.line, lineAt(moved, "res.json({ orders, total })"));
   await r.edit(EXPRESS, original[EXPRESS]!);
 
-  // (e) a rename whose second edit sits inside the value, across its start bound: the engine places the value by its
-  // parent slot (the send's argument), so the check stays armed, and a break made in this same edit gives its line.
+  // (e) a rename whose second edit sits inside the value: each run of changed lines moves the value by its own region,
+  // so the check stays armed, and a break made in this same edit gives its line.
   const renamed = original[EXPRESS]!.replace("const orders = list", "const kept = list").replace("{ orders, total }", "{ orders: kept, total }");
   assert.deepEqual((await r.edit(EXPRESS, renamed)).lines, []);
   const renamedBroken = original[EXPRESS]!.replace("const orders = list", "const kept = list").replace("{ orders, total }", "{ orders: kept }");
@@ -383,4 +389,93 @@ test("a gate pull with no answer for its text arms nothing and records no reason
   await r.ask(ORDERS, "read");
   await r.ask(ORDERS, "read");
   assert.equal(r.placed().armed.length, 9, "gated again after the next answer");
+});
+
+// A handler that logs one object and then replies with another, through a json call. The stored value is the reply.
+const UPLOAD = "src/upload.ts";
+const UPLOAD_TEXT = [
+  'import { Hono } from "hono";',
+  "",
+  "declare const log: { info(fields: object, message: string): void };",
+  "declare function save(): Promise<{ id: string; dupe: boolean; name: string }>;",
+  "",
+  "const app = new Hono();",
+  'app.post("/upload", async (c) => {',
+  "  const saved = await save();",
+  '  log.info({ id: saved.id, team: "t1", dupe: saved.dupe }, "saved");',
+  "  return c.json({ ok: true, id: saved.id, name: saved.name });",
+  "});",
+  "export default app;",
+  "",
+].join("\n");
+const REPLY = "{ ok: true, id: saved.id, name: saved.name }";
+/** Two edits to the file, one above the reply (new constants) and one below it (a new handler); neither touches the reply. */
+const UPLOAD_TWO_EDITS = UPLOAD_TEXT.replace(
+  "const app = new Hono();",
+  ["const LIMIT = 5;", 'const TEAM_HEADER = "x-team-id";', "const RETRY_AFTER_SECONDS = 30;", "const app = new Hono();"].join("\n"),
+).replace(
+  "export default app;",
+  ['app.post("/code", (c) => c.json({ code: String(LIMIT), header: TEAM_HEADER, retry: RETRY_AFTER_SECONDS }));', "export default app;"].join("\n"),
+);
+const uploadRows = (text: (rel: string) => string): ContractRow[] => [
+  row("POST /upload", UPLOAD, "{ ok: boolean; id: string; name: string }", [{ file: UPLOAD, span: spanOf(text(UPLOAD), REPLY) }]),
+];
+
+test("two edits around a stored reply, made while the engine starts, state no break now or at the next answer", { timeout: 300_000 }, async (t) => {
+  let root = "";
+  const r = await rig(
+    t,
+    uploadRows,
+    (at) => {
+      root = at;
+    },
+    // The engine is made after the start read the file and before its gate: the edit lands during the start.
+    (engine) => {
+      fs.writeFileSync(path.join(root, UPLOAD), UPLOAD_TWO_EDITS);
+      return engine;
+    },
+    undefined,
+    { [UPLOAD]: UPLOAD_TEXT },
+  );
+  assert.deepEqual(r.first.lines, [], "the first answer after the start");
+  assert.deepEqual((await r.ask(ORDERS)).lines, [], "the next answer: no standing row");
+  assert.deepEqual(r.placed().armed.map((a) => a.label), ["POST /upload"], "the check moved with the reply and stays armed");
+});
+
+test("two edits around a stored reply in one answer state no break; a real break of the reply is still stated", { timeout: 300_000 }, async (t) => {
+  const r = await rig(t, uploadRows, undefined, undefined, undefined, { [UPLOAD]: UPLOAD_TEXT });
+  assert.deepEqual((await r.edit(UPLOAD, UPLOAD_TWO_EDITS)).lines, [], "one answer for both edits");
+  assert.deepEqual((await r.ask(ORDERS)).lines, [], "the next answer: no standing row");
+  assert.deepEqual(r.placed().armed.map((a) => a.label), ["POST /upload"]);
+  const broken = UPLOAD_TWO_EDITS.replace("name: saved.name }", "title: saved.name }");
+  const said = await r.edit(UPLOAD, broken);
+  assert.equal(said.lines.length, 1, JSON.stringify(said.lines));
+  assert.equal(said.lines[0]!.label, "POST /upload");
+  assert.equal(said.lines[0]!.line, lineAt(broken, "return c.json({ ok: true"));
+  // The same break arriving in one answer with the two edits around it is stated too: the reply was moved, not dropped.
+  assert.deepEqual((await r.edit(UPLOAD, UPLOAD_TEXT)).lines, []);
+  const together = await r.edit(UPLOAD, broken);
+  assert.equal(together.lines.length, 1, JSON.stringify(together.lines));
+  assert.equal(together.lines[0]!.line, lineAt(broken, "return c.json({ ok: true"));
+});
+
+test("a real break of the reply, made with two edits around it while the engine starts, is stated at the first answer", { timeout: 300_000 }, async (t) => {
+  let root = "";
+  const broken = UPLOAD_TWO_EDITS.replace("name: saved.name }", "title: saved.name }");
+  const r = await rig(
+    t,
+    uploadRows,
+    (at) => {
+      root = at;
+    },
+    (engine) => {
+      fs.writeFileSync(path.join(root, UPLOAD), broken);
+      return engine;
+    },
+    undefined,
+    { [UPLOAD]: UPLOAD_TEXT },
+  );
+  assert.equal(r.first.lines.length, 1, JSON.stringify(r.first.lines));
+  assert.equal(r.first.lines[0]!.label, "POST /upload");
+  assert.equal(r.first.lines[0]!.line, lineAt(broken, "return c.json({ ok: true"));
 });

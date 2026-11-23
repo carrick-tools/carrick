@@ -1078,7 +1078,8 @@ export function rangesOf(text: string, snippets: readonly string[]): Range[] {
   return ranges;
 }
 
-function lineStarts(text: string): number[] {
+/** Where each line starts, split at "\n" as git splits lines. */
+export function lineStarts(text: string): number[] {
   const starts = [0];
   for (let at = text.indexOf("\n"); at >= 0; at = text.indexOf("\n", at + 1)) starts.push(at + 1);
   return starts;

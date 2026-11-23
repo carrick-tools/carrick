@@ -15,27 +15,21 @@
 //   arm       (D6)  which checks may speak: clean passes, its twin fails
 //   attribute (R3)  which diagnostics are a check's own, and so may be a line
 //
-// Finding a node again after an edit that crosses its bounds is the compiler
-// engine's site finder, behind `SiteFinder`; nothing here parses a value.
+// A value is only ever placed by arithmetic. A value an edit crosses is never
+// placed again by a guess at the node it became: its check is dropped
+// (`value_edited`) until the text places it by arithmetic again. Nothing here
+// parses a value.
 
-import ts from "typescript";
-import { hunksOf } from "../facts/diff.ts";
+import { lineStarts } from "../facts/match.ts";
 
 /** One value's position: `[start, end)` in UTF-16 code units, never counting a leading BOM. */
 export type Value = { file: string; start: number; end: number };
 
 /** Why a value has no check. */
-export type ValueReason = "value_not_a_node" | "not_wrappable" | "value_edited";
-export type UnplacedReason = ValueReason | "javascript_file" | "top_type";
+export type UnplacedReason = "javascript_file" | "top_type";
 
 /** One changed stretch of text: the old and the new bounds (BOM not counted). */
 export type Region = { oldStart: number; oldEnd: number; newStart: number; newEnd: number };
-
-/** What the compiler engine is asked: the node the old span named, in the new text. */
-export type SiteQuery = { file: string; oldText: string; newText: string; start: number; end: number };
-export type SiteAnswer = { start: number; end: number } | { reason: ValueReason };
-/** The compiler engine's site finder (the engine action beside `site-node.ts`); a fake in tests. */
-export type SiteFinder = (query: SiteQuery) => Promise<SiteAnswer>;
 
 /** A compiler diagnostic: its start offset in the checked text, its code, its message. */
 export type Diag = { start: number; code: number; message: string };
@@ -100,36 +94,112 @@ export function regionOfEdit(oldText: string, newText: string): Region {
   return { oldStart: prefix, oldEnd: a.length - suffix, newStart: prefix, newEnd: b.length - suffix };
 }
 
-/** Where line `index` (0-based) starts; one past the last line is the text's end. TypeScript's own line map. */
-function lineStarts(text: string): (index: number) => number {
-  const sf = ts.createSourceFile("lines.ts", text, ts.ScriptTarget.Latest, false);
-  const last = sf.getLineAndCharacterOfPosition(text.length).line;
-  return (index) => (index > last ? text.length : sf.getPositionOfLineAndCharacter(index, 0));
+/** The longest edit script, in lines, the line diff searches for; a larger change is one run from its first changed line to its last. */
+const MAX_EDIT_LINES = 2000;
+
+/** A run of changed lines: old lines `[a0, a1)` became new lines `[b0, b1)`. */
+type Run = [a0: number, a1: number, b0: number, b1: number];
+
+/**
+ * The runs of lines that differ between `a` and `b`, in order, from the
+ * shortest edit script (Myers' diff over whole lines, after the common first
+ * and last lines are cut off).
+ */
+function changedRuns(a: string[], b: string[]): Run[] {
+  let lo = 0;
+  while (lo < a.length && lo < b.length && a[lo] === b[lo]) lo += 1;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > lo && endB > lo && a[endA - 1] === b[endB - 1]) {
+    endA -= 1;
+    endB -= 1;
+  }
+  const n = endA - lo;
+  const m = endB - lo;
+  if (n === 0 && m === 0) return [];
+  if (n === 0 || m === 0) return [[lo, endA, lo, endB]];
+  const off = n + m + 1;
+  const v = new Int32Array(2 * off + 1);
+  // `trace[d]` is `v` before step d, for diagonals -d-1 .. d+1 (diagonal k at `k + d + 1`).
+  const trace: Int32Array[] = [];
+  let reached = false;
+  for (let d = 0; d <= Math.min(n + m, MAX_EDIT_LINES) && !reached; d += 1) {
+    trace.push(v.slice(off - d - 1, off + d + 2));
+    for (let k = -d; k <= d; k += 2) {
+      let x = k === -d || (k !== d && v[off + k - 1]! < v[off + k + 1]!) ? v[off + k + 1]! : v[off + k - 1]! + 1;
+      let y = x - k;
+      while (x < n && y < m && a[lo + x] === b[lo + y]) {
+        x += 1;
+        y += 1;
+      }
+      v[off + k] = x;
+      if (x >= n && y >= m) {
+        reached = true;
+        break;
+      }
+    }
+  }
+  if (!reached) return [[lo, endA, lo, endB]];
+  // Walk back from the end: each step of d is one deleted or inserted line, after a run of equal ones.
+  const ops: Array<"=" | "-" | "+"> = [];
+  let x = n;
+  let y = m;
+  for (let d = trace.length - 1; d >= 0; d -= 1) {
+    const before = trace[d]!;
+    const at = (k: number): number => before[k + d + 1]!;
+    const k = x - y;
+    const prevK = k === -d || (k !== d && at(k - 1) < at(k + 1)) ? k + 1 : k - 1;
+    const prevX = at(prevK);
+    const prevY = prevX - prevK;
+    while (x > prevX && y > prevY) {
+      ops.push("=");
+      x -= 1;
+      y -= 1;
+    }
+    if (d > 0) ops.push(x === prevX ? "+" : "-");
+    x = prevX;
+    y = prevY;
+  }
+  ops.reverse();
+  const runs: Run[] = [];
+  let i = lo;
+  let j = lo;
+  let open: [number, number] | null = null;
+  for (const op of ops) {
+    if (op === "=") {
+      if (open !== null) runs.push([open[0], i, open[1], j]);
+      open = null;
+      i += 1;
+      j += 1;
+      continue;
+    }
+    if (open === null) open = [i, j];
+    if (op === "-") i += 1;
+    else j += 1;
+  }
+  if (open !== null) runs.push([open[0], i, open[1], j]);
+  return runs;
 }
 
 /**
- * `git diff -U0` line hunks turned into character regions, each narrowed by
- * common prefix and suffix inside its hunk (a hunk replaces whole lines; the
- * change is usually a few characters of them).
+ * The regions between two texts: one per run of changed lines, each narrowed
+ * by common prefix and suffix inside its run (a run replaces whole lines; the
+ * change is usually a few characters of them). A value between two runs moves
+ * by arithmetic, so an edit above it and an edit below it never cross it,
+ * however many edits the two texts are apart.
  */
-export function regionsFromHunks(oldText: string, newText: string, diffU0: string): Region[] {
+export function regionsBetween(oldText: string, newText: string): Region[] {
   const a = stripBom(oldText);
   const b = stripBom(newText);
-  const oldAt = lineStarts(a);
-  const newAt = lineStarts(b);
-  const out: Region[] = [];
-  for (const { oldStart: oldAt1, oldCount, newStart: newAt1, newCount } of hunksOf(diffU0)) {
-    // With nothing on a side, its start is the line BEFORE the change point.
-    const oldFirst = oldAt1 - 1 + (oldCount === 0 ? 1 : 0);
-    const newFirst = newAt1 - 1 + (newCount === 0 ? 1 : 0);
-    const oldStart = oldAt(oldFirst);
-    const oldEnd = oldAt(oldFirst + oldCount);
-    const newStart = newAt(newFirst);
-    const newEnd = newAt(newFirst + newCount);
+  if (a === b) return [];
+  const oldAt = [...lineStarts(a), a.length];
+  const newAt = [...lineStarts(b), b.length];
+  const lines = (text: string, at: number[]): string[] => at.slice(0, -1).map((start, i) => text.slice(start, at[i + 1]));
+  return changedRuns(lines(a, oldAt), lines(b, newAt)).map(([a0, a1, b0, b1]) => {
+    const [oldStart, oldEnd, newStart, newEnd] = [oldAt[a0]!, oldAt[a1]!, newAt[b0]!, newAt[b1]!];
     const inner = regionOfEdit(a.slice(oldStart, oldEnd), b.slice(newStart, newEnd));
-    out.push({ oldStart: oldStart + inner.oldStart, oldEnd: oldStart + inner.oldEnd, newStart: newStart + inner.newStart, newEnd: newStart + inner.newEnd });
-  }
-  return out;
+    return { oldStart: oldStart + inner.oldStart, oldEnd: oldStart + inner.oldEnd, newStart: newStart + inner.newStart, newEnd: newStart + inner.newEnd };
+  });
 }
 
 /**
@@ -174,24 +244,16 @@ const delta = (r: Region): number => r.newEnd - r.newStart - (r.oldEnd - r.oldSt
  * V5, the two arithmetic cases. A region meets the value when it touches
  * `[start, end]`. None does: the value shifts by the regions before it. Every
  * one that does lies strictly inside: the value keeps its bounds and grows or
- * shrinks with them. Any other edit (one across a bound) is the engine's to
- * place again: `"needs_site"`.
+ * shrinks with them. Any other edit (one across a bound) leaves no place a
+ * check may be trusted at: `"crossed"`, and the value is not placed.
  */
-export function mapValue(value: Value, regions: Region[]): Value | "needs_site" {
+export function mapValue(value: Value, regions: Region[]): Value | "crossed" {
   const meeting = regions.filter((r) => r.oldStart <= value.end && r.oldEnd >= value.start);
   const before = regions.filter((r) => r.oldEnd < value.start).reduce((sum, r) => sum + delta(r), 0);
   if (meeting.length === 0) return { file: value.file, start: value.start + before, end: value.end + before };
-  if (meeting.some((r) => r.oldStart <= value.start || r.oldEnd >= value.end)) return "needs_site";
+  if (meeting.some((r) => r.oldStart <= value.start || r.oldEnd >= value.end)) return "crossed";
   const within = meeting.reduce((sum, r) => sum + delta(r), 0);
   return { file: value.file, start: value.start + before, end: value.end + before + within };
-}
-
-/** `mapValue`, and for an edit across a bound the compiler engine's site finder on both texts. */
-export async function resolveValue(value: Value, regions: Region[], oldText: string, newText: string, find: SiteFinder): Promise<Value | ValueReason> {
-  const mapped = mapValue(value, regions);
-  if (mapped !== "needs_site") return mapped;
-  const answer = await find({ file: value.file, oldText, newText, start: value.start, end: value.end });
-  return "reason" in answer ? answer.reason : { file: value.file, start: answer.start, end: answer.end };
 }
 
 type Op = { at: number; s: string; side: "pre" | "post"; seq: number; start: number; end: number };

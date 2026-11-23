@@ -180,12 +180,7 @@ async function begin(t: { after: (fn: () => void | Promise<void>) => void }, opt
   fs.writeFileSync(entry, FAKE_ENGINE);
   const extra = opts.during === undefined ? {} : { FAKE_EDIT_FILE: path.join(root, ORDERS), FAKE_EDIT_TEXT: opts.during };
   const init: ServiceInit = { repo: REPO, service: SERVICE, repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
-  // The site finder places the payload on the text it is given, as the real one does for an edit across a bound.
-  const site = async (q: { newText: string }) => {
-    const at = q.newText.indexOf("{ id: \"o1\"");
-    return { start: at, end: q.newText.indexOf(" }", at) + 2 };
-  };
-  const runtime = createRuntime({ root, home, entry, env: { ...process.env, ...extra }, site, makeEngine: () => new FakeCompiler() });
+  const runtime = createRuntime({ root, home, entry, env: { ...process.env, ...extra }, makeEngine: () => new FakeCompiler() });
   const started = await runtime.start(init);
   assert.ok("engine" in started, JSON.stringify(started));
   const service: ServiceEngine = started.engine;

@@ -14,7 +14,6 @@ import ts from "typescript";
 import type { ServiceEngine, ServiceInit } from "../src/held/daemon.ts";
 import type { Diag, Engine } from "../src/held/engine.ts";
 import { placedPath } from "../src/held/paths.ts";
-import type { SiteFinder } from "../src/held/place.ts";
 import { createRuntime } from "../src/held/runtime.ts";
 import { buildFacts, factsPath } from "../src/facts/store.ts";
 
@@ -152,8 +151,8 @@ type Rig = {
   facts: (rows: Wire[], table: unknown) => Promise<void>;
 };
 
-/** The resolver file's text at the index commit, and the site finder (by default it never finds the value again). */
-type RigOptions = { resolvers?: string; site?: SiteFinder };
+/** The resolver file's text at the index commit. */
+type RigOptions = { resolvers?: string };
 
 async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows: Wire[], table: unknown, startCompiler = true, extraEnv: Record<string, string> = {}, options: RigOptions = {}): Promise<Rig | { placed: Rig["placed"]; asked: Rig["asked"] }> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-gql-runtime-")));
@@ -184,7 +183,6 @@ async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows:
   const init: ServiceInit = { repo: REPO, service: SERVICE, repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
   const runtime = createRuntime({
     root, home, entry, env: { ...process.env, FAKE_ENGINE_LOG: log, ...extraEnv },
-    site: options.site ?? (async () => ({ reason: "value_edited" })),
     makeEngine: () => {
       assert.ok(startCompiler, "no held compiler may start here");
       return compiler;
@@ -334,19 +332,11 @@ test("s1-then-break: a set-aside check still states a break its clean check prov
   assert.deepEqual(summary(r.placed().armed), ARMED_ALL, "the clean check spoke at this answer: not set aside");
 });
 
-test("s1-cross: an edit across the value's bounds, re-armed by the regate, is set aside at the same edit", async (t) => {
-  let asks = 0;
-  const site: SiteFinder = async (q) => {
-    asks += 1;
-    if (asks === 1) return { reason: "value_edited" };
-    const m = /\{ id: "[^"]*", total: 3 \}/.exec(q.newText);
-    return m === null ? { reason: "value_not_a_node" } : { start: m.index, end: m.index + m[0].length };
-  };
-  const r = (await rig(t, rowsOf(true), TABLE, true, {}, { site })) as Rig;
+test("s1-cross: an edit across the value's bounds drops its check (value_edited) and states nothing: a crossed value is never placed by a guess", async (t) => {
+  const r = (await rig(t, rowsOf(true), TABLE)) as Rig;
   const crossed = RESOLVERS_TEXT.replace('({ id: "o1", total: 3 })', '({ id: "CONVERTED", total: 3 } as const)');
   assert.deepEqual(await r.edit(RESOLVERS, crossed), []);
-  assert.ok(asks >= 2, "the move lost the value and the regate found it");
-  assert.deepEqual(summary(r.placed().unarmed), SET_ASIDE);
+  assert.deepEqual(summary(r.placed().unarmed), ["graphql QUERY order#0:value_edited"]);
 });
 
 test("resid: a check whose wire line already speaks at the gate is never set aside (F2)", async (t) => {
