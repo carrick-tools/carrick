@@ -40,6 +40,7 @@ import { slowHookLines, timed } from "./timings.ts";
 import { startFactsRefresh } from "../facts/fetch.ts";
 import { ensureHeld } from "../held/client.ts";
 import { sessionGenerationSentence } from "./generation.ts";
+import { markNoticed, startUsageSend, USAGE_NOTICE, usageGate } from "./usage.ts";
 
 const log = createLogger("carrick-session");
 
@@ -104,6 +105,11 @@ async function main(): Promise<void> {
   const note = rootNote(choice);
   if (note) log(note);
 
+  // Counts of hook runs are sent only after the person has been told once.
+  // Claude Code shows the notice to them here; Codex has no such message, so
+  // it is told by `carrick init` or `carrick telemetry on`.
+  const notice = !codex && choice.markerFound && usageGate().reason === "never_noticed" ? USAGE_NOTICE : null;
+
   // Printed whatever the index turns out to say, and before the read that may
   // have nothing to report: a machine with no index yet is a machine about to
   // run its first scan, which is the worst moment to be on a stale build.
@@ -136,10 +142,13 @@ async function main(): Promise<void> {
     if (mismatch && !allHeld) lines.push(mismatch);
   }
 
+  // Detached and unwaited, and above the status read, whose failure returns early.
+  if (choice.markerFound) startUsageSend(choice.root);
+
   const outcome = await status({ cwd: choice.root, workspace: choice.markerFound ? choice.root : null });
   if (!outcome.result) {
     log("no answer", outcome.failure ?? "");
-    flush(lines, codex);
+    flush(lines, codex, notice);
     return;
   }
   // What the MCP answers from, and the copy the hooks compare against, ahead
@@ -184,7 +193,7 @@ async function main(): Promise<void> {
   } catch (error) {
     log("held-compiler daemon not ensured", String(error));
   }
-  flush(lines, codex);
+  flush(lines, codex, notice);
 }
 
 /** Default gap between two statements that HEAD keeps the copy back. */
@@ -219,11 +228,27 @@ export function hostedSync(
   return lines.length > 0 ? lines : null;
 }
 
+/**
+ * What session start writes. With `notice`, the Claude Code form that shows the
+ * person a message (`systemMessage`) and still hands the agent the lines.
+ */
+function sessionOutput(lines: string[], codex: boolean, notice: string | null): string | null {
+  if (notice !== null) {
+    return JSON.stringify({
+      systemMessage: notice,
+      hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: lines.join("\n") },
+    });
+  }
+  if (lines.length === 0) return null;
+  return codex ? codexEmission(lines.join("\n")) : `${lines.join("\n")}\n`;
+}
+
 /** One write at the end, so the Codex form is a single JSON document. */
-function flush(lines: string[], codex: boolean): void {
-  if (lines.length === 0) return;
-  if (codex) process.stdout.write(codexEmission(lines.join("\n")));
-  else process.stdout.write(`${lines.join("\n")}\n`);
+function flush(lines: string[], codex: boolean, notice: string | null = null): void {
+  // Told only when the message is about to be written; a Codex session shows none.
+  if (notice !== null) markNoticed();
+  const output = sessionOutput(lines, codex, notice);
+  if (output !== null) process.stdout.write(output);
 }
 
 await timed("session-start", () => main());

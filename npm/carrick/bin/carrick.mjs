@@ -58,7 +58,7 @@ const [command, ...rest] = argv;
  * the commands that write, audit and undo the very files the notice would be
  * about, so each of them says it better in its own words.
  */
-const NO_NOTICE = new Set(["hook", "lsp", "init", "doctor", "remove", "uninstall"]);
+const NO_NOTICE = new Set(["hook", "lsp", "init", "doctor", "remove", "uninstall", "telemetry"]);
 
 /**
  * One line a day, on stderr, naming what an upgrade left behind here.
@@ -297,6 +297,7 @@ function extraHelp() {
     "ACCOUNT:",
     "    login                        sign in to a Carrick workspace",
     "    logout                       sign this machine out and revoke its key",
+    "    telemetry on|off|status      daily counts of hook runs sent to Carrick",
     "",
     "INTEGRATION:",
     "    lsp --stdio                  the language server, for an editor or an agent",
@@ -345,6 +346,17 @@ const SUBCOMMAND_HELP = {
     "Print the GitHub Actions workflow file to stdout. Each --variable value pair",
     "fills a placeholder of that name, for example `--default-branch trunk`. It",
     "writes no file.",
+    "",
+  ],
+  telemetry: [
+    "carrick telemetry on|off|status",
+    "",
+    "Carrick counts how often its hooks run on this machine and sends the daily",
+    "totals to Carrick: counts only, no code, file names or paths.",
+    "  on      count and send",
+    "  off     send nothing",
+    "  status  show the setting and the last body sent from this folder",
+    "CARRICK_TELEMETRY=0 and DO_NOT_TRACK=1 also turn it off.",
     "",
   ],
 };
@@ -403,6 +415,10 @@ switch (command) {
   case "doctor": {
     const { doctor } = await import("../dist/init/doctor.js");
     process.exit(await doctor(rest));
+  }
+  case "telemetry": {
+    const { telemetry } = await import("../dist/init/telemetry.js");
+    process.exit(telemetry(rest));
   }
   case "templates": {
     const { templates } = await import("../dist/init/run.js");
