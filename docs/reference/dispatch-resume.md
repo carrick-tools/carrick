@@ -3,20 +3,24 @@
 How a scan hands its analysis to Carrick Cloud and how another run collects
 it. Pointed at from `src/analysis_job.rs` and `src/analysis_channel.rs`.
 
+Carrick's cloud builds your index, so this path is not part of setup.
+`carrick index --dispatch` and `carrick resume` still ship; this page says what
+they do.
+
 ## Why
 
 A first index of a large monorepo is thousands of model calls, and every one of
-them has to survive on the machine that started the scan. A closed laptop, a
-dropped connection or a shell that times out loses the run — and the next
+them has to survive on the machine that started the scan. A closed lid, a
+dropped connection or a shell that times out loses the run, and the next
 attempt starts again.
 
-`carrick index --dispatch` splits the scan in two. The laptop does everything
+`carrick index --dispatch` splits the scan in two. The scanning machine does everything
 up to and including building the prompts, ships them as one object, and exits.
 The cloud answers them on its own time. `carrick resume` — on that machine or
 another one holding the same repository — replays the answers through an
 ordinary scan.
 
-## What the laptop still does
+## What the scanning machine still does
 
 Everything except the model calls for files. Framework detection and guidance
 (about seven calls) are synchronous and happen before the hand-off, because the
@@ -187,7 +191,7 @@ Three goldens hold the bytes:
   OPTIONAL section — the GraphQL hints, the imported wrappers, the postMessage
   block — which a plain HTTP fixture renders as zero bytes.
 - `local_mode::jobs` reads `tests/golden/jobs-0.3.81.json` back: the record a
-  customer's laptop is holding, which this release must still be able to read
+  machine is holding, which this release must still be able to read
   or the answers it names are unreachable.
 
 A deliberate prompt or schema change updates the golden in the same PR, and
@@ -212,7 +216,7 @@ to undo by accident:
   synchronous path and passes having dispatched nothing. The proof it
   dispatched is `.carrick/jobs.json`: it is written only from a submission the
   cloud accepted and named, so the smoke reads that, not the exit code.
-- **It must authenticate as a laptop.** `CloudAuth::detect` prefers OIDC
+- **It must not authenticate with OIDC.** `CloudAuth::detect` prefers OIDC
   whenever the runner offers it, and an OIDC run opens no scan — so it holds no
   `scan_id`, which is exactly what `submit-analysis-job` refuses without. The
   workflow grants `contents: read` and nothing else for that reason.

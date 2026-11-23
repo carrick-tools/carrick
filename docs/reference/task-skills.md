@@ -1,6 +1,6 @@
 # Task skills
 
-The four skills `carrick init` installs, what each one does, and when it fires.
+The five skills `carrick init` installs, what each one does, and when it fires.
 
 Governed code: `npm/carrick/src/init/task-skills.ts` (the install, the stamp and
 the removal) and `npm/carrick/templates/skills/` (the bodies, one markdown file
@@ -14,7 +14,7 @@ explore instead is not one of these.
 The reminder skill at `.claude/skills/carrick/SKILL.md` is the cloud scaffold's
 and is untouched by everything below.
 
-## The four
+## The five
 
 | Skill | When it fires | What it calls |
 |---|---|---|
@@ -22,6 +22,7 @@ and is untouched by everything below.
 | `carrick-reuse` | At the end of a task that added or changed functions, and on "does this already exist" or "where have we built this twice" | `find_similar`, targeted with up to 20 entries, or in audit mode with none |
 | `carrick-drift` | Before changing a request or response type, and when a compatibility verdict names a problem with no location | `get_service_graph` for the pairs, then `get_contract_pair` per pair |
 | `carrick-census` | "Every place that does X" questions | `search_by_intent` asked in two wordings, purpose and mechanism, paged to the end |
+| `carrick-audit` | The ask is what is wrong in the codebase, what to clean up, or a health check | `get_findings` for type mismatches, calls that reach no route and functions written twice, then each item read in source |
 
 Each one reports a table first, with a file and line on every row and a fixed
 set of class words (DUPLICATE, VARIANT, FALSE POSITIVE; MATCH, DRIFT,
@@ -290,13 +291,13 @@ let the turn end, which is a block. The hook emits `hookSpecificOutput` and
 nothing else, and only when a re-check answer needs acting on or is still
 running.
 
-**No check line at Stop.** The Stop hook does not ask for `carrick check
---changed`: a 1-3 minute check at every turn end is the user's cost, so the
-check is left to the agent's guidance (the AGENTS.md section, the session-start
-line and the post-edit "not re-checked" line: "Carrick: <file> was not
-re-checked: <reason>. Run `carrick check --changed` before you finish."). An
-edit that needs a re-scan is queued for a background runner instead and its
-answer is delivered by the next hook that speaks (`npm/carrick/src/hook/late.ts`).
+**No check line at Stop.** The Stop hook does not run `carrick check
+--changed`: a 1-3 minute check at every turn end is a cost the user pays. Rule 5
+in `.carrick/RULES.md` tells the agent that each edit is checked in the
+background and that it need not run or wait for a check. An edit that needs a
+re-scan is queued for a background runner, and the next hook that speaks
+delivers the answer (`npm/carrick/src/hook/late.ts`). An edit that could not be
+re-checked gets this line: "Carrick: <file> was not re-checked: <reason>."
 
 `carrick uninstall` deletes the session records; `carrick doctor` reports a missing
 Stop entry with the other two, because both read `expectedCarrickHooks`.
