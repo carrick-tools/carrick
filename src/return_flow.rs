@@ -1066,7 +1066,17 @@ fn read_of(returned: &[&Expr], scope: &Scope) -> ReturnRead {
 /// Why one returned value [`classify`] gives no shape is no chain: a value
 /// the function makes itself, or one this pass does not follow.
 fn unshaped(returned: &Expr, scope: &Scope) -> NoChain {
+    unshaped_within(returned, scope, 0)
+}
+
+/// [`unshaped`] with the nested reads counted, bounded as [`classify_within`]
+/// is: a name that names itself is one not followed.
+fn unshaped_within(returned: &Expr, scope: &Scope, depth: usize) -> NoChain {
     use swc_ecma_ast::Lit;
+    if depth >= MAX_CLASSIFY_DEPTH {
+        return NoChain::Unfollowed;
+    }
+    let depth = depth + 1;
     let value = resolve(returned, scope);
     // A value that is one of two (`c ? a : b`, `a || b`, `a ?? b`) is its
     // own where neither side is unfollowed and at most one is a call's
@@ -1079,10 +1089,10 @@ fn unshaped(returned: &Expr, scope: &Scope) -> NoChain {
     let either = |left: &Expr, right: &Expr| {
         // `Some(true)` for a call's value, `Some(false)` for one of the
         // function's own, `None` for one not followed.
-        let side = |expr: &Expr| match classify(expr, scope) {
+        let side = |expr: &Expr| match classify_within(expr, scope, depth) {
             Some(Returned::Shape(_) | Returned::Defaulted(_)) => Some(true),
             Some(Returned::NoBody) => Some(false),
-            None => (unshaped(expr, scope) == NoChain::Own).then_some(false),
+            None => (unshaped_within(expr, scope, depth) == NoChain::Own).then_some(false),
         };
         match (side(left), side(right)) {
             (Some(false), Some(_)) | (Some(true), Some(false)) => NoChain::Own,
@@ -1248,12 +1258,26 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
 }
 
 fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
+    classify_within(returned, scope, 0)
+}
+
+/// Nested reads of one value followed at most this deep. A name whose only
+/// given value names itself (`var x = x || null; return x`) reads as no
+/// shape instead of recursing without end.
+const MAX_CLASSIFY_DEPTH: usize = 16;
+
+fn classify_within(returned: &Expr, scope: &Scope, depth: usize) -> Option<Returned> {
+    if depth >= MAX_CLASSIFY_DEPTH {
+        return None;
+    }
+    let depth = depth + 1;
     let value = resolve(returned, scope);
-    let no_body = |expr: &Expr| matches!(classify(expr, scope), Some(Returned::NoBody));
+    let no_body =
+        |expr: &Expr| matches!(classify_within(expr, scope, depth), Some(Returned::NoBody));
     let default = |expr: &Expr| is_literal_default(expr, scope);
     // The value with a literal default (carrick#4513 P2): what the value is,
     // marked defaulted.
-    let defaulted = |value: &Expr| match classify(value, scope) {
+    let defaulted = |value: &Expr| match classify_within(value, scope, depth) {
         Some(Returned::Shape(shape) | Returned::Defaulted(shape)) => {
             Some(Returned::Defaulted(shape))
         }
@@ -1273,14 +1297,18 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
                 ) =>
             {
                 if no_body(&bin.right) {
-                    return classify(&bin.left, scope);
+                    return classify_within(&bin.left, scope, depth);
                 }
                 if default(&bin.right) {
                     return defaulted(&bin.left);
                 }
             }
-            Expr::Cond(cond) if no_body(&cond.alt) => return classify(&cond.cons, scope),
-            Expr::Cond(cond) if no_body(&cond.cons) => return classify(&cond.alt, scope),
+            Expr::Cond(cond) if no_body(&cond.alt) => {
+                return classify_within(&cond.cons, scope, depth);
+            }
+            Expr::Cond(cond) if no_body(&cond.cons) => {
+                return classify_within(&cond.alt, scope, depth);
+            }
             Expr::Cond(cond) if default(&cond.alt) => return defaulted(&cond.cons),
             Expr::Cond(cond) if default(&cond.cons) => return defaulted(&cond.alt),
             _ => {}
@@ -1333,7 +1361,7 @@ fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
             _ if catches_own_value(call) => {
                 let caught = match catch_handler(call) {
                     Some((receiver, _)) if catches_literal_default(call) => {
-                        match classify(receiver, scope) {
+                        match classify_within(receiver, scope, depth) {
                             Some(Returned::Shape(inner) | Returned::Defaulted(inner)) => {
                                 Some(Box::new(inner))
                             }
@@ -1768,6 +1796,23 @@ mod tests {
             "async function f(o) { const r = await call(o); return r.data || 'none'; }",
         );
         assert_eq!(own, None);
+    }
+
+    /// A name whose only given value names itself reads as no shape and
+    /// never recurses without end (carrick-cloud#3983: a stack overflow
+    /// aborted the scan).
+    #[test]
+    fn a_name_given_only_itself_reads_as_no_shape() {
+        for body in [
+            "var x = x || null; return x;",
+            "var x = x ?? undefined; return x;",
+            "var x = x ? x : null; return x;",
+            "var x = null || x; return x;",
+            "var x = x || null; return (x);",
+        ] {
+            let source = format!("function f() {{ {body} }}");
+            assert!(matches!(read(&source), ReturnRead::NoShape(_)), "{source}");
+        }
     }
 
     /// The first function's [`ReturnRead`] of `source`.
