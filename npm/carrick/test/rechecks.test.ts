@@ -25,7 +25,6 @@ import {
   runQueue,
   takenDir,
 } from "../src/hook/rechecks.ts";
-import { checkedSinceLastEdit } from "../src/hook/checked.ts";
 import { lateContext } from "../src/hook/late.ts";
 import { recordEdit } from "../src/hook/reuse.ts";
 import { sessionCoverage } from "../src/hook/stop-wait.ts";
@@ -332,8 +331,6 @@ test("a changed entry runs after every per-file entry, one per session and root,
       lateContext({ ...changed, changed: problem }, false) ?? "",
       /^Carrick ran `carrick check --changed` for this session's change: 1 contract problem in 1 changed file\.\n- /,
     );
-    // The binary's marker (exit 0, begun after the edit) settles later lines.
-    assert.equal(checkedSinceLastEdit("s1", s.root, s.home), true);
   } finally {
     s.cleanup();
   }

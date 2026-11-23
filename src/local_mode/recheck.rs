@@ -785,14 +785,12 @@ fn miss_reason_in(owner: &Owner, miss: &Miss, worktree: bool) -> String {
     match owner {
         Owner::Service(service) => format!(
             "re-reading {service} ({} indexed files) took longer than {took} against this index, so \
-             edits in {service} are not re-checked{place} until `carrick refresh`. Run `carrick check \
-             --changed` before you finish.",
+             edits in {service} are not re-checked{place} until `carrick refresh`.",
             miss.files
         ),
         Owner::File { file, .. } => format!(
             "re-reading services that read {file} ({} indexed files) took longer than {took} \
-             against this index, so edits to {file} are not re-checked{place} until `carrick refresh`. \
-             Run `carrick check --changed` before you finish.",
+             against this index, so edits to {file} are not re-checked{place} until `carrick refresh`.",
             miss.files
         ),
     }
@@ -2166,7 +2164,7 @@ fn state_stale_counterparts(items: &mut [IndexedItem], stale: &[String]) {
         };
         verdict.detail = format!(
             "{} ({who} {changed} and this check {re_read}, so the verdict uses {uses} indexed \
-             code. `carrick check --changed` gives the current verdict.)",
+             code.)",
             verdict.detail
         );
         if verdict.state != "not_checked" && verdict.result.as_deref() == Some("compatible") {
@@ -3484,16 +3482,15 @@ mod tests {
         assert_eq!(
             marked.detail,
             "both sides agree (emitter has changed since it was indexed and this check did not \
-             re-read it, so the verdict uses its indexed code. `carrick check --changed` gives \
-             the current verdict.)"
+             re-read it, so the verdict uses its indexed code.)"
         );
         assert_eq!(items[1].verdict, before.verdict, "a current counterpart");
         let mismatch = items[2].verdict.as_ref().expect("a verdict");
         assert_eq!(mismatch.state, "resolved", "a mismatch stays a finding");
         assert!(
-            mismatch
-                .detail
-                .contains("`carrick check --changed` gives the current verdict.")
+            !mismatch.detail.contains("carrick check --changed"),
+            "{}",
+            mismatch.detail
         );
     }
 
@@ -3995,16 +3992,17 @@ mod tests {
     }
 
     /// The reason a skipped re-check gives names the service, how much of it
-    /// the index holds, and the command that gives a fresh answer.
+    /// the index holds, and `carrick refresh`; it never tells the agent to run a check.
     #[test]
-    fn the_miss_reason_names_the_service_and_the_fresh_read() {
+    fn the_miss_reason_names_the_service_and_the_refresh() {
         let reason = miss_reason(&svc("catalog"), &miss(12));
         assert!(
             reason.contains("re-reading catalog (12 indexed files)"),
             "{reason}"
         );
         assert!(reason.contains("took longer than 10 s"), "{reason}");
-        assert!(reason.contains("check --changed"), "{reason}");
+        assert!(reason.contains("carrick refresh"), "{reason}");
+        assert!(!reason.contains("check --changed"), "{reason}");
     }
 
     fn shared() -> Owner {
@@ -4120,11 +4118,11 @@ mod tests {
     }
 
     #[test]
-    fn the_miss_reason_for_a_shared_file_names_the_file_and_the_fresh_read() {
+    fn the_miss_reason_for_a_shared_file_names_the_file_and_the_refresh() {
         let reason = miss_reason(&shared(), &miss(5));
         assert!(reason.contains("shared/types.ts"), "{reason}");
         assert!(reason.contains("carrick refresh"), "{reason}");
-        assert!(reason.contains("carrick check --changed"), "{reason}");
+        assert!(!reason.contains("check --changed"), "{reason}");
     }
 
     #[test]

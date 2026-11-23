@@ -5,6 +5,7 @@ import {
   answersTheEdit,
   boundaryFor,
   boundaryLines,
+  changedLines,
   itemLine,
   movedLines,
   renderPostRead,
@@ -20,10 +21,10 @@ import {
 } from "../src/render.ts";
 import fs from "node:fs";
 import path from "node:path";
-import { parseCheckResult, SCHEMA } from "../src/contract.ts";
+import { parseChangedResult, parseCheckResult, SCHEMA } from "../src/contract.ts";
 import type { Boundary, CheckItem, CheckResult, MovedRow } from "../src/contract.ts";
 import { messageOf } from "../src/diagnostics.ts";
-import { asStated, fixture, statusFixture, testDir } from "./helpers.ts";
+import { asStated, fixture, fixturePath, statusFixture, testDir } from "./helpers.ts";
 
 // What an edit is told (the post-edit hook): only what this edit changed or
 // what needs action, a few lines at most. Never the index's stored verdict
@@ -1452,4 +1453,20 @@ test("the not-checked line names files that share a reason in one clause", () =>
     notCoveredLine(mixed),
     `Carrick did not check the whole change: 2 files (api/a.ts, api/b.ts), each because ${stale}; api/x.ts: no re-check answered it.${tail}`,
   );
+});
+
+test("#5076: a background whole-change answer prints every stated problem and never points at another check", () => {
+  const changed = parseChangedResult(fs.readFileSync(fixturePath("check-changed-problem.json"), "utf8"), 1)!;
+  const one = changed.problems.find((problem) => problem.stated === true)!;
+  const five = { ...changed, problems: Array.from({ length: 5 }, () => ({ ...one })) };
+  const lines = changedLines(five).split("\n");
+  assert.equal(lines.filter((line) => line.startsWith("- ")).length, 5);
+  assert.doesNotMatch(lines.join("\n"), /lists them/);
+});
+
+test("#5076: more moved rows than the cap end in a pointer to the edited file's own re-check", () => {
+  const rows = Array.from({ length: 4 }, (_, n) => earlyMoved({ line: n + 1 }));
+  const lines = movedLines(earlyResultOf(rows), "web/src/client.ts");
+  assert.equal(lines.at(-1), "- and 1 more rows outside this file moved: `carrick check web/src/client.ts --recheck --json` lists them.");
+  assert.doesNotMatch(lines.join("\n"), /check --changed/);
 });
