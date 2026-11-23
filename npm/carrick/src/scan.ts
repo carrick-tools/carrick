@@ -237,7 +237,7 @@ export function timingLine(timing: Timing): string {
 export function outroLine(summary: Summary): string {
   const next = summary.next ?? [];
   if (next.length > 0) return next.join(" ");
-  return "Your agents can query it now. `carrick index --verbose` shows the full report.";
+  return "Your agents can query it now.";
 }
 
 /** What one open phase is counting, for the spinner's label. */

@@ -67,7 +67,7 @@ const PINNED =
   "◇ indexing api  95 files, Ns\n" +
   "◇ 111 routes · 363 functions · 175 types · 10 external calls · 46 routes without a response type\n" +
   "local read 1m1s · model analysis 1m36s · upload 12.0s\n" +
-  "Your agents can query it now. `carrick index --verbose` shows the full report.\n";
+  "Your agents can query it now.\n";
 
 /** The three fixed read orders: as written, stdout first, stderr first. */
 function fixedOrders(rows: Row[]): Row[][] {
@@ -155,7 +155,7 @@ test("a build renders as an intro, one step per phase and the counts", async () 
       `◇  indexing api  95 files, ${elapsed(0)}`,
       "◇  111 routes · 363 functions · 175 types · 10 external calls · 46 routes without a response type",
       "│  local read 1m1s · model analysis 1m36s · upload 12.0s",
-      "└  Your agents can query it now. `carrick index --verbose` shows the full report.",
+      "└  Your agents can query it now.",
     ],
   );
   // And nothing of the three faults the ticket names.
