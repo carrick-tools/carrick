@@ -567,7 +567,7 @@ export type MachinePlan = {
   sessions: number;
   notice: boolean;
   installId: boolean;
-  /** The usage-counts setting, `~/.carrick/telemetry`. */
+  /** The usage counts setting, `~/.carrick/telemetry`. */
   telemetry: boolean;
   /** The credential file, where this run deletes it. */
   credential: string | null;
@@ -612,7 +612,7 @@ export function machineLines(plan: MachinePlan): string[] {
   if (plan.sessions > 0) lines.push(`${plan.sessions} session record(s) in ${tilde(sessionsDir())}`);
   if (plan.notice) lines.push(`The refresh notice's last-shown date, in ${tilde(noticeFile())}`);
   if (plan.installId) lines.push(`This machine's install id, in ${tilde(installIdPath())}`);
-  if (plan.telemetry) lines.push(`This machine's usage-counts setting, in ${tilde(telemetryPath())}`);
+  if (plan.telemetry) lines.push(`This machine's usage counts setting, in ${tilde(telemetryPath())}`);
   if (plan.credential !== null) {
     lines.push(`The saved credential, in ${tilde(plan.credential)}, which signs this machine out`);
   }
@@ -656,7 +656,7 @@ function removeMachine(plan: MachinePlan, out: InitOutput): void {
   if (plan.telemetry) {
     try {
       fs.rmSync(telemetryPath(), { force: true });
-      out.done("The usage-counts setting removed");
+      out.done("The usage counts setting removed");
     } catch (error) {
       out.refuse(`${(error as Error).message}. Delete ${telemetryPath()} by hand.`);
     }

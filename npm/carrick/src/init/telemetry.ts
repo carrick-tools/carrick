@@ -34,9 +34,9 @@ export function telemetry(
   if (action === "status" && extra.length === 0) {
     const held = readTelemetry(options.home);
     const lines: string[] = [];
-    if (held.state === "off") lines.push("Usage counts: off.");
-    else if (held.noticed_at === null) lines.push("Usage counts: on, and nothing is counted until you have been told. Run `carrick telemetry on` to start now.");
-    else lines.push("Usage counts: on. Daily counts of Carrick hook runs are sent: no code, file names or paths.");
+    if (held.state === "off") lines.push("Usage counts are off.");
+    else if (held.noticed_at === null) lines.push("Usage counts are on, but counting starts only after the notice has been shown once. Run `carrick telemetry on` to start now.");
+    else lines.push("Usage counts are on. Daily hook-run counts are sent, never code, file names, paths or repository names.");
     const forced = envSwitch(env);
     if (forced !== null) lines.push(`${forced} is set, so nothing is sent.`);
     if (env["CI"]) lines.push("CI is set, so nothing is sent.");

@@ -72,7 +72,7 @@ export type UsageBody = {
 
 /** The sentence a person is told once, by `carrick init` or the first session start. */
 export const USAGE_NOTICE =
-  "Carrick counts how often its hooks run on this machine (counts only: no code, file names or paths) and sends the daily totals to Carrick. Turn it off with `carrick telemetry off`.";
+  "This machine sends Carrick daily usage counts (how often each hook ran, whether it printed, how long it took, and a random machine id), never code, file names, paths or repository names. Turn it off with `carrick telemetry off`.";
 
 /** At most one send per folder in this time. */
 export const USAGE_COOLDOWN_MS = 60 * 60_000;

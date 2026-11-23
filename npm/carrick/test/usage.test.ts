@@ -217,7 +217,7 @@ test("5. the first session start shows the notice once, then prints plain text",
   const first = await run();
   const parsed = JSON.parse(first.stdout);
   assert.match(parsed.systemMessage, /carrick telemetry off/);
-  assert.match(parsed.systemMessage, /no code, file names or paths/);
+  assert.match(parsed.systemMessage, /never code, file names, paths or repository names/);
   assert.equal(parsed.hookSpecificOutput.hookEventName, "SessionStart");
   assert.ok(JSON.parse(fs.readFileSync(path.join(home, ".carrick", "telemetry"), "utf8")).noticed_at);
   const second = await run();
@@ -258,7 +258,7 @@ test("7. carrick telemetry on, off and status", () => {
     return code;
   };
   assert.equal(run(["status"]), 0);
-  assert.match(out, /nothing is counted until you have been told/);
+  assert.match(out, /counting starts only after the notice has been shown once/);
   assert.equal(run(["off"]), 0);
   assert.equal(usageGate({}, home).reason, "off");
   assert.equal(run(["on"]), 0);
