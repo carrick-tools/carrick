@@ -13,11 +13,11 @@ import { problemItems } from "../contract.ts";
 import type { CheckResult } from "../contract.ts";
 import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
-import { answersTheEdit, changedCleanLine, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
+import { answersTheEdit, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
 import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, newestEarlies, owedFor, readAnswer, readEarly, sessionEarlies, sessionListing } from "./rechecks.ts";
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
-import { confirmedResult, earlyRows, keepRows, standingEarly, standsAsRun, toldBreak, unsettledFiles, withoutTold } from "./confirm.ts";
-import { markLed, markSaid, markTold, readSession, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
+import { confirmedResult, earlyRows, keepRows, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
+import { markLed, markTold, readSession, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
@@ -28,8 +28,7 @@ const log = createLogger("carrick-late");
 /** The words for one finished answer, or null when there is nothing to say. */
 export function lateContext(answer: Answer, uses: boolean): string | null {
   // The whole-change check a Stop queued (carrick#3466) speaks with a problem.
-  // A clean run speaks only for the files Stop named, once per set
-  // (`deliverLate`); a run that could not check and a run that gave no answer
+  // A clean run, a run that could not check and a run that gave no answer
   // print nothing (a failure is logged by `deliverLate`).
   if (isChanged(answer)) return answer.changed ? changedLines(answer.changed) || null : null;
   // A re-check that stopped, gave no answer or answered nothing prints
@@ -163,24 +162,6 @@ export function deliverEarlies(session: string, seen: Set<string>, home?: string
   return earlyOwedFor(session, home, listing).flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { home, now, reader: session }));
 }
 
-/**
- * The clean line for a `check --changed` that answered with no problem over
- * files a Stop named as still checking (hook-wording audit decision 1: a
- * finding or a named clean result, once per set). Null for any other answer,
- * and for a set already said this session.
- */
-function cleanNamedLine(session: string, answer: Answer, home?: string): string | null {
-  if (!isChanged(answer) || answer.changed?.exit !== 0) return null;
-  // A file whose early break still stands, or that another engine's answer left unsettled, is not called clean (#4786).
-  const unsettled = unsettledFiles(sessionEarlies(session, home), newestEarlies(session, home));
-  const files = [...new Set(answer.named ?? [])].filter((file) => ![...unsettled].some((u) => u === file || file.endsWith(`/${u}`))).sort();
-  if (files.length === 0) return null;
-  const key = `clean:${files.join("\n")}`;
-  if (wasSaid(session, answer.root, key, home)) return null;
-  markSaid(session, answer.root, key, home);
-  return changedCleanLine(files);
-}
-
 /** Whether an answer holds a row to act on: a problem, a moved row, a deletion. */
 export function hasFindings(answer: Answer): boolean {
   const result = answer.result;
@@ -203,11 +184,12 @@ export function adoptedLine(raw: Answer, home?: string): string | null {
 
 /**
  * The one reader of a finished `check --changed` answer, for every hook that
- * speaks it (the carriers and Stop): a problem, or the clean line for the set a
- * Stop named, once per set. Null when there is nothing to say.
+ * speaks it (the carriers and Stop): a problem. A clean run prints nothing: Stop
+ * names no gap, so a clean line would have no visible cause. Null when there is
+ * nothing to say.
  */
 export function changedLine(session: string, answer: Answer, home?: string): string | null {
-  return lateContext(answer, false) ?? cleanNamedLine(session, answer, home);
+  return lateContext(answer, false);
 }
 
 /** The index a delivered answer was read from, and where in the returned contexts its words start. */

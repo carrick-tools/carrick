@@ -408,7 +408,6 @@ function namedOperations(clauses: readonly string[]): string {
  * - problems: a header and the problem and moved lines of `fresh` (the
  *   answers this Stop delivers; the others were printed when they landed);
  * - judged operations with no problem: one line naming them;
- * - operations whose types were not checked: one line naming them and why;
  * - no route or call in any edited file: nothing.
  * `key` is the sorted list of the operations a clean or not-checked line
  * names, so the caller prints the same set once; null when problems print.
@@ -443,8 +442,6 @@ export function sessionCheckedLines(
 
   type Named = { clause: string; id: string };
   const judged: Named[] = [];
-  const unjudged: Named[] = [];
-  let unjudgedResult: CheckResult | undefined;
   for (const { result, where: file } of covered) {
     const named = (item: CheckItem): Named => ({
       clause: operationClause(item, file),
@@ -453,9 +450,6 @@ export function sessionCheckedLines(
     const items = result.items ?? [];
     if (judgedAnyPair(result)) {
       judged.push(...items.filter((item) => item.verdict?.state === "resolved" && item.verdict.result === "compatible").map(named));
-    } else if (items.length > 0) {
-      unjudged.push(...items.map(named));
-      unjudgedResult ??= result;
     }
   }
   const out: string[] = [];
@@ -465,40 +459,9 @@ export function sessionCheckedLines(
       `Carrick checked the ${noun(judged.length)} this session changed (${namedOperations(judged.map((n) => n.clause))}): both sides agree.`,
     );
   }
-  if (unjudged.length > 0) {
-    out.push(
-      `Carrick found the ${noun(unjudged.length)} this session changed (${namedOperations(unjudged.map((n) => n.clause))}) but did not check their types (${notJudgedReason(unjudgedResult!)}), so there is no contract verdict.`,
-    );
-  }
   if (out.length === 0) return { text: "", key: null };
-  const key = [...judged, ...unjudged].map((n) => n.id).sort().join("\n");
+  const key = judged.map((n) => n.id).sort().join("\n");
   return { text: out.join("\n"), key };
-}
-
-/** Files one clause of the not-checked line names before it counts the rest. */
-const MAX_GAP_FILES = 3;
-
-/**
- * The Stop hook's line for a change it could not state from the per-file
- * re-checks: each file and why, and that the whole-change check is queued.
- * Files with the same reason share one clause, in first-seen order.
- */
-export function notCoveredLine(gaps: ReadonlyArray<{ file: string; reason: string }>): string {
-  // Files that share a reason are one clause: eight files with one reason
-  // printed the same sentence eight times.
-  const groups = new Map<string, string[]>();
-  for (const gap of gaps) {
-    const reason = gap.reason.trim().replace(/\.+$/, "");
-    groups.set(reason, [...(groups.get(reason) ?? []), gap.file]);
-  }
-  const named = [...groups]
-    .map(([reason, files]) => {
-      if (files.length === 1) return `${files[0]}: ${reason}`;
-      const more = files.length - MAX_GAP_FILES;
-      return `${files.length} files (${files.slice(0, MAX_GAP_FILES).join(", ")}${more > 0 ? `, and ${more} more` : ""}), each because ${reason}`;
-    })
-    .join("; ");
-  return `Carrick did not check the whole change: ${named}. A background \`carrick check --changed\` is queued; its answer comes with the next Carrick line.`;
 }
 
 /** What a background `check --changed` found: its problem lines, or "" when it found none. */
@@ -526,17 +489,6 @@ export function changedLines(changed: ChangedResult): string {
   // A run with no stated problem, and a run that gave no answer, say nothing:
   // only a problem is worth the agent's attention (hook-wording audit T3).
   return "";
-}
-
-/**
- * The one line for a clean `check --changed` whose files a Stop named as not
- * yet checked: the files (up to 3, then a count) and that no contract problem
- * was found. The answer to the line `notCoveredLine` promised.
- */
-export function changedCleanLine(files: ReadonlyArray<string>): string {
-  const shown = files.slice(0, 3).join(", ");
-  const rest = files.length > 3 ? ` and ${files.length - 3} more` : "";
-  return `Carrick checked ${shown}${rest} and found no contract problem.`;
 }
 
 /** The line for a deleted file, or null when the index held no rows for it: nothing to tell. */

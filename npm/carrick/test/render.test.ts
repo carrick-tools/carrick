@@ -16,7 +16,6 @@ import {
   hasSomethingToDo,
   shortHash,
   typedMismatchClause,
-  notCoveredLine,
 } from "../src/render.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -1221,12 +1220,11 @@ test("a call is named as a call", () => {
   assert.match(sessionCheckedLines([{ result, where: "web/cart.ts" }], []).text, /\(a call to POST \/orders at web\/cart\.ts:40\)/);
 });
 
-test("operations whose types were not checked are named with the reason", () => {
+test("operations whose types were not checked print nothing: no finding, no clean result", () => {
   const result = rechecked();
   result.items = [{ ...judgedItem(), verdict: { state: "not_checked", result: null } }];
   result.type_check = { ran: false, reason: "no tsconfig found", pairs: 1, judged: 0 };
-  const { text } = sessionCheckedLines([{ result, where: "api/users.ts" }], []);
-  assert.match(text, /^Carrick found the 1 operation this session changed \(GET \/api\/users at api\/users\.ts:10\) but did not check their types \(no tsconfig found\), so there is no contract verdict\.$/);
+  assert.deepEqual(sessionCheckedLines([{ result, where: "api/users.ts" }], []), { text: "", key: null });
 });
 
 // A call the scan did not read (carrick#3688 U4). The CLI marks the lines the
@@ -1432,24 +1430,4 @@ test("T2: an early item line is followed by its copy line, outside the 400-chara
   const at = rows.findIndex((row) => row.startsWith("- api/src/widgets.ts:3"));
   assert.ok(rows[at]!.length <= 400, `${rows[at]!.length}`);
   assert.equal(rows[at + 1], "  The caller's side was read from main at 0123456. You changed web/src/client.ts in this session; the check used main's copy of it.");
-});
-
-test("the not-checked line names files that share a reason in one clause", () => {
-  const stale = "4 services connected to it by import or operation were judged at their indexed version (web, admin, billing, and 1 more)";
-  const tail = " A background `carrick check --changed` is queued; its answer comes with the next Carrick line.";
-  // One file: the clause is as it was.
-  assert.equal(notCoveredLine([{ file: "api/a.ts", reason: stale }]), `Carrick did not check the whole change: api/a.ts: ${stale}.${tail}`);
-  // Five files, one reason: one clause, three names and the count of the rest.
-  const five = ["a", "b", "c", "d", "e"].map((name) => ({ file: `api/${name}.ts`, reason: stale }));
-  assert.equal(notCoveredLine(five), `Carrick did not check the whole change: 5 files (api/a.ts, api/b.ts, api/c.ts, and 2 more), each because ${stale}.${tail}`);
-  // Two reasons: one clause each, in first-seen order; a reason's own full stop is dropped.
-  const mixed = [
-    { file: "api/a.ts", reason: stale },
-    { file: "api/x.ts", reason: "no re-check answered it." },
-    { file: "api/b.ts", reason: stale },
-  ];
-  assert.equal(
-    notCoveredLine(mixed),
-    `Carrick did not check the whole change: 2 files (api/a.ts, api/b.ts), each because ${stale}; api/x.ts: no re-check answered it.${tail}`,
-  );
 });

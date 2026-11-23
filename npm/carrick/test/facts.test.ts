@@ -1530,29 +1530,15 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
   });
   assert.equal(context(run.stdout), `${SIMILAR_LEAD}\n\n${GET_ORDER_LINE}`);
   await waitForAnswer(ws, "lead");
-  // What this Stop said with CARRICK_FACT_LINES unset (review run 2, S4).
-  assert.equal(
-    await stop(ws, "lead", slowCheck),
-    JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "Stop",
-        additionalContext:
-          "Carrick did not check the whole change: orders-api/src/routes/orders.ts: this edit needs a re-scan, which this call was asked not to start. A background `carrick check --changed` is queued; its answer comes with the next Carrick line.",
-      },
-    }),
-  );
-  // The file is named once: this Stop does not name it again. On a slow
-  // machine the queued check can answer before this Stop runs in spite of the
-  // hold; Stop then states its clean line itself (carrick#4085), and that is
-  // the one time it is said.
-  const clean = "Carrick checked orders-api/src/routes/orders.ts and found no contract problem.";
-  const second = context(await stop(ws, "lead"));
-  assert.ok(second === "" || second === clean, `named once: ${second}`);
-  // The `check --changed` Stop queued has answered (the fake binary: clean).
+  // A gap is neither a finding nor a clean result: Stop says nothing, and the
+  // whole-change check is still queued.
+  assert.equal(context(await stop(ws, "lead", slowCheck)), "");
+  // A clean background answer prints nothing either.
   await waitForSessionAnswers(ws.home, "lead", 2);
+  assert.equal(context(await stop(ws, "lead")), "");
   const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", { session: "lead", probe: "check-silent.json" });
-  // The block printed in the edit's own result and is not said again; the clean line prints here unless the second Stop said it.
-  assert.equal(context(next.stdout), second === "" ? clean : "");
+  // The block printed in the edit's own result and is not said again; the clean background answer prints nothing.
+  assert.equal(context(next.stdout), "");
 });
 
 // P5 (#4110): a sub-agent's edit takes the fact-file path like the main session's.
