@@ -1149,10 +1149,19 @@ fn unshaped_within(returned: &Expr, scope: &Scope, depth: usize) -> NoChain {
 /// Whether `obj` resolves to a call's value, or to a part or a member of
 /// one: what is read off it is a value the function made by reading.
 fn reads_off_a_value(obj: &Expr, scope: &Scope) -> bool {
+    reads_off_a_value_within(obj, scope, 0)
+}
+
+/// [`reads_off_a_value`] bounded as [`classify_within`] is: `var x = x.a`
+/// follows itself, and reads as no value.
+fn reads_off_a_value_within(obj: &Expr, scope: &Scope, depth: usize) -> bool {
+    if depth >= MAX_CLASSIFY_DEPTH {
+        return false;
+    }
     let obj = resolve(obj, scope);
     match obj.expr {
         Expr::Call(_) | Expr::OptChain(_) => true,
-        Expr::Member(read) => reads_off_a_value(&read.obj, scope),
+        Expr::Member(read) => reads_off_a_value_within(&read.obj, scope, depth + 1),
         _ => obj.part,
     }
 }
@@ -1802,17 +1811,40 @@ mod tests {
     /// never recurses without end (carrick-cloud#3983: a stack overflow
     /// aborted the scan).
     #[test]
-    fn a_name_given_only_itself_reads_as_no_shape() {
-        for body in [
-            "var x = x || null; return x;",
-            "var x = x ?? undefined; return x;",
-            "var x = x ? x : null; return x;",
-            "var x = null || x; return x;",
-            "var x = x || null; return (x);",
-        ] {
-            let source = format!("function f() {{ {body} }}");
-            assert!(matches!(read(&source), ReturnRead::NoShape(_)), "{source}");
-        }
+    fn a_name_given_only_itself_through_or_reads_as_no_shape() {
+        no_shape("var x = x || null; return x;");
+    }
+
+    #[test]
+    fn a_name_given_only_itself_through_nullish_reads_as_no_shape() {
+        no_shape("var x = x ?? undefined; return x;");
+    }
+
+    #[test]
+    fn a_name_given_only_itself_through_a_conditional_reads_as_no_shape() {
+        no_shape("var x = x ? x : null; return x;");
+    }
+
+    #[test]
+    fn a_name_given_only_itself_on_the_right_reads_as_no_shape() {
+        no_shape("var x = null || x; return x;");
+    }
+
+    #[test]
+    fn a_parenthesised_name_given_only_itself_reads_as_no_shape() {
+        no_shape("var x = x || null; return (x);");
+    }
+
+    #[test]
+    fn a_member_of_a_name_given_only_itself_reads_as_no_shape() {
+        no_shape("var x = x.a; return x;");
+        no_shape("var x = x.a; return x.b;");
+    }
+
+    /// `body` inside one function reads, without aborting, as no shape.
+    fn no_shape(body: &str) {
+        let source = format!("function f() {{ {body} }}");
+        assert!(matches!(read(&source), ReturnRead::NoShape(_)), "{source}");
     }
 
     /// The first function's [`ReturnRead`] of `source`.
