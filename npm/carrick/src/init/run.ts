@@ -13,7 +13,6 @@
 // these repos the workspace holds, installs the local tools for them, and
 // reads their index in.
 
-import { memoryBudgetMb } from "../held/registry.ts";
 import { realPath } from "../fs-util.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -36,6 +35,7 @@ import { reposUrl } from "./connect.ts";
 import { checkoutOf } from "../hook/worktree.ts";
 import { downloadHostedIndex, hostedReport, nativeRunner, STEP_LABEL } from "./hosted.ts";
 import { fetchFactsNow } from "../facts/fetch.ts";
+import { withQuietLog } from "../log.ts";
 import { listProjects, projectLabel, SLUG, type Project } from "./projects.ts";
 import {
   committedHooksAreOurs,
@@ -71,6 +71,7 @@ import { markNoticed, USAGE_NOTICE, usageGate } from "../hook/usage.ts";
 import { excludedRepos, readWorkspaceFile, removeSelection, writeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
 import {
   createOutput,
+  DOCS_COMPILER_CHECK,
   DOCS_EDITOR,
   DOCS_INIT_FILES,
   listBlock,
@@ -79,14 +80,22 @@ import {
   type InitOutput,
 } from "./output.ts";
 
-/** What a run with nothing left to set up closes on: what this machine can do now. */
-export const READY_SENTENCE =
-  "The index is on this machine: `carrick check <file>` answers for a file, and your agent can ask who calls an operation.";
-
 /** The title of the block a run closes on (carrick#3286). */
+/** The first "Next:" line up to the names it lists. */
+export const HIDDEN_LINE = "Keep Carrick's hooks and skills out of git with .git/info/exclude";
+export const HIDDEN_FOLDER_LINE = "Keep Carrick's hooks and skills out of git with each repo's .git/info/exclude";
+export const RULES_LINE_PREFIX = "Add Carrick's rules section to";
+
 /** What the run says about the compiler check, which is on unless `CARRICK_COMPILER_LINES=0`. */
-export function compilerCheckNote(budgetMb: number = memoryBudgetMb()): string {
-  return `The compiler check is on by default. It starts on your first read or edit of a service, takes about 20 s on a large one, and holds up to ${budgetMb} MB of memory across all checkouts. To turn it off, set CARRICK_COMPILER_LINES=0 in the "env" block of .claude/settings.local.json, or in the shell you start Claude Code from.`;
+export const COMPILER_CHECK_NOTE = `The compiler check is on. See ${DOCS_COMPILER_CHECK}`;
+
+/**
+ * Fetch the edit-time fact file for init: the progress line and the step
+ * results are init's only output, so the fetch's own log lines (a build still
+ * in flight, a retry) stay out of the terminal.
+ */
+export function fetchFactsQuietly(workspace: string, options: Parameters<typeof fetchFactsNow>[1] = {}): ReturnType<typeof fetchFactsNow> {
+  return withQuietLog(() => fetchFactsNow(workspace, options));
 }
 
 export const CLOUD_NEXT_TITLE = "Done. Open a new agent session in this folder, then ask it:";
@@ -343,69 +352,49 @@ export function installSentence(commands: string[]): string | null {
 }
 
 /**
- * The files the run creates, as one line under "Next:" (carrick#1489,
- * carrick#1512).
- *
- * Directories, because each holds several files and the line has to stay one
- * sentence; every file outside the workspace by its own path, because those
- * belong to somebody's editor. Claude Code's server list is written by its own
- * command, so it is named rather than given a path. It says "add", because
- * that is what happens: every writer here merges. And it says where: a folder
- * of repos gets the hooks and skills in the folder and again in each repo,
- * with that repo's `.git/info/exclude` (carrick#1512, option A), so `folder`
- * is the folder as the reader types it, and null for a run in one repo.
+ * The first line under "Next:": which coding agents and apps this run sets up.
+ * Every one whose config it writes is named, an editor by its app name (never
+ * a path), and a folder of repos says it covers each repo too.
  */
 export function writesLine(options: {
-  workspaceFile: boolean;
-  editorFiles: string[];
+  /** The apps whose MCP config this run writes (Cursor, Windsurf), by name. */
+  editors: string[];
   claudeCode: boolean;
   codex: boolean;
+  /** The folder as the reader types it, or null for a run in one repo. */
   folder: string | null;
-  home?: string;
   /** The agents whose files this run writes; both where it is not said. */
   files?: CopyAgents;
 }): string {
-  const mcp = [
-    ...(options.claudeCode ? ["Claude Code"] : []),
-    ...(options.codex ? ["Codex"] : []),
-    ...options.editorFiles.map((file) => tilde(file, options.home)),
-  ];
-  const where = options.folder === null ? "" : ` in ${options.folder} and in each repo`;
   const files = options.files ?? { claudeCode: true, codex: true };
-  const folders = !files.codex ? ".claude/" : !files.claudeCode ? ".agents/ and .codex/" : ".claude/, .agents/ and .codex/";
-  const parts = [
-    `Add Carrick's hooks and skills to ${folders}${where}`,
-    options.workspaceFile ? `create .carrick/ and ${WORKSPACE_FILE}` : "create .carrick/",
-    ...(mcp.length > 0 ? [`add Carrick's MCP server to ${listed(mcp, 5)}`] : []),
+  const names = [
+    ...(options.claudeCode || files.claudeCode ? ["Claude Code"] : []),
+    ...(options.codex || files.codex ? ["Codex"] : []),
+    ...options.editors,
   ];
-  return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
+  const all = listed(names, 5);
+  return options.folder === null
+    ? `Create .carrick/ and add Carrick to ${all}`
+    : `Create .carrick/ and set up ${options.folder} and each repo for ${all}`;
 }
 
 /**
- * The lines under "Next:": `writesLine` first, then one fact per line about
- * what the run hides, allows and adds to the rules files, each only in its case.
+ * The lines under "Next:": `writesLine` first, then what the run hides and
+ * what it adds to the rules files, each only in its case.
  */
 export function nextLines(options: {
   /** `writesLine`'s answer. */
   writes: string;
   /** "repo": one repo where git tracks nothing this run writes; "folder": a folder of repos; null: neither. */
   hidden: "repo" | "folder" | null;
-  /** The settings file the MCP allow entry goes into, or null where none is added. */
-  allowFile: string | null;
   /** The folder has a CLAUDE.md, which gets the rules section too. */
   claudeFile: boolean;
-  /** Neither agent was found, so both are set up. */
-  guessed: boolean;
 }): string[] {
   return [
     options.writes,
-    ...(options.hidden === "repo" ? ["Keep these files out of git with .git/info/exclude"] : []),
-    ...(options.hidden === "folder" ? ["Keep each repo's copy out of git with its .git/info/exclude"] : []),
-    ...(options.allowFile === null
-      ? []
-      : [`Allow Carrick's read-only MCP tools in ${options.allowFile} so headless \`claude -p\` runs can call them`]),
-    `Add Carrick's rules section to ${options.claudeFile ? `${AGENTS_FILE} and ${CLAUDE_FILE}` : AGENTS_FILE}`,
-    ...(options.guessed ? ["Set up both Claude Code and Codex, because neither was detected"] : []),
+    ...(options.hidden === "repo" ? [HIDDEN_LINE] : []),
+    ...(options.hidden === "folder" ? [HIDDEN_FOLDER_LINE] : []),
+    `${RULES_LINE_PREFIX} ${options.claudeFile ? `${AGENTS_FILE} and ${CLAUDE_FILE}` : AGENTS_FILE}`,
   ];
 }
 
@@ -670,17 +659,14 @@ async function planRun(input: {
     nextBlock(
       nextLines({
         writes: writesLine({
-          workspaceFile: deselected.length > 0,
-          editorFiles: offered.filter((client) => editors.includes(client.name)).map((client) => client.file),
+          editors: offered.filter((client) => editors.includes(client.name)).map((client) => client.name),
           claudeCode: claudeCodeFound(),
           codex: codexFound(),
           folder,
           files: agents,
         }),
         hidden: folder !== null ? "folder" : tracked !== null && tracked.size === 0 ? "repo" : null,
-        allowFile: !agents.claudeCode || teamHooks ? null : hidden ? ".claude/settings.local.json" : ".claude/settings.json",
         claudeFile: fs.existsSync(path.join(workspace, CLAUDE_FILE)),
-        guessed: harnesses.guessed,
       }),
     ),
   );
@@ -1056,7 +1042,7 @@ export async function initWith(
       // The fact file the edit and Read hooks answer from is part of the index
       // on this machine. Fetched here, and waited for while the cloud builds
       // it, so the first agent session starts with it (`fetchFactsNow`).
-      if (outcome.kind === "downloaded") await fetchFactsNow(derived.workspace);
+      if (outcome.kind === "downloaded") await fetchFactsQuietly(derived.workspace);
       return outcome;
     },
     (outcome) => hostedReport(outcome, (Date.now() - startedAt) / 1000),
@@ -1075,8 +1061,7 @@ export async function initWith(
   }
   const install = installSentence(installCommands(derived, readFromHosted));
   if (install !== null) out.warn(install);
-  if (downloaded) out.done(READY_SENTENCE);
-  out.say(compilerCheckNote());
+  out.say(COMPILER_CHECK_NOTE);
   // The one place a person who never opens Claude Code's session start is told.
   if (usageGate().reason === "never_noticed") {
     out.say(USAGE_NOTICE);

@@ -49,6 +49,8 @@ export const REFUSE = "■";
 export const DOCS = "https://docs.carrick.tools/quickstart";
 /** What `init` writes on this machine, file by file: the page `doctor`, `remove` and `uninstall` point at. */
 export const DOCS_INIT_FILES = "https://docs.carrick.tools/cli#workspace-initialisation";
+/** The page on the hooks and the compiler check, with the switch that turns each off. */
+export const DOCS_COMPILER_CHECK = "https://docs.carrick.tools/while-you-edit";
 export const DOCS_EDITOR = "https://docs.carrick.tools/editor";
 
 /**

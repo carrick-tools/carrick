@@ -39,6 +39,7 @@ import {
   summaryLine,
   nextBlock,
   writesLine,
+  nextLines,
   parseArgs,
   init,
   initWith as initOnMachine,
@@ -48,7 +49,7 @@ import {
   cloudNextLines,
   ASK_YOUR_AGENT_PROMPT,
   type InitOptions,
-  compilerCheckNote,
+  COMPILER_CHECK_NOTE,
 } from "../src/init/run.ts";
 import { inspectTaskSkills, removeTaskSkills, renderTaskSkill, SKILL_ROOTS, stamped, taskSkillPaths, taskSkillWarnings, writeTaskSkills } from "../src/init/task-skills.ts";
 import { checkTaskSkills } from "../src/init/doctor.ts";
@@ -929,7 +930,7 @@ test("a repo --repo leaves out is named in no request, written into nothing, and
     // file is named in the list the question that writes it is about
     // (carrick#1489, carrick#1512), not on a line of its own afterwards.
     assert.deepEqual(selection.carrick, { exclude: ["web"] });
-    assert.match(result.stdout.replace(/\n +/g, " "), /Add Carrick's hooks .*create \.carrick\/ and carrick-workspace\.json/);
+    assert.match(result.stdout.replace(/\n +/g, " "), /Create \.carrick\/ and set up .* and each repo for Claude Code and Codex/);
     assert.doesNotMatch(result.stdout, /web excluded in/);
   } finally {
     fixture.cleanup();
@@ -998,7 +999,7 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
           `mcp add --scope user --transport http carrick https://api.carrick.tools/mcp --header X-Carrick-Install-Id: ${installId}`,
         ),
       );
-      assert.match(result.stdout.replace(/\n +/g, " "), /add Carrick's MCP server to Claude Code/);
+      assert.match(result.stdout.replace(/\n +/g, " "), /add Carrick to Claude Code/);
       assert.doesNotMatch(result.stdout, /No agent client/);
       if (process.platform !== "win32") {
         // Nobody else's to read: it is this machine's name, not a shared one.
@@ -2183,43 +2184,35 @@ test("an editor file is written only for an editor found here, or one somebody n
   // every writer merges, and a list of folders read as though it replaced
   // them (carrick#1512).
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, codex: false, folder: null, home: "/home/dev" }),
-    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
+    writesLine({ editors: [], claudeCode: true, codex: false, folder: null, files: { claudeCode: true, codex: false } }),
+    "Create .carrick/ and add Carrick to Claude Code",
   );
+  // An editor is named by its app, never by the path of its config file.
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: false, codex: false, folder: null, home: "/home/dev" }),
-    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to ~/.cursor/mcp.json",
+    writesLine({ editors: ["Windsurf"], claudeCode: true, codex: true, folder: null }),
+    "Create .carrick/ and add Carrick to Claude Code, Codex and Windsurf",
   );
+  // A folder run writes into each repo too, so the line says where.
   assert.equal(
-    writesLine({ workspaceFile: true, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: true, codex: false, folder: "~/shop", home: "/home/dev" }),
-    `Add Carrick's hooks and skills to .claude/, .agents/ and .codex/ in ~/shop and in each repo, create .carrick/ and ${WORKSPACE_FILE}, and add Carrick's MCP server to Claude Code and ~/.cursor/mcp.json`,
-  );
-  // A folder run writes into each repo too, so the line says where
-  // (carrick#1512, option A as ruled).
-  assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, codex: false, folder: "~/shop", home: "/home/dev" }),
-    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/ in ~/shop and in each repo, create .carrick/, and add Carrick's MCP server to Claude Code",
-  );
-  assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: false, codex: false, folder: null, home: "/home/dev" }),
-    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, and create .carrick/",
+    writesLine({ editors: ["Cursor"], claudeCode: true, codex: false, folder: "~/shop", files: { claudeCode: true, codex: false } }),
+    "Create .carrick/ and set up ~/shop and each repo for Claude Code and Cursor",
   );
 });
 
 // The list of files printed before they are written, inside the gutter: a long
 // line is broken between words rather than left for the terminal to wrap under
 // the gutter (carrick#1512).
-test("the files the run writes are one wrapped line under Next:", () => {
-  const writes = "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code";
-  assert.equal(
-    nextBlock([writes]),
-    [
-      "Next:",
-      "  Add Carrick's hooks and skills to .claude/, .agents/ and .codex/,",
-      "  create .carrick/, and add Carrick's MCP server to Claude Code",
-    ].join("\n"),
-  );
-  assert.ok(wrapped(writes).every((line) => line.length <= 68));
+test("the plan under Next: is at most three short lines and names every agent and app it sets up", () => {
+  const all = nextLines({
+    writes: writesLine({ editors: ["Cursor", "Windsurf"], claudeCode: true, codex: true, folder: null }),
+    hidden: "repo",
+    claudeFile: true,
+  });
+  assert.ok(all.length <= 3, all.join("\n"));
+  assert.ok(all.every((line) => line.length <= 80), all.join("\n"));
+  for (const name of ["Claude Code", "Codex", "Cursor", "Windsurf"]) assert.match(all[0]!, new RegExp(name));
+  assert.doesNotMatch(all.join("\n"), /mcp_config|\.codeium|\.cursor|headless|read-only/);
+  assert.equal(nextBlock(["a", "b"]), "Next:\n  a\n  b");
 });
 
 // carrick#1512: which repos beside this one are candidates for "the same
@@ -2271,9 +2264,6 @@ const READ_WITHOUT_TYPES =
   "Dependencies are not installed, so the index here was read without their types. Run `npm install` in api, then carrick refresh.";
 const SYSTEM_ON_DASHBOARD =
   "On this workspace repos change system on the dashboard: https://app.carrick.tools/w/acme/repos. Run carrick init without --project.";
-const READY =
-  "The index is on this machine: `carrick check <file>` answers for a file, and your agent can ask who calls an operation.";
-
 /**
  * A folder of repos in the `acme` workspace, with the server and the scanner
  * answered in this process.
@@ -2535,10 +2525,11 @@ test("where Carrick builds the index, init asks nothing, installs everything and
       // No scan: the local read, and the status either side of it.
       assert.deepEqual(fixture.commands(), ["derive", "status", "refresh", "status"]);
       const text = out.lines.join("\n");
-      assert.match(text, /Next:\n {2}Add Carrick's hooks and skills to \.claude\/, \.agents\/ and \.codex\//);
+      assert.match(text, /Next:\n {2}Create \.carrick\/ and add Carrick to Claude Code and Codex\n/);
       assert.ok(out.lines.includes("◇ Set up in project Shop (shop): api"), text);
       assert.match(text, /^Hosted index for 1 service read into \.carrick\/ in \d/m);
-      assert.ok(out.lines.includes(`◇ ${READY}`), text);
+      // The "index is on this machine" line is gone (the founder: it sounds like this is all Carrick is).
+      assert.doesNotMatch(text, /index is on this machine/, text);
       // The run closes on the new-session step, the prompt and, on a first
       // write of the Codex hooks, the trust step, said once and last
       // (carrick#3286); the laptop lane's paste-this block never appears.
@@ -2585,7 +2576,7 @@ test("a folder is set up for the repos the workspace holds, and the rest are nam
     assert.ok(first.lines.includes(`▲ ${NOT_IN_WORKSPACE("acme/notes", "is", "it")}`), first.lines.join("\n"));
     assert.ok(first.lines.includes(`▲ ${NO_INDEX_YET}`), first.lines.join("\n"));
     assert.ok(first.lines.includes("◇ Set up in project Shop (shop): api, web"), first.lines.join("\n"));
-    assert.ok(first.lines.includes(`◇ ${READY}`), first.lines.join("\n"));
+    assert.doesNotMatch(first.lines.join("\n"), /index is on this machine/);
     // A repo has no index yet: the closing block says refresh reads it in.
     assert.match(first.lines.join("\n"), /`carrick refresh` reads it in once Carrick has built it/);
     // The repo the workspace does not hold is out of the file every later
@@ -2695,8 +2686,7 @@ test("on that workspace a release mismatch and missing dependencies name no scan
     assert.ok(out.lines.includes(BUILT_BY_ANOTHER_RELEASE), text);
     assert.ok(out.lines.includes(`▲ ${READ_WITHOUT_TYPES}`), text);
     assert.doesNotMatch(text, /carrick index|before the next scan|scaffold/);
-    // Nothing was read in, so the run does not say the index is here.
-    assert.equal(out.lines.includes(`◇ ${READY}`), false);
+    assert.doesNotMatch(text, /index is on this machine/);
   } finally {
     fixture.restore();
   }
@@ -2752,7 +2742,7 @@ test("on that workspace an editor found on this machine gets its entry unasked, 
     assert.match(fs.readFileSync(cursor, "utf8"), /api\.carrick\.tools\/mcp/);
     assert.equal(fs.existsSync(path.join(home, ".codeium", "windsurf", "mcp_config.json")), false);
     // And the file is named in the list before it is written.
-    assert.match(out.lines.join("\n").replace(/\n +/g, " "), /add Carrick's MCP server to Claude Code and ~\/\.cursor\/mcp\.json/);
+    assert.match(out.lines.join("\n").replace(/\n +/g, " "), /add Carrick to Claude Code(, Codex)? and Cursor/);
   } finally {
     fixture.restore();
   }
@@ -3360,11 +3350,11 @@ test("moving an older install's hooks out of the shared file keeps an allow entr
   }
 });
 
-test("init says the compiler check is on, its memory budget and its off switch", () => {
-  const text = compilerCheckNote(4096);
-  assert.match(text, /^The compiler check is on by default\./);
-  assert.match(text, /holds up to 4096 MB of memory across all checkouts/);
-  assert.match(text, /CARRICK_COMPILER_LINES=0 in the "env" block of \.claude\/settings\.local\.json, or in the shell you start Claude Code from/);
+test("init says the compiler check is on in one short line with a docs link", () => {
+  assert.equal(COMPILER_CHECK_NOTE, "The compiler check is on. See https://docs.carrick.tools/while-you-edit");
+  assert.match(COMPILER_CHECK_NOTE, /https:\/\/docs\.carrick\.tools\/\S+/);
+  assert.doesNotMatch(COMPILER_CHECK_NOTE, /MB|\bs\b|CARRICK_COMPILER_LINES|settings\.local/);
+  assert.ok(COMPILER_CHECK_NOTE.length <= 80);
 });
 
 // T2a: init writes files only for the coding agent this developer uses, and
@@ -3379,60 +3369,39 @@ function unwrapped(out: { lines: string[] }): string {
   return out.lines.join("\n").replace(/\n {2,}/g, " ");
 }
 
-test("the Next list says what this run writes, hides, allows and adds to the rules files", () => {
-  const { nextLines } = run as unknown as { nextLines?: (options: Record<string, unknown>) => string[] };
-  assert.equal(typeof nextLines, "function", "run.ts exports nextLines");
+test("the Next list says what this run sets up, hides and adds to the rules files", () => {
   const writes = (files: { claudeCode: boolean; codex: boolean }, folder: string | null = null): string =>
-    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, codex: false, folder, home: "/home/dev", files } as Parameters<typeof writesLine>[0]);
-  const hidden = "Keep these files out of git with .git/info/exclude";
-  const hiddenFolder = "Keep each repo's copy out of git with its .git/info/exclude";
-  const allow = (file: string): string => `Allow Carrick's read-only MCP tools in ${file} so headless \`claude -p\` runs can call them`;
+    writesLine({ editors: [], claudeCode: files.claudeCode, codex: files.codex, folder, files });
+  const hidden = "Keep Carrick's hooks and skills out of git with .git/info/exclude";
+  const hiddenFolder = "Keep Carrick's hooks and skills out of git with each repo's .git/info/exclude";
   const rules = "Add Carrick's rules section to AGENTS.md";
-  const guessed = "Set up both Claude Code and Codex, because neither was detected";
 
-  // Claude Code only, in one repo.
-  assert.deepEqual(
-    nextLines!({ writes: writes(CLAUDE_HERE), hidden: "repo", allowFile: ".claude/settings.local.json", claudeFile: false, guessed: false }),
-    [
-      "Add Carrick's hooks and skills to .claude/, create .carrick/, and add Carrick's MCP server to Claude Code",
-      hidden,
-      allow(".claude/settings.local.json"),
-      rules,
-    ],
-  );
-  // Codex only: no allow entry, which is Claude Code's.
-  assert.deepEqual(nextLines!({ writes: writes(CODEX_HERE), hidden: "repo", allowFile: null, claudeFile: false, guessed: false }), [
-    "Add Carrick's hooks and skills to .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
+  assert.deepEqual(nextLines({ writes: writes(CLAUDE_HERE), hidden: "repo", claudeFile: false }), [
+    "Create .carrick/ and add Carrick to Claude Code",
     hidden,
     rules,
   ]);
-  // Both, in a folder of repos.
-  assert.deepEqual(
-    nextLines!({ writes: writes(mcp.BOTH_HARNESSES, "~/shop"), hidden: "folder", allowFile: ".claude/settings.json", claudeFile: false, guessed: false }),
-    [
-      "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/ in ~/shop and in each repo, create .carrick/, and add Carrick's MCP server to Claude Code",
-      hiddenFolder,
-      allow(".claude/settings.json"),
-      rules,
-    ],
-  );
+  assert.deepEqual(nextLines({ writes: writes(CODEX_HERE), hidden: "repo", claudeFile: false }), [
+    "Create .carrick/ and add Carrick to Codex",
+    hidden,
+    rules,
+  ]);
+  assert.deepEqual(nextLines({ writes: writes(mcp.BOTH_HARNESSES, "~/shop"), hidden: "folder", claudeFile: false }), [
+    "Create .carrick/ and set up ~/shop and each repo for Claude Code and Codex",
+    hiddenFolder,
+    rules,
+  ]);
   // A repo with a CLAUDE.md gets the section there too; git tracking a path this run writes hides nothing.
-  assert.deepEqual(
-    nextLines!({ writes: writes(mcp.BOTH_HARNESSES), hidden: null, allowFile: null, claudeFile: true, guessed: false }).slice(1),
-    ["Add Carrick's rules section to AGENTS.md and CLAUDE.md"],
-  );
-  assert.deepEqual(
-    nextLines!({ writes: writes(mcp.BOTH_HARNESSES), hidden: "repo", allowFile: ".claude/settings.local.json", claudeFile: false, guessed: true }).at(-1),
-    guessed,
-  );
-  // Both found: the line is today's, and the rules line follows it.
-  assert.deepEqual(nextLines!({ writes: writes(mcp.BOTH_HARNESSES), hidden: null, allowFile: null, claudeFile: false, guessed: false }), [
-    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
+  assert.deepEqual(nextLines({ writes: writes(mcp.BOTH_HARNESSES), hidden: null, claudeFile: true }).slice(1), [
+    "Add Carrick's rules section to AGENTS.md and CLAUDE.md",
+  ]);
+  assert.deepEqual(nextLines({ writes: writes(mcp.BOTH_HARNESSES), hidden: null, claudeFile: false }), [
+    "Create .carrick/ and add Carrick to Claude Code and Codex",
     rules,
   ]);
 });
 
-test("a Claude Code-only run in one repo writes no Codex file and lists what it writes, hides and allows", posixNativeFixture, async () => {
+test("a Claude Code-only run in one repo writes no Codex file and lists what it sets up and hides", posixNativeFixture, async () => {
   const fixture = cloudWorkspace({ repos: { api: "indexed" } });
   const out = silentTerminal();
   try {
@@ -3442,10 +3411,8 @@ test("a Claude Code-only run in one repo writes no Codex file and lists what it 
     assert.equal(fs.existsSync(path.join(repo, ".agents")), false);
     assert.ok(fs.existsSync(path.join(repo, ".claude", "settings.local.json")));
     const text = unwrapped(out);
-    assert.match(text, /Next: Add Carrick's hooks and skills to \.claude\/, create \.carrick\//);
-    assert.ok(text.includes("Keep these files out of git with .git/info/exclude"), text);
-    assert.ok(text.includes("Allow Carrick's read-only MCP tools in .claude/settings.local.json so headless `claude -p` runs can call them"), text);
-    assert.ok(text.includes("Add Carrick's rules section to AGENTS.md"), text);
+    assert.match(text, /Next: Create \.carrick\/ and add Carrick to Claude Code Keep Carrick's hooks and skills out of git with \.git\/info\/exclude Add Carrick's rules section to AGENTS\.md/);
+    assert.doesNotMatch(text, /headless|read-only MCP tools/);
     assert.doesNotMatch(text, /because neither was detected/);
   } finally {
     fixture.restore();
@@ -3465,8 +3432,7 @@ test("a folder of repos outside any repository, Claude Code only: the folder and
     }
     for (const name of ["api", "web"]) assert.ok(fs.existsSync(path.join(fixture.repo(name), ".claude", "settings.local.json")), name);
     const text = unwrapped(out);
-    assert.ok(text.includes("Keep each repo's copy out of git with its .git/info/exclude"), text);
-    assert.ok(text.includes("Allow Carrick's read-only MCP tools in .claude/settings.json so headless `claude -p` runs can call them"), text);
+    assert.ok(text.includes("Keep Carrick's hooks and skills out of git with each repo's .git/info/exclude"), text);
   } finally {
     fixture.restore();
   }
@@ -3480,7 +3446,7 @@ test("a folder inside another repository's work tree gets both agents' files, as
     assert.ok(fs.existsSync(path.join(fixture.folder, ".claude", "settings.json")));
     assert.ok(fs.existsSync(path.join(fixture.folder, CODEX_HOOKS_FILE)));
     for (const skill of taskSkillPaths()) assert.ok(fs.existsSync(path.join(fixture.folder, skill)), skill);
-    assert.match(unwrapped(out), /Next: Add Carrick's hooks and skills to \.claude\/, \.agents\/ and \.codex\//);
+    assert.match(unwrapped(out), /Next: Create \.carrick\/ and set up .* and each repo for Claude Code and Codex/);
   } finally {
     fixture.restore();
   }

@@ -11,7 +11,6 @@ export type Logger = (...parts: unknown[]) => void;
 
 export function createLogger(prefix: string, env: NodeJS.ProcessEnv = process.env): Logger {
   const file = env["CARRICK_LOG"] ?? null;
-  const quiet = env["CARRICK_LOG_QUIET"] === "1";
   return (...parts: unknown[]): void => {
     const text = parts
       .map((part) => (typeof part === "string" ? part : JSON.stringify(part)))
@@ -25,11 +24,28 @@ export function createLogger(prefix: string, env: NodeJS.ProcessEnv = process.en
         // A log that cannot be written is not a reason to fail an edit.
       }
     }
-    if (quiet) return;
+    // Read per line, so `withQuietLog` can silence loggers made at import time.
+    if (env["CARRICK_LOG_QUIET"] === "1") return;
     try {
       process.stderr.write(line);
     } catch {
       // Same.
     }
   };
+}
+
+/**
+ * Run `work` with every logger's terminal line off (a log file named by
+ * CARRICK_LOG still gets its lines). `carrick init` prints only its progress
+ * line and step results, so a hook-style log line must not land in the middle.
+ */
+export async function withQuietLog<T>(work: () => Promise<T>): Promise<T> {
+  const before = process.env["CARRICK_LOG_QUIET"];
+  process.env["CARRICK_LOG_QUIET"] = "1";
+  try {
+    return await work();
+  } finally {
+    if (before === undefined) delete process.env["CARRICK_LOG_QUIET"];
+    else process.env["CARRICK_LOG_QUIET"] = before;
+  }
 }
