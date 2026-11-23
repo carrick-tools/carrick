@@ -77,10 +77,6 @@
     "carrick": "bin/carrick.mjs"
   },
   "exports": {
-    "./templates": {
-      "types": "./dist/templates.d.ts",
-      "default": "./dist/templates.js"
-    },
     "./package.json": "./package.json"
   },
   "engines": {

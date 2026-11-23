@@ -55,7 +55,6 @@ import { checkTaskSkills } from "../src/init/doctor.ts";
 import { writeIfChanged } from "../src/init/files.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "../src/init/codex.ts";
-import { TEMPLATE_PATHS } from "../src/templates.ts";
 import {
   BEAT_MS,
   downloadHostedIndex,
@@ -1303,7 +1302,7 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
     );
     assert.doesNotMatch(result.stdout, /Restart Claude Code|proposal|carrick\.json|carrick index/);
     // The quickstart carries what left the terminal, and none of it is printed.
-    assert.doesNotMatch(result.stdout, /--plugin-dir|--install-extension|carrick templates workflow|docs\.carrick\.tools\/carrick-json/);
+    assert.doesNotMatch(result.stdout, /--plugin-dir|--install-extension|docs\.carrick\.tools\/carrick-json/);
   } finally {
     fixture.cleanup();
   }
@@ -2555,7 +2554,7 @@ test("where Carrick builds the index, init asks nothing, installs everything and
       assert.doesNotMatch(text, /scaffold|carrick\.json|carrick index|workflow|paste this/i);
       const repo = fixture.repo("api");
       assert.equal(fs.existsSync(path.join(repo, "carrick.json")), false);
-      assert.equal(fs.existsSync(path.join(repo, TEMPLATE_PATHS.workflow)), false);
+      assert.equal(fs.existsSync(path.join(repo, ".github", "workflows", "carrick.yml")), false);
       // Every install step ran: the hooks for both hosts, the skills under
       // both roots, and Claude Code's MCP server; and no proposal.
       assert.equal(fs.existsSync(path.join(repo, ".carrick", "proposal.json")), false);

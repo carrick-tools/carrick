@@ -16,7 +16,7 @@
 //  2. **A finding is something that is wrong**, not something that is unusual.
 //     Exit is non-zero on any finding, so a check that fires on a healthy repo
 //     costs the whole command its meaning: a workspace with no committed
-//     config is the ordinary one, a workflow left behind is a note, and a
+//     config is the ordinary one, and a
 //     local index behind the working tree is a note, because that is what an
 //     index looks like while someone is working.
 //  3. **Each check lives with what it checks.** The hook and MCP readers are
@@ -36,7 +36,6 @@ import { status as runStatus } from "../cli.ts";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { compilerCoverage } from "../held/coverage.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
-import { TEMPLATE_PATHS } from "../templates.ts";
 import {
   BOTH_HARNESSES,
   CODEX_ADD_LINE,
@@ -105,9 +104,8 @@ function help(): string {
     "",
     "Re-check what carrick init set up here: the agent hooks, the task skills and",
     "the MCP connection on this machine, and how far the index is behind. It also",
-    "checks the paths a committed carrick.json declares, and names a Carrick CI",
-    "workflow that is no longer needed. It writes nothing, runs no scan, and exits",
-    "non-zero when it finds something.",
+    "checks the paths a committed carrick.json declares. It writes nothing, runs no",
+    "scan, and exits non-zero when it finds something.",
     "",
     "    -w, --workspace DIR  The folder init was run in (default: this one)",
     "",
@@ -363,30 +361,6 @@ function matchesAFile(root: string, pattern: string): boolean {
   } catch {
     return false;
   }
-}
-
-const WORKFLOW_PATH = TEMPLATE_PATHS.workflow;
-
-/**
- * A Carrick workflow left in a repo, which nothing needs any more.
- *
- * Carrick scans every repo in its own runners on every push (carrick#2219),
- * so a workflow file only spends CI minutes, and a missing one is the
- * expected state. Every repo is read, with or without a committed config: the
- * workflow and the config were written together by the old scaffold, and
- * either can be left behind. A note, never a finding (carrick#3361).
- */
-export function checkWorkflow(repos: ConfiguredRepo[]): Line[] {
-  const lines: Line[] = [];
-  for (const repo of repos) {
-    if (!isFile(path.join(repo.root, WORKFLOW_PATH))) continue;
-    lines.push(
-      say(
-        `${repo.label}: Carrick now scans this repo in its own cloud runners on every push, so ${WORKFLOW_PATH} is no longer needed and only uses CI minutes. You can delete it.`,
-      ),
-    );
-  }
-  return lines;
 }
 
 /** What the hook check needs to know about this machine. */
@@ -930,7 +904,6 @@ export async function doctor(
     ...checkPathVersion(workspace, pathCarrick()),
     ...checkDeclaredPaths(repos),
     ...checkCompilerCoverage(workspace, repos),
-    ...checkWorkflow(repos),
     ...checkHooks(workspace, realMachine(), harnesses.claudeCode),
     ...checkCodexHooks(workspace, harnesses),
     ...checkTaskSkills(inspectTaskSkills(workspace), harnesses),

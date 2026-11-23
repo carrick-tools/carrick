@@ -21,10 +21,10 @@ USAGE:
 
 SCAN:
     [REPO_PATH]    Repository to analyse (default: the working directory). This
-                   is what Carrick's cloud runners and the GitHub Action run: it
-                   scans the source, resolves the types, and uploads that
-                   repository's index. Carrick builds your index itself, so you
-                   do not need to run it.
+                   is what Carrick's cloud runners run: it scans the source,
+                   resolves the types, and uploads that repository's index.
+                   Carrick builds your index itself, so you do not need to run
+                   it.
 
 WORKSPACE:
     init       Set up this folder: sign in, download the index Carrick builds
@@ -37,15 +37,6 @@ WORKSPACE:
     uninstall  Undo what init wrote on this machine for every folder: the MCP
                server in each agent client, the install id and the sign-in.
     derive    Print the repos and services a folder resolves to, writing nothing.
-    index      Scan every repo in the workspace and build <workspace>/.carrick/.
-               Carrick Cloud classifies what the deterministic passes could
-               not. Each repo needs a carrick.json. Carrick builds the index
-               of the repos in your workspace itself, and `carrick refresh`
-               downloads it. With --dispatch it builds every prompt and hands
-               them to Carrick Cloud. The analysis then runs whether or not
-               this machine is on, and `carrick resume` collects it.
-    resume     Collect a dispatched analysis and finish the index. Files that
-               changed since the hand-off are analysed now.
     refresh    Re-scan one service, or every repo, and re-join the index.
                What the session-start hook runs; it asks no model. With
                --hosted-only it scans nothing: it moves this machine's copy
@@ -78,12 +69,9 @@ OPTIONS:
                    Let this machine idle-sleep during a scan. By default a scan
                    on macOS keeps it awake until the scan finishes, for at most
                    three hours, and says so; closing the lid still sleeps it.
-                   Applies to a scan of a path and to index, resume and refresh.
+                   Applies to a scan of a path and to refresh.
 
 ENVIRONMENT VARIABLES:
-    ACTIONS_ID_TOKEN_REQUEST_URL    GitHub Actions OIDC token endpoint (auto-set
-                                    when the job grants `id-token: write`)
-    ACTIONS_ID_TOKEN_REQUEST_TOKEN  Bearer token for the OIDC endpoint (auto-set)
     CARRICK_TOKEN                   A Carrick API token, used in place of the
                                     credential `carrick login` saves
     CARRICK_WORKSPACE               The workspace the commands above act on,
@@ -134,7 +122,7 @@ ENVIRONMENT VARIABLES:
 /// still be able to say where they are: `init` is where the first run starts,
 /// so "unknown command" is the wrong answer for it, and a user who reached
 /// the binary directly needs the package named rather than the name denied.
-pub const PACKAGE_COMMANDS: [&str; 10] = [
+pub const PACKAGE_COMMANDS: [&str; 9] = [
     "init",
     "doctor",
     "remove",
@@ -143,7 +131,6 @@ pub const PACKAGE_COMMANDS: [&str; 10] = [
     "logout",
     "lsp",
     "hook",
-    "templates",
     "telemetry",
 ];
 
@@ -152,9 +139,37 @@ mod tests {
     use super::*;
     use crate::local_mode::cli::LOCAL_COMMANDS;
 
+    /// Parsed and kept, but not offered: Carrick's runners build the index, so
+    /// a person is not told to build one from this machine or from CI. The
+    /// commands stay in the binary.
+    const UNLISTED_COMMANDS: [&str; 2] = ["index", "resume"];
+
+    #[test]
+    fn help_offers_no_way_to_build_an_index_here_or_in_ci() {
+        for gone in ["templates", "ACTIONS_ID_TOKEN", "GitHub Action", "workflow"] {
+            assert!(!HELP.contains(gone), "--help still names {gone}");
+        }
+        for command in UNLISTED_COMMANDS {
+            assert!(
+                !HELP
+                    .lines()
+                    .any(|line| lists_with_a_description(line, command)),
+                "--help still lists `carrick {command}`"
+            );
+            assert!(
+                LOCAL_COMMANDS.contains(&command),
+                "`{command}` must still parse"
+            );
+        }
+        assert!(!PACKAGE_COMMANDS.contains(&"templates"));
+    }
+
     #[test]
     fn every_command_the_parser_accepts_is_named_with_a_description() {
-        for command in LOCAL_COMMANDS {
+        for command in LOCAL_COMMANDS
+            .into_iter()
+            .filter(|command| !UNLISTED_COMMANDS.contains(command))
+        {
             let line = HELP
                 .lines()
                 .find(|line| line.trim_start().starts_with(&format!("{command} ")))

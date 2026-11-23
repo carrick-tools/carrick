@@ -27,7 +27,6 @@ import {
   checkMcp,
   checkPathVersion,
   checkTaskSkills,
-  checkWorkflow,
   configuredRepos,
   declaredServices,
   findingCount,
@@ -45,14 +44,15 @@ import {
   writeTaskSkills,
 } from "../src/init/task-skills.ts";
 import { recordCliVersion } from "../src/init/outdated.ts";
-import { renderTemplate, TEMPLATE_PATHS } from "../src/templates.ts";
 import { statusFixture } from "./helpers.ts";
 import { placedPath } from "../src/held/paths.ts";
 import { writeState } from "../src/held/state.ts";
 import type { StatusResult } from "../src/contract.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const workflowPath = TEMPLATE_PATHS.workflow;
+// A Carrick workflow left in a repo: doctor says nothing about it.
+const workflowPath = ".github/workflows/carrick.yml";
+const leftoverWorkflow = "name: Carrick\n";
 
 /** A throwaway workspace, one repo, with whatever files a test names. */
 function workspace(files: Record<string, string>): string {
@@ -170,22 +170,10 @@ test("a workspace with no carrick.json is no finding, and the line names the con
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("the workflow check has one lane: no workflow is no line, and a workflow is told it can go", () => {
-  const none = workspace({ "carrick.json": JSON.stringify({ serviceName: "api" }) });
-  assert.deepEqual(checkWorkflow(configuredRepos(none)), []);
-  // A workflow is named whether or not the repo commits a config.
-  const kept = workspace({ [workflowPath]: renderTemplate("workflow") });
-  const keptLines = checkWorkflow(configuredRepos(kept));
-  assert.equal(findingCount(keptLines), 0, texts(keptLines).join("\n"));
-  assert.equal(keptLines.length, 1, texts(keptLines).join("\n"));
-  assert.match(keptLines[0]!.text, /no longer needed/);
-  for (const root of [none, kept]) fs.rmSync(root, { recursive: true, force: true });
-});
-
 test("doctor's help names no template to match and no config to write", () => {
   const help = parseArgs(["--help"]);
   assert.equal(typeof help, "string");
-  assert.doesNotMatch(String(help), /current template|derives one|for your agent to write/);
+  assert.doesNotMatch(String(help), /current template|derives one|for your agent to write|workflow/);
 });
 
 test("a sibling repo with no carrick.json is no line at all: its config is Carrick's", () => {
@@ -615,7 +603,7 @@ test("the whole command, on a workspace with exactly three findings", () => {
       2,
     ),
     "api/index.ts": "export {};\n",
-    [workflowPath]: renderTemplate("workflow"),
+    [workflowPath]: leftoverWorkflow,
     ".claude/settings.json": mergeCarrickHooks(null).body,
   });
   writeLauncher(path.join(root, ".claude"));
@@ -683,7 +671,6 @@ test("the whole command, on a workspace with exactly three findings", () => {
   const lines = run.stdout.trimEnd().split("\n");
   assert.deepEqual(lines, [
     `■ ${path.basename(root)}: service "api" includes "packages/shared", which is not a directory in this repo.`,
-    `${path.basename(root)}: Carrick now scans this repo in its own cloud runners on every push, so .github/workflows/carrick.yml is no longer needed and only uses CI minutes. You can delete it.`,
     `◇ Agent hooks are installed here and run \`carrick\` on PATH (${path.join(bin, "carrick")}).`,
     // Claude Code only: `.agents/skills` is Codex's, and holds nothing of ours.
     "▲ 5 of the 5 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",

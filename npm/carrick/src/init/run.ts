@@ -78,7 +78,6 @@ import {
   tilde,
   type InitOutput,
 } from "./output.ts";
-import { renderTemplate } from "../templates.ts";
 
 /** What a run with nothing left to set up closes on: what this machine can do now. */
 export const READY_SENTENCE =
@@ -1085,26 +1084,4 @@ export async function initWith(
   }
   out.note(CLOUD_NEXT_TITLE, cloudNextLines(codexTrust, plan.waiting.length > 0 || !downloaded));
   return 0;
-}
-
-/** `carrick templates <name>`, so a workflow is one command. */
-export function templates(argv: string[]): number {
-  const [name, ...rest] = argv;
-  const variables: Record<string, string> = {};
-  for (let index = 0; index < rest.length; index += 2) {
-    const key = rest[index];
-    const value = rest[index + 1];
-    if (!key?.startsWith("--") || value === undefined) {
-      process.stderr.write("carrick templates: expected --name value pairs\n");
-      return 2;
-    }
-    variables[key.slice(2).toUpperCase().replace(/-/g, "_")] = value;
-  }
-  try {
-    process.stdout.write(renderTemplate(name as never, variables));
-    return 0;
-  } catch (error) {
-    process.stderr.write(`carrick templates: ${(error as Error).message}\n`);
-    return 2;
-  }
 }

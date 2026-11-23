@@ -25,8 +25,7 @@ David's framing:
 **The GitHub Action already floats.** `action.yml` reads the version out of
 the `Cargo.toml` sitting beside it in the action checkout, and `release.yml`
 force-moves the `v1` tag onto every release commit. A workflow that says
-`carrick-tools/carrick@v1` — which is what `carrick templates workflow` and
-`carrick init` write — therefore picks up each release with nobody touching
+`carrick-tools/carrick@v1` — which is what `carrick init` used to write — therefore picks up each release with nobody touching
 anything. Nothing needed fixing there.
 
 A workflow that pins anything else (`@v1.4.2`, a branch, a commit SHA) is

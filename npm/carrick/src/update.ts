@@ -405,7 +405,6 @@ const COMMANDS = new Set([
   "remove",
   "uninstall",
   "doctor",
-  "templates",
 ]);
 
 /** The commands that pay for a model and take minutes. */

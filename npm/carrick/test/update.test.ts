@@ -371,7 +371,6 @@ test("which invocations count as a scan", () => {
     "remove",
     "uninstall",
     "doctor",
-    "templates",
   ]) {
     assert.equal(isScanInvocation([command]), false, command);
   }
