@@ -52,6 +52,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { removeCredential, credentialPath } from "../auth/credentials.ts";
 import { installIdPath, removeInstallId } from "./install-id.ts";
+import { telemetryPath } from "../hook/usage.ts";
 import { removeSessions, sessionRecords, sessionsDir } from "../hook/reuse.ts";
 import { disconnectMcpClients, inspectMcpClients, type McpRemoval } from "./mcp.ts";
 import { repoRoots } from "./repos.ts";
@@ -566,6 +567,8 @@ export type MachinePlan = {
   sessions: number;
   notice: boolean;
   installId: boolean;
+  /** The usage counts setting, `~/.carrick/telemetry`. */
+  telemetry: boolean;
   /** The credential file, where this run deletes it. */
   credential: string | null;
   /** What stays, and why. */
@@ -578,6 +581,7 @@ export function machinePlan(keepLogin: boolean): MachinePlan {
     sessions: sessionRecords(),
     notice: fs.existsSync(noticeFile()),
     installId: fs.existsSync(installIdPath()),
+    telemetry: fs.existsSync(telemetryPath()),
     credential: null,
     leaves: [],
   };
@@ -608,6 +612,7 @@ export function machineLines(plan: MachinePlan): string[] {
   if (plan.sessions > 0) lines.push(`${plan.sessions} session record(s) in ${tilde(sessionsDir())}`);
   if (plan.notice) lines.push(`The refresh notice's last-shown date, in ${tilde(noticeFile())}`);
   if (plan.installId) lines.push(`This machine's install id, in ${tilde(installIdPath())}`);
+  if (plan.telemetry) lines.push(`This machine's usage counts setting, in ${tilde(telemetryPath())}`);
   if (plan.credential !== null) {
     lines.push(`The saved credential, in ${tilde(plan.credential)}, which signs this machine out`);
   }
@@ -644,6 +649,16 @@ function removeMachine(plan: MachinePlan, out: InitOutput): void {
       if (removeInstallId()) out.done("This machine's install id removed");
     } catch (error) {
       out.refuse(`${(error as Error).message}. Delete ${installIdPath()} by hand.`);
+    }
+  }
+
+  // Beside the id it was counted under, and for the same reason.
+  if (plan.telemetry) {
+    try {
+      fs.rmSync(telemetryPath(), { force: true });
+      out.done("The usage counts setting removed");
+    } catch (error) {
+      out.refuse(`${(error as Error).message}. Delete ${telemetryPath()} by hand.`);
     }
   }
 

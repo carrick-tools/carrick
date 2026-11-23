@@ -67,6 +67,7 @@ import { recordCliVersion } from "./outdated.ts";
 import { offerGlobalInstall } from "../global-install.ts";
 import { currentVersion } from "../update.ts";
 import { writeIfChanged } from "./files.ts";
+import { markNoticed, USAGE_NOTICE, usageGate } from "../hook/usage.ts";
 import { excludedRepos, readWorkspaceFile, removeSelection, writeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
 import {
   createOutput,
@@ -1077,6 +1078,11 @@ export async function initWith(
   if (install !== null) out.warn(install);
   if (downloaded) out.done(READY_SENTENCE);
   out.say(compilerCheckNote());
+  // The one place a person who never opens Claude Code's session start is told.
+  if (usageGate().reason === "never_noticed") {
+    out.say(USAGE_NOTICE);
+    markNoticed();
+  }
   out.note(CLOUD_NEXT_TITLE, cloudNextLines(codexTrust, plan.waiting.length > 0 || !downloaded));
   return 0;
 }

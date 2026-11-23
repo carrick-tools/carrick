@@ -17,3 +17,6 @@ process.env["CARRICK_NO_UPDATE_CHECK"] ??= "1";
 // Likewise the background fact refresh (`src/facts/fetch.ts`): it would ask
 // the cloud with whatever credential this machine holds.
 process.env["CARRICK_NO_FACTS_REFRESH"] ??= "1";
+// And the daily usage counts (`src/hook/usage.ts`): a test run never tells a
+// developer's machine about them or sends from it. A test of the counts sets it after this.
+process.env["CARRICK_TELEMETRY"] ??= "0";

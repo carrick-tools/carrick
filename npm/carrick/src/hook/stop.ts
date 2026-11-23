@@ -29,6 +29,7 @@ import { currentVersion } from "../update.ts";
 import { markInvoker } from "./invoker.ts";
 import { stopAnswers } from "./stop-wait.ts";
 import { timed, type Timing } from "./timings.ts";
+import { startUsageSend } from "./usage.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -84,6 +85,8 @@ async function main(timing: Timing): Promise<void> {
   // Once a day, through the same channel, because a mismatch stands until
   // somebody fixes it and a line per turn would be noise.
   const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
+  // The daily usage counts: one marker read, and a detached child when an hour has passed. Never waited on.
+  if (root !== null) startUsageSend(root);
   const mismatch = root === null ? null : throttledVersionMismatch(root, currentVersion());
   if (mismatch) parts.push(mismatch);
 

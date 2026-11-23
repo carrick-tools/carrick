@@ -1,0 +1,17 @@
+{"hook":"post-edit","start":"2026-11-22T08:00:00.000Z","duration_ms":100,"waited_ms":0,"outcome":"printed","file":"src/before-notice.ts"}
+{"hook":"session-start","start":"2026-11-22T13:00:00.000Z","duration_ms":200,"waited_ms":0,"outcome":"printed"}
+{"hook":"post-edit","start":"2026-11-22T13:05:00.000Z","duration_ms":400,"waited_ms":0,"outcome":"silent","file":"src/secret-billing-name.ts","facts_ms":12}
+{"hook":"post-edit","start":"2026-11-22T13:06:00.000Z","duration_ms":600,"waited_ms":100,"outcome":"printed","file":"src/secret-billing-name.ts","facts_stops":{"no_match":3},"engine_ready":true}
+{"hook":"post-edit","start":"2026-11-22T13:07:00.000Z","duration_ms":1800,"waited_ms":300,"outcome":"error","file":"src/secret-billing-name.ts","held_ms":40,"held_state":"ready","held":"same","held_rows":{"same":1,"differ":0,"part2_only":0,"part3_only":0}}
+{"hook":"post-edit","start":"2026-11-22T13:08:00.000Z","duratio
+{"hook":"post-read","start":"2026-11-22T14:00:00.000Z","duration_ms":50,"waited_ms":0,"outcome":"silent","file":"src/secret-billing-name.ts"}
+{"hook":"post-bash","start":"2026-11-22T14:10:00.000Z","duration_ms":70,"waited_ms":0,"outcome":"silent","file":"src/secret-billing-name.ts"}
+{"hook":"recheck","start":"2026-11-22T14:20:00.000Z","duration_ms":900,"waited_ms":800,"outcome":"silent","engine_ready":false}
+{"hook":"held","start":"2026-11-22T14:30:00.000Z","duration_ms":30,"waited_ms":0,"outcome":"silent","held":"differ"}
+{"hook":"prompt-submit","start":"2026-11-22T14:40:00.000Z","duration_ms":20,"waited_ms":0,"outcome":"printed"}
+{"hook":"stop","start":"2026-11-22T14:50:00.000Z","duration_ms":25,"waited_ms":0,"outcome":"printed"}
+{"hook":"subagent-stop","start":"2026-11-22T14:55:00.000Z","duration_ms":15,"waited_ms":0,"outcome":"silent"}
+{"hook":"session-start","start":"2026-11-23T09:00:00.000Z","duration_ms":300,"waited_ms":0,"outcome":"printed"}
+{"hook":"post-edit","start":"2026-11-23T09:05:00.000Z","duration_ms":410,"waited_ms":0,"outcome":"silent","file":"src/secret-billing-name.ts"}
+{"hook":"post-edit","start":"2026-11-23T09:06:00.000Z","duration_ms":1830,"waited_ms":0,"outcome":"printed","file":"src/secret-billing-name.ts"}
+{"hook":"mystery-hook","start":"2026-11-23T09:07:00.000Z","duration_ms":5,"waited_ms":0,"outcome":"silent"}
