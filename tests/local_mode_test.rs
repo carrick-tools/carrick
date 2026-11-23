@@ -1203,8 +1203,10 @@ fn a_re_check_that_missed_its_budget_is_not_started_again_until_the_index_moves(
     assert!(
         skipped["recheck"]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("check --changed")),
-        "the reason names the fresh read:\n{skipped:#}"
+            .is_some_and(
+                |reason| reason.contains("carrick refresh") && !reason.contains("check --changed")
+            ),
+        "the reason names the refresh and no check to run:\n{skipped:#}"
     );
     assert_eq!(
         named(&skipped),
@@ -6363,8 +6365,7 @@ fn a_re_check_marks_a_verdict_against_a_changed_service_it_did_not_read() {
             .as_str()
             .is_some_and(|detail| detail.contains(
                 "(inventory has changed since it was indexed and this check did not re-read it, \
-             so the verdict uses its indexed code. `carrick check --changed` gives the current \
-             verdict.)"
+             so the verdict uses its indexed code.)"
             )),
         "{answer:#}"
     );
@@ -6430,7 +6431,7 @@ fn shop_in_two_repos() -> tempfile::TempDir {
 const TWO_REPO_ROUTE: &str = "catalog/app/routes/api.v1.widgets.$widgetId.ts";
 const TWO_REPO_CLIENT: &str = "inventory/src/client.ts";
 const STALE_NOTE: &str = "has changed since it was indexed and this check did not re-read it, \
-     so the verdict uses its indexed code. `carrick check --changed` gives the current verdict.)";
+     so the verdict uses its indexed code.)";
 
 /// carrick#4819: the counterpart sits in ANOTHER repository, with an
 /// uncommitted edit this re-check did not read. The row says so, as it does
@@ -7893,8 +7894,10 @@ fn a_miss_in_one_service_leaves_the_others_re_checked() {
     assert!(
         skipped["recheck"]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("catalog") && reason.contains("check --changed")),
-        "the reason names the service and the fresh read:\n{skipped:#}"
+            .is_some_and(|reason| reason.contains("catalog")
+                && reason.contains("carrick refresh")
+                && !reason.contains("check --changed")),
+        "the reason names the service and the refresh:\n{skipped:#}"
     );
 
     // A new index is a new generation: catalog is re-checked again.

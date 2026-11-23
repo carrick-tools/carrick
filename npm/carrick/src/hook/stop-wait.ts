@@ -36,7 +36,6 @@ import {
   sessionCheckedLines,
   staleClause,
 } from "../render.ts";
-import { checkedSinceLastEdit } from "./checked.ts";
 import { adoptedLine, changedLine, confirmAnswer, deliverEarlies, deliverOne, hasFindings, withEditedNamed } from "./late.ts";
 import { withEarlyBreaks, withoutUnsettled } from "./confirm.ts";
 import {
@@ -276,7 +275,6 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
   for (const root of roots) {
     const upTo = record.edited[root] ?? 0;
     if ((record.stated[root] ?? -1) >= upTo) continue;
-    if (checkedSinceLastEdit(session, root, home)) continue;
     const coverage = sessionCoverage(session, root, home, clock());
     if (coverage.files === 0) continue;
     // A re-check still running is neither a finding nor a named clean result:
@@ -292,7 +290,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     // Everything a waiting Stop saw running is covered now: its answer was
     // delivered by a carrier, so it is stated silently, as before.
     if (coverage.gaps.length === 0 && (record.waiting[root] ?? -1) >= upTo) {
-      markStated(session, root, coverage.upTo, false, home);
+      markStated(session, root, coverage.upTo, home);
       continue;
     }
     if (coverage.gaps.length === 0) {
@@ -315,7 +313,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
       for (const answer of delivered) {
         if (answer.root === root && !isChanged(answer) && !answer.instead_of_probe) folded.add(answer.seq);
       }
-      markStated(session, root, coverage.upTo, true, home);
+      markStated(session, root, coverage.upTo, home);
       continue;
     }
     const queued = enqueueChanged(root, session, clock(), { home, named: coverage.gaps.map((gap) => gap.file) });
@@ -336,7 +334,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     // The queued check is not waited for: the gap is named now, and the
     // check's answer comes with the agent's next hook event.
     statedLines.set(root, notCoveredLine(named));
-    markStated(session, root, coverage.upTo, false, home);
+    markStated(session, root, coverage.upTo, home);
   }
 
   const lines: string[] = [...statedLines.values(), ...early];

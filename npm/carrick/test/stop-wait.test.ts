@@ -24,7 +24,6 @@ import {
   STOP_TIMEOUT_S,
 } from "../src/hook/rechecks.ts";
 import type { Answer, QueueEntry } from "../src/hook/rechecks.ts";
-import { checkedSinceLastEdit, checkMarkerPath } from "../src/hook/checked.ts";
 import { readSession, recordEdit, sessionRecords, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
 import { stopAnswers } from "../src/hook/stop-wait.ts";
 import { adoptedLine, deliverLate, hasFindings } from "../src/hook/late.ts";
@@ -536,19 +535,9 @@ test("the Stop entry carries no wait, and the prompt hook carries what lands aft
   assert.equal(hooks.SubagentStop![0]!.hooks[0]!.command, "carrick hook subagent-stop");
 });
 
-// A `carrick check --changed` that ran after the session's last edit has
-// already said what the clause "Run `carrick check --changed` before you
-// finish" asks for (carrick#3357): the agent ran it twice, 137 s then 133 s.
+// The Stop hook never tells the agent to run a check (carrick#3437, #5076).
 
 const CLAUSE = /If this change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you finish/;
-
-/** What `carrick check --changed` leaves in the workspace when it ends. */
-function marker(root: string, startedMs: number, exit: number): void {
-  writeAtomic(
-    checkMarkerPath(root),
-    `${JSON.stringify({ started_at_ms: startedMs, finished_at_ms: startedMs + 1000, exit })}\n`,
-  );
-}
 
 /** A re-check the runner gave up on: the line that carries the clause. */
 function stopped(home: string, entry: QueueEntry): void {
@@ -578,9 +567,8 @@ test("stop never carries the check clause: rule 5 and the post-edit line say it 
   assert.doesNotMatch(stoppedText, CLAUSE);
 
   const nothing = queue(workspace.root, home, workspace.file);
-  marker(workspace.root, 2_000_000, 2);
   stopped(home, nothing);
-  assert.doesNotMatch((stopAnswers(SESSION, { home })).lines.join("\n"), CLAUSE, "exit 2 checked nothing");
+  assert.doesNotMatch((stopAnswers(SESSION, { home })).lines.join("\n"), CLAUSE, "a second stopped answer carries no clause either");
 
   liveRunner(workspace.root);
   queue(workspace.root, home, workspace.file);
@@ -644,7 +632,7 @@ test("every edited file answered after its last edit: one checked-the-change lin
   assert.doesNotMatch(text, CLAUSE);
   assert.doesNotMatch(text, NOT_CHECKED);
   assert.equal(changedQueued(workspace.root).length, 0, "nothing to fall back on");
-  assert.equal(checkedSinceLastEdit(SESSION, workspace.root, home), true, "later lines drop the clause");
+  assert.ok(readSession(SESSION, home).stated[workspace.root]! >= readSession(SESSION, home).edited[workspace.root]!, "the change is stated");
 });
 
 /** A route on the edited file that the compiler compared with its consumer and found compatible. */
@@ -668,7 +656,6 @@ test("a Stop over covered files with no route or call prints nothing and records
 
   const first = stopAnswers(SESSION, { home, ensure: () => false });
   assert.deepEqual(first.lines, [], "no blank part either");
-  assert.equal(checkedSinceLastEdit(SESSION, workspace.root, home), true, "the change is still settled");
   assert.ok(readSession(SESSION, home).stated[workspace.root]! >= readSession(SESSION, home).edited[workspace.root]!);
 
   edit(workspace.root, home, workspace.file, Date.now() - 1000);

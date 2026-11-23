@@ -44,8 +44,8 @@ export type SessionRecord = {
    */
   written: Record<string, number>;
   /**
-   * Workspace root -> epoch ms of this session's newest recorded edit there.
-   * `checked.ts` compares it with the last `carrick check --changed`.
+   * Workspace root -> epoch ms of this session's newest recorded edit there:
+   * the edit the Stop hook states the session's check up to (`stop-wait.ts`).
    */
   edited: Record<string, number>;
   /**
@@ -65,12 +65,6 @@ export type SessionRecord = {
    * nothing of one that answered clean (`stopAnswers`).
    */
   waiting: Record<string, number>;
-  /**
-   * Workspace root -> the newest edit there whose every file the per-file
-   * re-checks answered, as Stop stated it. `checked.ts` reads it like a clean
-   * `check --changed` marker.
-   */
-  covered: Record<string, number>;
   /**
    * `root::<sorted operations>` for every clean or not-checked line Stop has
    * printed: the same set of operations is named once per session.
@@ -132,7 +126,6 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     files: {},
     stated: {},
     waiting: {},
-    covered: {},
     said: [],
     facts: {},
     owed: {},
@@ -173,7 +166,6 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       ),
       stated: stamps(record.stated),
       waiting: stamps(record.waiting),
-      covered: stamps(record.covered),
       said: Array.isArray(record.said) ? record.said.filter((entry): entry is string => typeof entry === "string") : [],
       facts: Object.fromEntries(
         Object.entries(record.facts ?? {}).filter(
@@ -439,14 +431,10 @@ export function recordEdit(sessionId: string, root: string, at: number, home?: s
   write(sessionId, current, home);
 }
 
-/**
- * Remember that Stop spoke about the change in `root` up to the edit at
- * `upTo`, and whether every file of it was answered (`covered`).
- */
-export function markStated(sessionId: string, root: string, upTo: number, covered: boolean, home?: string): void {
+/** Remember that Stop spoke about the change in `root` up to the edit at `upTo`. */
+export function markStated(sessionId: string, root: string, upTo: number, home?: string): void {
   const current = readSession(sessionId, home);
   current.stated[root] = Math.max(upTo, current.stated[root] ?? 0);
-  if (covered) current.covered[root] = Math.max(upTo, current.covered[root] ?? 0);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

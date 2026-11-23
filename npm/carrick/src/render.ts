@@ -318,7 +318,7 @@ export const MAX_MOVED_ROWS = 3;
  * (`recheck.moved` rows marked `stated`): one line each, naming the row and,
  * for a pair, its counterpart. A row the index never judged is never stated.
  */
-export function movedLines(result: CheckResult): string[] {
+export function movedLines(result: CheckResult, where: string = result.file ?? "this file"): string[] {
   const moved = statedMoved(result);
   const lines = moved.slice(0, MAX_MOVED_ROWS).flatMap((row) => {
     const at = `${row.file}${row.line ? `:${row.line}` : ""}`;
@@ -336,7 +336,7 @@ export function movedLines(result: CheckResult): string[] {
     return [cutLine(`- ${at}: this ${what}${other} ${verdict}.`), ...heldCopyLines(row, row.role === "route")];
   });
   if (moved.length > MAX_MOVED_ROWS) {
-    lines.push(`- and ${moved.length - MAX_MOVED_ROWS} more rows outside this file moved: \`carrick check --changed\` lists them.`);
+    lines.push(`- and ${moved.length - MAX_MOVED_ROWS} more rows outside this file moved: \`carrick check ${where} --recheck --json\` lists them.`);
   }
   return lines;
 }
@@ -431,7 +431,7 @@ export function sessionCheckedLines(
     for (const item of found.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, file)));
     const hidden = found.length - Math.min(found.length, MAX_EDIT_PROBLEMS);
     if (hidden > 0) lines.push(`- and ${hidden} more: \`carrick check ${file}\` lists them.`);
-    lines.push(...movedLines(result));
+    lines.push(...movedLines(result, file));
   }
   if (problems > 0 || lines.length > 0) {
     const tail = problems > 0 ? `${problems} contract ${problems === 1 ? "problem" : "problems"}` : "this change affects other code";
@@ -513,13 +513,10 @@ export function changedLines(changed: ChangedResult): string {
     const lines = [
       `${head}: ${failing.length} contract ${failing.length === 1 ? "problem" : "problems"} in ${files}.`,
     ];
-    for (const problem of failing.slice(0, MAX_EDIT_PROBLEMS)) {
+    for (const problem of failing) {
       const at = `${problem.file}${problem.line ? `:${problem.line}` : ""}`;
       const other = problem.other.length > 0 ? ` (against ${problem.other.join(", ")})` : "";
       lines.push(cutLine(`- ${at} ${problem.role} ${problem.method} ${problem.path}: ${problem.reason.replace(/\.+$/, "")}${other}.`));
-    }
-    if (failing.length > MAX_EDIT_PROBLEMS) {
-      lines.push(`- and ${failing.length - MAX_EDIT_PROBLEMS} more: \`carrick check --changed\` lists them.`);
     }
     return lines.join("\n");
   }
@@ -674,7 +671,7 @@ export function renderPostToolUse(
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)), ...heldCopyLines(item, item.kind === "route"));
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);
     if (hidden > 0) lines.push(`- and ${hidden} more: \`carrick check ${where}\` lists them.`);
-    lines.push(...movedLines(result));
+    lines.push(...movedLines(result, where));
     // Unread calls are not printed here: the agent cannot act on a limit of the
     // scan. `carrick check <file>` and `carrick status` still show them (carrick#3932).
   }

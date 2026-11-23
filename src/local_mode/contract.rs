@@ -1854,8 +1854,7 @@ mod tests {
             stale_since: Some("2026-09-13T22:26:26Z".to_string()),
             reason: Some(
                 "re-reading catalog (12 indexed files) took longer than 10 s against this \
-                 index, so edits in catalog are not re-checked until `carrick refresh`. Run \
-                 `carrick check --changed` before you finish."
+                 index, so edits in catalog are not re-checked until `carrick refresh`."
                     .to_string(),
             ),
             new_functions: Vec::new(),
@@ -1872,7 +1871,7 @@ mod tests {
             "re-check: not checked, so these verdicts do not include your edits and are from the index at \
              1a2b3c4 (computed 2026-09-13T22:26:26Z). Re-reading catalog (12 indexed files) \
              took longer than 10 s against this index, so edits in catalog are not re-checked \
-             until `carrick refresh`. Run `carrick check --changed` before you finish."
+             until `carrick refresh`."
         );
     }
 

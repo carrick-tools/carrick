@@ -94,8 +94,8 @@ export async function editFlow(
   });
   const note = rootNote(choice);
   if (note) log(note);
-  // Stamped before any line is built: a `carrick check --changed` that began
-  // earlier did not read this edit (`checked.ts`). The files themselves are
+  // Stamped before any line is built: a re-check that began earlier did not
+  // read this edit (Stop's `upTo`, `stop-wait.ts`). The files themselves are
   // recorded once the probe has answered (below).
   const editedAt = Date.now();
   if (session && edited.length > 0) recordEdit(session, choice.root, editedAt);
