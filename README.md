@@ -81,33 +81,11 @@ The MCP endpoint exposes the index as structured tools your agent can call direc
 | `get_service_dependencies` | Read npm dependencies and version conflicts, for one service or across the project |
 | `list_external_calls` | List outbound calls to external targets, such as SDK calls, external domains and env-var URLs |
 | `get_contract_pair` | Compare consumer and producer types, operation by operation |
-| `scaffold` | Generate Carrick setup files (the workflow, a Carrick skill, `carrick.json` and Claude Code hooks) |
+| `scaffold` | Generate Carrick setup files (a Carrick skill, `carrick.json` and Claude Code hooks) |
 
 ## Keep the index current
 
-The GitHub Action refreshes each repository's part of the index on every push to main. It runs read-only in CI, with no API key to store.
-
-```yaml
-name: Carrick
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-permissions:
-  id-token: write
-  contents: read
-jobs:
-  carrick:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: carrick-tools/carrick@v1
-```
-
-[Building the index](https://docs.carrick.tools/building-the-index) has the full workflow, with on-demand rescans, dependency installs and monorepo setup.
+Install the GitHub App on your org and pick repositories. Carrick builds the first index in the cloud, re-indexes on every push, and checks pull requests. Each developer runs `carrick init` in the repo.
 
 ## Docs
 
