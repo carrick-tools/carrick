@@ -1,6 +1,5 @@
 // The Carrick rules section `carrick init` keeps in a folder's AGENTS.md
-// (carrick#2828), so an agent in Codex or Claude Code runs the local check
-// before it says a change is done.
+// (carrick#2828), so an agent in Codex or Claude Code reads the rules.
 //
 // The section sits between two marker comments. Those markers are the whole
 // ownership rule: a re-run replaces what is between them and nothing else,
@@ -48,14 +47,11 @@ function countsPhrase(counts: WorkspaceCounts | null): string | null {
  * The rules `.carrick/RULES.md` holds, ending in one newline.
  *
  * The words are the rules block measured in carrick-cloud#2991 (21 graded runs
- * per arm on one build: reused 17/21 against 5/21), plus rule 5's contract
- * sentence: without it agents ran `check --changed` on 0 of 7 tasks that add a
- * call to another service, against 6 of 7 on the previous section. Rule 5 asks
- * for that check only where another service reads the change and leaves the
- * per-file check to the edit hook init installs for Claude Code and Codex: the
- * same 4 of 7 contract checks as the per-file wording, with no duplicate
- * per-file calls (carrick-cloud#3068, D13). Only the counts and the scope clause
- * vary; edit nothing else without a new measurement.
+ * per arm on one build: reused 17/21 against 5/21). Rule 5 no longer asks the
+ * agent to run a whole-change check or wait for one: every edit is re-checked
+ * in the background and its answer comes with a later hook line (carrick#5076).
+ * Only the counts and the scope clause vary; edit nothing else without a new
+ * measurement.
  */
 export function renderRules(scope: SkillScope, counts: WorkspaceCounts | null): string {
   const phrase = countsPhrase(counts);
@@ -88,10 +84,10 @@ export function renderRules(scope: SkillScope, counts: WorkspaceCounts | null): 
     "   similar endpoint or another API version, or a local copy of a type.",
     "4. Use grep and Read to confirm and to read code once Carrick has told you",
     "   where to look.",
-    "5. Run `carrick check --changed` before you say it is done only when your change",
-    "   touches a route, a call to another service, an event or a type another",
-    "   service reads. Each file you edit is already checked for you, so a change no",
-    "   other service sees needs nothing more. If Carrick found a problem or changed",
+    "5. Each file you edit is checked for you in the background, and Carrick's",
+    "   answer comes with a later tool call or your next turn: you do not need to",
+    "   run a check yourself or wait for one. If a Carrick line names a contract",
+    "   problem, fix it or say why it stands. If Carrick found a problem or changed",
     "   what you did, say so in one line in your final summary. Otherwise do not",
     "   mention it.",
     "",
