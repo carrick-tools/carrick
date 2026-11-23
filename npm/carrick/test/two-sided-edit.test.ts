@@ -231,6 +231,70 @@ test("(b) both edited, but the re-check re-read the route's service from the wor
   assert.ok(states(said), said);
 });
 
+/** The route's own full re-check after a one-sided edit: a stated break whose row names the route file itself, as an index answer may. */
+function routeRecheck(b: Bed, scope: boolean): CheckResult {
+  return {
+    schema: "carrick.check/0",
+    file: "src/items.ts",
+    service: "api",
+    stale: false,
+    items: [
+      {
+        kind: "call",
+        method: "POST",
+        path: "/items/upload",
+        line: 9,
+        source: "fact",
+        counterparts: [{ role: "producer", service: "api", repo: path.join(b.root, "api"), file: "src/items.ts", line: 9 }],
+        verdict: { state: "resolved", result: "type_mismatch", detail: "Property 'fileName' is missing in type 'POST /items/upload → Response'" },
+        direction: "response",
+        stated: true,
+      },
+    ],
+    recheck: {
+      ran: "extraction+types",
+      elapsed_ms: 5,
+      ...(scope ? { scope: { reread: ["api"], not_reread: [{ service: "web", operations: 1, reason: "indexed" }], stale: [] } } : {}),
+      moved: [
+        {
+          file: ROUTE,
+          line: 9,
+          role: "route",
+          method: "POST",
+          path: "/items/upload",
+          before: "compatible",
+          after: "type_mismatch",
+          counterparts: [`web ${PAGE}:14`],
+          reason: "the caller reads fileName",
+          not_judged_before: false,
+          stated: true,
+        },
+      ],
+    },
+  } as CheckResult;
+}
+
+for (const scope of [false, true]) {
+  test(`(b) only the route edited: its full re-check's break is stated at the next carrier (row naming the edited file itself, ${scope ? "with" : "no"} re-read scope)`, (t) => {
+    const b = bed(t);
+    edited(b, ROUTE, Date.now() - 2000);
+    answer(b, queue(b, ROUTE), routeRecheck(b, scope));
+    const said = deliverLate(SESSION, Date.now(), new Set(), b.home).join("\n");
+    assert.match(said, /contract problem/, said);
+    assert.match(said, /POST \/items\/upload/, said);
+    assert.equal(changedQueued(b).length, 0, "nothing held back");
+  });
+}
+
+test("(b) only the route edited, the turn ends before any carrier: Stop states the full re-check's break", (t) => {
+  const b = bed(t);
+  edited(b, ROUTE, Date.now() - 2000);
+  answer(b, queue(b, ROUTE), routeRecheck(b, true));
+  const stop = stopAnswers(SESSION, { home: b.home, ensure: () => false }).lines.join("\n");
+  assert.match(stop, /contract problem/, stop);
+  assert.equal(changedQueued(b).length, 0);
+});
+
 // --- (c) known positive 2: both edited and still inconsistent ---
 
 test("(c) both edited, still inconsistent: not stated early; the whole-change check's problem prints at Stop when it has landed", (t) => {

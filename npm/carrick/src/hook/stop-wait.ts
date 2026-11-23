@@ -151,10 +151,10 @@ function stated(answer: Answer, counted: Set<string>, now: number, home?: string
   const early = readEarly(answer.session, answer.seq, home);
   const all = newestEarlies(answer.session, home);
   // A break whose other side this session edited is not counted: the whole-change check states it.
-  const own = withoutStaleCopyBreaks(answer.result!, answer.session, answer.root, now, home).result;
+  const own = withoutStaleCopyBreaks(answer.result!, answer.session, now, home).result;
   const result = withoutUnsettled(own, sessionEarlies(answer.session, home).filter((e) => e.service === early?.service), all);
   if (early === null) return result;
-  const marked = withoutStaleCopyBreaks(early.result, answer.session, answer.root, now, home).result;
+  const marked = withoutStaleCopyBreaks(early.result, answer.session, now, home).result;
   return withEarlyBreaks(result, marked, early.service === undefined ? undefined : all.get(early.service), counted);
 }
 

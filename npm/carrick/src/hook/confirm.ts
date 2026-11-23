@@ -35,22 +35,23 @@ import { engineOfRun } from "../held/early.ts";
  * late.ts): `edited` says whether the session edited an absolute file.
  * - an early row (it carries `main_commit`): the compiler read every named
  *   file from main, so any named file edited;
- * - a re-check item: a counterpart file edited whose service the re-check did
- *   not re-read (`recheck.scope.reread`); a counterpart with no repo is
- *   judged as today;
- * - a re-check moved row: the row's own file edited. It names its other side
- *   only as `service file:line` text, so this one is per file, whatever service
- *   the re-check re-read.
+ * - a re-check item: a counterpart file edited whose service the re-check
+ *   names as read at its indexed version (`recheck.scope.stale` or
+ *   `not_reread`). A counterpart with no repo or no service, or a re-check that
+ *   names no scope, is judged as today;
+ * - any other row (a re-check's moved row names its other side only as text):
+ *   as today. A row is never held because its own file was edited: a session
+ *   always edits the file its own re-check is about.
  */
-export function readStaleCopy(row: CheckItem | MovedRow, result: CheckResult, edited: (file: string) => boolean, root: string): boolean {
+export function readStaleCopy(row: CheckItem | MovedRow, result: CheckResult, edited: (file: string) => boolean): boolean {
   if (row.main_commit !== undefined) return (row.named_files ?? []).some(edited);
-  if ("kind" in row) {
-    const reread = new Set(result.recheck?.scope?.reread ?? []);
-    return (row.counterparts ?? []).some(
-      (c) => typeof c.repo === "string" && typeof c.file === "string" && !(c.service !== undefined && reread.has(c.service)) && edited(path.join(c.repo, c.file)),
-    );
-  }
-  return edited(path.join(root, row.file));
+  if (!("kind" in row)) return false;
+  const scope = result.recheck?.scope;
+  const indexed = new Set([...(scope?.stale ?? []), ...(scope?.not_reread ?? []).map((s) => s.service)]);
+  for (const service of scope?.reread ?? []) indexed.delete(service);
+  return (row.counterparts ?? []).some(
+    (c) => typeof c.repo === "string" && typeof c.file === "string" && c.service !== undefined && indexed.has(c.service) && edited(path.join(c.repo, c.file)),
+  );
 }
 
 /** The label a check item has as a contract row: `METHOD path{ dispatch}`. */
