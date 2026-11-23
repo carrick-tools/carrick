@@ -1,9 +1,7 @@
 # Running a scan from a runner
 
 The scanner's side of the contract with a process that runs `carrick` on a
-checkout it made itself: a container the cloud starts, or any CI other than
-GitHub Actions. A GitHub Actions run needs none of this; the Action passes no
-flags and the scan reads its context from `GITHUB_*`.
+checkout it made itself, such as the container the cloud starts to build an index.
 
 ## The command
 

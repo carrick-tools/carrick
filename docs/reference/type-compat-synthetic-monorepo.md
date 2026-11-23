@@ -76,9 +76,7 @@ attributed*.
 ## Current state (what actually runs today)
 
 Per service, at scan time (all in the source repo, with `node_modules`
-available whenever the tree carries them — in CI the Action installs them
-before the scan when a lockfile is present, `scripts/install-scanned-deps.sh`;
-when it cannot, capture runs bare and step 8 below says what that costs):
+available whenever the tree carries them; when it does not, capture runs bare and step 8 below says what that costs):
 
 1. LLM file analysis emits type anchors per endpoint/call
    (`primary_type_symbol`, `type_import_source`, expression text, SWC spans).
@@ -93,7 +91,7 @@ when it cannot, capture runs bare and step 8 below says what that costs):
    (`resolve_all_types`, `append_inline_aliases`), enriches the manifest by
    alias-string join, uploads `bundled_types` + `type_manifest`.
 
-At check time (any repo's CI, after downloading all `CloudRepoData`):
+At check time, after downloading all `CloudRepoData`:
 
 5. `recreate_type_files_and_check` writes one `<stem>_types.d.ts` per service
    (padded with `= unknown // carrick:missing-alias` for unresolved aliases),
@@ -320,9 +318,8 @@ per-stub `node_modules`), with these corrections:
    on raw `repoName`, re-creating both the monorepo-services-clobber bug and
    invalid `@carrick/org/repo` package names.
 2. **pnpm is vendored as a devDependency of the sidecar** — version-pinned by
-   the existing lockfile, installed by the `npm ci` step already in
-   `action.yml`, invoked as `<sidecar>/node_modules/.bin/pnpm`. No corepack
-   (deprecated; removed from Node 25 while the action pins Node 24 — a silent
+   the existing lockfile, invoked as `<sidecar>/node_modules/.bin/pnpm`. No corepack
+   (deprecated; removed from Node 25, a silent
    time bomb), no runtime tool download. **The silent npm fallback is
    deleted**: plain-npm flat installs physically duplicate packages and
    manufacture nominal false-incompatibles program-wide (see 6) while
@@ -453,10 +450,10 @@ per-stub `node_modules`), with these corrections:
     prose mismatch string (`src/formatter/mod.rs:832-872` today).
 12. **Protocol:** `build_workspace` cold installs will exceed the Rust
     client's 60s read deadline (`src/services/type_sidecar.rs:569,610`), and `execSync`
-    blocks the sidecar's event loop so even `health` goes dark. The action
-    spawns the install async and the sidecar emits progress/keepalive frames;
-    the Rust client gets a workspace-scoped deadline. Workspace caching
-    (pnpm store via `actions/cache`, keyed on the fleet pinned-deps hash) is
+    blocks the sidecar's event loop so even `health` goes dark. The install
+    has to run async, with the sidecar emitting progress/keepalive frames, and
+    the Rust client needs a workspace-scoped deadline. Workspace caching
+    (keyed on the fleet pinned-deps hash) is
     a **same-repo re-run optimization only** — runners are ephemeral and
     caches are repo-scoped, so cross-repo warmth structurally cannot exist.
     Budget the cold path as the norm; benchmark on `xrepo-corpus-1/2` with a

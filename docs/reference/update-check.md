@@ -2,8 +2,8 @@
 
 Governs `npm/carrick/src/update.ts`, `npm/carrick/src/update-check.ts`, the
 `noticeUpdate()` block in `npm/carrick/bin/carrick.mjs`, the version line in
-`npm/carrick/src/hook/session-start.ts`, and `checkVersion` /
-`pinnedActionRef` in `npm/carrick/src/init/doctor.ts`.
+`npm/carrick/src/hook/session-start.ts`, and `checkVersion` in
+`npm/carrick/src/init/doctor.ts`.
 
 ## The problem
 
@@ -14,28 +14,10 @@ the older one most of the framework-detect calls exhausted their retries — a
 failure mode that did not exist on the newer build. The upgrade path was "we
 ask the human, the human asks their agent, the agent forgets."
 
-David's framing:
+## What is pinned
 
-> There must be a way people do this — i.e. start of session, not mid
-> session. CI auto updates the carrick action, but now we have the package I'm
-> not sure how that is handled.
-
-## What was actually pinned, and what was not
-
-**The GitHub Action already floats.** `action.yml` reads the version out of
-the `Cargo.toml` sitting beside it in the action checkout, and `release.yml`
-force-moves the `v1` tag onto every release commit. A workflow that says
-`carrick-tools/carrick@v1` — which is what `carrick templates workflow` and
-`carrick init` write — therefore picks up each release with nobody touching
-anything. Nothing needed fixing there.
-
-A workflow that pins anything else (`@v1.4.2`, a branch, a commit SHA) is
-frozen at whatever shipped with that ref, for as long as the workflow stands,
-and `carrick doctor` used to read a pinned ref back as a variable and report
-no finding at all. `pinnedActionRef` is that finding.
-
-**`npx --yes carrick@latest` is not the problem either**: it resolves fresh on
-every invocation. A bare `npx carrick` is — npx reuses its cached tree.
+**`npx --yes carrick@latest` is not a problem**: it resolves fresh on every
+invocation. A bare `npx carrick` is, because npx reuses its cached tree.
 
 **An installed `carrick` is the real case.** `npm install -g carrick` is what
 the README, the plugin docs and `carrick init` all tell people to run, and
@@ -82,7 +64,7 @@ guess about where an install is; that one does not guess.
 | `bin/carrick.mjs`, `lsp` and `hook` | refreshes the cache, prints nothing | a detached child at most once per TTL |
 | `hook session-start` | start of the session, **stdout** | the same cached read |
 | `carrick doctor` | on demand, a finding | one bounded fetch when the cache is stale |
-| any command, in CI, in front of a scan | before the scan, as a workflow annotation | one fetch bounded to 2 s |
+| any command, in CI, in front of a scan | before the scan, as a `::warning::` annotation on GitHub Actions | one fetch bounded to 2 s |
 
 The laptop path never blocks on the network. The invocation reads the cache
 and prints from it; a detached child fetches the registry's `dist-tags` and
@@ -106,11 +88,8 @@ old version**. CI's contract is that the workflow decides what runs; a scanner
 that refused to start because a newer one exists would be a worse outage than
 the stale build.
 
-The annotation names one of two different fixes, and naming the wrong one sends
-a reader to a line their workflow does not contain. The runner sets
-`GITHUB_ACTION_REPOSITORY` for a step belonging to an action, so a run through
-the Carrick action is told to move its `uses:` ref to `@v1`; a workflow that
-calls the CLI directly wrote a version string, and that is what it changes.
+On GitHub Actions the notice is spelled as a `::warning::` annotation, so it
+lands in the run's annotations instead of scrolling past in the log.
 
 The notice itself never mentions `CARRICK_NO_UPDATE_CHECK`. The session-start
 line goes on stdout, straight into an agent's context, and the failure this
@@ -171,7 +150,7 @@ on. Nothing is retried with more force.
 
 `hook`, `lsp`, `remove`, `uninstall`, `--version` and `--help` are excluded, along with CI
 and `CARRICK_NO_UPDATE_CHECK=1`. A run that is not through npx is skipped
-because it IS the install in question: a global `carrick index` is already the
+because it IS the install in question: a global `carrick` is already the
 version on PATH, and a project dependency belongs to the repository that pins
 it — that one is reported, never replaced.
 

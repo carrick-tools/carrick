@@ -22,7 +22,7 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 
 | command | reads | writes | budget |
 |---|---|---|---|
-| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes, and Carrick Cloud, which classifies what the deterministic passes could not | `<dir>/.carrick/` (including `.carrick/probe/`), plus `.carrick/last-scan.json` | the scan that builds the index, and the one a first run makes; minutes, cold |
+| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes, and Carrick Cloud, which classifies what the deterministic passes could not | `<dir>/.carrick/` (including `.carrick/probe/`), plus `.carrick/last-scan.json` | a scan on this machine; minutes, cold |
 | `carrick index --detach` | the same | the same, plus `.carrick/scan-<id>.log` and `.carrick/scan-<id>.json` | returns at once |
 | `carrick index --dispatch` | the same | `.carrick/jobs.json`, and no index — unless there was nothing to hand over, in which case it indexes here and says so (carrick#1251) | returns when the prompts are built, minutes on a large repo |
 | `carrick resume` | `.carrick/jobs.json`, Carrick Cloud, local source | `<dir>/.carrick/` | minutes; the analysis is already done |
@@ -31,6 +31,8 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 | `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> --recheck` | the same, plus the file's service in this repo's working tree and the blobs already on disk | `.carrick/working/`, `.carrick/judged/`, `.carrick/probe/` (replaced by the next index), and a temporary directory it deletes | 10 s budget |
 | `carrick refresh [--service <name>]` | local source and authenticated hosted indexes | `<dir>/.carrick/` (including `.carrick/probe/`) | seconds |
+
+Carrick's cloud builds the index. `carrick init` downloads it into `.carrick/`, and `carrick refresh` moves the copy forward. The `index`, `index --detach`, `index --dispatch` and `resume` rows are commands that still ship and scan on this machine; setup does not use them.
 
 `status` answers about the workspace and takes no file; it is what a surface
 opening a session asks. `touch` and `check` never call a model and never call
@@ -240,7 +242,7 @@ stored index.
 | `repo` | string | the absolute path of that repo on this machine. `repo` + `file` is the path to open; `file` alone is what the index keys on |
 | `service` | string | the service the file belongs to (`serviceName` from `carrick.json`, else the repo name) |
 | `index_commit` | string | the commit that service was indexed at |
-| `indexed_at` | string (RFC 3339) | when `index` (or the last `refresh` of this service) ran |
+| `indexed_at` | string (RFC 3339) | when this service's index was built, or the last `refresh` of it ran |
 | `scanner_version` | string | the scanner release that wrote the index |
 | `hosted` | object \| null | `{commit, indexed_at, scanner_version, project}` describing the hosted copy; its commit is separate from `index_commit`. Adds `source` (`"ci"` \| `"laptop"`), `uploaded_by` (GitHub login) and `dirty` (boolean) when the hosted row records them; each key is absent, never null, on a row that does not |
 | `hosted_state` | string | `enriched`, `no_index_yet`, `not_connected`, `remote_unnamed`, `not_signed_in`, `version_mismatch`, `commit_missing`, or `read_failed`; the boundary explains any failed refresh alongside a retained copy. `not_connected` is the cloud's answer about a repo it was asked about; `remote_unnamed` is this machine unable to read `owner/repo` from the repo's git remote, so it asked about nothing |
@@ -499,7 +501,7 @@ saying what to do, and with `--json` this to stdout:
 {
   "schema": "carrick.check/0",
   "error": "index_unreadable",
-  "message": "/w/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Re-run `carrick index`."
+  "message": "/w/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Run `carrick refresh` to download it again."
 }
 ```
 
@@ -515,7 +517,7 @@ on line 1 of the open file, and the session-start line repeats it.
 
 | `error` | meaning |
 |---|---|
-| `not_indexed` | no `.carrick/` above this file — run `carrick index --workspace <dir>` |
+| `not_indexed` | no `.carrick/` above this file: run `carrick init` in the folder holding your repos |
 | `not_in_workspace` | the file is not under any repo the workspace lists |
 | `index_unreadable` | `.carrick/` exists and could not be read (a version mismatch, a truncated write) |
 
@@ -549,7 +551,7 @@ hosted index and are absent here.
 
 ## On-disk layout
 
-`carrick index --workspace <dir>` writes `<dir>/.carrick/`:
+`carrick init`, `carrick refresh` and `carrick index` write `<dir>/.carrick/`:
 
 | path | what |
 |---|---|
@@ -564,7 +566,7 @@ hosted index and are absent here.
 | `.carrick/jobs.json` | the analysis Carrick Cloud is doing for this workspace: one entry per repo `carrick index --dispatch` handed over, with the job id, the commit the prompts were built at, how many files it carries and when it was submitted. `carrick resume` reads it and removes each entry once its answers are collected; `carrick status` reads it to say what is in flight. Outlives the scan record beside it, because a job outlives a build |
 | `.carrick/last-scan.json` | what the last scan reported: one entry per repo `carrick index` scanned, each carrying the cloud's `carrick.scan-spend/0` block. Written as each block lands, so a run killed part-way still leaves the record of the repos it uploaded. Beside the index rather than in it, because `carrick refresh` rebuilds the read model from scratch and a first run may be killed before there is one. Nothing the CLI prints reads from it |
 
-`index.json` is derived: deleting it and re-running `carrick index` reproduces
+`index.json` is derived: deleting it and running `carrick refresh` rebuilds
 it. Nothing outside `src/local_mode/` reads it, and its internal shape is not
 this contract — only the command output above is.
 
@@ -799,7 +801,7 @@ printed above the sentence, and carried in `running_scans` on the error body.
       "name": "webapp",
       "changed_since_index": 5,
       "outside_every_service": 2,
-      "stale_files": ["carrick.json", ".github/workflows/carrick.yml"],
+      "stale_files": ["carrick.json", "pnpm-lock.yaml"],
       "stale_files_truncated": false
     }
   ],
@@ -840,7 +842,7 @@ printed above the sentence, and carried in `running_scans` on the error body.
 | `hosted_checked_at` | when repository metadata last answered for this workspace |
 | `repos_detected_by` | `carrick_json`, `workspace_manifest`, `siblings`, `single_repo`, or `workspace_overrides` |
 | `repos_added`, `repos_excluded` | explicit workspace override paths; absent when empty |
-| `type_check` | what the last build's type check did: `pairs` matched, `judged` of them, `skipped` with the reason when it did not run, and `not_stored[]` of `{ consumer, producer, verdicts, indexed_before_producer, check_skipped }` for verdicts judged here that a consumer's upload does not carry, where `check_skipped` is why that consumer's own scan did not run its check. A laptop scan pairs with the siblings indexed before it, so a consumer scanned before its producer uploads without that verdict. The human `status` and the build's own output print it as lines. Absent on an index written before it existed |
+| `type_check` | what the last build's type check did: `pairs` matched, `judged` of them, `skipped` with the reason when it did not run, and `not_stored[]` of `{ consumer, producer, verdicts, indexed_before_producer, check_skipped }` for verdicts judged here that a consumer's upload does not carry, where `check_skipped` is why that consumer's own scan did not run its check. A scan on this machine pairs with the siblings indexed before it, so a consumer scanned before its producer uploads without that verdict. The human `status` and the build's own output print it as lines. Absent on an index written before it existed |
 
 Errors are the same three, with the same `message` beside the code, under this
 schema: `{ "schema": "carrick.status/0", "error": "not_indexed", "message": "..." }`.
