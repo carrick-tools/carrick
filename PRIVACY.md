@@ -2,7 +2,7 @@
 
 ## Usage counts
 
-Carrick counts how often its hooks run on your machine and sends the daily totals to Carrick. It is on by default, after you have been told once (by `carrick init`, or by a notice at your next Claude Code session start).
+Carrick sends daily usage counts: how often each hook ran, whether it printed, how long it took, and a random machine id. It is on by default, after you have been told once (by `carrick init`, or by a notice at your next Claude Code session start).
 
 **What is sent**, per day and per hook (session start, read, edit, shell, re-check, prompt, stop):
 
@@ -10,7 +10,7 @@ Carrick counts how often its hooks run on your machine and sends the daily total
 - the median and 90th-percentile run time, and the median time spent waiting on a check
 - the Carrick version, a random id for this machine and a random id for this folder, and your Carrick workspace
 
-**What is never sent:** code, file names or paths, repository, service or branch names, host or user names, session ids, environment values, or anything an agent wrote or read.
+**What is never sent:** code, file names, paths, repository, service or branch names, host or user names, session ids, environment values, or anything an agent wrote or read.
 
 The counts say that a hook printed text, not which text and not whether your agent used it. The exact body of the last send is in `.carrick/usage-last.json` in your folder, and `carrick telemetry status` prints it.
 
