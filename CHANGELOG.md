@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.181](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.180...carrick-v0.3.181) (2026-11-23)
+
+
+### Bug Fixes
+
+* **cli:** a finished index run no longer points at a command the CLI does not offer ([#5095](https://github.com/carrick-tools/carrick/issues/5095)) ([168f010](https://github.com/carrick-tools/carrick/commit/168f0107aebd4c385931ee036771197de0e847bb))
+* **hooks:** Stop says nothing when a change was not fully checked ([#5093](https://github.com/carrick-tools/carrick/issues/5093)) ([daba867](https://github.com/carrick-tools/carrick/commit/daba86714493b166495c7cd3f67bf60050d5529d))
+* **init:** say less at setup ([#5092](https://github.com/carrick-tools/carrick/issues/5092)) ([a5049dd](https://github.com/carrick-tools/carrick/commit/a5049ddc01957720b9c0c6c88c5739db149aa522))
+
 ## [0.3.180](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.179...carrick-v0.3.180) (2026-11-23)
 
 
