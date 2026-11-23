@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.178](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.177...carrick-v0.3.178) (2026-11-23)
+
+
+### Bug Fixes
+
+* **init:** rule 5 tells the agent each edit is checked in the background ([#5079](https://github.com/carrick-tools/carrick/issues/5079)) ([9722dab](https://github.com/carrick-tools/carrick/commit/9722dab6e0233ecc0cb431f7665cd2d6681684a6)), closes [#5076](https://github.com/carrick-tools/carrick/issues/5076)
+
 ## [0.3.177](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.176...carrick-v0.3.177) (2026-11-23)
 
 
