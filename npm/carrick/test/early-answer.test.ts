@@ -999,8 +999,6 @@ test("T1: the differ record counts an entry's own breaks, not the standing ones"
 // T2 (carrick#4742, R3; the compiler half of carrick#4720): an early line says which copy of the other side it read.
 const SHORT = COMMIT.slice(0, 7);
 const COPY = `read from main at ${SHORT}`;
-const HOME_CLAUSE = "changed ext/src/types.ts in this session; the check used main's copy of it";
-const PLACE_CLAUSE = "changed ext/src/view4.ts in this session; the check used main's copy of it";
 
 /** The session edited `rel` of the workspace at `at` (a hook records this before it prints). */
 const editedBy = (ws: Ws, session: string, rel: string, at: number): void => recordEdit(session, ws.root, at, ws.home, [ws.at(rel)]);
@@ -1016,22 +1014,21 @@ test("T2: every early line says which commit of main its other side was read fro
   assert.equal(kept.result.items?.[0]?.main_commit, COMMIT, "every early row carries the commit");
 });
 
-test("T2: a named place file the session edited before the line printed is said to have been read from main", async (t) => {
+test("T2: a named place file the session edited before the line printed holds the line back for the whole-change check", async (t) => {
   const ws = await workspace(t);
   await liveDaemon(t, ws, () => [broken(ws)]);
   editedBy(ws, "t2b", "ext/src/view4.ts", Date.now() - 5000);
   const first = context((await edit(ws, "t2b", part2(ws, []))).stdout);
-  assert.ok(first.includes(COPY), first);
-  assert.ok(first.includes(PLACE_CLAUSE), first);
+  assert.doesNotMatch(first, /type_mismatch/, first);
+  assert.ok(!first.includes(COPY), first);
 });
 
-test("T2: the file that declares the caller's type counts as named", async (t) => {
+test("T2: the file that declares the caller's type counts as named: its edit holds the line back", async (t) => {
   const ws = await workspace(t);
   await liveDaemon(t, ws, () => [broken(ws, { named_files: [ws.at("ext/src/view4.ts"), ws.at("ext/src/types.ts")] })]);
   editedBy(ws, "t2c", "ext/src/types.ts", Date.now() - 5000);
   const first = context((await edit(ws, "t2c", part2(ws, []))).stdout);
-  assert.ok(first.includes(HOME_CLAUSE), first);
-  assert.ok(!first.includes("view4.ts in this session"), first);
+  assert.doesNotMatch(first, /type_mismatch/, first);
 });
 
 test("T2: a named file edited after the line printed, or a file no row names, adds no session clause", async (t) => {
@@ -1047,7 +1044,6 @@ test("T2: a named file edited after the line printed, or a file no row names, ad
 test("T2: an early row on a route in another file agreed before the edit, never 'in the index', and says its copy", async (t) => {
   const ws = await workspace(t);
   await liveDaemon(t, ws, () => [otherFile(ws)]);
-  editedBy(ws, "t2e", "ext/src/view4.ts", Date.now() - 5000);
   const first = context((await edit(ws, "t2e", part2(ws, []))).stdout);
   const moved = first.split("\n").find((line) => line.includes("route GET /others"))!;
   assert.ok(moved.includes("agreed before the edit and now reads type_mismatch"), first);
@@ -1066,7 +1062,7 @@ test("T2: Stop's print of an early break the session was not told says its copy"
   forgetQueue(ws);
 });
 
-test("T2: a types-only file the session edited through the hook is recorded, so the session clause names it", async (t) => {
+test("T2: a types-only file the session edited through the hook is recorded, so its edit holds the line back", async (t) => {
   const ws = await workspace(t);
   await liveDaemon(t, ws, () => [broken(ws, { named_files: [ws.at("ext/src/view4.ts"), ws.at("ext/src/types.ts")] })]);
   fs.mkdirSync(ws.at("ext/src"), { recursive: true });
@@ -1084,7 +1080,7 @@ test("T2: a types-only file the session edited through the hook is recorded, so 
     env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...ON }),
   });
   const first = context((await edit(ws, "t2h", part2(ws, []))).stdout);
-  assert.ok(first.includes(HOME_CLAUSE), first);
+  assert.doesNotMatch(first, /type_mismatch/, first);
 });
 
 test("T2: an early moved row printed at a later carrier reads the same, after 'your earlier edit'", async (t) => {

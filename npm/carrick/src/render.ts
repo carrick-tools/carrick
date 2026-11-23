@@ -342,16 +342,13 @@ export function movedLines(result: CheckResult): string[] {
 }
 /**
  * An early row's copy line (T2, R3): which copy of the other side the compiler
- * read, and, when this session edited a file that holds it, that the check did
- * not see the edit. Its own line, so the line cap never cuts it. Nothing for a
- * row part 2 or the CLI states: it carries no `main_commit`.
+ * read. A row whose other side this session edited never reaches here
+ * (`withoutStaleCopyBreaks`, hook/late.ts). Its own line, so the line cap never
+ * cuts it. Nothing for a row part 2 or the CLI states: it carries no `main_commit`.
  */
-function heldCopyLines(row: Pick<CheckItem, "main_commit" | "edited_named">, caller: boolean): string[] {
+function heldCopyLines(row: Pick<CheckItem, "main_commit">, caller: boolean): string[] {
   if (row.main_commit === undefined) return [];
-  const read = `The ${caller ? "caller's" : "other"} side was read from main ${row.main_commit === null ? "as of the last index" : `at ${row.main_commit.slice(0, 7)}`}`;
-  const edited = row.edited_named ?? [];
-  const changed = edited.length > 0 ? `. You changed ${edited.join(", ")} in this session; the check used main's copy of ${edited.length === 1 ? "it" : "them"}` : "";
-  return [cutLine(`  ${read}${changed}.`)];
+  return [cutLine(`  The ${caller ? "caller's" : "other"} side was read from main ${row.main_commit === null ? "as of the last index" : `at ${row.main_commit.slice(0, 7)}`}.`)];
 }
 
 /** How long one problem line of an edit's message may run before it is cut. */

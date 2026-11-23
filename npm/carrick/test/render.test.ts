@@ -1411,9 +1411,9 @@ test("T2: an early moved row that already stood makes no claim about before", ()
   assert.match(lines[0]!, /now reads type_mismatch\.$/);
 });
 
-test("T2: the session clause names each edited file, or says the index has no commit", () => {
-  const lines = movedLines(earlyResultOf([earlyMoved({ main_commit: null, edited_named: ["web/src/client.ts", "web/src/types.ts"] })]));
-  assert.equal(lines[1], "  The caller's side was read from main as of the last index. You changed web/src/client.ts, web/src/types.ts in this session; the check used main's copy of them.");
+test("T2: the copy line says the index has no commit when the fact file names none", () => {
+  const lines = movedLines(earlyResultOf([earlyMoved({ main_commit: null })]));
+  assert.equal(lines[1], "  The caller's side was read from main as of the last index.");
 });
 
 test("T2: part 2's moved row keeps its words and gets no copy line", () => {
@@ -1433,11 +1433,10 @@ test("T2: an early item line is followed by its copy line, outside the 400-chara
     verdict: { state: "resolved", result: "type_mismatch", detail: "x".repeat(380) },
     stated: true,
     main_commit: "0123456789abcdef0123456789abcdef01234567",
-    edited_named: ["web/src/client.ts"],
   };
   const text = renderPostToolUse({ ...rechecked(), items: [item] }, "api/src/widgets.ts", { early: true }) ?? "";
   const rows = text.split("\n");
   const at = rows.findIndex((row) => row.startsWith("- api/src/widgets.ts:3"));
   assert.ok(rows[at]!.length <= 400, `${rows[at]!.length}`);
-  assert.equal(rows[at + 1], "  The caller's side was read from main at 0123456. You changed web/src/client.ts in this session; the check used main's copy of it.");
+  assert.equal(rows[at + 1], "  The caller's side was read from main at 0123456.");
 });

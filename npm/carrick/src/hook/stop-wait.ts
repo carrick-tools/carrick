@@ -36,7 +36,7 @@ import {
   staleClause,
 } from "../render.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
-import { adoptedLine, changedLine, confirmAnswer, deliverEarlies, deliverOne, hasFindings, withEditedNamed } from "./late.ts";
+import { adoptedLine, changedLine, confirmAnswer, deliverEarlies, deliverOne, hasFindings, owedWholeChange, withoutStaleCopyBreaks } from "./late.ts";
 import { withEarlyBreaks, withoutUnsettled } from "./confirm.ts";
 import {
   changedAnsweredAt,
@@ -126,14 +126,14 @@ export type StopResult = {
  * all (R46.2): Stop claims it only with a finding it prints, and otherwise
  * leaves it for the next carrier, which prints all of it.
  */
-function collect(session: string, home: string | undefined, now: number): { own: Answer[]; adopted: Answer[]; early: string[] } {
+function collect(session: string, home: string | undefined, now: number, ensure: (root: string) => unknown): { own: Answer[]; adopted: Answer[]; early: string[] } {
   const own: Answer[] = [];
   const adopted: Answer[] = [];
   // Early answers (part 3, B1) still owed are findings: said as the carriers
   // say them, once, before the full answers they are compared with. Stop never
   // waits for one.
   const listing = sessionListing(home);
-  const early = deliverEarlies(session, new Set(), home, now, listing);
+  const early = deliverEarlies(session, new Set(), home, now, listing, ensure);
   for (const { owner, answer } of owedFor(session, home, listing)) {
     if (answer.instead_of_probe && !hasFindings(confirmAnswer(answer, home).answer)) continue;
     if (!claimDelivery(owner, answer.seq, home, now)) continue;
@@ -150,10 +150,11 @@ function collect(session: string, home: string | undefined, now: number): { own:
 function stated(answer: Answer, counted: Set<string>, now: number, home?: string): CheckResult {
   const early = readEarly(answer.session, answer.seq, home);
   const all = newestEarlies(answer.session, home);
-  const result = withoutUnsettled(answer.result!, sessionEarlies(answer.session, home).filter((e) => e.service === early?.service), all);
+  // A break whose other side this session edited is not counted: the whole-change check states it.
+  const own = withoutStaleCopyBreaks(answer.result!, answer.session, now, home).result;
+  const result = withoutUnsettled(own, sessionEarlies(answer.session, home).filter((e) => e.service === early?.service), all);
   if (early === null) return result;
-  // Early rows on a named file this session edited by Stop are not counted (P4.6).
-  const marked = withEditedNamed(early.result, answer.session, answer.root, now, home);
+  const marked = withoutStaleCopyBreaks(early.result, answer.session, now, home).result;
   return withEarlyBreaks(result, marked, early.service === undefined ? undefined : all.get(early.service), counted);
 }
 
@@ -262,7 +263,11 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
       log("could not restart the re-check runner", String(error));
     }
   }
-  const { own: delivered, adopted, early } = collect(session, home, clock());
+  const { own: delivered, adopted, early } = collect(session, home, clock(), ensure);
+  // A break held back for the whole-change check (`withoutStaleCopyBreaks`) has that check queued.
+  for (const answer of [...delivered, ...adopted]) {
+    if (confirmAnswer(answer, home, clock()).held > 0) owedWholeChange(answer.session, answer.root, clock(), home, ensure);
+  }
 
   // The session's check, per workspace with an edit Stop has not yet spoken
   // about. A clean `check --changed` the agent ran since that edit already

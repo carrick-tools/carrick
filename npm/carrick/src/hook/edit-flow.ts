@@ -15,7 +15,7 @@ import { currentVersion } from "../update.ts";
 import { markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import type { SimilarLines } from "./similar.ts";
-import { deliverEarly, deliverLateFirst, emitPostToolUse } from "./late.ts";
+import { deliverEarly, deliverLateFirst, emitPostToolUse, owedWholeChange, withoutStaleCopyBreaks } from "./late.ts";
 import { needsBackground, probeEdits, probeTimeoutMs } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, earlyOwedFor, enqueue, ensureRunner, readEarly } from "./rechecks.ts";
@@ -225,7 +225,10 @@ export async function editFlow(
       // fact lines could have stood in for it (the switch is on).
       if (input.timing && facts !== null && factsEnabled()) input.timing.usesFallback = true;
     }
-    const context = renderPostToolUse(result, relative, { uses: show });
+    // A break whose other side this session edited is the whole-change check's to state (late.ts).
+    const own = session ? withoutStaleCopyBreaks(result, session, Date.now()) : { result, held: 0 };
+    if (own.held > 0) owedWholeChange(session!, choice.root, Date.now());
+    const context = renderPostToolUse(own.result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) rendered.set(index, context);
   }

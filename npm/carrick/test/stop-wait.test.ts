@@ -1213,11 +1213,13 @@ test("T4 P4.4 (#4900): one break listed by two files' early answers is counted o
   assert.match(text.split("\n")[0]!, /: 1 contract problem\.$/, text);
 });
 
-test("T4 P4.6: an early break whose named file the session edited: Stop's line says main's copy was read and the file changed", (t) => {
+test("T4 P4.6: an early break whose named file the session edited: Stop does not print it and the whole-change check is queued", (t) => {
   const { workspace, home } = setup(t);
   editWith(workspace.root, home, workspace.file, [zzBreak(workspace.file, { main_commit: "abcdef1234567890", named_files: [workspace.file] })], clean());
   const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
-  assert.match(text, /The caller's side was read from main at abcdef1\. You changed user-service\/src\/routes\/users\.ts in this session; the check used main's copy of it\./, text);
+  assert.equal(zzLines(text), 0, text);
+  assert.doesNotMatch(text, /read from main/, text);
+  assert.equal(changedQueued(workspace.root).length, 1, text);
 });
 
 test("T4 P4.6: an early break with no session edit of a named file: the read-from-main line alone", (t) => {
@@ -1242,7 +1244,7 @@ test("T4 P4.6: a break whose named caller file the session edited is not counted
   const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
   assert.doesNotMatch(text, /Carrick checked the .*contract problem/, text);
   assert.doesNotMatch(text, /found no contract problem|both sides agree/, text);
-  assert.match(text, /You changed user-service\/src\/routes\/users\.ts in this session/, text);
+  assert.equal(zzLines(text), 0, text);
 });
 
 test("T4 P4.6: the same break with no session edit of a named file is counted once", (t) => {
