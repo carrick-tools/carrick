@@ -236,7 +236,7 @@ test("6. the send never holds a hook: a silent server only costs the child its t
   assert.ok(!fs.existsSync(path.join(root, ".carrick", "last-usage-final-day")));
 });
 
-test("6b. Stop and prompt-submit start the child, and a fresh marker starts none", async () => {
+test("6b. Stop and prompt-submit run clean and unheld beside a fresh marker", async () => {
   for (const [script, payload] of [["stop.ts", { hook_event_name: "Stop", session_id: "usage-test-1" }], ["user-prompt.ts", { hook_event_name: "UserPromptSubmit", session_id: "usage-test-2", prompt: "x" }]] as const) {
     const { root, home } = setup();
     // A marker claimed a minute ago: nothing starts, and the hook is not held.
