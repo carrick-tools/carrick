@@ -10,13 +10,13 @@
 import { resolveChannel } from "../channel.ts";
 import path from "node:path";
 import { problemItems } from "../contract.ts";
-import type { CheckResult } from "../contract.ts";
+import type { CheckItem, CheckResult, MovedRow } from "../contract.ts";
 import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
-import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, newestEarlies, owedFor, readAnswer, readEarly, sessionEarlies, sessionListing } from "./rechecks.ts";
+import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, enqueueChanged, ensureRunner, isChanged, newestEarlies, owedFor, pendingFor, readAnswer, readEarly, sessionEarlies, sessionListing } from "./rechecks.ts";
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
-import { confirmedResult, earlyRows, keepRows, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
+import { confirmedResult, earlyRows, keepRows, readStaleCopy, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
 import { markLed, markTold, readSession, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
@@ -53,14 +53,19 @@ export function lateContext(answer: Answer, uses: boolean): string | null {
  * answer was never printed, is printed as it stands: an early break part 2 did
  * not judge is then printed by its own carrier (`deliverEarly`).
  */
-export function confirmAnswer(answer: Answer, home?: string): { answer: Answer; corrections: string[] } {
-  if (isChanged(answer) || !answer.result || answer.result.error) return { answer, corrections: [] };
+export function confirmAnswer(raw: Answer, home?: string, now: number = Date.now()): { answer: Answer; corrections: string[]; held: number } {
+  if (isChanged(raw) || !raw.result || raw.result.error) return { answer: raw, corrections: [], held: 0 };
+  // A break whose other side this session edited is the whole-change check's to state:
+  // `held` counts them, and the caller that prints the answer queues that check.
+  const own = withoutStaleCopyBreaks(raw.result, raw.session, raw.root, now, home);
+  const held = own.held;
+  const answer = held === 0 ? raw : { ...raw, result: own.result };
   const early = readEarly(answer.session, answer.seq, home);
   const said = early === null ? null : earlySaid(answer.session, answer.seq, home);
-  if (early === null || said === null || said.size === 0) return { answer, corrections: [] };
-  const { result, corrected } = confirmedResult(answer.result, early.result, said);
+  if (early === null || said === null || said.size === 0) return { answer, corrections: [], held };
+  const { result, corrected } = confirmedResult(own.result, early.result, said);
   if (result !== answer.result) log("late rows dropped: the early answer stated them", answer.relative);
-  return { answer: { ...answer, result }, corrections: corrected.map((label) => correctionLine(answer.relative, label)) };
+  return { answer: { ...answer, result }, corrections: corrected.map((label) => correctionLine(answer.relative, label)), held };
 }
 
 /**
@@ -72,6 +77,7 @@ export function confirmAnswer(answer: Answer, home?: string): { answer: Answer; 
  */
 export function deliverOne(session: string, raw: Answer, home?: string): string[] {
   const confirmed = confirmAnswer(raw, home);
+  if (confirmed.held > 0) owedWholeChange(raw.session, raw.root, Date.now(), home);
   const corrections = confirmed.corrections;
   // A break the session was told and that still stands is not said again at a later entry (T1 P1.3).
   const fresh = !isChanged(confirmed.answer) && confirmed.answer.result && !confirmed.answer.result.error
@@ -103,27 +109,53 @@ export function deliverOne(session: string, raw: Answer, home?: string): string[
 }
 
 /**
- * The early rows with the named files `session` edited before `now` marked on
- * them (T2 P2.3): the check held the other side fixed at main's copy, so an
- * edit of a file that holds it never reached the line. Decided here, at print
- * time, never when the answer is filed: an edit lands between the two.
+ * The rule for a break across two files this session edited (one answerer,
+ * for the early answer and every per-file re-check): a per-file check does not
+ * state a break on a pair when the other side lives in a file `session` edited
+ * at or before `now` and the check read main's or the indexed copy of it
+ * (`readStaleCopy`, confirm.ts). Such a row is no longer stated; the
+ * whole-change check, which reads both sides from the working tree, answers
+ * for it: whoever prints the result queues it (`owedWholeChange`). Decided at
+ * print time, never when the answer is filed: an edit lands between the two. `held` counts the rows taken out.
  */
-export function withEditedNamed(early: CheckResult, session: string, root: string, now: number, home?: string): CheckResult {
+export function withoutStaleCopyBreaks(result: CheckResult, session: string, root: string, now: number, home?: string): { result: CheckResult; held: number } {
   const edited = new Set(Object.entries(readSession(session, home).files).filter(([, edit]) => edit.at <= now).map(([file]) => realPath(file)));
-  if (edited.size === 0) return early;
-  const shown = (file: string): string => {
-    const rel = path.relative(realPath(root), realPath(file));
-    return rel.startsWith("..") || path.isAbsolute(rel) ? file : rel;
+  if (edited.size === 0) return { result, held: 0 };
+  const isEdited = (file: string): boolean => edited.has(realPath(file));
+  let held = 0;
+  const unstate = <T extends CheckItem | MovedRow>(row: T): T => {
+    if (row.stated !== true || !readStaleCopy(row, result, isEdited, root)) return row;
+    held += 1;
+    const { stated: _stated, ...rest } = row;
+    void _stated;
+    return rest as T;
   };
-  const mark = <T extends { named_files?: string[] }>(row: T): T => {
-    const hit = [...new Set((row.named_files ?? []).filter((file) => edited.has(realPath(file))).map(shown))].sort();
-    return hit.length === 0 ? row : { ...row, edited_named: hit };
-  };
+  const items = (result.items ?? []).map(unstate);
+  const moved = result.recheck?.moved?.map(unstate);
+  if (held === 0) return { result, held };
   return {
-    ...early,
-    items: (early.items ?? []).map(mark),
-    ...(early.recheck ? { recheck: { ...early.recheck, moved: (early.recheck.moved ?? []).map(mark) } } : {}),
+    result: { ...result, items, ...(result.recheck ? { recheck: { ...result.recheck, ...(moved ? { moved } : {}) } } : {}) },
+    held,
   };
+}
+
+/**
+ * Queue one `check --changed` for `root` unless one of `session` queued after
+ * its newest edit there is still unanswered, and make sure a runner takes it.
+ */
+export function owedWholeChange(session: string, root: string, now: number, home?: string, ensure: (root: string) => unknown = (at) => ensureRunner(at)): void {
+  const since = readSession(session, home).edited[root] ?? 0;
+  if (pendingFor(session, home).some((entry) => isChanged(entry) && entry.root === root && Date.parse(entry.enqueued_at) >= since)) return;
+  if (enqueueChanged(root, session, now, { home }) === null) {
+    log("could not queue check --changed for", root);
+    return;
+  }
+  log("a break across two edited files was held back; check --changed queued for", root);
+  try {
+    ensure(root);
+  } catch (error) {
+    log("could not start the re-check runner", String(error));
+  }
 }
 
 /**
@@ -138,28 +170,44 @@ export function withEditedNamed(early: CheckResult, session: string, root: strin
  * `reader` was already told of is kept in the claim and not printed. Each
  * printed row's told key is marked for `reader`, the session the words reach.
  */
-export function deliverEarly(owner: string, early: EarlyAnswer, seen: Set<string>, options: { home?: string; now?: number; late?: boolean; reader?: string } = {}): string[] {
+export function deliverEarly(
+  owner: string,
+  early: EarlyAnswer,
+  seen: Set<string>,
+  options: { home?: string; now?: number; late?: boolean; reader?: string; ensure?: (root: string) => unknown } = {},
+): string[] {
   const reader = options.reader ?? owner;
+  const now = options.now ?? Date.now();
   const full = readAnswer(owner, early.seq, options.home);
-  const judged = full?.state === "answered" && full.result && !full.result.error ? standingEarly(early.result, full.result) : early.result;
+  // Held rows are never claimed as said, so the full answer's copy of them is judged on its own.
+  const own = withoutStaleCopyBreaks(early.result, reader, early.root, now, options.home);
+  const judged = full?.state === "answered" && full.result && !full.result.error ? standingEarly(own.result, full.result) : own.result;
   const newest = early.service === undefined ? undefined : newestEarlies(owner, options.home).get(early.service);
   const view = keepRows(judged, (row) => standsAsRun(row, newest));
   const rows = earlyRows(view);
   if (!claimEarly(owner, early.seq, rows.map((row) => row.key), options.home, options.now)) return [];
+  if (own.held > 0) owedWholeChange(reader, early.root, now, options.home, options.ensure);
   const told = (row: (typeof rows)[number]): boolean => wasTold(reader, toldBreak(row.listed, row.run), options.home);
   const fresh = keepRows(view, (row) => !seen.has(row.key) && !told(row));
   for (const row of rows) seen.add(row.key);
-  const text = renderPostToolUse(withEditedNamed(fresh, reader, early.root, options.now ?? Date.now(), options.home), early.relative, { early: true, uses: false, late: options.late !== false });
+  const text = renderPostToolUse(fresh, early.relative, { early: true, uses: false, late: options.late !== false });
   if (text) {
     markTold(reader, earlyRows(fresh).map((row) => toldBreak(row.listed, row.run)), options.home);
-    log(`early answer ${early.relative} delivered ${Math.round(((options.now ?? Date.now()) - Date.parse(early.enqueued_at)) / 1000)} s after the edit`);
+    log(`early answer ${early.relative} delivered ${Math.round((now - Date.parse(early.enqueued_at)) / 1000)} s after the edit`);
   }
   return text ? [text] : [];
 }
 
 /** Every early answer `session` is owed, printed oldest first (`deliverEarly`). */
-export function deliverEarlies(session: string, seen: Set<string>, home?: string, now: number = Date.now(), listing?: readonly string[]): string[] {
-  return earlyOwedFor(session, home, listing).flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { home, now, reader: session }));
+export function deliverEarlies(
+  session: string,
+  seen: Set<string>,
+  home?: string,
+  now: number = Date.now(),
+  listing?: readonly string[],
+  ensure?: (root: string) => unknown,
+): string[] {
+  return earlyOwedFor(session, home, listing).flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { home, now, reader: session, ensure }));
 }
 
 /** Whether an answer holds a row to act on: a problem, a moved row, a deletion. */
@@ -176,7 +224,8 @@ export function hasFindings(answer: Answer): boolean {
  */
 export function adoptedLine(raw: Answer, home?: string): string | null {
   if (isChanged(raw)) return lateContext(raw, false);
-  const { answer, corrections } = confirmAnswer(raw, home);
+  const { answer, corrections, held } = confirmAnswer(raw, home);
+  if (held > 0) owedWholeChange(raw.session, raw.root, Date.now(), home);
   const said = hasFindings(answer) ? lateContext(answer, false) : null;
   const lines = [...(said ? [said] : []), ...corrections];
   return lines.length > 0 ? lines.join("\n\n") : null;

@@ -24,9 +24,34 @@
 //   `part3_only`, and the early break stands (R5a).
 // A part-2 break with no early row is `part2_only` and prints as today.
 
+import path from "node:path";
 import type { CheckItem, CheckResult, MovedRow } from "../contract.ts";
 import { problemItems, statedMoved } from "../contract.ts";
 import { engineOfRun } from "../held/early.ts";
+
+/**
+ * Whether a per-file check read the other side of `row` from a copy that
+ * predates this session's edit of it (the rule of `withoutStaleCopyBreaks`,
+ * late.ts): `edited` says whether the session edited an absolute file.
+ * - an early row (it carries `main_commit`): the compiler read every named
+ *   file from main, so any named file edited;
+ * - a re-check item: a counterpart file edited whose service the re-check did
+ *   not re-read (`recheck.scope.reread`); a counterpart with no repo is
+ *   judged as today;
+ * - a re-check moved row: the row's own file edited. It names its other side
+ *   only as `service file:line` text, so this one is per file, whatever service
+ *   the re-check re-read.
+ */
+export function readStaleCopy(row: CheckItem | MovedRow, result: CheckResult, edited: (file: string) => boolean, root: string): boolean {
+  if (row.main_commit !== undefined) return (row.named_files ?? []).some(edited);
+  if ("kind" in row) {
+    const reread = new Set(result.recheck?.scope?.reread ?? []);
+    return (row.counterparts ?? []).some(
+      (c) => typeof c.repo === "string" && typeof c.file === "string" && !(c.service !== undefined && reread.has(c.service)) && edited(path.join(c.repo, c.file)),
+    );
+  }
+  return edited(path.join(root, row.file));
+}
 
 /** The label a check item has as a contract row: `METHOD path{ dispatch}`. */
 export function itemLabel(item: CheckItem): string | null {
@@ -422,9 +447,8 @@ export function withEarlyBreaks(full: CheckResult, early: CheckResult, newest?: 
   // A break an earlier answer of the session already counted (#4900), or part 2 states itself, counts once.
   const kept = stands.filter((c) => !counted?.has(key(c)));
   for (const c of [...stands, ...compared.rows.filter((r) => r.outcome !== "part3_only" && !r.corrected)]) counted?.add(key(c));
-  // A break on a file the session edited since the check read main's copy may not exist in its tree: its early line says so, and it is not counted (P4.6).
-  const edited = (c: RowCompared): boolean => ((c.row.item ?? c.row.moved)?.edited_named ?? []).length > 0;
-  const added = kept.filter((c) => !edited(c)).map((c) => c.row.item ?? movedBreak(c.row.moved!));
+  // A break whose other side the session edited is not in `early` (`withoutStaleCopyBreaks`, late.ts): the whole-change check answers it.
+  const added = kept.map((c) => c.row.item ?? movedBreak(c.row.moved!));
   // A route part 2 did not judge (or holds no row for) gives way to the early break.
   const replaced = new Set(stands.filter((c) => c.match && "kind" in c.match).map((c) => c.match));
   if (added.length === 0) return full;
