@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.179](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.178...carrick-v0.3.179) (2026-11-23)
+
+
+### Features
+
+* **npm:** send daily hook usage counts after a one-time notice ([#5084](https://github.com/carrick-tools/carrick/issues/5084)) ([63fea6f](https://github.com/carrick-tools/carrick/commit/63fea6f79f0a4b924d2e949da3bce3dcfccae003))
+
 ## [0.3.178](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.177...carrick-v0.3.178) (2026-11-23)
 
 
