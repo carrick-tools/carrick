@@ -10,7 +10,7 @@ import fs from "node:fs";
 import ts from "typescript";
 import { hunksOf } from "../src/facts/diff.ts";
 import { arm, attribute, checkWire, mapValue, overlay, regionOfEdit, regionsBetween } from "../src/held/place.ts";
-import type { Diag, Value } from "../src/held/place.ts";
+import type { Diag, Region, Value } from "../src/held/place.ts";
 
 const dir = new URL("./fixtures/held/", import.meta.url);
 const TEXT = fs.readFileSync(new URL("sends.ts", dir), "utf8");
@@ -107,6 +107,85 @@ test("regionsBetween: equal texts have no region; a change on one line is that l
     start: HANDLER.indexOf(REPLY) - (HANDLER.indexOf("\nexport") + 1),
     end: HANDLER.indexOf(REPLY) - (HANDLER.indexOf("\nexport") + 1) + REPLY.length,
   });
+});
+
+test("regionsBetween, on random line edits: it rebuilds the new text, its regions are ordered and apart, and every untouched span maps to the same text", () => {
+  // A seeded generator: the same cases every run. A small alphabet, so lines repeat; both line endings; with and without a final newline.
+  let seed = 7;
+  const next = (n: number): number => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % n;
+  };
+  const words = ["a", "b", "}", "return c.json({ ok: true });", ""];
+  const textOf = (lines: string[], eol: string, last: boolean): string => (lines.length === 0 ? "" : lines.join(eol) + (last ? eol : ""));
+  const check = (old: string, edited: string, tag: string): Region[] => {
+    const regions = regionsBetween(old, edited);
+    let rebuilt = "";
+    let at = 0;
+    let atNew = 0;
+    let shift = 0;
+    for (const r of regions) {
+      // (b) in order and apart, in old and in new coordinates.
+      assert.ok(r.oldStart >= at && r.oldStart <= r.oldEnd, `${tag}: old order`);
+      assert.ok(r.newStart >= atNew && r.newStart <= r.newEnd, `${tag}: new order`);
+      assert.equal(r.newStart, r.oldStart + shift, `${tag}: the text before a region moved by the regions before it`);
+      rebuilt += old.slice(at, r.oldStart) + edited.slice(r.newStart, r.newEnd);
+      shift += r.newEnd - r.newStart - (r.oldEnd - r.oldStart);
+      at = r.oldEnd;
+      atNew = r.newEnd;
+    }
+    // (a) the regions applied to the old text are the new text.
+    assert.equal(rebuilt + old.slice(at), edited, `${tag}: only the regions differ`);
+    // (c) a span no region touches maps to a span holding the same text.
+    for (let probe = 0; probe < 20 && old.length > 0; probe += 1) {
+      const start = next(old.length);
+      const end = start + 1 + next(Math.min(12, old.length - start));
+      if (regions.some((r) => r.oldStart <= end && r.oldEnd >= start)) continue;
+      const got = mapValue({ file: "x.ts", start, end }, regions);
+      assert.notEqual(got, "crossed", `${tag}: [${start}, ${end}) is touched by no region`);
+      assert.equal(edited.slice((got as Value).start, (got as Value).end), old.slice(start, end), `${tag}: [${start}, ${end})`);
+    }
+    return regions;
+  };
+  check("", "", "both empty");
+  check("", "a\nb\n", "old empty");
+  check("a\nb\n", "", "new empty");
+  for (let round = 0; round < 500; round += 1) {
+    const eol = next(2) === 0 ? "\n" : "\r\n";
+    const lines = Array.from({ length: next(61) }, () => words[next(words.length)]!);
+    const changed = [...lines];
+    for (let edit = next(5); edit > 0; edit -= 1) {
+      const where = next(changed.length + 1);
+      const kind = next(3);
+      if (kind === 0) changed.splice(where, 0, ...Array.from({ length: 1 + next(4) }, () => words[next(words.length)]!));
+      else if (kind === 1) changed.splice(where, 1 + next(4));
+      else changed.splice(where, 1, words[next(words.length)]!);
+    }
+    check(textOf(lines, eol, next(2) === 0), textOf(changed.slice(0, 60), eol, next(2) === 0), `round ${round}`);
+  }
+  // (d) past the longest edit script searched: one region, and the new text is still rebuilt exactly.
+  const many = (tag: string, count: number): string => Array.from({ length: count }, (_, i) => `${tag} ${i}`).join("\n") + "\n";
+  assert.equal(check(many("old", 2100), many("new", 2100), "past the limit").length, 1);
+  const framed = (body: string): string => `head\n${body}tail\n`;
+  const kept = check(framed(many("old", 1200)), framed(many("new", 1300)), "past the limit, inside a kept head and tail");
+  assert.equal(kept.length, 1);
+});
+
+test("a reply whose text another handler repeats maps into its own handler, never onto the other's", () => {
+  const handler = (name: string): string => [`export function ${name}(c: { json(body: unknown): Response }) {`, "  return c.json({ ok: true });", "}", ""].join("\n");
+  const old = handler("first") + handler("second");
+  const reply = "{ ok: true }";
+  const second: Value = { file: "x.ts", start: old.lastIndexOf(reply), end: old.lastIndexOf(reply) + reply.length };
+  const own = (text: string): number => text.indexOf(reply, text.indexOf("function second("));
+  // A copy of the first handler inserted above, and a line appended below.
+  const copied = handler("first") + old + "// end\n";
+  assert.equal((mapValue(second, regionsBetween(old, copied)) as Value).start, own(copied));
+  // The first handler deleted, and an edit elsewhere.
+  const removed = handler("second").replace("export function", "export async function") + "// end\n";
+  const got = mapValue(second, regionsBetween(old, removed));
+  assert.ok(got === "crossed" || got.start === own(removed), JSON.stringify(got));
+  const dropped = handler("second") + "// end\n";
+  assert.equal((mapValue(second, regionsBetween(old, dropped)) as Value).start, own(dropped));
 });
 
 test("three runs of changed lines map a value between two of them exactly", () => {
