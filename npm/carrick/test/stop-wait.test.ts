@@ -259,30 +259,27 @@ function answerChangedClean(home: string, entry: QueueEntry): void {
   );
 }
 
-test("a clean whole-change check for files Stop named as still checking is printed once, as one line naming them", async (t) => {
+test("a gap prints nothing at Stop and the whole-change check is still queued", async (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
   gapQueue(workspace.root, home, workspace.file);
-  assert.match(context((await stopWith(home)).stdout), NOT_CHECKED);
+  assert.equal((await stopWith(home)).stdout, "", "no gap line");
+  assert.equal(changedQueued(workspace.root).length, 1, "the check --changed is queued");
+});
+
+test("a clean background answer for a gap Stop did not name prints nothing on every hook event", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  gapQueue(workspace.root, home, workspace.file);
+  assert.equal((await stopWith(home)).stdout, "");
 
   const [changedEntry] = changedQueued(workspace.root);
   answerChangedClean(home, changedEntry!);
-  const prompt = await promptHook(home, workspace.root);
-  assert.match(
-    context(prompt.stdout),
-    /^Carrick checked user-service\/src\/routes\/users\.ts and found no contract problem\.$/,
-  );
-  assert.equal((await promptHook(home, workspace.root)).stdout, "", "once: the next prompt says nothing");
-  assert.equal((await bashHook(home, workspace.root)).stdout, "", "once: the next tool hook says nothing");
-
-  // The same files named again by a later Stop and answered clean again: not said twice.
-  edit(workspace.root, home, workspace.file, Date.now() + 60_000);
-  await stopWith(home);
-  const again = changedQueued(workspace.root).find((entry) => entry.seq !== changedEntry!.seq);
-  assert.ok(again, "the second Stop queued its own check");
-  answerChangedClean(home, again!);
-  assert.equal((await promptHook(home, workspace.root)).stdout, "", "once per set of files");
+  assert.equal((await promptHook(home, workspace.root)).stdout, "", "the next prompt says nothing");
+  assert.equal((await bashHook(home, workspace.root)).stdout, "", "the next tool hook says nothing");
+  assert.equal((await stopWith(home)).stdout, "", "the next Stop says nothing");
 });
 
 test("a clean whole-change check for a set Stop never named prints nothing", async (t) => {
@@ -295,8 +292,6 @@ test("a clean whole-change check for a set Stop never named prints nothing", asy
   assert.equal((await promptHook(home, workspace.root)).stdout, "");
 });
 
-const CLEAN_NAMED = /^Carrick checked user-service\/src\/routes\/users\.ts and found no contract problem\.$/;
-
 /** The whole-change check answering with the given exit, as the runner writes it. */
 function answerChangedExit(home: string, entry: QueueEntry, exit: number): void {
   const changed = parseChangedResult(fs.readFileSync(fixturePath("check-changed-clean.json"), "utf8"), exit)!;
@@ -306,21 +301,6 @@ function answerChangedExit(home: string, entry: QueueEntry, exit: number): void 
   );
 }
 
-test("a clean whole-change check that lands before the next Stop is said once, by that Stop (carrick#4082)", async (t) => {
-  const { workspace, home } = setup(t);
-  liveRunner(workspace.root);
-  edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  gapQueue(workspace.root, home, workspace.file);
-  assert.match(context((await stopWith(home)).stdout), NOT_CHECKED);
-
-  const [changedEntry] = changedQueued(workspace.root);
-  answerChangedClean(home, changedEntry!);
-  const second = await stopWith(home);
-  assert.match(context(second.stdout), CLEAN_NAMED);
-  assert.equal((await promptHook(home, workspace.root)).stdout, "", "once: the next prompt says nothing");
-  assert.equal((await bashHook(home, workspace.root)).stdout, "", "once: the next tool hook says nothing");
-});
-
 test("a clean whole-change check for a set Stop never named prints nothing at Stop either", (t) => {
   const { workspace, home } = setup(t);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
@@ -328,41 +308,6 @@ test("a clean whole-change check for a set Stop never named prints nothing at St
   answerChangedClean(home, entry);
   const result = stopAnswers(SESSION, { home, ensure: () => false });
   assert.doesNotMatch(result.lines.join("\n"), /found no contract problem/);
-});
-
-test("the same named set answered clean again is not said by a later Stop", async (t) => {
-  const { workspace, home } = setup(t);
-  liveRunner(workspace.root);
-  edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  gapQueue(workspace.root, home, workspace.file);
-  await stopWith(home);
-  const [first] = changedQueued(workspace.root);
-  answerChangedClean(home, first!);
-  assert.match(context((await stopWith(home)).stdout), CLEAN_NAMED);
-
-  edit(workspace.root, home, workspace.file, Date.now() + 60_000);
-  await stopWith(home);
-  const again = changedQueued(workspace.root).find((entry) => entry.seq !== first!.seq);
-  assert.ok(again, "the later Stop queued its own check");
-  answerChangedClean(home, again!);
-  assert.doesNotMatch((await stopWith(home)).stdout, /found no contract problem/);
-});
-
-test("a clean named check beside a per-file problem: both print, the clean line once", async (t) => {
-  const { workspace, home } = setup(t);
-  liveRunner(workspace.root);
-  edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  gapQueue(workspace.root, home, workspace.file);
-  await stopWith(home);
-  const [changedEntry] = changedQueued(workspace.root);
-  answerChangedClean(home, changedEntry!);
-  const other = path.join(workspace.service, "src", "routes", "orders.ts");
-  fs.writeFileSync(other, "export {};\n");
-  answer(home, queue(workspace.root, home, other), problem());
-
-  const text = context((await stopWith(home)).stdout);
-  assert.match(text, /contract problem/);
-  assert.equal(text.split("\n").filter((line) => CLEAN_NAMED.test(line)).length, 1, text);
 });
 
 test("a check --changed that exits 2 prints nothing at Stop", async (t) => {
@@ -444,16 +389,15 @@ test("Stop leaves an answer queued in place of the probe with no finding unclaim
 // Ruling on R46.2: a flagged answer that did not answer the edit is a gap at
 // its first Stop, named as with the switch off, once; the next carrier still
 // prints what the probe would have printed in hand (its uses line).
-test("Stop names a flagged answer that did not answer the edit as a gap, once, and the next carrier prints its uses line", async (t) => {
+test("Stop says nothing for a flagged answer that did not answer the edit, and the next carrier prints its uses line", async (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   const now = Date.now();
   const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
   recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
   answer(home, entry, fixture("check-stale-uses.json"));
-  const first = context((await stopWith(home)).stdout);
-  assert.ok(first.startsWith("Carrick did not check the whole change: user-service/src/routes/users.ts: no re-check of it ran."), first);
-  assert.equal((await stopWith(home)).stdout, "", "named once");
+  assert.equal((await stopWith(home)).stdout, "", "a gap prints nothing");
+  assert.equal((await stopWith(home)).stdout, "", "still nothing");
   const next = context((await bashHook(home, workspace.root)).stdout);
   assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
 });
@@ -618,7 +562,7 @@ function changedQueued(root: string): QueueEntry[] {
 }
 
 const CHECKED = /^Carrick checked the (\d+) files? this session edited \(([^)]*)\): /;
-const NOT_CHECKED = /^Carrick did not check the whole change: /;
+const NOT_CHECKED = /^Carrick did not check the whole change: /; // the removed gap line: no Stop prints it
 
 test("every edited file answered after its last edit: one checked-the-change line, no check clause, the per-answer lines folded into it", async (t) => {
   const { workspace, home } = setup(t);
@@ -837,7 +781,7 @@ test("a Stop with 1 problem prints the header and its line", async (t) => {
   assert.match(lines[1]!, /^- \S*users\.ts:\d+:\d+ /);
 });
 
-test("an edit after the answer is not covered: Stop names the file and queues check --changed", async (t) => {
+test("an edit after the answer is not covered: Stop says nothing and queues check --changed", async (t) => {
   const { workspace, home } = setup(t);
   edit(workspace.root, home, workspace.file, Date.now() - 5000);
   answer(home, queue(workspace.root, home, workspace.file), reread(clean()));
@@ -845,7 +789,7 @@ test("an edit after the answer is not covered: Stop names the file and queues ch
 
   const text = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
   assert.doesNotMatch(text, CHECKED);
-  assert.match(text, /^Carrick did not check the whole change: user-service\/src\/routes\/users\.ts: it was edited after its last re-check\. A background `carrick check --changed` is queued/m);
+  assert.equal(text, "", "a gap prints nothing");
   assert.equal(changedQueued(workspace.root).length, 1);
 });
 
@@ -892,11 +836,7 @@ for (const [name, arrange, reason] of [
     });
     const text = result.lines.join("\n");
     assert.doesNotMatch(text, CHECKED);
-    const gap = text.split("\n").find((line) => NOT_CHECKED.test(line));
-    assert.ok(gap, text);
-    assert.match(gap!, /user-service\/src\/routes\/users\.ts: /);
-    assert.match(gap!, reason);
-    assert.match(gap!, /A background `carrick check --changed` is queued; its answer comes with the next Carrick line\.$/);
+    assert.equal(text, "", "a gap prints nothing");
     assert.doesNotMatch(text, CLAUSE);
     assert.equal(changedQueued(workspace.root).length, 1);
     assert.ok(ensured.includes(workspace.root), "a runner is made sure of for the queued check");
@@ -917,13 +857,13 @@ function answerChanged(home: string, entry: QueueEntry): void {
   );
 }
 
-test("a reported gap is not repeated once the whole-change check answered it, until the file changes again (carrick#3543)", async (t) => {
+test("a gap prints nothing, and the answered whole-change check queues no second one until the file changes again (carrick#3543)", async (t) => {
   const { workspace, home } = setup(t);
   edit(workspace.root, home, workspace.file, Date.now() - 5000);
   answer(home, queue(workspace.root, home, workspace.file), fixture("check-deferred.json"));
 
   const first = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
-  assert.match(first, NOT_CHECKED);
+  assert.equal(first, "", "a gap prints nothing");
   const [queued] = changedQueued(workspace.root);
   assert.ok(queued);
   answerChanged(home, queued!);
@@ -935,8 +875,8 @@ test("a reported gap is not repeated once the whole-change check answered it, un
   answerInHand(workspace.root, SESSION, other, reread(clean()), Date.now() + 2000, { home });
   const second = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
   assert.doesNotMatch(second, NOT_CHECKED);
-  // The named set's clean answer is said once, here (carrick#4082); nothing else names the file.
-  assert.doesNotMatch(second.replace(/^Carrick checked user-service\/src\/routes\/users\.ts and found no contract problem\.$/m, ""), /users\.ts/);
+  // Nothing names the file.
+  assert.doesNotMatch(second, /users\.ts/);
 
   // Nothing new: nothing said.
   const third = stopAnswers(SESSION, { home, ensure: () => false });
@@ -945,7 +885,7 @@ test("a reported gap is not repeated once the whole-change check answered it, un
   // The file changes again: it is named again.
   edit(workspace.root, home, workspace.file, Date.now() + 60_000);
   const fourth = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
-  assert.match(fourth, /^Carrick did not check the whole change: user-service\/src\/routes\/users\.ts: /m);
+  assert.equal(fourth, "", "a gap prints nothing");
 });
 
 /** A linked git worktree under the workspace (its `.git` is a file) holding one edited file. */
@@ -969,23 +909,25 @@ test("a file edited in a worktree that was removed is not named at Stop (carrick
   assert.equal(changedQueued(workspace.root).length, 0, "no whole-change check is queued for it");
 });
 
-test("a file edited in a worktree that still exists is still named (carrick#3595)", async (t) => {
+test("a file edited in a worktree that still exists still queues a check --changed (carrick#3595)", async (t) => {
   const { workspace, home } = setup(t);
   const { file } = linkedWorktree(workspace.root, "live");
   edit(workspace.root, home, file, Date.now() - 5000);
 
   const text = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
-  assert.match(text, /worktrees\/live\/user-service\/src\/a\.ts: no re-check answered it/);
+  assert.equal(text, "", "a gap prints nothing");
+  assert.equal(changedQueued(workspace.root).length, 1);
 });
 
-test("a file deleted in the main checkout is still named: only a gone worktree drops an entry (carrick#3595)", async (t) => {
+test("a file deleted in the main checkout still queues a check --changed: only a gone worktree drops an entry (carrick#3595)", async (t) => {
   const { workspace, home } = setup(t);
   fs.mkdirSync(path.join(workspace.root, ".git"));
   edit(workspace.root, home, workspace.file, Date.now() - 5000);
   fs.rmSync(workspace.file);
 
   const text = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
-  assert.match(text, /user-service\/src\/routes\/users\.ts: no re-check answered it/);
+  assert.equal(text, "", "a gap prints nothing");
+  assert.equal(changedQueued(workspace.root).length, 1);
 });
 
 test("stop delivers a finished check --changed answer: its verdict, never a clause", async (t) => {
@@ -1353,7 +1295,7 @@ function overran(reason: string, over: Record<string, unknown> = {}): CheckResul
   } as CheckResult;
 }
 
-test("a gap that lands after a Stop saw it running is named by the next Stop", (t) => {
+test("a gap that lands after a Stop saw it running prints nothing at the next Stop", (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
@@ -1364,9 +1306,8 @@ test("a gap that lands after a Stop saw it running is named by the next Stop", (
   answer(home, first, overran("the re-scan ran past the budget", { deadline: true }));
   answer(home, second, overran("re-reading shop-api (74 indexed files) took longer than 180 s against this index, so edits in shop-api are not re-checked until `carrick refresh`.", { known_miss: true }));
   const lines = stopAnswers(SESSION, { home, ensure: () => false }).lines;
-  assert.equal(lines.length, 1, lines.join("\n"));
-  assert.match(lines[0]!, /^Carrick did not check the whole change: /);
-  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, [], "said once");
+  assert.deepEqual(lines, [], "a gap prints nothing");
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, [], "still nothing");
 });
 
 test("a finding a carrier already printed is not restated by the Stop after a running one", (t) => {
@@ -1388,5 +1329,6 @@ test("a Stop that still sees the re-check running keeps waiting and says nothing
   assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, []);
   assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, []);
   answer(home, entry, overran("re-reading shop-api took longer than 180 s", { known_miss: true }));
-  assert.equal(stopAnswers(SESSION, { home, ensure: () => false }).lines.length, 1, "named once it lands");
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, [], "a gap that lands prints nothing");
+  assert.equal(changedQueued(workspace.root).length, 1);
 });

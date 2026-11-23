@@ -100,7 +100,7 @@ export type QueueEntry = {
   kind?: "changed";
   /**
    * The files the Stop that queued a `changed` entry named as not yet checked
-   * (workspace-relative). A clean answer is delivered only for a named set
+   * (workspace-relative). Kept for the record: a clean answer prints nothing
    * (`late.ts`); absent on an entry no Stop named.
    */
   named?: string[];

@@ -16,8 +16,8 @@
 // the change is recorded as stated. Judged operations with no problem: one
 // line naming them, once per distinct set of operations. Problems: a header
 // and the problem lines. Any gap (a stale service, a deferred or failed
-// re-check) is named in one line, with a `carrick check
-// --changed` queued behind the re-checks. Every answer that lands after Stop
+// re-check) prints nothing, with a `carrick check --changed` queued behind
+// the re-checks. Every answer that lands after Stop
 // returned, that check's included, is printed once by the agent's next hook
 // event that carries late answers (`late.ts`: the next prompt, Read, edit or
 // shell command).
@@ -31,7 +31,6 @@ import { createLogger } from "../log.ts";
 import {
   answersTheEdit,
   movedLines,
-  notCoveredLine,
   renderPostToolUse,
   sessionCheckedLines,
   staleClause,
@@ -333,15 +332,15 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     for (const answer of delivered) {
       if (answer.root === root && !isChanged(answer) && !hasFindings(answer)) folded.add(answer.seq);
     }
-    // The queued check is not waited for: the gap is named now, and the
-    // check's answer comes with the agent's next hook event.
-    statedLines.set(root, notCoveredLine(named));
+    // The queued check is not waited for, and a gap is neither a finding nor
+    // a named clean result: Stop says nothing. The check's problem, if any,
+    // comes with the agent's next hook event; a clean answer prints nothing.
     markStated(session, root, coverage.upTo, false, home);
   }
 
   const lines: string[] = [...statedLines.values(), ...early];
   // A whole-change check speaks through the one reader the carriers use: a
-  // problem, or the clean line for a set Stop named, once per set.
+  // problem; a clean run prints nothing.
   for (const answer of delivered) {
     if (!isChanged(answer)) continue;
     const text = changedLine(session, answer, home);
