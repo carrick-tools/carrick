@@ -30,6 +30,7 @@ import {
   removeCarrickHooks,
 } from "../src/init/settings.ts";
 import { LAUNCHER_FILE, launcherSource } from "../src/init/launcher.ts";
+import { buildFacts, factsPath, loadSqlite } from "../src/facts/store.ts";
 import { bringUpToDate } from "../src/init/self-update.ts";
 import { currentVersion } from "../src/update.ts";
 import {
@@ -177,6 +178,10 @@ function executableInitFixture(
     hosted?: { commit: string; source?: string; uploaded_by?: string };
     refreshFails?: boolean;
     localIndex?: "absent" | "stale" | "current";
+    /** A scanner `refresh` writes the hosted snapshot for the project the server holds, as the real one does. */
+    snapshotOnRefresh?: boolean;
+    /** The server answers `/mcp/facts` with a fact file for the project it was asked for (carrick#5094). */
+    facts?: boolean;
   } = {},
 ): {
   root: string;
@@ -219,6 +224,11 @@ if (indexed && argv[0] === "refresh") {
     process.exit(1);
   }
   fs.writeFileSync(wrote, "");
+  if (${JSON.stringify(workspace.snapshotOnRefresh === true)}) {
+    const dir = at("--workspace") + "/.carrick/hosted";
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(dir + "/snapshot.json", JSON.stringify({ resolution: { repos: [{ project_slug: ${JSON.stringify(projectSlug)} }] } }));
+  }
   process.stdout.write("indexed 1 repo(s) in 4.0s\\n");
   process.exit(0);
 }
@@ -274,6 +284,14 @@ const created = new Set();
 // and \`resolve-repos\` then reads back: the CLI claims nothing it has not read.
 let placed = ${JSON.stringify(projectSlug)};
 globalThis.fetch = async (input, init) => {
+  if (${JSON.stringify(workspace.facts === true)} && String(input) === "https://api.carrick.tools/mcp/facts") {
+    const asked = JSON.parse(String(init.body));
+    fs.appendFileSync(log, "facts " + asked.project + "\\n");
+    return Response.json({ success: true, staged_url: "https://stage.s3.amazonaws.com/" + asked.project });
+  }
+  if (${JSON.stringify(workspace.facts === true)} && String(input).startsWith("https://stage.s3.amazonaws.com/")) {
+    return new Response(JSON.stringify({ schema: 1, writer: 1, project_id: "p", project_slug: String(input).split("/").pop(), digest: "d1", built_at: "2026-01-01T00:00:00Z", repos: [], counts: { rows: 0, producers: 0, consumers: 0 } }) + "\\n");
+  }
   if (String(input) !== "https://api.carrick.tools/types/check-or-upload") throw new Error("unexpected URL");
   const body = JSON.parse(String(init.body));
   fs.appendFileSync(log, body.action + (Array.isArray(body.repos) ? " " + body.repos.join(",") : "") + "\\n");
@@ -1082,6 +1100,76 @@ test("the executable CLI re-reads nothing when this machine already holds a curr
     // And nothing claims a read that did not happen.
     assert.doesNotMatch(result.stdout, /read into \.carrick/);
     assert.doesNotMatch(result.stdout, /re-reading your code/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#5094, end to end. A folder set up for one project, then moved to
+// another: the second `carrick init` reads the hosted index again, and the
+// fact file, the index and the rules all name the project it set up.
+test("a second init after the repo moved project re-reads the index and leaves the new project's fact file", posixNativeFixture, async () => {
+  const fixture = executableInitFixture("project-b", "absent", "no-config", {}, {
+    indexed: true,
+    localIndex: "current",
+    snapshotOnRefresh: true,
+    facts: true,
+  });
+  try {
+    // What the first init left: the index read for project A and A's fact file.
+    const hosted = path.join(fixture.repo, ".carrick", "hosted");
+    fs.mkdirSync(hosted, { recursive: true });
+    fs.writeFileSync(path.join(hosted, "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "project-a" }] } }));
+    const header = JSON.stringify({ schema: 1, writer: 1, project_id: "p", project_slug: "project-a", digest: "d1", built_at: "2026-01-01T00:00:00Z", repos: [], counts: { rows: 0, producers: 0, consumers: 0 } });
+    await buildFacts(`${header}\n`, factsPath(fixture.repo), [], new Date().toISOString());
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: { ...fixture.env, CARRICK_NO_FACTS_REFRESH: "", CARRICK_FACT_LINES: "" }, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    // The index was read again, for project B, and said so once.
+    assert.ok(fixture.commands().includes("refresh"), fixture.commands().join(", "));
+    assert.ok(result.stdout.includes("Hosted index for 2 services read into .carrick/"), result.stdout);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(hosted, "snapshot.json"), "utf8")).resolution.repos, [{ project_slug: "project-b" }]);
+    // The fact file was asked for B, and what is on disk is B's.
+    assert.deepEqual(fixture.requests().filter((line) => line.startsWith("facts ")), ["facts project-b"]);
+    const sqlite = (await loadSqlite())!;
+    const db = new sqlite.DatabaseSync(factsPath(fixture.repo), { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'project'").get()?.["value"], "project-b");
+    } finally {
+      db.close();
+    }
+    assert.match(fs.readFileSync(path.join(fixture.repo, ".carrick", "RULES.md"), "utf8"), /project-b/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("the executable carrick refresh leaves the fact file of the project the folder is set up for", posixNativeFixture, async () => {
+  const fixture = executableInitFixture("project-b", "absent", "no-config", {}, {
+    indexed: true,
+    snapshotOnRefresh: true,
+    facts: true,
+  });
+  try {
+    const header = JSON.stringify({ schema: 1, writer: 1, project_id: "p", project_slug: "project-a", digest: "d1", built_at: "2026-01-01T00:00:00Z", repos: [], counts: { rows: 0, producers: 0, consumers: 0 } });
+    await buildFacts(`${header}\n`, factsPath(fixture.repo), [], new Date().toISOString());
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "refresh", "--workspace", fixture.repo],
+      { cwd: fixture.repo, env: { ...fixture.env, CARRICK_NO_FACTS_REFRESH: "", CARRICK_FACT_LINES: "" }, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stdout + result.stderr, /carrick-facts/);
+    const sqlite = (await loadSqlite())!;
+    const db = new sqlite.DatabaseSync(factsPath(fixture.repo), { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'project'").get()?.["value"], "project-b");
+    } finally {
+      db.close();
+    }
   } finally {
     fixture.cleanup();
   }

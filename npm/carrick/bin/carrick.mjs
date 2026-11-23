@@ -202,6 +202,12 @@ async function renderNative(args) {
     process.kill(process.pid, outcome.signal);
     return;
   }
+  // The fact file the edit hooks answer from belongs to the project this
+  // index was just read for (carrick#5094).
+  if (args[0] === "refresh" && outcome.code === 0) {
+    const { factsAfterRefresh } = await import("../dist/facts/after-refresh.js");
+    await factsAfterRefresh(args);
+  }
   process.exit(outcome.code);
 }
 

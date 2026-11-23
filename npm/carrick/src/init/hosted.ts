@@ -34,6 +34,7 @@ import path from "node:path";
 import type { RunningScan, StatusRepo, StatusResult } from "../contract.ts";
 import { parseStatusResult } from "../contract.ts";
 import { alive } from "../hook/lock.ts";
+import { snapshotRepos } from "../hosted-snapshot.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { elapsed, parseMarker } from "../scan.ts";
 import type { StepProgress, StepReport } from "./output.ts";
@@ -92,7 +93,7 @@ export type LocalIndexState =
   /** Another scan owns this index right now; a second pass would contend with it. */
   | { kind: "scanning" }
   /** The pass has to run, and this is what makes it worth the minutes. */
-  | { kind: "reread"; reason: string };
+  | { kind: "reread"; reason: string | null };
 
 /**
  * The hosted states a re-read can still change, so an index carrying one is
@@ -130,7 +131,11 @@ const ANSWERED_BY_A_REREAD = new Set([
  * the same `--workspace` argument, and a pair that still fails to line up
  * falls to the slow side, which is the safe one.
  */
-export function localIndexState(status: StatusResult | null, repos: string[]): LocalIndexState {
+export function localIndexState(
+  status: StatusResult | null,
+  repos: string[],
+  target: { workspace: string; project: string | null } | null = null,
+): LocalIndexState {
   if (status === null) return { kind: "reread", reason: "there is no index here yet" };
   // Before the index is read at all: a detached `carrick index` writes this
   // one, and a second pass over the same tree would be two scans contending
@@ -153,7 +158,27 @@ export function localIndexState(status: StatusResult | null, repos: string[]): L
     (service) => service.hosted_state !== undefined && ANSWERED_BY_A_REREAD.has(service.hosted_state),
   );
   if (unasked) return { kind: "reread", reason: "it holds no hosted rows yet" };
+  // Two reads that only the hosted side can answer, each of which init now
+  // says nothing about beyond the result line a read already prints
+  // (carrick#5094): an index read for another project than the one this run
+  // sets up, and a local copy `status` lists as unable to move to the hosted
+  // one (`kept_back`, the field and not its sentence).
+  if (target?.project != null) {
+    const read = snapshotSlugs(target.workspace);
+    if (read.size > 0 && !read.has(target.project)) return { kind: "reread", reason: null };
+  }
+  if ((status.kept_back ?? []).length > 0) return { kind: "reread", reason: null };
   return { kind: "current" };
+}
+
+/** The project slugs the workspace's cached hosted snapshot names: what the local index was last read for. */
+function snapshotSlugs(workspace: string): Set<string> {
+  const slugs = new Set<string>();
+  for (const repo of snapshotRepos(workspace) ?? []) {
+    const slug = (repo as { project_slug?: unknown } | null)?.project_slug;
+    if (typeof slug === "string" && slug !== "") slugs.add(slug);
+  }
+  return slugs;
 }
 
 /**
@@ -402,12 +427,13 @@ export async function downloadHostedIndex(
   run: NativeRun = nativeRunner(false),
   repos: string[] = [],
   say: StepProgress | null = null,
+  project: string | null = null,
 ): Promise<HostedDownload> {
   const before = await readStatus(workspace, run);
-  const local = localIndexState(before, repos);
+  const local = localIndexState(before, repos, { workspace, project });
   if (local.kind === "scanning") return { kind: "scanning" };
   if (local.kind === "current") return classify(before, null, false);
-  say?.(`${STEP_LABEL}: ${local.reason}, ${REREADING}`);
+  if (local.reason !== null) say?.(`${STEP_LABEL}: ${local.reason}, ${REREADING}`);
   const refreshed = await run(["refresh", "--workspace", workspace], true);
   if (refreshed.status !== 0) {
     return { kind: "failed", problem: firstLine(refreshed.stderr, "the scanner gave no reason") };
