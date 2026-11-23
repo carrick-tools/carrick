@@ -26,8 +26,6 @@ function reasonText(reason: string): string {
     case "decl_error":
       return "comparing a type with a compile error";
     case "value_edited":
-    case "value_not_a_node":
-    case "not_wrappable":
       return "with a send position that cannot be checked as written";
     case "top_type":
       return "with no checkable type";

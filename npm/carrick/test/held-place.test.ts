@@ -1,19 +1,16 @@
 // Place, arm and attribute (part 3, L1): pure functions that wrap each value a
 // producer's reply is sent from in a typed check, map a stored position across
 // an edit, decide which diagnostics are the check's own, and gate checks on the
-// current text. The moved-node lookup is the compiler engine's (a fake here).
+// current text. A value an edit crosses is never placed by a guess.
 // Every name is invented.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { execFileSync } from "node:child_process";
 import ts from "typescript";
 import { hunksOf } from "../src/facts/diff.ts";
-import { arm, attribute, checkWire, mapValue, overlay, regionOfEdit, regionsFromHunks, resolveValue } from "../src/held/place.ts";
-import type { Diag, SiteFinder, SiteQuery, Value } from "../src/held/place.ts";
+import { arm, attribute, checkWire, mapValue, overlay, regionOfEdit, regionsBetween } from "../src/held/place.ts";
+import type { Diag, Region, Value } from "../src/held/place.ts";
 
 const dir = new URL("./fixtures/held/", import.meta.url);
 const TEXT = fs.readFileSync(new URL("sends.ts", dir), "utf8");
@@ -33,7 +30,6 @@ const within = (text: string, outer: string, inner: string): Value => {
   const at = o.start + outer.indexOf(inner);
   return { file: "sends.ts", start: at, end: at + inner.length };
 };
-const never: SiteFinder = async (q) => assert.fail(`the site finder must not run: ${JSON.stringify(q)}`);
 const group = (type: string): { type: string } => ({ type });
 
 test("lines added above shift every value", () => {
@@ -47,60 +43,158 @@ test("lines added above shift every value", () => {
   assert.equal(moved.slice((got as Value).start, (got as Value).end), "{ id: order.id, total: order.total }");
 });
 
-test("an edit strictly inside the value keeps its bounds and never asks the engine", async () => {
+test("an edit strictly inside the value keeps its bounds", () => {
   const value = span(TEXT, "{ id: order.id, total: order.total }");
   const edited = TEXT.replace("total: order.total }", "amount: order.total }");
-  const region = regionOfEdit(TEXT, edited);
-  const got = await resolveValue(value, [region], TEXT, edited, never);
+  const got = mapValue(value, regionsBetween(TEXT, edited));
   assert.deepEqual(got, { file: "sends.ts", start: value.start, end: value.end + 1 });
   assert.equal(edited.slice((got as Value).start, (got as Value).end), "{ id: order.id, amount: order.total }");
 });
 
-test("an edit across a bound asks the engine for the moved node, with both texts", async () => {
+test("an edit across a bound places nothing: the value is crossed, never guessed", () => {
   // The shorthand-expanding rename: the local changes and so does the value's first characters.
   const old = within(TEXT, "c.json(result)", "result");
   const edited = TEXT.replace("const result = load();\n  return c.json(result);", "const found = load();\n  return c.json({ result: found });");
-  const region = regionOfEdit(TEXT, edited);
-  const seen: SiteQuery[] = [];
-  const finder: SiteFinder = async (q) => {
-    seen.push(q);
-    const start = edited.indexOf("{ result: found }");
-    return { start, end: start + "{ result: found }".length };
-  };
-  const got = await resolveValue(old, [region], TEXT, edited, finder);
-  assert.equal(seen.length, 1);
-  assert.deepEqual(seen[0], { file: "sends.ts", oldText: TEXT, newText: edited, start: old.start, end: old.end });
-  assert.equal(edited.slice((got as Value).start, (got as Value).end), "{ result: found }");
-});
-
-test("the engine's reason for a replaced parent comes back unchanged", async () => {
+  assert.equal(mapValue(old, regionsBetween(TEXT, edited)), "crossed");
+  // A replaced parent too.
   const value = span(TEXT, "{ first: 1 }");
-  const edited = TEXT.replace("return res.json({ first: 1 });", "return 1;");
-  const region = regionOfEdit(TEXT, edited);
-  assert.equal(await resolveValue(value, [region], TEXT, edited, async () => ({ reason: "value_edited" })), "value_edited");
-  // A shorthand value and a span that is no node are the engine's answers too.
-  assert.equal(await resolveValue(value, [region], TEXT, edited, async () => ({ reason: "not_wrappable" })), "not_wrappable");
-  assert.equal(await resolveValue(value, [region], TEXT, edited, async () => ({ reason: "value_not_a_node" })), "value_not_a_node");
+  assert.equal(mapValue(value, regionsBetween(TEXT, TEXT.replace("return res.json({ first: 1 });", "return 1;"))), "crossed");
 });
 
-test("three -U0 hunks map a value between two hunks exactly", () => {
+// A handler that logs one object and then replies with another (the stored value), and two edits that do not touch the reply:
+// constants above it and a handler below it. One region from the first change to the last would hold the reply.
+const HANDLER = [
+  "declare const log: { info(fields: object, message: string): void };",
+  "declare function save(): Promise<{ id: string; dupe: boolean; name: string }>;",
+  "",
+  "export async function upload(c: { json(body: unknown): Response }) {",
+  "  const saved = await save();",
+  '  log.info({ id: saved.id, team: "t1", dupe: saved.dupe }, "saved");',
+  "  return c.json({ ok: true, id: saved.id, name: saved.name });",
+  "}",
+  "",
+].join("\n");
+const REPLY = "{ ok: true, id: saved.id, name: saved.name }";
+const ABOVE = ["const LIMIT = 5;", 'const TEAM_HEADER = "x-team-id";', "", ""].join("\n");
+const BELOW = "\nexport const code = (c: { json(body: unknown): Response }) => c.json({ code: String(LIMIT), header: TEAM_HEADER });\n";
+
+test("an edit above a value and an edit below it, in one text, move it by arithmetic; each alone does too", () => {
+  const value: Value = { file: "x.ts", ...((at) => ({ start: at, end: at + REPLY.length }))(HANDLER.indexOf(REPLY)) };
+  const placedIn = (text: string): string => {
+    const got = mapValue(value, regionsBetween(HANDLER, text));
+    assert.notEqual(got, "crossed", text);
+    return text.slice((got as Value).start, (got as Value).end);
+  };
+  const both = ABOVE + HANDLER + BELOW;
+  assert.equal(regionsBetween(HANDLER, both).length, 2);
+  assert.equal(placedIn(both), REPLY);
+  assert.equal(placedIn(ABOVE + HANDLER), REPLY, "the edit above alone");
+  assert.equal(placedIn(HANDLER + BELOW), REPLY, "the edit below alone");
+  // The one-region map the daemon used before: the reply is crossed.
+  assert.equal(mapValue(value, [regionOfEdit(HANDLER, both)]), "crossed");
+});
+
+test("regionsBetween: equal texts have no region; a change on one line is that line's changed characters", () => {
+  assert.deepEqual(regionsBetween(HANDLER, HANDLER), []);
+  const edited = HANDLER.replace('team: "t1"', 'team: "t2"');
+  const [region, ...rest] = regionsBetween(HANDLER, edited);
+  assert.deepEqual(rest, []);
+  assert.equal(HANDLER.slice(region!.oldStart, region!.oldEnd), "1");
+  assert.equal(edited.slice(region!.newStart, region!.newEnd), "2");
+  // Lines removed and lines added at the ends of the text.
+  assert.deepEqual(mapValue({ file: "x.ts", start: HANDLER.indexOf(REPLY), end: HANDLER.indexOf(REPLY) + REPLY.length }, regionsBetween(HANDLER, HANDLER.slice(HANDLER.indexOf("\nexport") + 1) + "// end\n")), {
+    file: "x.ts",
+    start: HANDLER.indexOf(REPLY) - (HANDLER.indexOf("\nexport") + 1),
+    end: HANDLER.indexOf(REPLY) - (HANDLER.indexOf("\nexport") + 1) + REPLY.length,
+  });
+});
+
+test("regionsBetween, on random line edits: it rebuilds the new text, its regions are ordered and apart, and every untouched span maps to the same text", () => {
+  // A seeded generator: the same cases every run. A small alphabet, so lines repeat; both line endings; with and without a final newline.
+  let seed = 7;
+  const next = (n: number): number => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % n;
+  };
+  const words = ["a", "b", "}", "return c.json({ ok: true });", ""];
+  const textOf = (lines: string[], eol: string, last: boolean): string => (lines.length === 0 ? "" : lines.join(eol) + (last ? eol : ""));
+  const check = (old: string, edited: string, tag: string): Region[] => {
+    const regions = regionsBetween(old, edited);
+    let rebuilt = "";
+    let at = 0;
+    let atNew = 0;
+    let shift = 0;
+    for (const r of regions) {
+      // (b) in order and apart, in old and in new coordinates.
+      assert.ok(r.oldStart >= at && r.oldStart <= r.oldEnd, `${tag}: old order`);
+      assert.ok(r.newStart >= atNew && r.newStart <= r.newEnd, `${tag}: new order`);
+      assert.equal(r.newStart, r.oldStart + shift, `${tag}: the text before a region moved by the regions before it`);
+      rebuilt += old.slice(at, r.oldStart) + edited.slice(r.newStart, r.newEnd);
+      shift += r.newEnd - r.newStart - (r.oldEnd - r.oldStart);
+      at = r.oldEnd;
+      atNew = r.newEnd;
+    }
+    // (a) the regions applied to the old text are the new text.
+    assert.equal(rebuilt + old.slice(at), edited, `${tag}: only the regions differ`);
+    // (c) a span no region touches maps to a span holding the same text.
+    for (let probe = 0; probe < 20 && old.length > 0; probe += 1) {
+      const start = next(old.length);
+      const end = start + 1 + next(Math.min(12, old.length - start));
+      if (regions.some((r) => r.oldStart <= end && r.oldEnd >= start)) continue;
+      const got = mapValue({ file: "x.ts", start, end }, regions);
+      assert.notEqual(got, "crossed", `${tag}: [${start}, ${end}) is touched by no region`);
+      assert.equal(edited.slice((got as Value).start, (got as Value).end), old.slice(start, end), `${tag}: [${start}, ${end})`);
+    }
+    return regions;
+  };
+  check("", "", "both empty");
+  check("", "a\nb\n", "old empty");
+  check("a\nb\n", "", "new empty");
+  for (let round = 0; round < 500; round += 1) {
+    const eol = next(2) === 0 ? "\n" : "\r\n";
+    const lines = Array.from({ length: next(61) }, () => words[next(words.length)]!);
+    const changed = [...lines];
+    for (let edit = next(5); edit > 0; edit -= 1) {
+      const where = next(changed.length + 1);
+      const kind = next(3);
+      if (kind === 0) changed.splice(where, 0, ...Array.from({ length: 1 + next(4) }, () => words[next(words.length)]!));
+      else if (kind === 1) changed.splice(where, 1 + next(4));
+      else changed.splice(where, 1, words[next(words.length)]!);
+    }
+    check(textOf(lines, eol, next(2) === 0), textOf(changed.slice(0, 60), eol, next(2) === 0), `round ${round}`);
+  }
+  // (d) past the longest edit script searched: one region, and the new text is still rebuilt exactly.
+  const many = (tag: string, count: number): string => Array.from({ length: count }, (_, i) => `${tag} ${i}`).join("\n") + "\n";
+  assert.equal(check(many("old", 2100), many("new", 2100), "past the limit").length, 1);
+  const framed = (body: string): string => `head\n${body}tail\n`;
+  const kept = check(framed(many("old", 1200)), framed(many("new", 1300)), "past the limit, inside a kept head and tail");
+  assert.equal(kept.length, 1);
+});
+
+test("a reply whose text another handler repeats maps into its own handler, never onto the other's", () => {
+  const handler = (name: string): string => [`export function ${name}(c: { json(body: unknown): Response }) {`, "  return c.json({ ok: true });", "}", ""].join("\n");
+  const old = handler("first") + handler("second");
+  const reply = "{ ok: true }";
+  const second: Value = { file: "x.ts", start: old.lastIndexOf(reply), end: old.lastIndexOf(reply) + reply.length };
+  const own = (text: string): number => text.indexOf(reply, text.indexOf("function second("));
+  // A copy of the first handler inserted above, and a line appended below.
+  const copied = handler("first") + old + "// end\n";
+  assert.equal((mapValue(second, regionsBetween(old, copied)) as Value).start, own(copied));
+  // The first handler deleted, and an edit elsewhere.
+  const removed = handler("second").replace("export function", "export async function") + "// end\n";
+  const got = mapValue(second, regionsBetween(old, removed));
+  assert.ok(got === "crossed" || got.start === own(removed), JSON.stringify(got));
+  const dropped = handler("second") + "// end\n";
+  assert.equal((mapValue(second, regionsBetween(old, dropped)) as Value).start, own(dropped));
+});
+
+test("three runs of changed lines map a value between two of them exactly", () => {
   const old = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
   const lines = old.split("\n");
   lines.splice(2, 0, "added one", "added two"); // after line 2: +2 lines
   lines.splice(14, 1); // the old line 13 (index 12 + 2 added) goes: -1 line
   const edited = lines.join("\n").replace("line 25", "line twenty five"); // a change in place
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "held-place-"));
-  fs.writeFileSync(path.join(tmp, "a.txt"), old);
-  fs.writeFileSync(path.join(tmp, "b.txt"), edited);
-  let diff = "";
-  try {
-    execFileSync("git", ["diff", "--no-index", "--no-ext-diff", "--no-color", "-U0", "a.txt", "b.txt"], { cwd: tmp, encoding: "utf8" });
-  } catch (error) {
-    diff = (error as { stdout: string }).stdout; // exit 1 means the files differ
-  }
-  fs.rmSync(tmp, { recursive: true });
-  assert.equal((diff.match(/^@@ /gm) ?? []).length, 3, diff);
-  const regions = regionsFromHunks(old, edited, diff);
+  const regions = regionsBetween(old, edited);
   assert.equal(regions.length, 3);
   const value: Value = { file: "x.ts", start: old.indexOf("line 20"), end: old.indexOf("line 20") + "line 20".length };
   const got = mapValue(value, regions) as Value;
@@ -236,7 +330,7 @@ function typecheck(text: string): Array<{ start: number; code: number; message: 
   }));
 }
 
-test("hunksOf reads every `-U0` header, with the counts git omits as 1; the offset map and part 1's diff read the same headers", () => {
+test("hunksOf reads every `-U0` header, with the counts git omits as 1 (part 1's diff)", () => {
   const diff = "diff --git a/f b/f\n@@ -3 +3,2 @@\n-a\n+b\n+c\n@@ -10,0 +12,4 @@\n+x\n@@ -20,2 +22 @@\n";
   assert.deepEqual(hunksOf(diff), [
     { oldStart: 3, oldCount: 1, newStart: 3, newCount: 2 },

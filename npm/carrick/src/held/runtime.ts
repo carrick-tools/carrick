@@ -19,7 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
-import { diffAgainst, textAtCommit } from "../facts/diff.ts";
+import { textAtCommit } from "../facts/diff.ts";
 import { contractKey } from "../facts/lines.ts";
 import { commitsOf, indexedCommit, localCheckouts } from "../facts/peers.ts";
 import { localNames, localRepos } from "../facts/repo-match.ts";
@@ -33,22 +33,20 @@ import {
   attribute,
   checkWire,
   isTopOrBytes,
+  mapValue,
   overlay,
-  regionOfEdit,
-  regionsFromHunks,
-  resolveValue,
+  regionsBetween,
   type CheckInput,
   type Diag,
   type GraphqlForm,
   type MessageForm,
   type Overlay,
   type Region,
-  type SiteFinder,
   type Value,
 } from "./place.ts";
 import { runOf } from "./early.ts";
 import { messageSendRows } from "./message-rows.ts";
-import { engineEntry, engineSiteFinder, writeShadow, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
+import { engineEntry, writeShadow, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
 import { StepTimer, type Steps } from "./steps.ts";
 
 const log = createLogger("carrick-held-runtime");
@@ -74,8 +72,6 @@ export type RuntimeDeps = {
   stamp?: () => string;
   /** The held compiler over a shadow's `w` directory. */
   makeEngine?: (command: string, cwd: string) => Engine;
-  /** The compiler engine's site finder; the engine's `find_site` action by default. */
-  site?: SiteFinder;
 };
 
 type Unarmed = { label: string; protocol: string; file: string; reason: string; group: number; position: number | null; line?: number | null };
@@ -177,7 +173,7 @@ const hasLeaf = (input: CheckInput): boolean => input.form?.kind === "graphql" &
 const FIELD_RESOLVER_UNREAD = "field_resolver_unread";
 
 /** Whether an unarmed reason may pass when the file is edited again. */
-const transient = (reason: string): boolean => reason === "value_edited" || reason === "value_not_a_node" || reason === "not_wrappable" || reason.startsWith("clean_check_fails");
+const transient = (reason: string): boolean => reason === "value_edited" || reason.startsWith("clean_check_fails");
 
 /** One service's held compiler: its shadow, its checks and what is armed. */
 class HeldService implements ServiceEngine {
@@ -248,7 +244,7 @@ class HeldService implements ServiceEngine {
   private readonly engineId = `${process.pid}-${Date.now()}`;
 
   private readonly init: ServiceInit;
-  private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "repoPaths" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
+  private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "repoPaths" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
   private readonly engine: Engine;
   private readonly w: string;
   private readonly wire: string[];
@@ -259,7 +255,7 @@ class HeldService implements ServiceEngine {
 
   constructor(
     init: ServiceInit,
-    deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "repoPaths" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv },
+    deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "repoPaths" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv },
     engine: Engine,
     w: string,
     ownFiles: string[],
@@ -314,7 +310,7 @@ class HeldService implements ServiceEngine {
     for (const key of [...this.setAside]) if (!liveKeys.has(key)) this.setAside.delete(key);
   }
 
-  /** The text of `rel` at the index commit and the regions the disk text changed it by; or why neither is known. */
+  /** The text of `rel` at the index commit and the regions `text` (the text being gated) changed it by; or why neither is known. */
   private baseline(rel: string, text: string): { old: string; regions: Region[] } | "index_text_unavailable" {
     const commit = indexedCommit(this.commits, this.init.repo);
     if (commit === null) return "index_text_unavailable";
@@ -322,9 +318,7 @@ class HeldService implements ServiceEngine {
     const old = textAtCommit(real, commit, this.deps.env, GIT_BUDGET_MS);
     if (old === null) return "index_text_unavailable";
     if (old === text) return { old, regions: [] };
-    const diff = diffAgainst(real, commit, this.deps.env, GIT_BUDGET_MS);
-    if (diff === null || diff === "") return "index_text_unavailable";
-    return { old, regions: regionsFromHunks(old, text, diff) };
+    return { old, regions: regionsBetween(old, text) };
   }
 
   private commits: Record<string, string> | null = null;
@@ -404,15 +398,10 @@ class HeldService implements ServiceEngine {
         continue;
       }
       const span = p.row.values![p.at]!.span;
-      let placed: Value | string;
-      try {
-        placed = await resolveValue({ file: rel, start: span[0], end: span[1] }, base.regions, base.old, text, this.deps.site);
-      } catch (error) {
-        log("find_site failed", String(error));
-        placed = "value_not_a_node";
-      }
-      if (typeof placed === "string") {
-        p.row.groups.forEach((_, g) => no(p, g, placed as string));
+      // A value an edit crossed is never placed by a guess: it waits for a text that places it by arithmetic again.
+      const placed = mapValue({ file: rel, start: span[0], end: span[1] }, base.regions);
+      if (placed === "crossed") {
+        p.row.groups.forEach((_, g) => no(p, g, "value_edited"));
         continue;
       }
       this.values.set(p.id, placed);
@@ -569,20 +558,20 @@ class HeldService implements ServiceEngine {
       .map((p) => p.id);
   }
 
-  /** Move every position of `rel` with the edit from `old` to `text`; one that lost its place is dropped and the file is gated again. */
-  private async remap(rel: string, old: string, text: string): Promise<void> {
-    const regions = [regionOfEdit(old, text)];
+  /**
+   * Move every position of `rel` with the edit from `old` to `text`, by the
+   * region of each run of changed lines: however many edits the two texts are
+   * apart, a value no edit crossed moves by arithmetic. One an edit crossed is
+   * dropped, never placed by a guess (its check would speak on whatever node it
+   * landed on), and the file is gated again.
+   */
+  private remap(rel: string, old: string, text: string): void {
+    const regions = regionsBetween(old, text);
     for (const pos of this.byFile.get(rel) ?? []) {
       const value = this.values.get(pos.id);
       if (value === undefined) continue;
-      let moved: Value | string;
-      try {
-        moved = await resolveValue(value, regions, old, text, this.deps.site);
-      } catch (error) {
-        log("find_site failed", String(error));
-        moved = "value_edited";
-      }
-      if (typeof moved === "string") {
+      const moved = mapValue(value, regions);
+      if (moved === "crossed") {
         this.values.delete(pos.id);
         this.queue(rel, [pos.id]);
       } else {
@@ -1029,7 +1018,6 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       }
       const w = path.dirname(shadow.tsconfig);
       const engine = (options.makeEngine ?? ((command, cwd) => new Ts7Lsp(command, cwd)))(shadow.native_tsc, w);
-      const site = options.site ?? engineSiteFinder(entry, env, options.home);
       const wire = checkWire(shadow.wire, shadow.tolerances.declarations);
       const answered = graphqlReason === null ? shadow.graphql : undefined;
       const gql: GraphqlChecks = {
@@ -1038,7 +1026,7 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
         reason: graphqlReason,
         input: graphqlInput(mine, table),
       };
-      const service = new HeldService(init, { ...deps, site }, engine, w, shadow.own_files, wire, gql, message, snapshot);
+      const service = new HeldService(init, deps, engine, w, shadow.own_files, wire, gql, message, snapshot);
       try {
         service.loadRows(mine);
         await service.gate(false);
