@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.177](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.176...carrick-v0.3.177) (2026-11-23)
+
+
+### Bug Fixes
+
+* **intents:** reuse a previous sentence only for the same function ([#5067](https://github.com/carrick-tools/carrick/issues/5067)) ([9ba3048](https://github.com/carrick-tools/carrick/commit/9ba30484ddb6fadeee0432cc328c498940e41611))
+
+
+### Documentation
+
+* the Carrick section in AGENTS.md is one line, and the rules are in .carrick/RULES.md ([#5066](https://github.com/carrick-tools/carrick/issues/5066)) ([b90c155](https://github.com/carrick-tools/carrick/commit/b90c155c7dc60aff02f54ee9540bf65e9024f7bc))
+
 ## [0.3.176](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.175...carrick-v0.3.176) (2026-11-22)
 
 
