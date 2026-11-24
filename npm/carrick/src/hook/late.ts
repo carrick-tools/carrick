@@ -20,6 +20,7 @@ import { confirmedResult, earlyRows, keepRows, readStaleCopy, standingEarly, sta
 import { markLed, markTold, readSession, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
+import { linkedCheckoutTop, mainCheckoutOf } from "./worktree.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
 
@@ -57,7 +58,7 @@ export function confirmAnswer(raw: Answer, home?: string, now: number = Date.now
   if (isChanged(raw) || !raw.result || raw.result.error) return { answer: raw, corrections: [], held: 0 };
   // A break whose other side this session edited is the whole-change check's to state:
   // `held` counts them, and the caller that prints the answer queues that check.
-  const own = withoutStaleCopyBreaks(raw.result, raw.session, now, home);
+  const own = withoutStaleCopyBreaks(raw.result, raw.session, now, home, raw.file);
   const held = own.held;
   const answer = held === 0 ? raw : { ...raw, result: own.result };
   const early = readEarly(answer.session, answer.seq, home);
@@ -118,8 +119,20 @@ export function deliverOne(session: string, raw: Answer, home?: string): string[
  * for it: whoever prints the result queues it (`owedWholeChange`). Decided at
  * print time, never when the answer is filed: an edit lands between the two. `held` counts the rows taken out.
  */
-export function withoutStaleCopyBreaks(result: CheckResult, session: string, now: number, home?: string): { result: CheckResult; held: number } {
-  const edited = new Set(Object.entries(readSession(session, home).files).filter(([, edit]) => edit.at <= now).map(([file]) => realPath(file)));
+export function withoutStaleCopyBreaks(result: CheckResult, session: string, now: number, home?: string, ownFile?: string): { result: CheckResult; held: number } {
+  const recorded = Object.entries(readSession(session, home).files).filter(([, edit]) => edit.at <= now);
+  const edited = new Set(recorded.map(([file]) => realPath(file)));
+  // In a linked worktree the index names a counterpart under the main checkout, but the session edited it in its
+  // own checkout: the same repo-relative path counts. Only edits in the checkout `ownFile` sits in (never another
+  // worktree's) are mapped (#5038).
+  const top = ownFile === undefined ? null : linkedCheckoutTop(ownFile);
+  const main = top === null ? null : mainCheckoutOf(top);
+  if (top !== null && main !== null) {
+    for (const [file, edit] of recorded) {
+      const at = edit.checkout ?? linkedCheckoutTop(file);
+      if (at !== null && realPath(at) === realPath(top)) edited.add(realPath(path.join(main, path.relative(at, file))));
+    }
+  }
   if (edited.size === 0) return { result, held: 0 };
   const isEdited = (file: string): boolean => edited.has(realPath(file));
   let held = 0;
@@ -184,7 +197,7 @@ export function deliverEarly(
   const now = options.now ?? Date.now();
   const full = readAnswer(owner, early.seq, options.home);
   // Held rows are never claimed as said, so the full answer's copy of them is judged on its own.
-  const own = withoutStaleCopyBreaks(early.result, reader, now, options.home);
+  const own = withoutStaleCopyBreaks(early.result, reader, now, options.home, early.file);
   const judged = full?.state === "answered" && full.result && !full.result.error ? standingEarly(own.result, full.result) : own.result;
   const newest = early.service === undefined ? undefined : newestEarlies(owner, options.home).get(early.service);
   const view = keepRows(judged, (row) => standsAsRun(row, newest));
