@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.184](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.183...carrick-v0.3.184) (2026-11-24)
+
+
+### Bug Fixes
+
+* **hooks:** a change to both sides of a contract is judged by the whole-change check, not against a stale copy ([#5107](https://github.com/carrick-tools/carrick/issues/5107)) ([3e4b522](https://github.com/carrick-tools/carrick/commit/3e4b5225b3b4dc467747509860fe54cffe812684))
+* **hooks:** the clean line names the files edited, not operations "changed" ([#5106](https://github.com/carrick-tools/carrick/issues/5106)) ([9df56c1](https://github.com/carrick-tools/carrick/commit/9df56c130caab16a9297083fca6c7d3b1697face))
+
 ## [0.3.183](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.182...carrick-v0.3.183) (2026-11-23)
 
 
