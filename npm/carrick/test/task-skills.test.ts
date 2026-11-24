@@ -156,7 +156,8 @@ test("the whole-project duplicate ask belongs to the audit skill, and reuse says
     assert.doesNotMatch(reuseFlat, /class what every page returned/);
     // The audit narrows itself for that ask, and still handles a project larger than one window.
     const auditFlat = audit.replace(/\s+/g, " ");
-    assert.match(auditFlat, /the audit is sections C, D and E: count and estimate those three, run only their units/);
+    assert.match(auditFlat, /the audit is sections C, D and E: count and estimate those three/);
+    assert.match(auditFlat, /It is still the whole of C, D and E\. Every unit of the three runs/);
     assert.match(auditFlat, /Any other ask runs all five/);
     assert.match(auditFlat, /scan_from: <next_scan_from>/);
   }

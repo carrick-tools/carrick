@@ -53,8 +53,11 @@ Read these counts out of the answers:
 
 Where the ask is only where the project has built the same thing twice, or
 which duplicates are worth fixing, the audit is sections C, D and E: count and
-estimate those three, run only their units, and say in the report that A and B
-were not asked for. Any other ask runs all five.
+estimate those three, and say in the report that A and B were not asked for.
+It is still the whole of C, D and E. Every unit of the three runs, in
+sub-agents where you can start them, and the answer waits for every count
+line: the duplicates most worth fixing sit low on the list, so its first page
+does not answer the question. Any other ask runs all five.
 
 Work out the estimate from the counts. New tokens are input read for the first
 time plus output:
