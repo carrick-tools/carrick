@@ -20,7 +20,7 @@ and is untouched by everything below.
 |---|---|---|
 | `carrick-impact` | Before changing or removing a route, a handler, a response shape, an event, or a function other code calls. Also on "who calls this" and "what breaks if I change it" | `get_operation`, `get_callers`, `check_compatibility`, and `carrick check <file> --recheck --json` for a file already edited in the working tree |
 | `carrick-reuse` | At the end of a task that added or changed functions, and on "does this already exist" or "where have we built this twice" | `find_similar`, targeted with up to 20 entries, or in audit mode with none |
-| `carrick-drift` | Before changing a request or response type, and when a compatibility verdict names a problem with no location | `get_service_graph` for the pairs, then `get_contract_pair` per pair |
+| `carrick-drift` | Before changing a request or response type, and when a compatibility verdict names a problem with no location | `get_project_map` for the pairs, then `get_contract_pair` per pair |
 | `carrick-census` | "Every place that does X" questions | `search_by_intent` asked in two wordings, purpose and mechanism, paged to the end |
 
 Each one reports a table first, with a file and line on every row and a fixed
