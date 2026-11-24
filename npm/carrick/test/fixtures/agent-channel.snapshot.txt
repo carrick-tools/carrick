@@ -27,6 +27,9 @@ Carrick re-checked user-service/src/routes/users.ts after this edit: 1 contract 
 ### check-deleted.json :: renderPostToolUse
 Carrick: user-service/src/routes/users.ts is gone from disk and the index still holds 1 row(s) for it, with 1 counterpart(s) still on the other side.
 
+### check-known-miss.json :: renderPostToolUse
+(silent)
+
 ### check-mismatch.json :: renderPostToolUse
 (silent)
 
