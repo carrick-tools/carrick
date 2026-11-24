@@ -46,7 +46,8 @@ import {
 } from "./place.ts";
 import { runOf } from "./early.ts";
 import { messageSendRows } from "./message-rows.ts";
-import { engineEntry, writeShadow, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
+import { heldBuildId } from "./build.ts";
+import { engineEntry, writeShadow, writeShadowStamp, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
 import { StepTimer, type Steps } from "./steps.ts";
 
 const log = createLogger("carrick-held-runtime");
@@ -1003,6 +1004,12 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
         graphqlReason = GRAPHQL_TABLE_UNUSABLE;
       }
       if (ask !== undefined && shadow.graphql === undefined) graphqlReason = GRAPHQL_TABLE_UNUSABLE;
+      // Main's answer and its stamp, saved beside the shadow for a worktree's clone (carrick#5038). Never fails a start.
+      try {
+        writeShadowStamp(out, shadow, init.scan_root, heldBuildId());
+      } catch {
+        // No saved answer: a worktree clone is refused until the next start.
+      }
       if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
       if (!sameFitOptions(shadow.options.service, shadow.options.judge)) {
         writePlaced(placedPath(options.root, init.service, options.home), init.service, [], allUnarmed(mine, () => "options_differ"));
