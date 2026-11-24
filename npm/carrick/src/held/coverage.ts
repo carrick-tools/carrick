@@ -9,18 +9,26 @@ import { readJson } from "../hook/lock.ts";
 import { serviceFilesDir } from "./paths.ts";
 import type { ServiceState } from "./state.ts";
 
-type Placed = { service?: string; armed?: unknown[]; unarmed?: Array<{ reason?: string }> };
+type Fit = { strictNullChecks?: boolean; strictFunctionTypes?: boolean; exactOptionalPropertyTypes?: boolean };
+type Placed = {
+  service?: string;
+  armed?: unknown[];
+  unarmed?: Array<{ reason?: string }>;
+  /** Written with `options_differ`: both sides' values and the tsconfig the service's came from. */
+  options?: { service?: Fit; judge?: Fit };
+  tsconfig?: string;
+};
 type Held = { placed: Placed | null; state: ServiceState | null };
 
 /** An unarmed reason as the phrase a person reads after "N rows". */
-function reasonText(reason: string): string {
+function reasonText(reason: string, placed: Placed): string {
   const failing = /^clean_check_fails:(TS\d+)$/.exec(reason);
   if (failing) return `already reporting ${failing[1]} before the check runs`;
   switch (reason) {
     case "no_values":
       return "with no stored send position";
     case "options_differ":
-      return "in a service whose compiler options differ from Carrick's";
+      return differText(placed);
     case "twin_passes":
       return "that would not fail the check on a deliberately wrong value";
     case "decl_error":
@@ -44,6 +52,18 @@ function reasonText(reason: string): string {
   }
 }
 
+const FIT_OPTIONS = ["strictNullChecks", "strictFunctionTypes", "exactOptionalPropertyTypes"] as const;
+
+/** `options_differ`, naming the options and both values when the placed file kept them (an older file did not). */
+function differText(placed: Placed): string {
+  const own = placed.options?.service;
+  const judge = placed.options?.judge;
+  const named = own === undefined || judge === undefined ? [] : FIT_OPTIONS.filter((key) => own[key] !== judge[key]);
+  if (own === undefined || judge === undefined || named.length === 0) return "in a service whose compiler options differ from Carrick's";
+  const values = named.map((key) => `${key} is ${own[key] ? "on" : "off"} in this service and ${judge[key] ? "on" : "off"} in Carrick's check`).join(". ");
+  return `due to TypeScript options that differ from Carrick's check. ${values}. This service's values come from ${placed.tsconfig ?? "its tsconfig"}`;
+}
+
 function engineText(state: ServiceState): string {
   switch (state.state) {
     case "ready":
@@ -58,6 +78,9 @@ function engineText(state: ServiceState): string {
       return `The compiler engine could not start${state.reason === undefined ? "" : `: ${state.reason.replace(/[.\s]+$/, "")}`}.`;
   }
 }
+
+/** More services than this with no typed route are one line with a count. */
+const MAX_NOTHING_LINES = 5;
 
 type Filed = Held & { repo: string | null };
 
@@ -88,8 +111,12 @@ function recorded(root: string, home: string | undefined): Map<string, Filed> {
   return found;
 }
 
-function serviceLine(head: string, { placed, state }: Held): string {
+/** No engine has started here, and the fact file holds no response row for the service: none ever will. */
+const NO_TYPED_ROUTE = "no route here has a known reply type, so nothing will be checked.";
+
+function serviceLine(head: string, { placed, state }: Held, typed: boolean | null = null): string {
   const engine = state === null ? "" : ` ${engineText(state)}`;
+  if (placed === null && state === null && typed === false) return `${head} ${NO_TYPED_ROUTE}`;
   if (placed === null) return `${head} ${state === null ? "not started yet." : "nothing is checked yet."}${engine}`;
   const armed = placed.armed?.length ?? 0;
   const unarmed = placed.unarmed ?? [];
@@ -97,7 +124,7 @@ function serviceLine(head: string, { placed, state }: Held): string {
   if (total === 0) return `${head} no route with a stored send position.${engine}`;
   const counts = new Map<string, number>();
   for (const row of unarmed) counts.set(row.reason ?? "unknown", (counts.get(row.reason ?? "unknown") ?? 0) + 1);
-  const rest = [...counts].map(([reason, n]) => `${n} ${n === 1 ? "row" : "rows"} ${reasonText(reason)}`);
+  const rest = [...counts].map(([reason, n]) => `${n} ${n === 1 ? "row" : "rows"} ${reasonText(reason, placed)}`);
   return `${head} ${armed} of ${total} rows are checked after an edit.${rest.length > 0 ? ` Not checked: ${rest.join("; ")}.` : ""}${engine}`;
 }
 
@@ -112,14 +139,22 @@ export function compilerCoverage(
   workspace: { root: string; label: string; repos: ReadonlyArray<{ name: string; label: string; services: readonly string[] }> },
   on: boolean,
   home?: string,
+  /** The services that hold a response row in the fact file; null when it cannot be read (nothing is then said about "no typed route"). */
+  typed: ReadonlySet<string> | null = null,
 ): string[] {
   const held = recorded(workspace.root, home);
   if (!on && held.size === 0) return [];
   const none: Held = { placed: null, state: null };
   const mine = new Set<string>();
   const lines: string[] = [];
+  // Services with nothing to check are one line when there are many.
+  const nothing: Array<{ label: string; name: string }> = [];
   const emit = (label: string, services: Iterable<string>): void => {
-    for (const name of services) lines.push(serviceLine(`${label}: compiler check, service "${name}":`, held.get(name) ?? none));
+    for (const name of services) {
+      const mineHeld = held.get(name) ?? none;
+      if (mineHeld.placed === null && mineHeld.state === null && typed !== null && !typed.has(name)) nothing.push({ label, name });
+      else lines.push(serviceLine(`${label}: compiler check, service "${name}":`, mineHeld, typed === null ? null : typed.has(name)));
+    }
   };
   for (const repo of workspace.repos) {
     const recordedHere = [...held].filter(([, r]) => r.repo === repo.name).map(([name]) => name);
@@ -130,5 +165,9 @@ export function compilerCoverage(
     emit(repo.label, own);
   }
   emit(workspace.label, [...held.keys()].filter((name) => !mine.has(name)));
+  if (nothing.length > MAX_NOTHING_LINES) {
+    const first = nothing.slice(0, 3).map((entry) => entry.name).join(", ");
+    lines.push(`${workspace.label}: compiler check, ${nothing.length} services have no route with a known reply type (${first} and ${nothing.length - 3} more), so nothing will be checked there.`);
+  } else for (const { label, name } of nothing) lines.push(`${label}: compiler check, service "${name}": ${NO_TYPED_ROUTE}`);
   return lines;
 }

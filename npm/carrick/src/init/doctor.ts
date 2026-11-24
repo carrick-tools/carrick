@@ -35,6 +35,7 @@ import { spawnSync } from "node:child_process";
 import { status as runStatus } from "../cli.ts";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { compilerCoverage } from "../held/coverage.ts";
+import { servicesWithRows } from "../held/runtime.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import {
   BOTH_HARNESSES,
@@ -326,6 +327,7 @@ export function checkCompilerCoverage(
   repos: ConfiguredRepo[],
   home?: string,
   env: NodeJS.ProcessEnv = process.env,
+  typed: ReadonlySet<string> | null = null,
 ): Line[] {
   // The daemon files its records under the checkout root it was started with, the workspace.
   const declared = repos.map((repo) => ({
@@ -333,7 +335,7 @@ export function checkCompilerCoverage(
     label: repo.label,
     services: repo.config === null ? [] : declaredServices(repo.config).map((service) => service.name),
   }));
-  return compilerCoverage({ root: workspace, label: path.basename(workspace), repos: declared }, compilerLinesEnabled(env), home).map(say);
+  return compilerCoverage({ root: workspace, label: path.basename(workspace), repos: declared }, compilerLinesEnabled(env), home, typed).map(say);
 }
 
 function isDirectory(target: string): boolean {
@@ -882,6 +884,15 @@ function print(out: InitOutput, lines: Line[]): void {
   }
 }
 
+/** The services with a response row in the fact file; null when it cannot be read. Opens no engine. */
+async function typedServices(workspace: string): Promise<Set<string> | null> {
+  try {
+    return await servicesWithRows(workspace);
+  } catch {
+    return null;
+  }
+}
+
 export async function doctor(
   argv: string[],
   out: InitOutput = createOutput(),
@@ -903,7 +914,7 @@ export async function doctor(
     ...(await checkVersion()),
     ...checkPathVersion(workspace, pathCarrick()),
     ...checkDeclaredPaths(repos),
-    ...checkCompilerCoverage(workspace, repos),
+    ...checkCompilerCoverage(workspace, repos, undefined, process.env, await typedServices(workspace)),
     ...checkHooks(workspace, realMachine(), harnesses.claudeCode),
     ...checkCodexHooks(workspace, harnesses),
     ...checkTaskSkills(inspectTaskSkills(workspace), harnesses),
