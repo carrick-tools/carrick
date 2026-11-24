@@ -48,12 +48,6 @@ function crashed(error: unknown): void {
 }
 
 async function main(): Promise<void> {
-  // First step: leave whatever directory started this process. A daemon that keeps a worktree as its
-  // working directory fails every engine start once that worktree is removed (carrick#5038). Every
-  // path the daemon uses is absolute or built from `root`, never from the working directory.
-  const stateDir = heldDir();
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  process.chdir(stateDir);
   const root = process.argv.slice(2)[0];
   if (!root) {
     log("no checkout root given");
@@ -61,6 +55,12 @@ async function main(): Promise<void> {
   }
   const env = process.env;
   if (!compilerLinesEnabled(env)) return;
+  // First step once the switch is on (a switch-off run touches nothing): leave whatever directory started this process. A daemon that keeps a worktree as its
+  // working directory fails every engine start once that worktree is removed (carrick#5038). Every
+  // path the daemon uses is absolute or built from `root`, never from the working directory.
+  const stateDir = heldDir();
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  process.chdir(stateDir);
   rootForCrash = root;
   const buildId = heldBuildId();
   idForCrash = buildId;
