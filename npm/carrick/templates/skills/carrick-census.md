@@ -80,8 +80,17 @@ get_operation({{SCOPE}}, method: "<METHOD>", path: "<path>")
 ```
 
 Read `consumers` only: service and `call_file_location`. Skip `unread_sites`.
-Where more than 10 endpoints were reached, do this for the 10 the question
-cares about most and say how many were not looked up.
+Do this for every endpoint step 2 reached; there is no cap. Where there are
+more than 15, say the number first (each lookup is one call of about 6,000
+tokens) and split them into lots of 15. Where you can start sub-agents, give
+each lot to its own sub-agent with this brief and nothing else:
+
+> Call get_operation({{SCOPE}}, method, path) for each of these endpoints and
+> return, for each, every consumer's service and call_file_location, or "no
+> recorded caller": <the lot's methods and paths>
+
+Where you cannot, do the lots yourself one after another. The report states
+endpoints reached against endpoints looked up, and the two are equal.
 
 ## 4. Report
 

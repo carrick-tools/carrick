@@ -178,6 +178,41 @@ test("the bodies read what an answer carries rather than a response shape writte
   assert.match(census, /Do not change `similarity_threshold` while paging/);
 });
 
+test("drift proves in source whether a difference can break, pair by pair, and never says so from type texts", () => {
+  // Measured: a whole-project run on the earlier body read 3 of 9 pairs, left
+  // the one stored mismatch unsettled ("I did not read the router") and called
+  // an upload route that parses form data the likeliest real break.
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const drift = renderTaskSkill("carrick-drift", scope).replace(/\s+/g, " ");
+    const argument = scope.slug === null ? 'repo: "<owner/repo>"' : 'project: "acme-index"';
+    // The pairs come from the map, which lists them in one small answer.
+    assert.ok(drift.includes(`get_project_map(${argument})`), "the pairs no longer come from the map");
+    assert.doesNotMatch(drift, /get_service_graph\(/);
+    assert.match(drift, /## 4\. Can it break: prove it in source/);
+    for (const word of ["**REAL**", "**TYPE-ONLY**", "**FALSE**", "**CAN'T TELL**"]) {
+      assert.ok(drift.includes(word), `step 4 has no ${word}`);
+    }
+    assert.match(drift, /look at how the producer parses it \(a validator, a form or multipart parser\)/);
+    assert.match(drift, /Never write that a row can break, or is likely to, from the type texts alone/);
+    // A whole-project ask reads every pair: a sub-agent a pair, or one after another.
+    assert.match(drift, /Load the carrick-drift skill\. Do its steps 2 to 4 for the one pair <consumer>/);
+    assert.match(drift, /state pairs read against pairs the map lists/);
+    assert.match(drift, /\| operation \| class \| producer type \| consumer type \| call site \| verdict \| can it break \|/);
+  }
+});
+
+test("census looks up the callers of every endpoint it reached, in lots, with no cap", () => {
+  // Measured: with the cap of 10, a question that reached about 60 endpoints
+  // came back with callers confirmed for 13 of them.
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const census = renderTaskSkill("carrick-census", scope).replace(/\s+/g, " ");
+    assert.match(census, /Do this for every endpoint step 2 reached; there is no cap/);
+    assert.doesNotMatch(census, /do this for the 10 the question cares about most/);
+    assert.match(census, /split them into lots of 15/);
+    assert.match(census, /endpoints reached against endpoints looked up, and the two are equal/);
+  }
+});
+
 test("census follows helpers to callers through the endpoint, impact greps on zero, drift reads per-call-site verdicts (#3443)", () => {
   const census = renderTaskSkill("carrick-census", { slug: "acme-index" }).replace(/\s+/g, " ");
   assert.match(census, /depth: 3/);
