@@ -8,18 +8,34 @@ description: Use when the ask is whether a consumer and a producer still agree o
 {{SCOPE_NOTE}}
 
 `get_contract_pair` holds both sides and the verdict. It reports what the scan
-stored and computes no verdict of its own, and neither do you.
+stored and computes no verdict of its own, and neither do you. Whether a
+difference can break anything is a second question, answered in source in step
+4 and reported in its own column.
 
 ## 1. The pairs
 
 ```
-get_service_graph({{SCOPE}})
+get_project_map({{SCOPE}})
 ```
 
-Each edge is a consumer and a producer. An edge carrying `via_sdk` reaches its
-producer through a published package and has no call site of its own. Page with
-`offset: <next_offset>` while the rows keep coming. To start from one service,
-pass `service: "<name>"`.
+Each line under CONSUMERS is a producer and the services that call it: one pair
+per consumer. Where the map cuts the list short, call it again with `detail:
+true`. A consumer that reaches its producer through a published package has no
+call site of its own.
+
+Where the ask names one pair or one operation, do steps 2 to 4 for that. Where
+it is about the whole project, every pair is read: say how many pairs there
+are before you start, and do steps 2 to 4 for each. Where you can start
+sub-agents, give each pair to its own sub-agent, six at a time at most, with
+this brief and nothing else:
+
+> Load the carrick-drift skill. Do its steps 2 to 4 for the one pair <consumer>
+> to <producer>, every page, and return the rows, the count of operations
+> returned against operations classed, and any refused calls. Do no other pair
+> and start no sub-agents.
+
+Where you cannot, do the pairs yourself one after another, and write each
+pair's rows to the user before you start the next.
 
 ## 2. Each pair, operation by operation
 
@@ -74,12 +90,34 @@ A GET declares no request type by design, and `untyped_sides` already counts it
 that way. The wire note covers both readings above, so a `Date` on one side
 against a `string` on the other is not a difference.
 
-## 4. Report
+## 4. Can it break: prove it in source
 
-| operation | class | producer type | consumer type | call site | verdict |
-|---|---|---|---|---|---|
-| GET /api/orders/:id | DRIFT | Order | OrderSummary | web/src/orders.ts:31 | incompatible |
-| POST /api/orders | UNRESOLVED | NewOrder | OrderDraft | web/src/orders.ts:52 | unresolved; type texts differ on `note` |
+The classes above say what the index holds. For every DRIFT row, and every
+row whose type texts differ, open source before you say it can break: the
+producer's handler (how it reads the request, what it sends), the consumer's
+call site, and the code that uses the response. A body the two sides describe
+differently can still be read correctly, so look at how the producer parses it
+(a validator, a form or multipart parser) before you call it a mismatch. Then
+give the row one of these:
+
+- **REAL**: the consumer reads a field the producer does not send, or one side
+  can send a value that breaks the other, such as a null passed to code that
+  needs a string. Quote the line that breaks.
+- **TYPE-ONLY**: the types disagree and no value that is sent can break
+  anything: a null that is dropped or guarded before use, a string holding a
+  fixed set of values against a union of them. Quote the guard.
+- **FALSE**: the index is wrong about one side: the field is sent, the body is
+  parsed the way the consumer sends it, or the type is misread. Quote the line.
+- **CAN'T TELL**: the value comes from somewhere you cannot read. Say where.
+
+Never write that a row can break, or is likely to, from the type texts alone.
+
+## 5. Report
+
+| operation | class | producer type | consumer type | call site | verdict | can it break |
+|---|---|---|---|---|---|---|
+| GET /api/orders/:id | DRIFT | Order | OrderSummary | web/src/orders.ts:31 | incompatible | REAL: the page reads `total`, which the handler no longer sends (api/orders.ts:88) |
+| POST /api/orders | UNRESOLVED | NewOrder | OrderDraft | web/src/orders.ts:52 | unresolved; type texts differ on `note` | TYPE-ONLY: the handler drops a null `note` (api/orders.ts:40) |
 
 Class words, and only these: MATCH, DRIFT, UNRESOLVED, NOT JUDGED, CONSUMER
 UNTYPED, PRODUCER UNTYPED. Every operation the answer returned carries one of
@@ -90,14 +128,19 @@ UNRESOLVED, NOT JUDGED, MATCH, because a stored incompatible verdict is the
 finding and a side carrying no type is why nothing past it could be judged.
 A reading of the two type texts goes in the verdict
 column beside the stored state, in the words "type texts differ", so nothing in
-the table reads as a verdict the index did not give you.
+the table reads as a verdict the index did not give you. The last column
+holds step 4's word and its quoted line for every DRIFT row and every row whose
+type texts differ, and is empty for the rest.
+
+For a whole-project ask, state pairs read against pairs the map lists, and put
+the REAL rows first.
 
 State alongside it: `operations_total` against `operations_shown`,
 `matched_calls` and `unmatched_calls`, `dropped_rows`, and the `non_http_note`
 where the pair also carries GraphQL, socket or pub/sub operations, whose type
 text this surface does not hold.
 
-## 5. Act
+## 6. Act
 
 Change no type unless you were asked to. Offer one issue per DRIFT, and one per
 UNRESOLVED or NOT JUDGED row whose type texts differ. File the ones accepted:
