@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.3.185](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.184...carrick-v0.3.185) (2026-11-24)
+
+
+### Features
+
+* **held:** cap live worktree slots, add an off switch (T3) ([#5117](https://github.com/carrick-tools/carrick/issues/5117)) ([d5192fa](https://github.com/carrick-tools/carrick/commit/d5192fa9082d47284cfd77ed993854dabdc5aad7))
+* **held:** clone main's shadow for a worktree ([#5114](https://github.com/carrick-tools/carrick/issues/5114)) ([21ebeef](https://github.com/carrick-tools/carrick/commit/21ebeefd02680a84cf41c0df76e31be916c9df31))
+* **held:** serve a worktree edit from a clone of main's shadow ([#5038](https://github.com/carrick-tools/carrick/issues/5038) T2) ([#5115](https://github.com/carrick-tools/carrick/issues/5115)) ([0a854d9](https://github.com/carrick-tools/carrick/commit/0a854d9bccb1bf297d048505c3b1e9baf8ba2ade))
+* **hook:** tell an agent in a linked worktree where the rules file is ([#5134](https://github.com/carrick-tools/carrick/issues/5134)) ([#5136](https://github.com/carrick-tools/carrick/issues/5136)) ([24deb4d](https://github.com/carrick-tools/carrick/commit/24deb4d20d1d5413ffd90d74d96329df9ea4b8ab))
+* **skills:** drift proves in source whether a difference can break; census looks up every endpoint's callers ([#5130](https://github.com/carrick-tools/carrick/issues/5130)) ([23a31c5](https://github.com/carrick-tools/carrick/commit/23a31c580959b04620d3fe418a0bf48f453fac6d))
+* **skills:** make carrick-audit a full audit that states its cost first ([#5127](https://github.com/carrick-tools/carrick/issues/5127)) ([c72d3b9](https://github.com/carrick-tools/carrick/commit/c72d3b95e88c8cf6f05c4bef9c3d9cc50e51498c))
+* **skills:** the whole-project duplicate ask loads carrick-audit; reuse keeps the targeted check ([#5132](https://github.com/carrick-tools/carrick/issues/5132)) ([7f1f801](https://github.com/carrick-tools/carrick/commit/7f1f801d1da1e247a7af014cf35f52730f3d517e))
+
+
+### Bug Fixes
+
+* **held:** a worktree edit made while its slot waits for main is still checked ([#5137](https://github.com/carrick-tools/carrick/issues/5137)) ([a55f664](https://github.com/carrick-tools/carrick/commit/a55f66425b71ac71c42002adf8264a2f84b8dc69))
+* **held:** no held ask is lost while the daemon is busy ([#5119](https://github.com/carrick-tools/carrick/issues/5119)) ([267ba69](https://github.com/carrick-tools/carrick/commit/267ba6982b4087dba0ac3a643125be7a4039ae94))
+* **held:** the daemon and detached hook children never keep the hook's directory ([#5123](https://github.com/carrick-tools/carrick/issues/5123)) ([991c120](https://github.com/carrick-tools/carrick/commit/991c1206e05365fe3c7474a3fb3dacda9e9d2f8c))
+* **held:** worktree dependency guard ignores main's untracked build output ([#5038](https://github.com/carrick-tools/carrick/issues/5038)) ([#5122](https://github.com/carrick-tools/carrick/issues/5122)) ([4ef3695](https://github.com/carrick-tools/carrick/commit/4ef3695753318b84ee0a19f22c0a2b9e0c23a61f))
+* **hook:** a counterpart edited in the session's own worktree holds the stale-copy break ([#5124](https://github.com/carrick-tools/carrick/issues/5124)) ([b0a0518](https://github.com/carrick-tools/carrick/commit/b0a05181d9d2f0c0b20537dda029e872ddeb52ed))
+* **hook:** no service re-read or whole-change check from a linked worktree ([#5038](https://github.com/carrick-tools/carrick/issues/5038) T4) ([#5118](https://github.com/carrick-tools/carrick/issues/5118)) ([0c3339c](https://github.com/carrick-tools/carrick/commit/0c3339c01ccd354e170c16c1a77a2363da9112f8))
+* **hook:** reuse block speaks only for a function the edit added ([#5125](https://github.com/carrick-tools/carrick/issues/5125)) ([323f06f](https://github.com/carrick-tools/carrick/commit/323f06f6964738806ede315e066fc821080b9c80))
+
+
+### Documentation
+
+* **task-skills:** carrick-drift reads its pairs from get_project_map ([#5131](https://github.com/carrick-tools/carrick/issues/5131)) ([251d725](https://github.com/carrick-tools/carrick/commit/251d7250e4cf58c8bc0d89a92e82d33476cc9cdf))
+* **task-skills:** carrick-reuse is the targeted check only ([#5135](https://github.com/carrick-tools/carrick/issues/5135)) ([7d28038](https://github.com/carrick-tools/carrick/commit/7d280381c65c9a888725cf2ec9ce1ac42b64725c))
+
 ## [0.3.184](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.183...carrick-v0.3.184) (2026-11-24)
 
 
