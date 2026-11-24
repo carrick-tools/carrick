@@ -64,3 +64,12 @@ export function notCheckedLines(session: string, root: string, notes: readonly N
   }
   return { lines, keys };
 }
+
+/** Said once per session and worktree when an edit in a linked worktree is checked by the compiler engine alone (#5038 T4). Proposed wording. */
+export const WORKTREE_CHECK_LINE = "Carrick: in this git worktree only the compiler engine checks your edits; the wider re-check runs in the main checkout.";
+
+/** The worktree line for `files` edited in a linked worktree of this session's own checkout, unless already told; and its key. */
+export function worktreeCheckLines(session: string, root: string, tops: readonly string[], home?: string): { lines: string[]; keys: string[] } {
+  const keys = [...new Set(tops)].map((top) => `held-worktree-check::${rootKey(root)}::${top}`).filter((key) => !wasTold(session, key, home));
+  return { lines: keys.length > 0 ? [WORKTREE_CHECK_LINE] : [], keys };
+}

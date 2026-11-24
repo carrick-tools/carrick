@@ -316,6 +316,36 @@ test("row 10: a file in a linked worktree is not asked about", async (t) => {
   assert.equal(daemon.requests.length, 0);
 });
 
+test("T4: an edit in the session's own linked worktree says once that only the compiler engine checks it there; main never says it", async (t) => {
+  const ws = await workspace(t);
+  const repo = path.join(ws.root, "api");
+  fs.writeFileSync(path.join(repo, ".gitignore"), ".claude/worktrees/\n");
+  git(repo, "init", "-q", "-b", "main");
+  git(repo, "add", ".");
+  git(repo, "commit", "-q", "-m", "init");
+  git(repo, "worktree", "add", "-q", ".claude/worktrees/wt", "-b", "wt");
+  const top = path.join(repo, ".claude", "worktrees", "wt");
+  const daemon = await fakeDaemon(ws, ready([]));
+  t.after(() => daemon.close());
+  const editIn = (file: string, cwd: string, session: string) =>
+    runHook("post-edit.ts", {
+      payload: {
+        hook_event_name: "PostToolUse",
+        tool_name: "Edit",
+        session_id: session,
+        cwd,
+        tool_input: { file_path: file, old_string: "x", new_string: "" },
+        tool_response: { structuredPatch: [{ oldStart: 3, oldLines: 0, newLines: 0, newStart: 3, lines: [`+  ${IN_LIST}`] }] },
+      },
+      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...ON }),
+    });
+  const LINE = "in this git worktree only the compiler engine checks your edits; the wider re-check runs in the main checkout.";
+  const first = context((await editIn(path.join(top, "src", "tasks.ts"), top, "t4")).stdout);
+  assert.ok(first.includes(LINE), first);
+  assert.ok(!context((await editIn(path.join(top, "src", "tasks.ts"), top, "t4")).stdout).includes(LINE), "said once per session");
+  assert.ok(!context((await editIn(ws.at("api/src/tasks.ts"), ws.root, "t4-main")).stdout).includes(LINE), "never in the main checkout");
+});
+
 test("a Read asks the daemon with kind read and prints nothing of part 3", async (t) => {
   const ws = await workspace(t);
   const daemon = await fakeDaemon(ws, { state: "cold", lines: [], ms: 1 });

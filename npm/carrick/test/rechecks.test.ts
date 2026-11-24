@@ -26,7 +26,7 @@ import {
   takenDir,
 } from "../src/hook/rechecks.ts";
 import { checkedSinceLastEdit } from "../src/hook/checked.ts";
-import { lateContext } from "../src/hook/late.ts";
+import { lateContext, owedWholeChange } from "../src/hook/late.ts";
 import { recordEdit } from "../src/hook/reuse.ts";
 import { sessionCoverage } from "../src/hook/stop-wait.ts";
 import { readTimings } from "../src/hook/timings.ts";
@@ -476,6 +476,67 @@ test("a background re-check writes a timing row that says whether the engine was
       [["a.ts", false], ["b.ts", true]],
     );
     assert.ok(rows.every((row) => row.waited_ms >= 0 && row.duration_ms >= 0));
+  } finally {
+    s.cleanup();
+  }
+});
+
+// A linked worktree's edits are the compiler engine's: the late re-check never re-reads the service for them,
+// Stop states nothing from them and no whole-change check is queued for them; the main checkout is unchanged (#5038 T4).
+
+/** `scratch` with the workspace a git repo and a nested linked worktree `.claude/worktrees/wt` of it. */
+function scratchWithWorktree() {
+  const s = scratch();
+  const g = (cwd: string, ...args: string[]) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd, stdio: "ignore" });
+  fs.writeFileSync(s.file("a.ts"), "export const a = 1;\n");
+  fs.writeFileSync(s.file(".gitignore"), ".claude/worktrees/\n.carrick/\n");
+  g(s.root, "init", "-q", "-b", "main");
+  g(s.root, "add", "-A");
+  g(s.root, "commit", "-q", "-m", "init");
+  g(s.root, "worktree", "add", "-q", ".claude/worktrees/wt", "-b", "wt");
+  return { ...s, inWorktree: path.join(s.root, ".claude", "worktrees", "wt", "a.ts") };
+}
+
+test("T4: a worktree file's late re-check runs with --no-rescan; a main-checkout file's runs as before", async () => {
+  const s = scratchWithWorktree();
+  try {
+    const now = Date.now();
+    enqueue(s.root, "s1", [s.inWorktree], now, { home: s.home });
+    enqueue(s.root, "s2", [s.file("a.ts")], now, { home: s.home });
+    await runQueue(s.root, { env: env(s), home: s.home });
+    const byFile = new Map(argvs(s.log).map((argv) => [argv[1]!, argv]));
+    assert.ok(byFile.get(".claude/worktrees/wt/a.ts")?.includes("--no-rescan"), JSON.stringify([...byFile]));
+    assert.ok(byFile.get("a.ts")?.includes("--recheck"));
+    assert.ok(!byFile.get("a.ts")?.includes("--no-rescan"), "main: unchanged");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("T4: Stop states nothing from a worktree file's re-check and queues no whole-change check; a main file is still a gap", async () => {
+  const s = scratchWithWorktree();
+  try {
+    const now = Date.now();
+    recordEdit("s1", s.root, now, s.home, [s.inWorktree, s.file("a.ts")]);
+    const coverage = sessionCoverage("s1", s.root, s.home, now);
+    assert.equal(coverage.files, 1, "only the main file counts");
+    assert.deepEqual(coverage.gaps.map((g) => g.file), ["a.ts"]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("T4: a break held back in a worktree file queues no check --changed; one in a main file does", () => {
+  const s = scratchWithWorktree();
+  try {
+    const now = Date.now();
+    recordEdit("s1", s.root, now - 10, s.home, [s.inWorktree]);
+    const started: string[] = [];
+    owedWholeChange("s1", s.root, s.inWorktree, now, s.home, (root) => started.push(root));
+    assert.deepEqual(pendingFor("s1", s.home), [], "nothing queued from the worktree");
+    owedWholeChange("s1", s.root, s.file("a.ts"), now, s.home, (root) => started.push(root));
+    assert.equal(pendingFor("s1", s.home).filter((e) => e.kind === "changed").length, 1, "main: queued as before");
+    assert.deepEqual(started, [s.root]);
   } finally {
     s.cleanup();
   }

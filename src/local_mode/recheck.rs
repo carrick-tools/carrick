@@ -918,6 +918,9 @@ impl ServiceMisses {
                 ..Default::default()
             };
         }
+        // A worktree that is gone keeps no misses: a new worktree made at the
+        // same path must not inherit them (#5038 T4).
+        held.checkouts.retain(|key, _| Path::new(key).is_dir());
         let (services, files) = match checkout {
             None => (&mut held.services, &mut held.files),
             Some(checkout) => {
@@ -3890,6 +3893,36 @@ mod tests {
                 .expect("the file")
                 .contains("checkouts"),
             "main's file is unchanged when only main missed"
+        );
+    }
+
+    #[test]
+    fn a_removed_worktrees_misses_are_dropped_when_the_file_is_next_written() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("recheck-misses.json");
+        let gone = dir.path().join("gone-wt");
+        let kept = dir.path().join("kept-wt");
+        std::fs::create_dir_all(&gone).expect("a worktree folder");
+        std::fs::create_dir_all(&kept).expect("a second worktree folder");
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40), Some(&gone));
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40), Some(&kept));
+        std::fs::remove_dir_all(&gone).expect("remove the worktree");
+
+        ServiceMisses::record(&path, "g1", &svc("other"), miss(40), None);
+        let read = ServiceMisses::read(&path);
+        assert!(
+            read.holds("g1", &svc("big"), TEN_S, Some(&gone)).is_none(),
+            "the removed worktree's entry is gone"
+        );
+        assert_eq!(read.checkouts.len(), 1, "{read:?}");
+        assert_eq!(
+            read.holds("g1", &svc("big"), TEN_S, Some(&kept)),
+            Some(&miss(40)),
+            "a worktree still on disk keeps its misses"
+        );
+        assert_eq!(
+            read.holds("g1", &svc("other"), TEN_S, None),
+            Some(&miss(40))
         );
     }
 

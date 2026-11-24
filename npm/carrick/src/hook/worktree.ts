@@ -57,6 +57,14 @@ export function linkedCheckoutTop(file: string): string | null {
   return own !== null && own.linked ? own.top : null;
 }
 
+/**
+ * Whether `file` sits in a linked git worktree. Only the compiler engine checks an edit there: the hook
+ * never starts a full re-read or a whole-change check for it, which the main checkout runs (#5038 T4).
+ */
+export function inLinkedWorktree(file: string): boolean {
+  return linkedCheckoutTop(file) !== null;
+}
+
 /** Whether a linked worktree top recorded at edit time has been removed. */
 export function worktreeGone(top: string): boolean {
   return !fs.existsSync(path.join(top, ".git"));

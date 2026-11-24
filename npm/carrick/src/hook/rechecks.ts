@@ -24,6 +24,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { binary, check, checkChanged, refresh } from "../cli.ts";
+import { inLinkedWorktree } from "./worktree.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
 import {
@@ -806,10 +807,13 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
         remove(taken);
         continue;
       }
+      // The deciding call (#5038 T4): a file of a linked worktree is answered without a re-scan. A worktree's
+      // first re-read of a large service ran past the budget every time and left a miss; the compiler engine checks it.
       const outcome = await check(entry.relative, {
         cwd: root,
         workspace: root,
         recheck: true,
+        ...(inLinkedWorktree(entry.file) ? { noRescan: true } : {}),
         limitMs: cap + CALL_SLACK_MS,
         env: callEnv,
         bin,

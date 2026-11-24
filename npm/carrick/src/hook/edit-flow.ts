@@ -17,7 +17,7 @@ import { similarLines } from "./similar.ts";
 import type { SimilarLines } from "./similar.ts";
 import { deliverEarly, deliverLateFirst, emitPostToolUse, owedWholeChange, withoutStaleCopyBreaks } from "./late.ts";
 import { needsBackground, probeEdits, probeTimeoutMs } from "./probe.ts";
-import { inOtherWorktree } from "./worktree.ts";
+import { inOtherWorktree, linkedCheckoutTop } from "./worktree.ts";
 import { answerInHand, earlyOwedFor, enqueue, ensureRunner, readEarly } from "./rechecks.ts";
 import type { QueueEntry } from "./rechecks.ts";
 import { engineReadyOf } from "./timings.ts";
@@ -32,7 +32,7 @@ import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEna
 import { askHeld } from "../held/client.ts";
 import type { AskAnswer } from "../held/client.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
-import { notCheckedLines } from "./not-checked.ts";
+import { notCheckedLines, worktreeCheckLines } from "./not-checked.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
 
 const log = createLogger("carrick-hook");
@@ -227,7 +227,7 @@ export async function editFlow(
     }
     // A break whose other side this session edited is the whole-change check's to state (late.ts).
     const own = session ? withoutStaleCopyBreaks(result, session, Date.now()) : { result, held: 0 };
-    if (own.held > 0) owedWholeChange(session!, choice.root, Date.now());
+    if (own.held > 0) owedWholeChange(session!, choice.root, edited[index]!, Date.now());
     const context = renderPostToolUse(own.result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) rendered.set(index, context);
@@ -274,6 +274,11 @@ export async function editFlow(
   // An edit the engine did not check says so once per session, service and state (T7).
   const unchecked = session ? notCheckedLines(session, choice.root, answered.flatMap((a) => a.answer.not_checked ?? [])) : { lines: [], keys: [] };
   told.push(...unchecked.keys);
+  // An edit in this session's own linked worktree: only the compiler engine checks it, said once per session and worktree (#5038 T4).
+  const worktreeTops = edited.filter((file) => !inOtherWorktree(file, cwd ?? process.cwd())).flatMap((file) => linkedCheckoutTop(file) ?? []);
+  const worktreeLine = session && channel.channel === "hook" ? worktreeCheckLines(session, choice.root, worktreeTops) : { lines: [], keys: [] };
+  told.push(...worktreeLine.keys);
+  unchecked.lines.push(...worktreeLine.lines);
   const seen = new Set<string>();
   // Early answers owed from earlier edits are said first, oldest first, so a break
   // one of them states as new is said as that edit's; this edit's answer then lists

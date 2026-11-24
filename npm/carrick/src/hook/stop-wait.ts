@@ -54,7 +54,7 @@ import {
   type Answer,
 } from "./rechecks.ts";
 import { markSaid, markStated, markWaiting, readSession, wasSaid } from "./reuse.ts";
-import { worktreeGone } from "./worktree.ts";
+import { inLinkedWorktree, worktreeGone } from "./worktree.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -192,6 +192,12 @@ export function sessionCoverage(session: string, root: string, home?: string, no
   // named again until the file changes (carrick#3543).
   const changedAt = changedAnsweredAt(session, root, home);
   for (const [file, edit] of edits) {
+    // A file of a linked worktree is the compiler engine's alone (its answers are delivered as early answers): its
+    // late re-check does not re-read the service, so Stop states nothing from it and queues no whole-change check (#5038 T4).
+    if (inLinkedWorktree(file)) {
+      coverage.files -= 1;
+      continue;
+    }
     const relative = file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file;
     const retired = edit.at <= changedAt;
     const gap = (reason: string, running?: true) => {
@@ -266,7 +272,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
   const { own: delivered, adopted, early } = collect(session, home, clock(), ensure);
   // A break held back for the whole-change check (`withoutStaleCopyBreaks`) has that check queued.
   for (const answer of [...delivered, ...adopted]) {
-    if (confirmAnswer(answer, home, clock()).held > 0) owedWholeChange(answer.session, answer.root, clock(), home, ensure);
+    if (confirmAnswer(answer, home, clock()).held > 0) owedWholeChange(answer.session, answer.root, answer.file, clock(), home, ensure);
   }
 
   // The session's check, per workspace with an edit Stop has not yet spoken
