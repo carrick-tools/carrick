@@ -19,6 +19,16 @@ export function rootKey(root: string): string {
   return createHash("sha256").update(realPath(root)).digest("hex").slice(0, 12);
 }
 
+/**
+ * The checkout a held engine's files are named by: a linked worktree's top when the service's init names
+ * one (`checkout`), else the daemon's own checkout. One answer for every per-engine key and file (slot key,
+ * shadow folder, placed file, state file, registry entry), so a worktree's engine never shares or deletes
+ * the main checkout's. A main-checkout init has no `checkout`: its keys and files are unchanged.
+ */
+export function heldRootOf(init: { checkout?: string }, root: string): string {
+  return init.checkout ?? root;
+}
+
 export function socketPath(root: string, home?: string): string {
   return path.join(heldDir(home), `${rootKey(root)}.sock`);
 }

@@ -27,7 +27,7 @@ import { factsPath, openFacts, type ContractGroup, type ContractRow, type Graphq
 import { createLogger } from "../log.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit, ServiceRuntime, StartResult } from "./daemon.ts";
 import { StalePull, Ts7Lsp, type Diag as LspDiag, type Engine } from "./engine.ts";
-import { placedPath, shadowDir } from "./paths.ts";
+import { heldRootOf, placedPath, shadowDir } from "./paths.ts";
 import {
   arm,
   attribute,
@@ -548,7 +548,7 @@ class HeldService implements ServiceEngine {
         });
       });
     }
-    writePlaced(placedPath(this.deps.root, this.init.service, this.deps.home), this.init.service, armed, unarmed);
+    writePlaced(placedPath(heldRootOf(this.init, this.deps.root), this.init.service, this.deps.home), this.init.service, armed, unarmed);
   }
 
   /** The positions of `rel` that are unarmed for a reason an edit can change. */
@@ -981,7 +981,7 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
     async start(init: ServiceInit): Promise<StartResult> {
       const entry = options.entry === undefined ? engineEntry(env) : options.entry;
       if (entry === null) return { state: "error", reason: "the compiler engine is not built" };
-      const out = shadowDir(options.root, init.service, options.home);
+      const out = shadowDir(heldRootOf(init, options.root), init.service, options.home);
       fs.rmSync(out, { recursive: true, force: true });
       const mine = (await deps.rows()).filter((row) => row.repo === init.repo && row.service === init.service && row.direction === "response");
       // N2: the value files as they are now, before the shadow is written and the engine starts; an edit made during the start is not in them.
@@ -1005,7 +1005,7 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       if (ask !== undefined && shadow.graphql === undefined) graphqlReason = GRAPHQL_TABLE_UNUSABLE;
       if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
       if (!sameFitOptions(shadow.options.service, shadow.options.judge)) {
-        writePlaced(placedPath(options.root, init.service, options.home), init.service, [], allUnarmed(mine, () => "options_differ"));
+        writePlaced(placedPath(heldRootOf(init, options.root), init.service, options.home), init.service, [], allUnarmed(mine, () => "options_differ"));
         return { engine: new IdleService() };
       }
       const message = shadow.message ?? null;
@@ -1013,7 +1013,7 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
         isGraphql(row) && graphqlReason !== null ? graphqlReason : isMessage(row) && message === null ? MESSAGE_RULES_MISSING : null;
       const armable = (row: ContractRow): boolean => hasValues(row) && blocked(row) === null;
       if (!mine.some(armable)) {
-        writePlaced(placedPath(options.root, init.service, options.home), init.service, [], allUnarmed(mine, (row) => (hasValues(row) ? blocked(row)! : "no_values")));
+        writePlaced(placedPath(heldRootOf(init, options.root), init.service, options.home), init.service, [], allUnarmed(mine, (row) => (hasValues(row) ? blocked(row)! : "no_values")));
         return { engine: new IdleService() };
       }
       const w = path.dirname(shadow.tsconfig);
