@@ -11,16 +11,18 @@ import { fileURLToPath } from "node:url";
 import {
   HeldDaemon,
   serve,
+  WORKTREE_IDLE_MS,
   type HeldLine,
   type HeldRequest,
   type ServiceEngine,
   type ServiceInit,
   type ServiceRuntime,
+  type StartOptions,
   type StartResult,
 } from "../src/held/daemon.ts";
 import { askHeld, ensureHeld } from "../src/held/client.ts";
 import { liveEntries, writeEntry } from "../src/held/registry.ts";
-import { lockPath as heldLockPath, logPath, rootKey, socketPath, statePath } from "../src/held/paths.ts";
+import { lockPath as heldLockPath, logPath, placedPath, rootKey, socketPath, statePath } from "../src/held/paths.ts";
 import { readState, writeState } from "../src/held/state.ts";
 import { compilerLinesEnabled } from "../src/facts/enabled.ts";
 import { takeLock } from "../src/hook/lock.ts";
@@ -835,35 +837,334 @@ function worktreeWorld(serviceDir: string, rowCount?: number) {
       return { engine: { answer: async () => (events.push("answer"), { lines: [] }), rss: () => 100, close: async () => undefined } };
     },
   };
-  const daemon = new HeldDaemon({ root, home, env: { ...ON }, programs: async () => [init], runtime });
+  const daemon = new HeldDaemon({ root, home, env: { ...ON }, totalmem: () => 64 * 1024 ** 3, programs: async () => [init], runtime });
   const req = (file: string): HeldRequest => ({ session: "s1", files: [file], kind: "edit", edited_at: 1 });
   return { dir, root, daemon, events, req, main: path.join(dirOf, "src", "x.ts"), twin: path.join(root, ".claude", "worktrees", "b", serviceDir, "src", "x.ts"), done: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
-test("a worktree file under a repo-top service is never served by the main engine: it answers worktree and starts nothing", async () => {
-  const w = worktreeWorld("");
+// A worktree file gets its own slot of its twin's service, started from a clone of main's shadow (#5038, T2).
+
+type Scripted = StartResult | "engine";
+
+/** `worktreeWorld` with a clock, a 64 GB machine, and a runtime that records each start and gives scripted results in turn. */
+function slotWorld(serviceDir: string, script: Scripted[] = []) {
+  const w = worktreeWorld(serviceDir);
+  const home = path.join(w.dir, "home");
+  const clock = { now: 1_000_000 };
+  const started: ServiceInit[] = [];
+  const options: Array<StartOptions | undefined> = [];
+  const closed: string[] = [];
+  const results = [...script];
+  /** Set to make a worktree engine's answers never end (an ask in flight). */
+  const hang = { worktree: false };
+  const engineFor = (init: ServiceInit): ServiceEngine => ({
+    answer: async () => (init.checkout !== undefined && hang.worktree ? new Promise<never>(() => undefined) : { lines: [] }),
+    rss: () => 100,
+    close: async () => {
+      closed.push(init.checkout ?? "main");
+    },
+  });
+  const runtime: ServiceRuntime = {
+    start: async (init, opts) => {
+      started.push(init);
+      options.push(opts);
+      const next = results.shift() ?? "engine";
+      return next === "engine" ? { engine: engineFor(init) } : next;
+    },
+  };
+  const init: ServiceInit = { repo: "shop", service: "api", repo_path: w.root, sidecar_root: path.join(w.root, serviceDir), tsconfig: null, scan_root: w.root };
+  const daemon = new HeldDaemon({ root: w.root, home, env: { ...ON }, totalmem: () => 64 * 1024 ** 3, clock: () => clock.now, programs: async () => [init], runtime });
+  const top = path.join(w.root, ".claude", "worktrees", "b");
+  return { ...w, home, clock, daemon, started, options, closed, top, hang };
+}
+
+test("T2: a worktree file under a repo-top service starts the worktree's own slot (checkout set, folders under the worktree); the next ask is ready", async () => {
+  const w = slotWorld("");
   try {
-    const answer = await w.daemon.handle(w.req(w.twin));
-    assert.equal(answer.state, "worktree");
-    assert.deepEqual(answer.lines, []);
-    assert.deepEqual(answer.not_checked, [{ service: "api", state: "worktree", checkout: path.join(w.root, ".claude", "worktrees", "b") }]);
+    const first = await w.daemon.handle(w.req(w.twin));
+    assert.equal(first.state, "cold");
+    assert.deepEqual(first.not_checked, [{ service: "api", state: "cold" }]);
     await settle();
-    assert.deepEqual(w.events, [], "no start, no answer");
+    assert.equal(w.started.length, 1, "one start");
+    const init = w.started[0]!;
+    assert.equal(init.checkout, w.top);
+    assert.equal(init.service, "api");
+    assert.equal(init.repo_path, w.top);
+    assert.equal(init.scan_root, w.top);
+    assert.equal(init.sidecar_root, w.top);
+    assert.equal((await w.daemon.handle(w.req(w.twin))).state, "ready");
+    assert.equal(w.started.length, 1, "no second start");
   } finally {
     w.done();
   }
 });
 
-test("a worktree file under a sub-folder service answers worktree, not none", async () => {
-  const w = worktreeWorld("apps/api");
+test("T2: a worktree file under a sub-folder service starts a slot whose program folder is that sub-folder of the worktree", async () => {
+  const w = slotWorld("apps/api");
   try {
-    const answer = await w.daemon.handle(w.req(w.twin));
-    assert.equal(answer.state, "worktree");
-    assert.equal(answer.not_checked?.[0]?.service, "api");
-    assert.deepEqual(w.events, []);
+    assert.equal((await w.daemon.handle(w.req(w.twin))).state, "cold");
+    await settle();
+    assert.equal(w.started[0]?.sidecar_root, path.join(w.top, "apps", "api"));
+    assert.equal(w.started[0]?.scan_root, w.top);
+    assert.equal((await w.daemon.handle(w.req(w.twin))).state, "ready");
   } finally {
     w.done();
   }
+});
+
+for (const stale of ["no_saved_answer", "stale_build", "stale_main_inputs"]) {
+  test(`T2: a clone refused for ${stale} starts the main checkout's service first, then clones once more`, async () => {
+    const w = slotWorld("", [{ state: "refused", refused: stale, detail: "d" }]);
+    try {
+      assert.equal((await w.daemon.handle(w.req(w.twin))).state, "cold");
+      await settle();
+      assert.deepEqual(w.started.map((i) => i.checkout ?? "main"), [w.top, "main", w.top]);
+      assert.equal(readState(w.root, "api", w.home)?.state, "ready", "main started through its normal path: state record");
+      assert.ok(liveEntries(w.home).some((e) => e.root === w.root), "and registry entry");
+      assert.equal((await w.daemon.handle(w.req(w.twin))).state, "ready");
+    } finally {
+      w.done();
+    }
+  });
+}
+
+test("T2: a clone refused twice answers worktree with the refusal, never main's answer", async () => {
+  const refused: StartResult = { state: "refused", refused: "no_saved_answer", detail: "d" };
+  const w = slotWorld("", [refused, "engine", refused]);
+  try {
+    await w.daemon.handle(w.req(w.twin));
+    await settle();
+    const answer = await w.daemon.handle(w.req(w.twin));
+    assert.equal(answer.state, "worktree");
+    assert.deepEqual(answer.lines, []);
+    assert.deepEqual(answer.not_checked, [{ service: "api", state: "worktree", reason: "no_saved_answer", checkout: w.top }]);
+    assert.equal(liveEntries(w.home).some((e) => e.root === w.top), false, "a refused slot holds no memory");
+  } finally {
+    w.done();
+  }
+});
+
+for (const refusal of ["worktree_deps_differ", "vendored_reaches_own", "vendored_repo_file_differs", "destination_in_main", "worktree_unreadable"]) {
+  test(`T2: a clone refused for ${refusal} starts nothing else and answers worktree with the reason`, async () => {
+    const w = slotWorld("", [{ state: "refused", refused: refusal, detail: "d" }]);
+    try {
+      await w.daemon.handle(w.req(w.twin));
+      await settle();
+      assert.equal(w.started.length, 1, "no main start, no second clone");
+      const answer = await w.daemon.handle(w.req(w.twin));
+      assert.equal(answer.state, "worktree");
+      assert.deepEqual(answer.not_checked, [{ service: "api", state: "worktree", reason: refusal, checkout: w.top }]);
+      assert.equal(w.started.length, 1, "not retried at once");
+    } finally {
+      w.done();
+    }
+  });
+}
+
+test("T2: no saved answer while main's engine is ready does not restart main: one more clone, then worktree", async () => {
+  const refused: StartResult = { state: "refused", refused: "no_saved_answer", detail: "d" };
+  const w = slotWorld("", ["engine", refused, refused]);
+  try {
+    await w.daemon.handle(w.req(w.main));
+    await settle();
+    await w.daemon.handle(w.req(w.twin));
+    await settle();
+    assert.deepEqual(w.started.map((i) => i.checkout ?? "main"), ["main", w.top, w.top]);
+    assert.equal((await w.daemon.handle(w.req(w.main))).state, "ready", "main's engine kept");
+    assert.equal((await w.daemon.handle(w.req(w.twin))).state, "worktree");
+  } finally {
+    w.done();
+  }
+});
+
+for (const stale of ["stale_build", "stale_main_inputs"]) {
+  test(`T2 F3: ${stale} while main's engine is ready closes and restarts main, then clones: the worktree is checked`, async () => {
+    const refused: StartResult = { state: "refused", refused: stale, detail: "d" };
+    const w = slotWorld("", ["engine", refused]);
+    try {
+      await w.daemon.handle(w.req(w.main));
+      await settle();
+      await w.daemon.handle(w.req(w.twin));
+      for (let i = 0; i < 3; i += 1) await settle();
+      assert.deepEqual(w.started.map((i) => i.checkout ?? "main"), ["main", w.top, "main", w.top]);
+      assert.deepEqual(w.closed, ["main"], "the stale main engine was closed");
+      assert.equal((await w.daemon.handle(w.req(w.twin))).state, "ready");
+      assert.equal((await w.daemon.handle(w.req(w.main))).state, "ready");
+    } finally {
+      w.done();
+    }
+  });
+}
+
+test("T2 F1: a worktree slot begun by an edit starts with that edit's files; one begun by a read, and a main start, get none", async () => {
+  const w = slotWorld("");
+  try {
+    await w.daemon.handle(w.req(w.twin));
+    await w.daemon.handle(w.req(w.main));
+    await settle();
+    assert.deepEqual(w.options, [{ edited: [w.twin] }, undefined]);
+    w.clock.now += WORKTREE_IDLE_MS;
+    await w.daemon.tick();
+    await w.daemon.handle({ ...w.req(w.twin), kind: "read" });
+    await settle();
+    assert.deepEqual(w.options[2], {}, "a read begins it with no edited files");
+    w.clock.now += WORKTREE_IDLE_MS;
+    await w.daemon.tick();
+    await w.daemon.handle(w.req(w.twin));
+    await settle();
+    assert.deepEqual(w.options[3], { edited: [w.twin] }, "the first edit after an idle close starts it again with that edit's files");
+  } finally {
+    w.done();
+  }
+});
+
+test("T2 F4: a closed worktree slot's state and placed files go with it; main's stay", async () => {
+  const w = slotWorld("");
+  try {
+    await w.daemon.handle(w.req(w.main));
+    await w.daemon.handle(w.req(w.twin));
+    await settle();
+    fs.writeFileSync(placedPath(w.top, "api", w.home), "{}");
+    assert.ok(fs.existsSync(statePath(w.top, "api", w.home)));
+    w.clock.now += WORKTREE_IDLE_MS;
+    await w.daemon.tick();
+    assert.equal(fs.existsSync(statePath(w.top, "api", w.home)), false, "state gone");
+    assert.equal(fs.existsSync(placedPath(w.top, "api", w.home)), false, "placed gone");
+    assert.equal(fs.existsSync(path.join(w.home, ".carrick", "held", rootKey(w.top))), false, "the worktree's folder gone");
+    assert.ok(fs.existsSync(statePath(w.root, "api", w.home)), "main's state kept");
+  } finally {
+    w.done();
+  }
+});
+
+test("T2 F4: a refused worktree slot does not keep the daemon from its empty exit", async () => {
+  const w = slotWorld("", [{ state: "refused", refused: "worktree_deps_differ", detail: "d" }]);
+  try {
+    await w.daemon.handle(w.req(w.twin));
+    await settle();
+    w.clock.now += 5 * MIN;
+    assert.equal(w.daemon.wantsExit(), true);
+  } finally {
+    w.done();
+  }
+});
+
+test("T2 F5: a main start waits at most 2 s for a worktree engine's ask in flight, then closes that engine", async () => {
+  const w = slotWorld("");
+  try {
+    await w.daemon.handle(w.req(w.twin));
+    await settle();
+    w.hang.worktree = true;
+    void w.daemon.handle(w.req(w.twin));
+    await settle();
+    const asked = Date.now();
+    await w.daemon.handle(w.req(w.main));
+    for (let i = 0; i < 300 && !w.started.some((s) => s.checkout === undefined); i += 1) await new Promise((r) => setTimeout(r, 20));
+    const waited = Date.now() - asked;
+    assert.ok(w.started.some((s) => s.checkout === undefined), "main started");
+    assert.ok(waited >= 1_900 && waited < 4_000, `main waited ${waited} ms`);
+    assert.deepEqual(w.closed, [w.top]);
+  } finally {
+    w.done();
+  }
+});
+
+test("T2: a worktree slot closes after one idle minute; main's stays", async () => {
+  const w = slotWorld("");
+  try {
+    await w.daemon.handle(w.req(w.main));
+    await w.daemon.handle(w.req(w.twin));
+    await settle();
+    w.clock.now += WORKTREE_IDLE_MS - 1;
+    await w.daemon.tick();
+    assert.deepEqual(w.closed, [], "not yet");
+    w.clock.now += 1;
+    await w.daemon.tick();
+    assert.deepEqual(w.closed, [w.top], "the worktree engine closed; main's did not");
+    assert.equal((await w.daemon.handle(w.req(w.main))).state, "ready");
+    assert.equal((await w.daemon.handle(w.req(w.twin))).state, "cold", "a later ask starts it again");
+  } finally {
+    w.done();
+  }
+});
+
+test("T2: a main start first closes the service's ready worktree engines (it rewrites the packages their clones read)", async () => {
+  const w = slotWorld("");
+  try {
+    await w.daemon.handle(w.req(w.twin));
+    await settle();
+    assert.equal((await w.daemon.handle(w.req(w.twin))).state, "ready");
+    await w.daemon.handle(w.req(w.main));
+    await settle();
+    assert.deepEqual(w.closed, [w.top]);
+    assert.deepEqual(w.started.map((i) => i.checkout ?? "main"), [w.top, "main"]);
+  } finally {
+    w.done();
+  }
+});
+
+test("T2: a worktree engine whose start ended just as a main start queued behind it is closed, never served on main's rewritten shadow", async () => {
+  const w = worktreeWorld("");
+  try {
+    const home = path.join(w.dir, "home");
+    const closed: string[] = [];
+    const started: string[] = [];
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const runtime: ServiceRuntime = {
+      start: async (init) => {
+        started.push(init.checkout ?? "main");
+        if (init.checkout !== undefined && started.length === 1) await held;
+        return { engine: { answer: async () => ({ lines: [] }), rss: () => 100, close: async () => void closed.push(init.checkout ?? "main") } };
+      },
+    };
+    const init: ServiceInit = { repo: "shop", service: "api", repo_path: w.root, sidecar_root: w.root, tsconfig: null, scan_root: w.root };
+    const daemon = new HeldDaemon({ root: w.root, home, env: { ...ON }, totalmem: () => 64 * 1024 ** 3, programs: async () => [init], runtime });
+    const top = path.join(w.root, ".claude", "worktrees", "b");
+    assert.equal((await daemon.handle(w.req(w.twin))).state, "cold");
+    await settle();
+    assert.equal((await daemon.handle(w.req(w.main))).state, "cold", "main's start queues behind the worktree's");
+    await settle();
+    release();
+    for (let i = 0; i < 4; i += 1) await settle();
+    assert.deepEqual(started, [top, "main"]);
+    assert.deepEqual(closed, [top], "the worktree engine was closed");
+    assert.equal((await daemon.handle(w.req(w.twin))).state, "cold", "the next worktree ask starts a fresh clone");
+  } finally {
+    w.done();
+  }
+});
+
+test("T2: a main-checkout ask starts and writes the same with and without a worktree slot alive", async () => {
+  /** Main's start init, every file under main's held folder (path and bytes), main's registry entry and its log row. */
+  const record = async (withWorktree: boolean) => {
+    const w = slotWorld("");
+    try {
+      if (withWorktree) {
+        await w.daemon.handle(w.req(w.twin));
+        await settle();
+        assert.equal((await w.daemon.handle(w.req(w.twin))).state, "ready");
+      }
+      const answer = await w.daemon.handle(w.req(w.main));
+      await settle();
+      const ready = await w.daemon.handle(w.req(w.main));
+      const dir = path.join(w.home, ".carrick", "held", rootKey(w.root));
+      const files = fs.readdirSync(dir).sort().map((name) => `${name}\n${fs.readFileSync(path.join(dir, name), "utf8")}`);
+      const entry = liveEntries(w.home).filter((e) => e.root === w.root).map((e) => ({ ...e, pid: 0 }));
+      const rows = fs.readFileSync(logPath(w.root, w.home), "utf8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+      const mainRows = rows.filter((r) => r["kind"] !== "close").slice(withWorktree ? 2 : 0).map((r) => ({ ...r, ms: 0, steps: undefined }));
+      const main = w.started.find((i) => i.checkout === undefined);
+      return { answer: { ...answer, ms: 0 }, ready: { ...ready, ms: 0 }, main, files, entry, mainRows };
+    } finally {
+      w.done();
+    }
+  };
+  const alone = await record(false);
+  const beside = await record(true);
+  // The two worlds sit in different temporary folders: compare with each world's folder taken out.
+  const norm = (v: unknown, root: string): string => JSON.stringify(v).split(root).join("<root>");
+  assert.ok(alone.main !== undefined);
+  assert.equal(norm(beside, path.dirname(beside.main!.repo_path)), norm(alone, path.dirname(alone.main!.repo_path)));
 });
 
 test("a worktree file whose twin's service has no rows answers none with no note", async () => {
