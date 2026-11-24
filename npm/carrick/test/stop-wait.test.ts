@@ -68,6 +68,7 @@ function answer(home: string, entry: QueueEntry, result: CheckResult): void {
     started_at: entry.enqueued_at,
     finished_at: new Date().toISOString(),
     ...(entry.instead_of_probe ? { instead_of_probe: true as const } : {}),
+    ...(entry.added ? { added: entry.added } : {}),
     result,
   };
   writeAtomic(path.join(sessionsDir(home), `${entry.session}.recheck.${entry.seq}.answer.json`), `${JSON.stringify(body)}\n`);
@@ -408,7 +409,7 @@ test("Stop prints an answer queued in place of the probe whole when it holds a f
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   const now = Date.now();
-  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true, added: new Map([[workspace.file, { whole: true as const }]]) })[0]!;
   // Recorded, as the edit hook records every file it queues.
   recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
   const lead = fixture("check-deferred-similar.json").recheck!.new_functions!;

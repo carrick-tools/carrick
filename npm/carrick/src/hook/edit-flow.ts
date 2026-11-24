@@ -15,6 +15,7 @@ import { currentVersion } from "../update.ts";
 import { markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import type { SimilarLines } from "./similar.ts";
+import type { Added } from "./added.ts";
 import { deliverEarly, deliverLateFirst, emitPostToolUse, owedWholeChange, withoutStaleCopyBreaks } from "./late.ts";
 import { needsBackground, probeEdits, probeTimeoutMs } from "./probe.ts";
 import { inOtherWorktree, linkedCheckoutTop } from "./worktree.ts";
@@ -64,6 +65,12 @@ export async function editFlow(
      * lines: which lines changed is not known.
      */
     changes?: ReadonlyMap<string, Omit<FactEdit, "file">>;
+    /**
+     * Absolute path -> what the edit added (`added.ts`): the reuse block
+     * speaks only for a function the edit added. A file not named here
+     * (a shell write, a tool with no patch) is read against `git HEAD`.
+     */
+    added?: ReadonlyMap<string, Added>;
     /**
      * The files came from a shell command's write shapes, not from an edit
      * tool, so who wrote them is not proven: a file in another linked
@@ -172,7 +179,7 @@ export async function editFlow(
   const covered = new Set(facts?.callersRead ?? []);
   const queued = new Set<string>();
   if (insteadOfProbe && edited.length > 0) {
-    const entries = enqueue(choice.root, session!, edited, editedAt, { factsCallers: covered, insteadOfProbe, cwd });
+    const entries = enqueue(choice.root, session!, edited, editedAt, { factsCallers: covered, insteadOfProbe, cwd, added: input.added });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
     askFor(entries);
@@ -192,7 +199,7 @@ export async function editFlow(
       // re-check states the edit's answer.
       const answer = answers.results[index] ?? null;
       if (answer) {
-        const found = similarLines(answer, relative, cwd, (key) => !session || !wasLed(session, key), log);
+        const found = similarLines(answer, relative, cwd, (key) => !session || !wasLed(session, key), log, input.added?.get(edited[index]!));
         if (found.lines.length > 0) leads.set(index, found);
       }
       log("queued in place of the probe:", relative);
@@ -209,7 +216,7 @@ export async function editFlow(
       continue;
     }
     // The block rides on the probe answer, so a queued file gets it too.
-    const found = similarLines(result, relative, cwd, (key) => !session || !wasLed(session, key), log);
+    const found = similarLines(result, relative, cwd, (key) => !session || !wasLed(session, key), log, input.added?.get(edited[index]!));
     if (found.lines.length > 0) leads.set(index, found);
     if (queueable && needsBackground(result)) {
       toQueue.push(index);
@@ -236,7 +243,7 @@ export async function editFlow(
   if (toQueue.length > 0 && session) {
     // A file whose callers the fact lines answered keeps its late answer free
     // of the uses-count line too, as this answer would have been.
-    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered, cwd });
+    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered, cwd, added: input.added });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
     askFor(entries);

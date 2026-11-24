@@ -1143,13 +1143,16 @@ const SIMILAR_BLOCK = [
   "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
 ].join("\n");
 
+// The binary's new-function list is read against what the edit added (carrick#5121): a created file added all of it.
+const createPayload = (workspace: { root: string; file: string }) => ({ ...editPayload(workspace, "Write"), tool_response: { type: "create" } });
+
 test("an answered edit whose new function has similar rows prints the block once per session", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
   const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions-similar.json") });
   const edit = (session: string) =>
-    runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: session }, env });
+    runHook("post-edit.ts", { payload: { ...createPayload(workspace), session_id: session }, env });
 
   const first = contextOf((await edit("sess-similar")).stdout);
   assert.ok(first.split("\n\n").includes(SIMILAR_BLOCK), first);
@@ -1181,7 +1184,7 @@ test("a queued edit with similar rows prints the block alone, and names another 
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
   const run = await runHook("post-edit.ts", {
-    payload: { ...editPayload(workspace), session_id: "sess-similar-q" },
+    payload: { ...createPayload(workspace), session_id: "sess-similar-q" },
     env: deferredEnv(home, {
       CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred-similar.json"),
       CARRICK_FAKE_FULL_DELAY_MS: "100",

@@ -26,6 +26,7 @@ import fs from "node:fs";
 import { patchedFiles, patchEdits, placeHunks } from "./apply-patch.ts";
 import { MAX_FACT_FILE_BYTES } from "../facts/files.ts";
 import type { FactEdit } from "../facts/lines.ts";
+import { addedFromPayload } from "./added.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLateFirst, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
@@ -61,6 +62,8 @@ type Payload = {
   tool_response?: {
     structuredPatch?: Array<{ newStart?: unknown; lines?: unknown }>;
     type?: unknown;
+    /** A `Write` over an existing file: the text it replaced. */
+    originalFile?: unknown;
   };
 };
 
@@ -133,7 +136,8 @@ async function main(timing: Timing): Promise<void> {
 
   timing.file = (edited[0] ?? factOnly[0])!;
   const changes = factsOn ? await changesFromPayload(payload, [...edited, ...factOnly], cwd) : undefined;
-  await editFlow({ cwd, session, subAgent: Boolean(payload.agent_id), channel: channel.channel, timing, changes, factOnly }, edited);
+  const added = await addedFromPayload(payload, edited, changes);
+  await editFlow({ cwd, session, subAgent: Boolean(payload.agent_id), channel: channel.channel, timing, changes, added, factOnly }, edited);
 }
 
 type Change = Omit<FactEdit, "file">;
