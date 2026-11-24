@@ -52,9 +52,10 @@ import {
   pendingFor,
   readEarly,
   type Answer,
+  worktreeSkipped,
 } from "./rechecks.ts";
 import { markSaid, markStated, markWaiting, readSession, wasSaid } from "./reuse.ts";
-import { inLinkedWorktree, worktreeGone } from "./worktree.ts";
+import { worktreeGone } from "./worktree.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -97,6 +98,8 @@ function renderOne(answer: Answer): string {
     return `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.`;
   }
   if (readsNothing(result)) return "";
+  // A worktree re-read skipped for a miss is said once per session by the edit hook (`worktreeSkipLines`), not per answer (#5038 T4).
+  if (worktreeSkipped(answer.file, result)) return "";
   if (!answersTheEdit(result)) {
     const reason = result.recheck?.reason;
     return reason
@@ -192,12 +195,6 @@ export function sessionCoverage(session: string, root: string, home?: string, no
   // named again until the file changes (carrick#3543).
   const changedAt = changedAnsweredAt(session, root, home);
   for (const [file, edit] of edits) {
-    // A file of a linked worktree is the compiler engine's alone (its answers are delivered as early answers): its
-    // late re-check does not re-read the service, so Stop states nothing from it and queues no whole-change check (#5038 T4).
-    if (inLinkedWorktree(file)) {
-      coverage.files -= 1;
-      continue;
-    }
     const relative = file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file;
     const retired = edit.at <= changedAt;
     const gap = (reason: string, running?: true) => {
@@ -239,6 +236,12 @@ export function sessionCoverage(session: string, root: string, home?: string, no
     }
     if (readsNothing(result)) {
       covered();
+      continue;
+    }
+    // A linked worktree file whose re-read was skipped (a recorded miss, or another worktree re-reading): the
+    // compiler engine checks it, Stop states nothing from it and queues no whole-change check for it (#5038 T4).
+    if (worktreeSkipped(file, result)) {
+      coverage.files -= 1;
       continue;
     }
     if (!answersTheEdit(result)) {

@@ -3,6 +3,7 @@
 // one. The daemon is a fake socket server in this process that files its
 // answer as the real one does (`answerEarly`). Every name is invented.
 
+import { worktreeSkipLine } from "../src/hook/not-checked.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -316,7 +317,7 @@ test("row 10: a file in a linked worktree is not asked about", async (t) => {
   assert.equal(daemon.requests.length, 0);
 });
 
-test("T4: an edit in the session's own linked worktree says once that only the compiler engine checks it there; main never says it", async (t) => {
+test("T4: a worktree edit whose service re-read is skipped for a miss says so once; no miss says nothing; main never says it", async (t) => {
   const ws = await workspace(t);
   const repo = path.join(ws.root, "api");
   fs.writeFileSync(path.join(repo, ".gitignore"), ".claude/worktrees/\n");
@@ -327,7 +328,7 @@ test("T4: an edit in the session's own linked worktree says once that only the c
   const top = path.join(repo, ".claude", "worktrees", "wt");
   const daemon = await fakeDaemon(ws, ready([]));
   t.after(() => daemon.close());
-  const editIn = (file: string, cwd: string, session: string) =>
+  const editIn = (file: string, cwd: string, session: string, fixture: string) =>
     runHook("post-edit.ts", {
       payload: {
         hook_event_name: "PostToolUse",
@@ -337,13 +338,15 @@ test("T4: an edit in the session's own linked worktree says once that only the c
         tool_input: { file_path: file, old_string: "x", new_string: "" },
         tool_response: { structuredPatch: [{ oldStart: 3, oldLines: 0, newLines: 0, newStart: 3, lines: [`+  ${IN_LIST}`] }] },
       },
-      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...ON }),
+      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath(fixture), ...ON }),
     });
-  const LINE = "in this git worktree only the compiler engine checks your edits; the wider re-check runs in the main checkout.";
-  const first = context((await editIn(path.join(top, "src", "tasks.ts"), top, "t4")).stdout);
+  const LINE = worktreeSkipLine("user-service");
+  const inWorktree = path.join(top, "src", "tasks.ts");
+  const first = context((await editIn(inWorktree, top, "t4", "check-known-miss.json")).stdout);
   assert.ok(first.includes(LINE), first);
-  assert.ok(!context((await editIn(path.join(top, "src", "tasks.ts"), top, "t4")).stdout).includes(LINE), "said once per session");
-  assert.ok(!context((await editIn(ws.at("api/src/tasks.ts"), ws.root, "t4-main")).stdout).includes(LINE), "never in the main checkout");
+  assert.ok(!context((await editIn(inWorktree, top, "t4", "check-known-miss.json")).stdout).includes(LINE), "said once per session");
+  assert.ok(!context((await editIn(inWorktree, top, "t4-none", "check-silent.json")).stdout).includes("is skipped in this worktree"), "no miss: nothing said");
+  assert.ok(!context((await editIn(ws.at("api/src/tasks.ts"), ws.root, "t4-main", "check-known-miss.json")).stdout).includes("is skipped in this worktree"), "never in the main checkout");
 });
 
 test("a Read asks the daemon with kind read and prints nothing of part 3", async (t) => {

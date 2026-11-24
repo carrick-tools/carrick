@@ -66,11 +66,23 @@ export function notCheckedLines(session: string, root: string, notes: readonly N
   return { lines, keys };
 }
 
-/** Said once per session and worktree when an edit in a linked worktree is checked by the compiler engine alone (#5038 T4). Proposed wording. */
-export const WORKTREE_CHECK_LINE = "Carrick: in this git worktree only the compiler engine checks your edits; the wider re-check runs in the main checkout.";
+/**
+ * Said once per session, worktree and service when a linked worktree's wider re-check of a service was skipped
+ * because it ran past its time limit (a recorded miss) (#5038 T4). Proposed wording.
+ */
+export function worktreeSkipLine(service: string): string {
+  return `Carrick: the wider re-check of ${service} is skipped in this worktree because it ran past its time limit; the compiler engine still checks your edits here.`;
+}
 
-/** The worktree line for `files` edited in a linked worktree of this session's own checkout, unless already told; and its key. */
-export function worktreeCheckLines(session: string, root: string, tops: readonly string[], home?: string): { lines: string[]; keys: string[] } {
-  const keys = [...new Set(tops)].map((top) => `held-worktree-check::${rootKey(root)}::${top}`).filter((key) => !wasTold(session, key, home));
-  return { lines: keys.length > 0 ? [WORKTREE_CHECK_LINE] : [], keys };
+/** The skip lines for each (worktree top, service) of this session not yet told, and their keys. */
+export function worktreeSkipLines(session: string, root: string, skipped: ReadonlyArray<{ top: string; service: string }>, home?: string): { lines: string[]; keys: string[] } {
+  const lines: string[] = [];
+  const keys: string[] = [];
+  for (const { top, service } of skipped) {
+    const key = `held-worktree-skip::${rootKey(root)}::${top}::${service}`;
+    if (keys.includes(key) || wasTold(session, key, home)) continue;
+    keys.push(key);
+    lines.push(worktreeSkipLine(service));
+  }
+  return { lines, keys };
 }

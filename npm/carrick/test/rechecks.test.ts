@@ -24,6 +24,7 @@ import {
   requestPath,
   runQueue,
   takenDir,
+  worktreeRereadLock,
 } from "../src/hook/rechecks.ts";
 import { checkedSinceLastEdit } from "../src/hook/checked.ts";
 import { lateContext, owedWholeChange } from "../src/hook/late.ts";
@@ -497,46 +498,68 @@ function scratchWithWorktree() {
   return { ...s, inWorktree: path.join(s.root, ".claude", "worktrees", "wt", "a.ts") };
 }
 
-test("T4: a worktree file's late re-check runs with --no-rescan; a main-checkout file's runs as before", async () => {
+test("T4: with the machine's re-read slot free, a worktree file's re-check re-reads (no blanket skip) and frees the slot", async () => {
   const s = scratchWithWorktree();
   try {
+    enqueue(s.root, "s1", [s.inWorktree], Date.now(), { home: s.home });
+    await runQueue(s.root, { env: env(s), home: s.home });
+    const argv = argvs(s.log).find((a) => a[1] === ".claude/worktrees/wt/a.ts");
+    assert.ok(argv?.includes("--recheck") && !argv.includes("--no-rescan"), JSON.stringify(argv));
+    assert.equal(fs.existsSync(worktreeRereadLock(s.home)), false, "the slot is free again");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("T4: while another worktree re-read holds the machine's slot, a worktree file is answered with --no-rescan; a main file re-reads as before", async () => {
+  const s = scratchWithWorktree();
+  // A live process (the test's parent) holds the slot, freshly touched.
+  const holder = { pid: process.ppid, started: new Date().toISOString(), touched: new Date().toISOString() };
+  try {
+    fs.writeFileSync(worktreeRereadLock(s.home), JSON.stringify(holder));
     const now = Date.now();
     enqueue(s.root, "s1", [s.inWorktree], now, { home: s.home });
     enqueue(s.root, "s2", [s.file("a.ts")], now, { home: s.home });
     await runQueue(s.root, { env: env(s), home: s.home });
     const byFile = new Map(argvs(s.log).map((argv) => [argv[1]!, argv]));
     assert.ok(byFile.get(".claude/worktrees/wt/a.ts")?.includes("--no-rescan"), JSON.stringify([...byFile]));
-    assert.ok(byFile.get("a.ts")?.includes("--recheck"));
-    assert.ok(!byFile.get("a.ts")?.includes("--no-rescan"), "main: unchanged");
+    assert.ok(byFile.get("a.ts")?.includes("--recheck") && !byFile.get("a.ts")?.includes("--no-rescan"), "main: unchanged");
+    assert.equal(JSON.parse(fs.readFileSync(worktreeRereadLock(s.home), "utf8")).pid, process.ppid, "the holder's lock is left alone");
   } finally {
     s.cleanup();
   }
 });
 
-test("T4: Stop states nothing from a worktree file's re-check and queues no whole-change check; a main file is still a gap", async () => {
-  const s = scratchWithWorktree();
-  try {
-    const now = Date.now();
-    recordEdit("s1", s.root, now, s.home, [s.inWorktree, s.file("a.ts")]);
-    const coverage = sessionCoverage("s1", s.root, s.home, now);
-    assert.equal(coverage.files, 1, "only the main file counts");
-    assert.deepEqual(coverage.gaps.map((g) => g.file), ["a.ts"]);
-  } finally {
-    s.cleanup();
-  }
-});
-
-test("T4: a break held back in a worktree file queues no check --changed; one in a main file does", () => {
+test("T4: Stop leaves out a worktree file whose re-read was skipped for a miss, and queues nothing for it; one with no miss is a gap as before", async () => {
   const s = scratchWithWorktree();
   try {
     const now = Date.now();
     recordEdit("s1", s.root, now - 10, s.home, [s.inWorktree]);
-    const started: string[] = [];
-    owedWholeChange("s1", s.root, s.inWorktree, now, s.home, (root) => started.push(root));
-    assert.deepEqual(pendingFor("s1", s.home), [], "nothing queued from the worktree");
-    owedWholeChange("s1", s.root, s.file("a.ts"), now, s.home, (root) => started.push(root));
-    assert.equal(pendingFor("s1", s.home).filter((e) => e.kind === "changed").length, 1, "main: queued as before");
-    assert.deepEqual(started, [s.root]);
+    enqueue(s.root, "s1", [s.inWorktree], now, { home: s.home });
+    await runQueue(s.root, { env: env(s, { CARRICK_FAKE_FIXTURE: fixturePath("check-known-miss.json") }), home: s.home });
+    const skipped = sessionCoverage("s1", s.root, s.home, now);
+    assert.equal(skipped.files, 0);
+    assert.deepEqual(skipped.gaps, []);
+    recordEdit("s2", s.root, now, s.home, [s.inWorktree]);
+    assert.deepEqual(sessionCoverage("s2", s.root, s.home, now).gaps.map((g) => g.file), [".claude/worktrees/wt/a.ts"], "no miss, no answer yet: a gap as before");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("T4: a held-back break in a worktree file whose re-read was skipped for a miss queues no check --changed; with no miss, or in main, it is queued as before", async () => {
+  const s = scratchWithWorktree();
+  try {
+    const now = Date.now();
+    enqueue(s.root, "s1", [s.inWorktree], now - 20, { home: s.home });
+    await runQueue(s.root, { env: env(s, { CARRICK_FAKE_FIXTURE: fixturePath("check-known-miss.json") }), home: s.home });
+    const changed = (session: string) => pendingFor(session, s.home).filter((e) => e.kind === "changed").length;
+    owedWholeChange("s1", s.root, s.inWorktree, now, s.home, () => true);
+    assert.equal(changed("s1"), 0, "a recorded miss: nothing queued");
+    owedWholeChange("s2", s.root, s.inWorktree, now, s.home, () => true);
+    assert.equal(changed("s2"), 1, "no miss for this session's file: queued as before");
+    owedWholeChange("s3", s.root, s.file("a.ts"), now, s.home, () => true);
+    assert.equal(changed("s3"), 1, "main: queued as before");
   } finally {
     s.cleanup();
   }

@@ -32,7 +32,7 @@ import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEna
 import { askHeld } from "../held/client.ts";
 import type { AskAnswer } from "../held/client.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
-import { notCheckedLines, worktreeCheckLines } from "./not-checked.ts";
+import { notCheckedLines, worktreeSkipLines } from "./not-checked.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
 
 const log = createLogger("carrick-hook");
@@ -274,9 +274,14 @@ export async function editFlow(
   // An edit the engine did not check says so once per session, service and state (T7).
   const unchecked = session ? notCheckedLines(session, choice.root, answered.flatMap((a) => a.answer.not_checked ?? [])) : { lines: [], keys: [] };
   told.push(...unchecked.keys);
-  // An edit in this session's own linked worktree: only the compiler engine checks it, said once per session and worktree (#5038 T4).
-  const worktreeTops = edited.filter((file) => !inOtherWorktree(file, cwd ?? process.cwd())).flatMap((file) => linkedCheckoutTop(file) ?? []);
-  const worktreeLine = session && channel.channel === "hook" ? worktreeCheckLines(session, choice.root, worktreeTops) : { lines: [], keys: [] };
+  // An edit in this session's own linked worktree whose service re-read is skipped for a recorded miss (the probe
+  // says `known_miss`): said once per session, worktree and service (#5038 T4).
+  const skipped = edited.flatMap((file, index) => {
+    const top = inOtherWorktree(file, cwd ?? process.cwd()) ? null : linkedCheckoutTop(file);
+    const probe = answers.results[index] ?? null;
+    return top !== null && probe?.recheck?.known_miss === true ? [{ top, service: probe.service ?? "this service" }] : [];
+  });
+  const worktreeLine = session && channel.channel === "hook" ? worktreeSkipLines(session, choice.root, skipped) : { lines: [], keys: [] };
   told.push(...worktreeLine.keys);
   unchecked.lines.push(...worktreeLine.lines);
   const seen = new Set<string>();

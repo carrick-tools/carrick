@@ -14,8 +14,7 @@ import type { CheckItem, CheckResult, MovedRow } from "../contract.ts";
 import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
-import { inLinkedWorktree } from "./worktree.ts";
-import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, enqueueChanged, ensureRunner, isChanged, newestEarlies, owedFor, pendingFor, readAnswer, readEarly, sessionEarlies, sessionListing } from "./rechecks.ts";
+import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, enqueueChanged, ensureRunner, isChanged, newestEarlies, newestPerFile, owedFor, pendingFor, readAnswer, readEarly, sessionEarlies, sessionListing, worktreeSkipped } from "./rechecks.ts";
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
 import { confirmedResult, earlyRows, keepRows, readStaleCopy, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
 import { markLed, markTold, readSession, toldKey, wasLed, wasTold } from "./reuse.ts";
@@ -143,11 +142,12 @@ export function withoutStaleCopyBreaks(result: CheckResult, session: string, now
 /**
  * Queue one `check --changed` for `root` unless one of `session` queued after
  * its newest edit there is still unanswered, and make sure a runner takes it.
- * Never for a break in a file of a linked worktree (`file`): that check reads
- * the main checkout's change, and only the compiler engine checks the worktree (#5038 T4).
+ * Not for a break in a linked worktree file (`file`) whose own re-read was
+ * skipped (`worktreeSkipped`): a recorded miss says that service's re-read
+ * runs past its time there (#5038 T4).
  */
 export function owedWholeChange(session: string, root: string, file: string, now: number, home?: string, ensure: (root: string) => unknown = (at) => ensureRunner(at)): void {
-  if (inLinkedWorktree(file)) return;
+  if (worktreeSkipped(file, newestPerFile(session, home).get(file)?.answer?.result)) return;
   const since = readSession(session, home).edited[root] ?? 0;
   if (pendingFor(session, home).some((entry) => isChanged(entry) && entry.root === root && Date.parse(entry.enqueued_at) >= since)) return;
   if (enqueueChanged(root, session, now, { home }) === null) {

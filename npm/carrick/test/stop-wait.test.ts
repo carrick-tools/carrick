@@ -909,13 +909,25 @@ test("a file edited in a worktree that was removed is not named at Stop (carrick
   assert.equal(changedQueued(workspace.root).length, 0, "no whole-change check is queued for it");
 });
 
-test("a file edited in a worktree that still exists queues no check --changed: the compiler engine checks it (#5038 T4)", async (t) => {
+test("a file edited in a worktree that still exists still queues a check --changed (carrick#3595)", async (t) => {
   const { workspace, home } = setup(t);
   const { file } = linkedWorktree(workspace.root, "live");
   edit(workspace.root, home, file, Date.now() - 5000);
 
   const text = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
-  assert.equal(text, "", "nothing printed");
+  assert.equal(text, "", "a gap prints nothing");
+  assert.equal(changedQueued(workspace.root).length, 1);
+});
+
+test("a worktree file whose re-read was skipped for a recorded miss queues no check --changed and is not named (#5038 T4)", async (t) => {
+  const { workspace, home } = setup(t);
+  const { file } = linkedWorktree(workspace.root, "missed");
+  edit(workspace.root, home, file, Date.now() - 5000);
+  const entry = queue(workspace.root, home, file);
+  answer(home, entry, { ...clean(), stale: true, recheck: { ran: "none", elapsed_ms: 0, reason: "re-reading user-service took longer than 180 s", known_miss: true } });
+
+  const text = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
+  assert.doesNotMatch(text, /worktrees\/missed/);
   assert.equal(changedQueued(workspace.root).length, 0);
 });
 
