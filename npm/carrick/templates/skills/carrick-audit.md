@@ -1,6 +1,6 @@
 ---
 name: carrick-audit
-description: Use when the ask is what is wrong in this codebase, what to clean up, or a health check of the project. A full audit from the Carrick index on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice, routes written twice, one job done several ways), with each item proven in source and a fix list at the end. It states its estimated tokens and minutes before it reads any source; narrow it to one service to spend less.
+description: Use when the ask is what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice. A full audit from the Carrick index on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice, routes written twice, one job done several ways), with each item proven in source and a fix list at the end. It states its estimated tokens and minutes before it reads any source; narrow it to one service to spend less.
 ---
 
 # A full audit from the index, proven in source
@@ -50,6 +50,11 @@ Read these counts out of the answers:
   index at <commits> · built <day>`): copy it to the top of the report, word
   for word. Where the answer says no findings list has been built yet, say so
   in the report and carry on: the sections below ask the index directly.
+
+Where the ask is only where the project has built the same thing twice, or
+which duplicates are worth fixing, the audit is sections C, D and E: count and
+estimate those three, run only their units, and say in the report that A and B
+were not asked for. Any other ask runs all five.
 
 Work out the estimate from the counts. New tokens are input read for the first
 time plus output:
@@ -229,7 +234,10 @@ find_similar({{SCOPE}}, audit: true, offset: <first offset of the unit>, limit: 
 ```
 
 A page can come back shorter than its limit. Follow `next_offset` until you
-hold every group of the unit. Read every member of every group at its file and
+hold every group of the unit. Where an answer carries `window`, the project is
+larger than one pass: run the units for that window, then call again with
+`scan_from: <next_scan_from>` and run them for the next, until an answer
+carries no `next_scan_from`. Read every member of every group at its file and
 line, also in a group that lists its members as locators only, and diff the
 bodies. Class each group:
 
