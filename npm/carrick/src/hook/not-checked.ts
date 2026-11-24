@@ -16,6 +16,7 @@ function why(note: NotChecked): string {
     case "cold":
       return note.took_s === undefined ? "it is starting" : `it is starting, which took about ${note.took_s} s last time`;
     case "capped":
+      if (note.reason !== undefined) return note.reason;
       return `the memory budget of ${note.budget_mb ?? 0} MB is held by ${note.holders ?? 0} other engines`;
     case "no_compiler":
       return "no TypeScript 7 compiler is installed";
