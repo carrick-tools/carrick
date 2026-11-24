@@ -919,6 +919,18 @@ test("a file edited in a worktree that still exists still queues a check --chang
   assert.equal(changedQueued(workspace.root).length, 1);
 });
 
+test("a worktree file whose re-read was skipped for a recorded miss queues no check --changed and is not named (#5038 T4)", async (t) => {
+  const { workspace, home } = setup(t);
+  const { file } = linkedWorktree(workspace.root, "missed");
+  edit(workspace.root, home, file, Date.now() - 5000);
+  const entry = queue(workspace.root, home, file);
+  answer(home, entry, { ...clean(), stale: true, recheck: { ran: "none", elapsed_ms: 0, reason: "re-reading user-service took longer than 180 s", known_miss: true } });
+
+  const text = (stopAnswers(SESSION, { home, ensure: () => false })).lines.join("\n");
+  assert.doesNotMatch(text, /worktrees\/missed/);
+  assert.equal(changedQueued(workspace.root).length, 0);
+});
+
 test("a file deleted in the main checkout still queues a check --changed: only a gone worktree drops an entry (carrick#3595)", async (t) => {
   const { workspace, home } = setup(t);
   fs.mkdirSync(path.join(workspace.root, ".git"));

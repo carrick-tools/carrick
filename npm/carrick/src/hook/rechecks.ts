@@ -24,6 +24,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { binary, check, checkChanged, refresh } from "../cli.ts";
+import { inLinkedWorktree } from "./worktree.ts";
+import { heldDir } from "../held/paths.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
 import {
@@ -259,6 +261,17 @@ export function enqueue(
     queued.push(entry);
   }
   return queued;
+}
+
+/** The one machine-wide lock a linked worktree's service re-read holds while it runs (#5038 T4). */
+export function worktreeRereadLock(home?: string): string {
+  fs.mkdirSync(heldDir(home), { recursive: true, mode: 0o700 });
+  return path.join(heldDir(home), "worktree-reread.lock");
+}
+
+/** A linked worktree file's late answer that started no service re-read: a recorded miss skipped it, or another worktree's re-read held the machine's one slot (#5038 T4). */
+export function worktreeSkipped(file: string, result: CheckResult | null | undefined): boolean {
+  return inLinkedWorktree(file) && (result?.recheck?.known_miss === true || result?.recheck?.deferred === true);
 }
 
 /**
@@ -806,14 +819,21 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
         remove(taken);
         continue;
       }
+      // A file of a linked worktree re-reads its service only while no other worktree re-read runs on this
+      // machine (#5038 T4); otherwise it is answered without a re-scan, never held back. A service whose re-read
+      // already missed, in main or any worktree, is skipped by the binary itself (`recheck.rs` known misses).
+      const worktree = inLinkedWorktree(entry.file);
+      const reread = worktree && takeLock(worktreeRereadLock(options.home), pid, clock(), cap + CALL_SLACK_MS);
       const outcome = await check(entry.relative, {
         cwd: root,
         workspace: root,
         recheck: true,
+        ...(worktree && !reread ? { noRescan: true } : {}),
         limitMs: cap + CALL_SLACK_MS,
         env: callEnv,
         bin,
       });
+      if (reread) releaseLock(worktreeRereadLock(options.home), pid);
       // The local read model was being rebuilt and nothing was judged: the
       // edit goes back in the queue unanswered, and this runner stops so it
       // does not take it again at once. The next hook's runner asks again.

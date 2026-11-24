@@ -14,7 +14,7 @@ import type { CheckItem, CheckResult, MovedRow } from "../contract.ts";
 import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
-import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, enqueueChanged, ensureRunner, isChanged, newestEarlies, owedFor, pendingFor, readAnswer, readEarly, sessionEarlies, sessionListing } from "./rechecks.ts";
+import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, enqueueChanged, ensureRunner, isChanged, newestEarlies, newestPerFile, owedFor, pendingFor, readAnswer, readEarly, sessionEarlies, sessionListing, worktreeSkipped } from "./rechecks.ts";
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
 import { confirmedResult, earlyRows, keepRows, readStaleCopy, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
 import { markLed, markTold, readSession, toldKey, wasLed, wasTold } from "./reuse.ts";
@@ -77,7 +77,7 @@ export function confirmAnswer(raw: Answer, home?: string, now: number = Date.now
  */
 export function deliverOne(session: string, raw: Answer, home?: string): string[] {
   const confirmed = confirmAnswer(raw, home);
-  if (confirmed.held > 0) owedWholeChange(raw.session, raw.root, Date.now(), home);
+  if (confirmed.held > 0) owedWholeChange(raw.session, raw.root, raw.file, Date.now(), home);
   const corrections = confirmed.corrections;
   // A break the session was told and that still stands is not said again at a later entry (T1 P1.3).
   const fresh = !isChanged(confirmed.answer) && confirmed.answer.result && !confirmed.answer.result.error
@@ -142,8 +142,12 @@ export function withoutStaleCopyBreaks(result: CheckResult, session: string, now
 /**
  * Queue one `check --changed` for `root` unless one of `session` queued after
  * its newest edit there is still unanswered, and make sure a runner takes it.
+ * Not for a break in a linked worktree file (`file`) whose own re-read was
+ * skipped (`worktreeSkipped`): a recorded miss says that service's re-read
+ * runs past its time there (#5038 T4).
  */
-export function owedWholeChange(session: string, root: string, now: number, home?: string, ensure: (root: string) => unknown = (at) => ensureRunner(at)): void {
+export function owedWholeChange(session: string, root: string, file: string, now: number, home?: string, ensure: (root: string) => unknown = (at) => ensureRunner(at)): void {
+  if (worktreeSkipped(file, newestPerFile(session, home).get(file)?.answer?.result)) return;
   const since = readSession(session, home).edited[root] ?? 0;
   if (pendingFor(session, home).some((entry) => isChanged(entry) && entry.root === root && Date.parse(entry.enqueued_at) >= since)) return;
   if (enqueueChanged(root, session, now, { home }) === null) {
@@ -186,7 +190,7 @@ export function deliverEarly(
   const view = keepRows(judged, (row) => standsAsRun(row, newest));
   const rows = earlyRows(view);
   if (!claimEarly(owner, early.seq, rows.map((row) => row.key), options.home, options.now)) return [];
-  if (own.held > 0) owedWholeChange(reader, early.root, now, options.home, options.ensure);
+  if (own.held > 0) owedWholeChange(reader, early.root, early.file, now, options.home, options.ensure);
   const told = (row: (typeof rows)[number]): boolean => wasTold(reader, toldBreak(row.listed, row.run), options.home);
   const fresh = keepRows(view, (row) => !seen.has(row.key) && !told(row));
   for (const row of rows) seen.add(row.key);
@@ -225,7 +229,7 @@ export function hasFindings(answer: Answer): boolean {
 export function adoptedLine(raw: Answer, home?: string): string | null {
   if (isChanged(raw)) return lateContext(raw, false);
   const { answer, corrections, held } = confirmAnswer(raw, home);
-  if (held > 0) owedWholeChange(raw.session, raw.root, Date.now(), home);
+  if (held > 0) owedWholeChange(raw.session, raw.root, raw.file, Date.now(), home);
   const said = hasFindings(answer) ? lateContext(answer, false) : null;
   const lines = [...(said ? [said] : []), ...corrections];
   return lines.length > 0 ? lines.join("\n\n") : null;

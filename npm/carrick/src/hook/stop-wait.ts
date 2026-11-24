@@ -52,6 +52,7 @@ import {
   pendingFor,
   readEarly,
   type Answer,
+  worktreeSkipped,
 } from "./rechecks.ts";
 import { markSaid, markStated, markWaiting, readSession, wasSaid } from "./reuse.ts";
 import { worktreeGone } from "./worktree.ts";
@@ -97,6 +98,8 @@ function renderOne(answer: Answer): string {
     return `Carrick: ${where} was not re-checked: ${reason.replace(/\.+$/, "")}.`;
   }
   if (readsNothing(result)) return "";
+  // A worktree re-read skipped for a miss is said once per session by the edit hook (`worktreeSkipLines`), not per answer (#5038 T4).
+  if (worktreeSkipped(answer.file, result)) return "";
   if (!answersTheEdit(result)) {
     const reason = result.recheck?.reason;
     return reason
@@ -235,6 +238,12 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       covered();
       continue;
     }
+    // A linked worktree file whose re-read was skipped (a recorded miss, or another worktree re-reading): the
+    // compiler engine checks it, Stop states nothing from it and queues no whole-change check for it (#5038 T4).
+    if (worktreeSkipped(file, result)) {
+      coverage.files -= 1;
+      continue;
+    }
     if (!answersTheEdit(result)) {
       gap(result.recheck?.reason ?? "no re-check of it ran");
       continue;
@@ -266,7 +275,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
   const { own: delivered, adopted, early } = collect(session, home, clock(), ensure);
   // A break held back for the whole-change check (`withoutStaleCopyBreaks`) has that check queued.
   for (const answer of [...delivered, ...adopted]) {
-    if (confirmAnswer(answer, home, clock()).held > 0) owedWholeChange(answer.session, answer.root, clock(), home, ensure);
+    if (confirmAnswer(answer, home, clock()).held > 0) owedWholeChange(answer.session, answer.root, answer.file, clock(), home, ensure);
   }
 
   // The session's check, per workspace with an edit Stop has not yet spoken
