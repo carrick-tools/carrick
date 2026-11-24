@@ -13,7 +13,9 @@
  * A returned branch these rules cannot read makes the whole answer `unknown`
  * with the decided reason `serialised_body_unread`. Publishing the branches
  * that did read would state part of the contract as the whole of it, and
- * publishing the envelope or `string` would be a wrong contract.
+ * publishing the envelope or `string` would be a wrong contract. The abstain
+ * still names where the values it found are sent (carrick#5133,
+ * `infer-serialised-body-abstain-sends.test.ts`).
  *
  * An object-typed `body` is not an envelope under this rule: a runtime that
  * serialises the handler's return value sends that object as the payload, so

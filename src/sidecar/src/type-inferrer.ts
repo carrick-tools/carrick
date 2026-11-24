@@ -302,8 +302,15 @@ interface EnvelopeBuilder {
  */
 type EnvelopeUnreadCause = 'prebuilt' | 'not_serialised' | 'builder' | 'top_type';
 
-/** What one returned branch of an envelope handler sends. */
-type EnvelopeBranchRead = PayloadCandidate | 'dropped' | { unread: EnvelopeUnreadCause };
+/**
+ * What one returned branch of an envelope handler sends. An unread branch
+ * whose serialised value was found but holds a top type keeps that value as
+ * `located` (carrick#5133): where it is sent from is known, what it is not.
+ */
+type EnvelopeBranchRead =
+  | PayloadCandidate
+  | 'dropped'
+  | { unread: EnvelopeUnreadCause; located?: PayloadCandidate };
 
 /** The provenance sentence for each reason a branch was not read. */
 const SERIALISED_BODY_UNREAD_DETAIL: Record<EnvelopeUnreadCause, string> = {
@@ -316,6 +323,9 @@ const SERIALISED_BODY_UNREAD_DETAIL: Record<EnvelopeUnreadCause, string> = {
   top_type:
     'A return serialises a value typed any or unknown, so the shape of its body is not known.',
 };
+
+/** Type text with no value to place: bare `any`/`unknown`, a no-value type, or empty. */
+const NO_VALUE_TEXT = /^\s*(any|unknown|void|undefined|never)?\s*$/;
 
 /** `any` or `unknown` as a type in printed type text, not as a member name or a string. */
 const TOP_TYPE_TOKEN = /(?<![\w$'"`])(?:any|unknown)(?![\w$'"`?:])/;
@@ -8253,6 +8263,13 @@ export class TypeInferrer {
    * the answer is `unknown` with the decided reason `serialised_body_unread`
    * and one sentence per cause: the branches that did read are part of the
    * contract, and neither the envelope nor its `string` body is any of it.
+   *
+   * carrick#5133: that abstain still names where the handler sends the values
+   * it found (`read_spans`): each read branch's payload, and each payload whose
+   * type holds `any` or `unknown`, joined as a typed answer joins them. A
+   * branch with no value found (a prebuilt envelope, a helper not followed, a
+   * body not made by `JSON.stringify`) names nothing, and the stated type
+   * stays `unknown`.
    */
   private inferSerialisedBodyEnvelope(
     request: InferRequestItem,
@@ -8262,12 +8279,17 @@ export class TypeInferrer {
     const branches = this.envelopeBranches(func);
 
     const candidates: PayloadCandidate[] = [];
+    const located: PayloadCandidate[] = [];
     const causes = new Set<EnvelopeUnreadCause>();
     for (const branch of branches) {
       const read = this.readEnvelopeBranch(branch, func, wire, 0);
       if (read === 'dropped') continue;
-      if ('unread' in read) causes.add(read.unread);
-      else candidates.push(read);
+      if ('unread' in read) {
+        causes.add(read.unread);
+        if (read.located) located.push(read.located);
+      } else {
+        candidates.push(read);
+      }
     }
 
     const location = this.getNodeLocation(func);
@@ -8276,12 +8298,16 @@ export class TypeInferrer {
         `Return at ${request.file_path}:${request.line_number} is a serialised-body ` +
           `envelope and a returned branch was not read (${[...causes].join(', ')}); abstaining`
       );
-      return this.decidedAbstain(request, location, {
+      const abstain = this.decidedAbstain(request, location, {
         path: '',
         kind: 'unknown',
         reason: 'serialised_body_unread',
         detail: [...causes].map((cause) => SERIALISED_BODY_UNREAD_DETAIL[cause]).join(' '),
       });
+      const placed = [...candidates, ...located].filter(
+        (candidate) => !NO_VALUE_TEXT.test(candidate.typeString)
+      );
+      return this.stampReads(abstain, this.joinPayloadCandidates(placed)?.nodes ?? []);
     }
     const recovered = this.joinPayloadCandidates(candidates);
     if (!recovered) {
@@ -8695,7 +8721,9 @@ export class TypeInferrer {
    * envelope.
    */
   private checkedEnvelopeCandidate(candidate: PayloadCandidate): EnvelopeBranchRead {
-    return TOP_TYPE_TOKEN.test(candidate.typeString) ? { unread: 'top_type' } : candidate;
+    return TOP_TYPE_TOKEN.test(candidate.typeString)
+      ? { unread: 'top_type', located: candidate }
+      : candidate;
   }
 
   /**
@@ -12844,11 +12872,19 @@ export class TypeInferrer {
    * them. An answer whose text is bare `any`/`unknown`, a no-value type
    * (`void`, `undefined`, `never`) or empty has no value to place and gets
    * none, annotated or not; a decided abstain is built by
-   * `decidedAbstain` and never passes through here. Outer parentheses are
-   * peeled: `({ ... })` is the literal.
+   * `decidedAbstain` and never passes through here (the one abstain that
+   * names its sends calls `stampReads` itself, carrick#5133).
    */
   private withReads(inferred: InferredType, nodes: ReadonlyArray<Node | undefined>): InferredType {
-    if (/^\s*(any|unknown|void|undefined|never)?\s*$/.test(inferred.type_string)) return inferred;
+    if (NO_VALUE_TEXT.test(inferred.type_string)) return inferred;
+    return this.stampReads(inferred, nodes);
+  }
+
+  /**
+   * Stamp `nodes` on `inferred` as `read_spans`, deduped, whatever its text.
+   * Outer parentheses are peeled: `({ ... })` is the literal.
+   */
+  private stampReads(inferred: InferredType, nodes: ReadonlyArray<Node | undefined>): InferredType {
     const seen = new Set<string>();
     const spans: ReadSpan[] = [];
     for (const read of nodes) {
