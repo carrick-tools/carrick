@@ -292,6 +292,7 @@ test("the background check is started at most once a TTL, and never in CI", () =
     // and win32-x64 is a platform this package publishes.
     assert.equal(options[0]!["windowsHide"], true);
     assert.equal(options[0]!["detached"], true);
+    assert.equal(options[0]!["cwd"], os.homedir(), "never the folder of the command that started it (#5038)");
     assert.equal(options[0]!["stdio"], "ignore");
 
     // The parent stamped the cache before spawning, so the next invocation in

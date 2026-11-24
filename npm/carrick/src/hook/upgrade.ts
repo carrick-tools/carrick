@@ -12,6 +12,7 @@
 //
 // Fails open: an error anywhere prints nothing and starts nothing.
 
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -38,7 +39,7 @@ export type UpgradeLinesOptions = {
   /** The running version; this package's own when absent. */
   current?: string | null;
   /** Injected in tests; the real one detaches a child and forgets it. */
-  start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
+  start?: (command: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) => void;
 };
 
 export function upgradeLines(options: UpgradeLinesOptions = {}): string[] {
@@ -101,6 +102,8 @@ function tryStart(input: {
       process.execPath,
       [fileURLToPath(new URL("../self-upgrade.js", import.meta.url))],
       env,
+      // The upgrade is not tied to a checkout: the home folder cannot be removed under it (carrick#5038).
+      os.homedir(),
     );
   } catch {
     return null;

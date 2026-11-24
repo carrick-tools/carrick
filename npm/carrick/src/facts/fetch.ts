@@ -231,7 +231,7 @@ export async function fetchFactsNow(
  */
 export function startFactsRefresh(
   root: string,
-  options: { env?: NodeJS.ProcessEnv; now?: number; start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void } = {},
+  options: { env?: NodeJS.ProcessEnv; now?: number; start?: (command: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) => void } = {},
 ): boolean {
   const env = options.env ?? process.env;
   if (!factsEnabled(env)) return false;
@@ -242,7 +242,7 @@ export function startFactsRefresh(
     const cooldown = cooldownMs(env, "CARRICK_FACTS_COOLDOWN_MS", FACTS_STALE_MS);
     if (!claimRefresh(markerPath(root, FACTS_MARKER), options.now ?? Date.now(), cooldown)) return false;
     const { command, args } = scriptBeside(import.meta.url, "refresh-run", root);
-    (options.start ?? startDetached)(command, args, { ...env, CARRICK_NO_KEEP_AWAKE: "1" });
+    (options.start ?? startDetached)(command, args, { ...env, CARRICK_NO_KEEP_AWAKE: "1" }, root);
     return true;
   } catch (error) {
     log("fact refresh not started", String(error));

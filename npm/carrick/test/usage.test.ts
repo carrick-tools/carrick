@@ -177,6 +177,9 @@ test("4b. one send an hour: a second send, and a start beside a fresh marker, do
   assert.equal(startUsageSend(root, { env, home, now: NOW, start }), true);
   assert.ok(started[0]![0]!.includes("usage-run"));
   assert.equal(started[0]![1], root);
+  const cwds: Array<string | undefined> = [];
+  assert.equal(startUsageSend(root, { env, home, now: NOW + 61 * 60_000 * 2, start: (_c, _a, _e, cwd) => void cwds.push(cwd) }), true);
+  assert.deepEqual(cwds, [root], "the send starts in the checkout root, not the hook's folder (#5038)");
   const { calls, request } = recorder(200);
   assert.equal(await sendUsage(root, { env, home, now: NOW, request, version: "0.3.179" }), "sent");
   assert.equal(await sendUsage(root, { env, home, now: NOW + 59 * 60_000, request, version: "0.3.179" }), "none");
