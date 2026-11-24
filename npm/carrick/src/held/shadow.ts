@@ -171,6 +171,15 @@ function normalRel(rel: string): string {
   return clean === "." ? "" : clean;
 }
 
+/**
+ * A folder that is another checkout (it holds a `.git` file or folder, as the scan
+ * skips a git checkout inside a service, carrick#1906), or the place linked
+ * worktrees live (`.claude/worktrees`). The folder being scanned is never one.
+ */
+function isNestedCheckout(dir: string, top: string): boolean {
+  return defaultExists(path.join(dir, ".git")) || posix(path.relative(top, dir)).endsWith(".claude/worktrees");
+}
+
 type TreeScan = {
   /** Dependency inputs in the service's scope, by path under the checkout top, with the hash of their bytes. */
   inputs: Map<string, string>;
@@ -198,8 +207,7 @@ function scanTree(top: string, scanRel: string, published: PublishedInputs): Tre
     for (const entry of entries) {
       const abs = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        // A folder holding `.git` is another checkout (a nested linked worktree, a submodule): never this one's files.
-        if (!SKIPPED_DIRS.has(entry.name) && !defaultExists(path.join(abs, ".git"))) walk(abs);
+        if (!SKIPPED_DIRS.has(entry.name) && !isNestedCheckout(abs, top)) walk(abs);
       } else if (entry.isFile()) {
         if (isDependencyInput(entry.name, published.names)) inputs.set(posix(path.relative(top, abs)), sha(abs));
         if (published.extensions.has(path.extname(entry.name).slice(1))) sources.add(posix(path.relative(service, abs)));

@@ -301,3 +301,36 @@ test("no stamp is written outside a git checkout", () => {
   assert.equal(writeShadowStamp(out, bed().answer, dir, BUILD), false);
   assert.equal(fs.existsSync(savedAnswerPath(out)), false);
 });
+
+/** A linked worktree of main inside main's own folders, with its own package file and a source file. */
+function nestedWorktree(b: Bed, under: string, name: string): string {
+  const top = path.join(under, ".claude", "worktrees", name);
+  git(b.main, "worktree", "add", "-q", "-b", name, top);
+  put(path.join(top, SCAN_REL, "package.json"), '{"name":"nested","dependencies":{"z":"9"}}\n');
+  put(path.join(top, SCAN_REL, "src/nested.ts"), "export const nested = 1;\n");
+  return top;
+}
+
+test("a nested checkout in the service folder changes neither the stamp nor the clone", () => {
+  const b = bed();
+  const before = JSON.parse(read(savedAnswerPath(b.mainOut))).stamp.inputs_hash;
+  nestedWorktree(b, path.join(b.main, SCAN_REL), "x");
+  assert.equal(writeShadowStamp(b.mainOut, b.answer, path.join(b.main, SCAN_REL), BUILD), true);
+  assert.equal(JSON.parse(read(savedAnswerPath(b.mainOut))).stamp.inputs_hash, before);
+  const answer = ok(clone(b));
+  assert.deepEqual(answer.own_files, ["src/a.ts", "src/b.ts", "src/d.ts"]);
+  assert.equal(fs.existsSync(path.join(b.out, "w/src/nested.ts")), false);
+});
+
+test("a service that is the whole checkout does not read the worktrees under it, and a clone for one works", () => {
+  const b = bed();
+  const stampOf = (): string => JSON.parse(read(savedAnswerPath(b.mainOut))).stamp.inputs_hash;
+  assert.equal(writeShadowStamp(b.mainOut, b.answer, b.main, BUILD), true);
+  const before = stampOf();
+  const nested = nestedWorktree(b, b.main, "y");
+  put(path.join(nested, SCAN_REL, "package.json"), '{"name":"orders"}\n');
+  assert.equal(writeShadowStamp(b.mainOut, b.answer, b.main, BUILD), true);
+  assert.equal(stampOf(), before);
+  const answer = ok(cloneShadow(b.mainOut, nested, "", b.out, { buildId: BUILD }));
+  assert.ok(!answer.own_files.some((f) => f.includes("worktrees")));
+});

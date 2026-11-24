@@ -1006,6 +1006,38 @@ test("T2: a main start first closes the service's ready worktree engines (it rew
   }
 });
 
+test("T2: a worktree engine whose start ended just as a main start queued behind it is closed, never served on main's rewritten shadow", async () => {
+  const w = worktreeWorld("");
+  try {
+    const home = path.join(w.dir, "home");
+    const closed: string[] = [];
+    const started: string[] = [];
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const runtime: ServiceRuntime = {
+      start: async (init) => {
+        started.push(init.checkout ?? "main");
+        if (init.checkout !== undefined && started.length === 1) await held;
+        return { engine: { answer: async () => ({ lines: [] }), rss: () => 100, close: async () => void closed.push(init.checkout ?? "main") } };
+      },
+    };
+    const init: ServiceInit = { repo: "shop", service: "api", repo_path: w.root, sidecar_root: w.root, tsconfig: null, scan_root: w.root };
+    const daemon = new HeldDaemon({ root: w.root, home, env: { ...ON }, totalmem: () => 64 * 1024 ** 3, programs: async () => [init], runtime });
+    const top = path.join(w.root, ".claude", "worktrees", "b");
+    assert.equal((await daemon.handle(w.req(w.twin))).state, "cold");
+    await settle();
+    assert.equal((await daemon.handle(w.req(w.main))).state, "cold", "main's start queues behind the worktree's");
+    await settle();
+    release();
+    for (let i = 0; i < 4; i += 1) await settle();
+    assert.deepEqual(started, [top, "main"]);
+    assert.deepEqual(closed, [top], "the worktree engine was closed");
+    assert.equal((await daemon.handle(w.req(w.twin))).state, "cold", "the next worktree ask starts a fresh clone");
+  } finally {
+    w.done();
+  }
+});
+
 test("T2: a main-checkout ask starts and writes the same with and without a worktree slot alive", async () => {
   /** Main's start init, every file under main's held folder (path and bytes), main's registry entry and its log row. */
   const record = async (withWorktree: boolean) => {
