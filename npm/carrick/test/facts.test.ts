@@ -67,8 +67,13 @@ function edit(
   ws: FactsWorkspace,
   file: string,
   newString: string,
-  options: { session?: string; probe?: string; cwd?: string; env?: Record<string, string>; agent?: string } = {},
+  options: { session?: string; probe?: string; cwd?: string; env?: Record<string, string>; agent?: string; addedAt?: number } = {},
 ) {
+  // `addedAt`: the patch added that one line of the file (the canned probe answers name a new function there).
+  const patch =
+    options.addedAt === undefined
+      ? {}
+      : { tool_response: { structuredPatch: [{ newStart: options.addedAt, lines: [`+${fs.readFileSync(file, "utf8").split("\n")[options.addedAt - 1]}`] }] } };
   return runHook("post-edit.ts", {
     payload: {
       hook_event_name: "PostToolUse",
@@ -77,6 +82,7 @@ function edit(
       ...(options.agent ? { agent_id: options.agent } : {}),
       cwd: options.cwd ?? ws.root,
       tool_input: { file_path: file, old_string: "x", new_string: newString },
+      ...patch,
     },
     env: fakeEnv({
       HOME: ws.home,
@@ -1430,6 +1436,7 @@ test("with a fact file, the edit's own result holds the similar-function block b
   const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
     session: "lead-now",
     probe: "check-deferred-similar.json",
+    addedAt: 12,
     env: { CARRICK_FAKE_ARGV_LOG: argvLog },
   });
   assert.equal(context(run.stdout), `${SIMILAR_LEAD}\n\n${GET_ORDER_LINE}`);
@@ -1526,6 +1533,7 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
   const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
     session: "lead",
     probe: "check-deferred-similar.json",
+    addedAt: 12,
     env: slowCheck,
   });
   assert.equal(context(run.stdout), `${SIMILAR_LEAD}\n\n${GET_ORDER_LINE}`);
@@ -1567,6 +1575,7 @@ test("with a fact file, a sub-agent's edit holds the similar-function block in i
     session: "parent-lead",
     agent: "sub1",
     probe: "check-deferred-similar.json",
+    addedAt: 12,
     env: { CARRICK_FAKE_ARGV_LOG: argvLog },
   });
   assert.equal(context(run.stdout), `${SIMILAR_LEAD}\n\n${GET_ORDER_LINE}`);
