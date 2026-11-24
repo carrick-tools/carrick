@@ -100,3 +100,18 @@ test("an HTTP response that can send no body is read as the judge reads it; a re
   assert.ok(errors("{ a: string } | undefined", "{ a: number } | undefined").length > 0, "a real mismatch breaks");
   assert.deepEqual(errors("{ a: number }", "{ a: number }"), []);
 });
+
+test("the placed file of a service left unarmed names both sides' options and the tsconfig the service's came from", async (t) => {
+  const { root, home, init } = tree(t, { strict: false });
+  const runtime = createRuntime({
+    root, home, entry, env: process.env, rows: async () => [row("GET /a")], commits: async () => ({ shop: "x" }), stamp: () => "fixed",
+    makeEngine: () => {
+      throw new Error("a held compiler must not start here");
+    },
+  });
+  await runtime.start({ ...init, tsconfig: path.join(root, "tsconfig.json") });
+  const placed = JSON.parse(fs.readFileSync(placedPath(root, init.service, home), "utf8")) as { options: { service: Record<string, boolean>; judge: Record<string, boolean> }; tsconfig: string };
+  assert.deepEqual(placed.options.service, { strictNullChecks: false, strictFunctionTypes: false, exactOptionalPropertyTypes: false });
+  assert.deepEqual(placed.options.judge, { strictNullChecks: true, strictFunctionTypes: true, exactOptionalPropertyTypes: false });
+  assert.equal(placed.tsconfig, "tsconfig.json");
+});

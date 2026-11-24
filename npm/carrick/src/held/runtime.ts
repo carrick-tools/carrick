@@ -150,10 +150,13 @@ function readText(file: string): string | null {
   }
 }
 
-function writePlaced(file: string, service: string, armed: Armed[], unarmed: Unarmed[]): void {
+/** What `options_differ` leaves for the doctor: both sides' values and the tsconfig the service's came from. */
+type OptionsNote = { options: { service: FitOptions; judge: FitOptions }; tsconfig?: string };
+
+function writePlaced(file: string, service: string, armed: Armed[], unarmed: Unarmed[], note: OptionsNote | null = null): void {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), service, armed, unarmed }, null, 2));
+    fs.writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), service, armed, unarmed, ...(note ?? {}) }, null, 2));
   } catch (error) {
     log("could not write the placed record", String(error));
   }
@@ -918,6 +921,17 @@ async function factRepoPaths(root: string): Promise<Record<string, string>> {
   }
 }
 
+/**
+ * The services that hold at least one response row, read from the fact file the way `rowCount` counts them, so the
+ * doctor can tell "no typed route" from "not started yet" without an engine. Null when the fact file cannot be read.
+ */
+export async function servicesWithRows(root: string): Promise<Set<string> | null> {
+  const store = await openFacts(root);
+  if (store === null) return null;
+  store.close();
+  return new Set((await factRows(root)).filter((row) => row.direction === "response").map((row) => row.service));
+}
+
 async function factRows(root: string): Promise<ContractRow[]> {
   const store = await openFacts(root);
   if (store === null) return [];
@@ -1038,7 +1052,10 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       if (ask !== undefined && shadow.graphql === undefined) graphqlReason = GRAPHQL_TABLE_UNUSABLE;
       if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
       if (!sameFitOptions(shadow.options.service, shadow.options.judge)) {
-        writePlaced(placedPath(heldRootOf(init, options.root), init.service, options.home), init.service, [], allUnarmed(mine, () => "options_differ"));
+        writePlaced(placedPath(heldRootOf(init, options.root), init.service, options.home), init.service, [], allUnarmed(mine, () => "options_differ"), {
+          options: shadow.options,
+          ...(init.tsconfig === null ? {} : { tsconfig: path.isAbsolute(init.tsconfig) ? path.relative(init.repo_path, init.tsconfig) : init.tsconfig }),
+        });
         return { engine: new IdleService() };
       }
       const message = shadow.message ?? null;

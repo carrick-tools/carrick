@@ -738,6 +738,57 @@ test("doctor says why an engine holds no check: capped, no placed file, no route
   assert.equal(findingCount(checkCompilerCoverage(root, repos, home, { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" })), 0);
 });
 
+const ON = { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
+
+test("doctor tells the three 'nothing checked' cases apart: starts on first edit, no typed route, options differ", () => {
+  const { root, home, repos } = heldFixture();
+  const file = placedPath(root, "web", home);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const off = { strictNullChecks: false, strictFunctionTypes: false, exactOptionalPropertyTypes: false };
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      service: "web",
+      armed: [],
+      unarmed: [{ label: "GET /a", protocol: "http", file: "a.ts", group: 0, position: null, reason: "options_differ" }],
+      options: { service: off, judge: { ...off, strictNullChecks: true, strictFunctionTypes: true } },
+      tsconfig: "web/tsconfig.json",
+    }),
+  );
+  // "worker" holds a typed row and has not started; "empty" holds none.
+  const lines = checkCompilerCoverage(root, repos, home, ON, new Set(["api", "web", "worker"])).map((l) => l.text);
+  const of = (name: string) => lines.find((l) => l.includes(`service "${name}"`)) ?? "";
+  assert.match(of("worker"), /not started yet/);
+  assert.match(of("web"), /0 of 1 rows are checked/);
+  assert.match(of("web"), /strictNullChecks is off here and on in Carrick's check/);
+  assert.match(of("web"), /strictFunctionTypes is off here and on in Carrick's check/);
+  assert.ok(!of("web").includes("exactOptionalPropertyTypes"), of("web"));
+  assert.match(of("web"), /values come from web\/tsconfig\.json/);
+  // "empty" has a placed file with no rows (existing line); a never-started service with no row is the new line.
+  const lone = checkCompilerCoverage(root, repos, home, ON, new Set(["api", "web"])).map((l) => l.text);
+  assert.match(lone.find((l) => l.includes('service "worker"')) ?? "", /no typed route to check/);
+  assert.ok(!lone.some((l) => l.includes('service "worker"') && l.includes("not started yet")), lone.join("\n"));
+  // None of the three is a finding.
+  assert.equal(findingCount(checkCompilerCoverage(root, repos, home, ON, new Set(["api"]))), 0);
+  // The fact file unreadable: nothing is said about "no typed route".
+  const unknown = checkCompilerCoverage(root, repos, home, ON, null).map((l) => l.text);
+  assert.ok(!unknown.some((l) => l.includes("no typed route")), unknown.join("\n"));
+});
+
+test("doctor rolls up more than five services with no typed route into one line with a count", () => {
+  const names = ["s1", "s2", "s3", "s4", "s5", "s6", "s7"];
+  const root = workspace({ "carrick.json": JSON.stringify({ services: names.map((name) => ({ name })) }) });
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-")));
+  const few = checkCompilerCoverage(root, configuredRepos(root), home, ON, new Set(["s6", "s7"])).map((l) => l.text);
+  assert.equal(few.filter((l) => l.includes("no typed route to check")).length, 5, few.join("\n"));
+  assert.ok(!few.some((l) => l.includes("services (")), few.join("\n"));
+  const lines = checkCompilerCoverage(root, configuredRepos(root), home, ON, new Set(["s7"])).map((l) => l.text);
+  assert.equal(lines.length, 2, lines.join("\n"));
+  const roll = lines.find((l) => l.includes("6 services")) ?? "";
+  assert.match(roll, /no typed route to check in 6 services \(s1, s2, s3 and 3 more\)/);
+  assert.match(lines.find((l) => l.includes('service "s7"')) ?? "", /not started yet/);
+});
+
 test("doctor prints nothing about the compiler check when it is off and has never run", () => {
   const root = workspace({ "carrick.json": JSON.stringify({ services: [{ name: "api" }] }) });
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-")));
