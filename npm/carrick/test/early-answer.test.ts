@@ -149,18 +149,20 @@ async function liveDaemon(t: { after: (fn: () => void | Promise<void>) => void }
     conn.on("error", () => undefined);
     conn.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
-      const end = buffer.indexOf("\n");
-      if (end < 0) return;
-      const frame = buffer.slice(0, end);
-      buffer = buffer.slice(end + 1);
-      // The client says hello first; the fake is of the client's own build.
-      if ((JSON.parse(frame) as { hello?: boolean }).hello === true) {
-        conn.write(`${JSON.stringify({ hello: { build_id: heldBuildId(), pid: process.pid, root: ws.root } })}\n`);
-        return;
+      for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+        const frame = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        // The client says hello first; the fake is of the client's own build.
+        const parsed = JSON.parse(frame) as { hello?: boolean; ask?: HeldRequest };
+        if (parsed.hello === true) {
+          conn.write(`${JSON.stringify({ hello: { build_id: heldBuildId(), pid: process.pid, root: ws.root } })}\n`);
+          continue;
+        }
+        // The ask comes with the hello, stamped with the client's build (T5).
+        const request = parsed.ask ?? (parsed as unknown as HeldRequest);
+        requests.push(request);
+        void daemon.handle(request).then((answer) => conn.writable && conn.end(`${JSON.stringify(answer)}\n`));
       }
-      const request = JSON.parse(frame) as HeldRequest;
-      requests.push(request);
-      void daemon.handle(request).then((answer) => conn.writable && conn.end(`${JSON.stringify(answer)}\n`));
     });
   });
   await new Promise<void>((resolve) => server.listen(socketPath(ws.root, ws.home), resolve));

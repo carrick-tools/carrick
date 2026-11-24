@@ -48,7 +48,7 @@ import {
 import { runOf } from "./early.ts";
 import { messageSendRows } from "./message-rows.ts";
 import { heldBuildId } from "./build.ts";
-import { cloneShadow, engineEntry, writeShadow, writeShadowStamp, type CloneRefused, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
+import { cloneShadowOffLoop, engineEntry, writeShadow, writeShadowStamp, type CloneRefused, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
 import { StepTimer, type Steps } from "./steps.ts";
 
 const log = createLogger("carrick-held-runtime");
@@ -970,10 +970,10 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
    * A linked worktree's shadow (#5038, T2): a clone of the main checkout's shadow for the same service,
    * never a write of its own. The clone's tsconfig reads main's `v/` in place.
    */
-  const cloneOf = (init: ServiceInit & { checkout: string }, out: string): ShadowAnswer | CloneRefused => {
+  const cloneOf = (init: ServiceInit & { checkout: string }, out: string): Promise<ShadowAnswer | CloneRefused> => {
     const top = realPath(init.checkout);
     const scanRel = path.relative(top, realPath(init.scan_root));
-    return cloneShadow(shadowDir(options.root, init.service, options.home), top, scanRel, out, { buildId: heldBuildId() });
+    return cloneShadowOffLoop(shadowDir(options.root, init.service, options.home), top, scanRel, out, { buildId: heldBuildId() });
   };
   const runtime = {
     async rowCount(init: ServiceInit): Promise<number> {
@@ -1015,7 +1015,7 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       let graphqlReason = mine.some(isGraphql) && table === null ? GRAPHQL_TABLE_UNUSABLE : null;
       let shadow: ShadowAnswer;
       if (init.checkout !== undefined) {
-        const cloned = cloneOf({ ...init, checkout: init.checkout }, out);
+        const cloned = await cloneOf({ ...init, checkout: init.checkout }, out);
         if ("refused" in cloned) return { state: "refused", refused: cloned.refused, detail: cloned.detail };
         shadow = cloned;
       } else {

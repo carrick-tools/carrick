@@ -39,7 +39,7 @@ async function listening(root: string, home: string): Promise<void> {
   for (let i = 0; i < 100 && !fs.existsSync(socketPath(root, home)); i += 1) await new Promise((r) => setTimeout(r, 20));
 }
 
-test("a daemon of another build is told to exit, never asked; the ask answers cold and the next reaches a daemon of the client's build", async () => {
+test("a daemon of another build is told to exit and gets only a build-stamped ask; the ask answers cold and the next reaches a daemon of the client's build", async () => {
   const w = world();
   const answered: string[] = [];
   const starts: string[] = [];
@@ -94,7 +94,7 @@ test("the same build id is asked as before, after one hello", async () => {
       for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
         const frame = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
         buffer = buffer.slice(end + 1);
-        frames.push(frame["hello"] === true ? "hello" : "request");
+        frames.push(frame["hello"] === true ? "hello" : "ask" in frame ? "ask" : "request");
         if (frame["hello"] === true) conn.write(`${JSON.stringify({ hello: { build_id: "same", pid: process.pid, root: w.root } })}\n`);
         else conn.end(`${JSON.stringify({ state: "ready", lines: [LINE], ms: 1 })}\n`);
       }
@@ -104,7 +104,8 @@ test("the same build id is asked as before, after one hello", async () => {
   try {
     const answer = await askHeld(w.root, [w.file], { env: ON, home: w.home, session: "s", kind: "edit", buildId: "same" });
     assert.equal(answer.state, "ready");
-    assert.deepEqual(frames, ["hello", "request"]);
+    // The ask goes with the hello, stamped with the client's build (T5).
+    assert.deepEqual(frames, ["hello", "ask"]);
   } finally {
     server.close();
     w.done();
@@ -183,7 +184,7 @@ for (const [name, reply] of [
   ["answers a hello without a build id", { hello: { pid: 1, root: "/x" } }],
   ["answers something that is not JSON", "garbage"],
 ] as const) {
-  test(`a daemon that ${name} is never asked, is ended through the lock's pid, and is replaced`, async () => {
+  test(`a daemon that ${name} gets only a build-stamped ask, is ended through the lock's pid, and is replaced`, async () => {
     const w = world();
     const child = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], { stdio: "ignore" });
     const childPid = child.pid!;
@@ -199,7 +200,7 @@ for (const [name, reply] of [
         for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
           const frame = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
           buffer = buffer.slice(end + 1);
-          frames.push(frame["hello"] === true ? "hello" : frame["exit"] === true ? "exit" : "request");
+          frames.push(frame["hello"] === true ? "hello" : frame["exit"] === true ? "exit" : "ask" in frame ? "ask" : "request");
           if (reply !== null && frame["hello"] === true) conn.write(`${typeof reply === "string" ? reply : JSON.stringify(reply)}\n`);
         }
       });
@@ -239,11 +240,12 @@ async function lateDaemon(helloAfterMs: number | null, helloFile: boolean) {
       for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
         const frame = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
         buffer = buffer.slice(end + 1);
-        frames.push(frame["hello"] === true ? "hello" : "request");
+        frames.push(frame["hello"] === true ? "hello" : "ask" in frame ? "ask" : "request");
         if (frame["hello"] === true && helloAfterMs !== null) {
           setTimeout(() => conn.write(`${JSON.stringify({ hello: { build_id: "mine", pid: childPid, root: w.root } })}\n`), helloAfterMs);
-        } else if (frame["hello"] !== true) {
-          conn.end(`${JSON.stringify({ state: "ready", lines: [], ms: 1 })}\n`);
+        } else if (frame["hello"] !== true && helloAfterMs !== null) {
+          // A daemon reads its frames in order: the answer follows its hello (T5).
+          setTimeout(() => conn.end(`${JSON.stringify({ state: "ready", lines: [], ms: 1 })}\n`), helloAfterMs + 5);
         }
       }
     });
@@ -264,7 +266,7 @@ test("a daemon of this build that says hello after 200 ms is not ended", async (
   try {
     const answer = await d.ask();
     assert.equal(answer.state, "ready");
-    assert.deepEqual(d.frames, ["hello", "request"]);
+    assert.deepEqual(d.frames, ["hello", "ask"]);
     assert.equal(alive(d.childPid), true, "the busy daemon was not ended");
     assert.deepEqual(d.started, [], "no daemon was started");
   } finally {

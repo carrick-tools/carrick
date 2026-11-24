@@ -182,7 +182,12 @@ export type DaemonDeps = {
  * client asks only a daemon of its own build; `exit` retires one of another.
  */
 export type HeldHello = { build_id: string; pid: number; root: string };
-export type HeldFrame = { hello: true } | { exit: true };
+/**
+ * `ask`: a request written with the hello, before its reply (T5, #5038), stamped with the asker's build. A busy
+ * daemon reads it whenever its loop is free, even after the asker stopped waiting, and files its early answer;
+ * a daemon of another build never answers it.
+ */
+export type HeldFrame = { hello: true } | { exit: true } | { ask: HeldRequest; build_id: string };
 
 const MIN = 60_000;
 /** D2: an engine closes after this long with no request. */
@@ -457,7 +462,7 @@ export class HeldDaemon {
   }
 
   /** An answer that did not check the edit, with the facts the hook's line and the doctor's read (T7). */
-  private notChecked(init: ServiceInit, state: NotChecked["state"], reason?: string): Served {
+  private notChecked(init: ServiceInit, state: Exclude<NotChecked["state"], "busy">, reason?: string): Served {
     const note: NotChecked = { service: init.service, state };
     if (reason !== undefined) note.reason = reason;
     if (state === "worktree" && init.checkout !== undefined) note.checkout = init.checkout;
@@ -965,6 +970,9 @@ export async function serve(deps: DaemonDeps, options: ServeOptions = {}): Promi
           const frame = parseFrame(text);
           if (frame !== null && "hello" in frame) {
             conn.write(`${JSON.stringify({ hello })}\n`);
+          } else if (frame !== null && "ask" in frame) {
+            // Another build's ask is never answered, and the connection stays open for the `exit` its asker sends next.
+            if (frame.build_id === hello.build_id) conn.end(`${JSON.stringify(await answerRequest(daemon, frame.ask))}\n`);
           } else if (frame !== null) {
             retire();
             conn.end(`${JSON.stringify({ bye: true })}\n`);
@@ -1028,6 +1036,9 @@ function parseFrame(text: string): HeldFrame | null {
     const parsed = JSON.parse(text) as Record<string, unknown>;
     if (parsed["hello"] === true) return { hello: true };
     if (parsed["exit"] === true) return { exit: true };
+    if (typeof parsed["build_id"] === "string" && typeof parsed["ask"] === "object" && parsed["ask"] !== null) {
+      return { ask: parsed["ask"] as HeldRequest, build_id: parsed["build_id"] };
+    }
   } catch {
     // Not a frame: a request line, answered (or failed) as one.
   }
@@ -1036,7 +1047,15 @@ function parseFrame(text: string): HeldFrame | null {
 
 async function answer(daemon: HeldDaemon, text: string): Promise<HeldAnswer> {
   try {
-    return await daemon.handle(JSON.parse(text) as HeldRequest);
+    return await answerRequest(daemon, JSON.parse(text) as HeldRequest);
+  } catch {
+    return { state: "error", lines: [], ms: 0 };
+  }
+}
+
+async function answerRequest(daemon: HeldDaemon, request: HeldRequest): Promise<HeldAnswer> {
+  try {
+    return await daemon.handle(request);
   } catch {
     return { state: "error", lines: [], ms: 0 };
   }
