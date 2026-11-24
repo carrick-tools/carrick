@@ -16,6 +16,8 @@ Three rules hold from the first call to the last.
 - **Nothing is classed from the index's words alone.** Every item you call real
   quotes the source line that makes it real. Say what code does only where you
   can quote the line that does it; a comment or a log line is not behaviour.
+  Name a caller, a count or what a file mounts only from a row or a line you
+  hold; where you hold none, leave the statement out.
 - **Nothing is skipped or cut short.** Every section runs. Each list is paged to
   its end. Each section ends with a count line: rows the index returned against
   rows you classed. The two numbers are equal, or the line says which call was
@@ -107,8 +109,10 @@ Sections A to E do not depend on each other. Split them into units:
 - **E**: one unit.
 
 Where you can start sub-agents, give each unit to its own sub-agent and start
-them together, six at a time at most. The brief for each is these words with
-the unit filled in, and nothing else:
+them together, six at a time at most. The reply that starts them opens with
+the estimate block from step 1 as text, where the user has not been shown it
+yet. The brief for each is these words with the unit filled in, and nothing
+else:
 
 > Load the carrick-audit skill. Run only section <letter> of it, for <the
 > unit: its services or pairs, each named as the index spells it, or its
@@ -235,8 +239,17 @@ bodies. Class each group:
   another system can see. Quote the line that differs in each member, and write
   one input with each result beside it ("1234.5 comes out as `1,234.50` here
   and `1234,5` there"). Work each result through the code line by line; where
-  you cannot, describe the difference in words and write no example. Say where
-  each result is shown.
+  you cannot, describe the difference in words and write no example. Every
+  member must be in use: say where each result is shown, from the callers the
+  index names, or, for a function local to one file, from that file:
+
+  ```
+  get_callers({{SCOPE}}, function_name: "<name>", file: "<file>")
+  ```
+
+  A member with no recorded caller and no other use of its name in the
+  workspace (grep it) is unused code, which nobody sees a result from: the
+  group is then VARIANT, and the row says which member is unused.
 - **VARIANT**: the same job with a difference that is there on purpose or that
   changes no result: an extra parameter, another unit, a format an outside
   service asks for, names that state the difference (`fetchJson` beside

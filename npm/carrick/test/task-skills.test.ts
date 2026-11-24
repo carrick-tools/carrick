@@ -270,6 +270,10 @@ test("the audit skill runs five sections, each from an index call, and none can 
     // A real item is proven, and one that is not proven is not in the fix list.
     assert.match(audit, /quotes the source line that makes it real/);
     assert.match(audit, /A group you have not proven to the end is never DIVERGED/);
+    // A "different result" nobody is shown is unused code: every member needs a caller the index names.
+    assert.ok(audit.includes(`get_callers(${argument}, function_name: "<name>", file: "<file>")`), "DIVERGED does not ask who calls each member");
+    assert.match(audit, /is unused code, which nobody sees a result from: the group is then VARIANT/);
+    assert.match(audit, /Name a caller, a count or what a file mounts only from a row or a line you hold/);
     assert.match(audit, /constants and helpers it reads/);
     assert.match(audit, /different call signature/);
     const notCovered = /Not covered yet: ([^]*?) Say so in the report/.exec(audit);
