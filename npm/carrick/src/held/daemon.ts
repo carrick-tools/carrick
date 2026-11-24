@@ -208,6 +208,8 @@ type Slot = {
   cold: Map<string, { request: HeldRequest; files: string[] }>;
   /** Settles once the start has given its result. */
   started: Promise<void>;
+  /** A worktree slot whose start, inside the service's chain, has given an engine over its clone (set before `started` marks it ready). */
+  cloned?: true;
   settle: () => void;
 };
 
@@ -539,7 +541,7 @@ export class HeldDaemon {
     // first await) must not hold back the `cold` answer this ask is about to return.
     setImmediate(() => {
       void Promise.resolve()
-        .then(() => this.run(init))
+        .then(() => this.run(slot))
         .then(
           (result) => this.started(slot, result),
           (error: unknown) => this.started(slot, { state: "error", reason: String(error) }),
@@ -562,20 +564,28 @@ export class HeldDaemon {
    * next ask. A worktree start whose clone was refused for a stale or missing main shadow starts the main
    * checkout's service first, through its normal path, and clones once more (#5038, T2).
    */
-  private async run(init: ServiceInit): Promise<StartResult> {
+  private async run(slot: Slot): Promise<StartResult> {
+    const init = slot.init;
     if (init.checkout === undefined) {
       return this.serial(init, async () => {
+        // A worktree slot whose start already gave an engine is closed, ready or not yet marked so: it read the `v/` this start rewrites.
         for (const other of [...this.slots.values()]) {
-          if (other.init.checkout !== undefined && serviceKey(other.init) === serviceKey(init) && other.status === "ready") await this.closeSlot(other, "main_start", true);
+          if (other.init.checkout !== undefined && serviceKey(other.init) === serviceKey(init) && (other.status === "ready" || other.cloned)) await this.closeSlot(other, "main_start", true);
         }
         return this.deps.runtime.start(init);
       });
     }
-    const first = await this.serial(init, () => this.deps.runtime.start(init));
+    const clone = (): Promise<StartResult> =>
+      this.serial(init, async () => {
+        const result = await this.deps.runtime.start(init);
+        if ("engine" in result) slot.cloned = true;
+        return result;
+      });
+    const first = await clone();
     if (!("refused" in first) || !STALE_MAIN.has(first.refused)) return first;
     log(`worktree clone of ${init.service} refused (${first.refused}); starting the main checkout's engine first`);
     if (!(await this.startMain(init))) return first;
-    return this.serial(init, () => this.deps.runtime.start(init));
+    return clone();
   }
 
   /** Start the main checkout's slot of a worktree init's service, unless it has one, and wait for its start to end. False when it cannot be admitted. */
@@ -595,7 +605,9 @@ export class HeldDaemon {
   private started(slot: Slot, result: StartResult): void {
     if ("engine" in result) {
       if (this.closed || this.slots.get(key(slot.init)) !== slot) {
-        void result.engine.close();
+        // A worktree engine's close (it removes the clone) runs in the service's chain, before any new start of that worktree clones.
+        const engine = result.engine;
+        void (slot.init.checkout === undefined ? engine.close() : this.serial(slot.init, () => engine.close())).catch((error: unknown) => log("engine close failed", String(error)));
         return;
       }
       slot.engine = result.engine;
