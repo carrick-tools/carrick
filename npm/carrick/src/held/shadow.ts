@@ -8,7 +8,7 @@ import path from "node:path";
 import { defaultExists, isRecord, realPath } from "../fs-util.ts";
 import { writeAtomic } from "../hook/reuse.ts";
 import { checkoutOf } from "../hook/worktree.ts";
-import { git } from "../init/repo-copies.ts";
+import { git, trackedPaths } from "../init/repo-copies.ts";
 import { packageRoot, resolveSidecarDir } from "../native.ts";
 import { askEngine } from "../engine-ask.ts";
 import { heldDir } from "./paths.ts";
@@ -121,7 +121,6 @@ type SavedShadow = { stamp: ShadowStamp; answer: ShadowAnswer };
 
 export type CloneRefusal =
   | "no_saved_answer"
-  | "stale_main_head"
   | "stale_main_inputs"
   | "stale_build"
   | "worktree_deps_differ"
@@ -354,7 +353,7 @@ const insideOf = (parent: string, child: string): boolean => {
  * clone's tsconfig names main's packages by their path in `mainOut`.
  *
  * It refuses, with the one reason and what it names, and writes nothing, when
- * main's stamp is missing or stale (HEAD, dependency inputs, carrick build),
+ * main's stamp is missing or stale (dependency inputs, carrick build),
  * when a dependency input of the worktree differs from main's (PLAN.md R3),
  * when a repo file main vendored differs in the worktree (R10), or when `v/`
  * imports `w/`. `mainOut` is never written.
@@ -366,8 +365,8 @@ export function cloneShadow(mainOut: string, worktreeTop: string, scanRel: strin
   const { stamp, answer } = saved;
   const rel = normalRel(scanRel);
   if (insideOf(realPath(mainOut), realPath(out))) return refuse("destination_in_main", out);
-  const mainHead = git(stamp.main_top, ["rev-parse", "HEAD"])?.trim();
-  if (mainHead !== stamp.main_head) return refuse("stale_main_head", `main is at ${mainHead ?? "an unreadable HEAD"}, the shadow was written at ${stamp.main_head}`);
+  // Main's HEAD is not compared (`main_head` is kept as a record): every own file git tracks is mirrored from the worktree, so a
+  // commit in main changes nothing the clone reads from main but `v/`, which the dependency inputs and the build id guard.
   if (options.buildId !== stamp.build_id) return refuse("stale_build", "the shadow was written by another carrick build");
   let published: PublishedInputs;
   let main: TreeScan;
@@ -390,6 +389,12 @@ export function cloneShadow(mainOut: string, worktreeTop: string, scanRel: strin
   const mainService = path.join(stamp.main_top, stamp.scan_rel);
   const service = path.join(worktreeTop, rel);
   const own = new Set(answer.own_files);
+  // An own file the worktree lacks is gone from the clone only when git tracks it in main. One git ignores or does not track
+  // (generated clients, codegen output) is never in a fresh worktree, so the clone keeps main's copy.
+  const absent = answer.own_files.filter((file) => !defaultExists(path.join(path.join(worktreeTop, rel), file)));
+  const tracked = absent.length === 0 ? new Set<string>() : trackedPaths(stamp.main_top, absent.map((file) => path.join(stamp.scan_rel, file)));
+  if (tracked === null) return refuse("worktree_unreadable", `git ls-files failed in ${stamp.main_top}`);
+  const removed = new Set(absent.filter((file) => tracked.has(path.join(stamp.scan_rel, file))));
   const added = [...worktree.sources].filter((file) => !own.has(file) && !sameBytes(path.join(mainService, file), path.join(service, file))).sort();
 
   fs.rmSync(out, { recursive: true, force: true });
@@ -408,10 +413,10 @@ export function cloneShadow(mainOut: string, worktreeTop: string, scanRel: strin
   for (const file of own) {
     const from = path.join(service, file);
     const to = path.join(outW, file);
-    if (!defaultExists(from)) {
+    if (removed.has(file)) {
       fs.rmSync(to, { force: true });
       deleted.push(file);
-    } else if (!sameBytes(from, to)) {
+    } else if (defaultExists(from) && !sameBytes(from, to)) {
       fs.writeFileSync(to, fs.readFileSync(from));
     }
   }

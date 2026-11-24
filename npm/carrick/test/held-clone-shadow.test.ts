@@ -180,12 +180,27 @@ test("main's shadow is never written, even by a clone that mirrors changes", () 
   assert.match(refused(cloneShadow(b.mainOut, b.wt, SCAN_REL, path.join(b.mainOut, "inside"), { buildId: BUILD })).refused, /destination_in_main/);
 });
 
-test("a main commit since the stamp is refused", () => {
+test("a main commit since the stamp is not refused: the worktree's tracked files are still its own (#5038 T2, F3)", () => {
   const b = bed();
-  put(path.join(b.main, SCAN_REL, "src/e.ts"), "export const e = 5;\n");
+  put(path.join(b.main, SCAN_REL, "src/b.ts"), "export const b = { id: 'main moved on' };\n");
   git(b.main, "add", "-A");
   git(b.main, "commit", "-q", "-m", "next");
-  assert.equal(refused(clone(b)).refused, "stale_main_head");
+  ok(clone(b));
+  assert.equal(read(path.join(b.out, "w/src/b.ts")), read(path.join(b.wt, SCAN_REL, "src/b.ts")), "the worktree's bytes, not main's");
+});
+
+test("an own file git ignores in main, absent in the worktree (generated code), keeps main's copy (#5038 T2, F2)", () => {
+  const b = bed();
+  const svc = path.join(b.main, SCAN_REL);
+  fs.appendFileSync(path.join(b.main, ".git", "info", "exclude"), "gen.ts\n");
+  put(path.join(svc, "src/gen.ts"), "export const gen = 1;\n");
+  put(path.join(b.mainOut, "w/src/gen.ts"), "export const gen = 1;\n");
+  assert.equal(writeShadowStamp(b.mainOut, { ...b.answer, own_files: [...b.answer.own_files, "src/gen.ts"] }, svc, BUILD), true);
+  fs.rmSync(path.join(b.wt, SCAN_REL, "src/d.ts"));
+  const answer = ok(clone(b));
+  assert.equal(read(path.join(b.out, "w/src/gen.ts")), "export const gen = 1;\n", "ignored: main's copy stays");
+  assert.ok(answer.own_files.includes("src/gen.ts"));
+  assert.equal(fs.existsSync(path.join(b.out, "w/src/d.ts")), false, "tracked and deleted in the worktree: gone");
 });
 
 test("a changed dependency input in main since the stamp is refused", () => {
