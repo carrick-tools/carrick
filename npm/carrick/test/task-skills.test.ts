@@ -196,38 +196,86 @@ test("census follows helpers to callers through the endpoint, impact greps on ze
   assert.match(drift, /`verdicts` is empty and no call site carries a `verdict`/);
 });
 
-test("the audit skill renders for both scopes and names its two finding kinds and its cost", () => {
-  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
-    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
-    assert.doesNotMatch(audit, /\{\{/);
-    assert.match(audit, /kind: "type_mismatch"/);
-    assert.match(audit, /kind: "similar_functions"/);
-    assert.match(audit, /Cost: this skill opens source for every item it reads\./);
-    assert.match(audit, /index at/);
-    assert.match(audit, /No findings list has been built/);
-    assert.match(audit, /caps each section at 10/);
-    assert.match(audit, /refused:/);
-    assert.match(audit, /Your first words to the user are the three counts/);
-    assert.match(audit, /one command per shell call/);
-    assert.match(audit, /including any you then worked around/);
-    assert.match(audit, /constants and helpers it reads/);
-    assert.match(audit, /different call signature/);
-    assert.match(audit, /quotes the line that differs/);
-    for (const word of ["GraphQL", "socket", "pub/sub", "queue", "RPC"]) {
-      assert.ok(audit.includes(word), `the audit skill does not name ${word}`);
-    }
-    assert.match(audit, /1,600 TypeScript files/);
-    assert.doesNotMatch(audit, /2,200 files/);
-  }
-});
-
-test("the audit skill reads calls that reach no route, scoped, and no longer lists them as not covered", () => {
+test("the audit skill renders for both scopes, counts first and states its estimate before any source", () => {
   for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
     const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
     const argument = scope.slug === null ? 'repo: "<owner/repo>"' : 'project: "acme-index"';
-    assert.ok(audit.includes(`get_service_graph(${argument}, limit: 200)`), "the graph step is missing or unscoped");
-    assert.match(audit, /## 4\. Calls that reach no route/);
+    assert.doesNotMatch(audit, /\{\{/);
+    // The four counting calls are cheap on purpose: one row a list, totals unpaged.
+    for (const call of [
+      `get_project_map(${argument})`,
+      `get_service_graph(${argument}, limit: 1)`,
+      `find_similar(${argument}, audit: true, limit: 1)`,
+      `get_findings(${argument}, limit: 1)`,
+    ]) {
+      assert.ok(audit.includes(call), `the counting step lacks ${call}`);
+    }
+    assert.match(audit, /Open no source yet/);
+    assert.match(audit, /Carrick audit: estimate, before any source is read/);
+    assert.match(audit, /Estimate: about <total> new tokens/);
+    assert.match(audit, /Time: about <n> minutes with sub-agents/);
+    // A run nobody can answer carries on; neither kind of run is capped.
+    assert.match(audit, /do not end your turn on a question/);
+    assert.match(audit, /There is no cap in either case/);
+    assert.doesNotMatch(audit, /caps each section/);
+    assert.match(audit, /index at/);
+    assert.match(audit, /refused:/);
+    assert.match(audit, /one command per shell call/);
+    assert.match(audit, /including any you then worked around/);
+    for (const word of ["GraphQL", "socket", "pub/sub", "queue", "RPC"]) {
+      assert.ok(audit.includes(word), `the audit skill does not name ${word}`);
+    }
+  }
+});
+
+test("the audit skill's description keeps the words that load it for a plain question", () => {
+  const audit = renderTaskSkill("carrick-audit", { slug: "acme-index" });
+  const description = /^description: (.*)$/m.exec(audit)?.[1] ?? "";
+  assert.match(description, /what is wrong in this codebase, what to clean up, or a health check/);
+  assert.match(description, /estimated tokens and minutes before it reads any source/);
+});
+
+test("the audit skill runs five sections, each from an index call, and none can be skipped", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    const argument = scope.slug === null ? 'repo: "<owner/repo>"' : 'project: "acme-index"';
+    for (const heading of [
+      "## A. Calls that reach no route",
+      "## B. Type verdicts, pair by pair",
+      "## C. Functions written twice",
+      "## D. Routes written twice",
+      "## E. One job, several answers",
+    ]) {
+      assert.ok(audit.includes(heading), `missing ${heading}`);
+    }
+    // Each section's leads come from a scoped index call, never from reading the tree.
+    for (const call of [
+      `get_service_graph(${argument}, service: "<service>", limit: 200)`,
+      `check_compatibility(${argument}, consumer_service: "<consumer>", producer_service: "<producer>", limit: 50)`,
+      `find_similar(${argument}, audit: true, offset: <first offset of the unit>, limit: 20)`,
+      `find_similar(${argument}, audit: true, include_callbacks: true, service: "<producer>", limit: 20)`,
+      `search_by_intent(${argument}, query: "<job>", also_phrased_as: ["<the same job in other words>"], top_k: 30, compact: true)`,
+    ]) {
+      assert.ok(audit.includes(call), `missing or unscoped: ${call}`);
+    }
+    assert.match(audit, /Do not read through the code looking for problems/);
     assert.match(audit, /no_matching_producer/);
+    // One sub-agent a unit where the harness has them, the same units in order where it has none.
+    assert.match(audit, /Load the carrick-audit skill\. Run only section <letter> of it/);
+    assert.match(audit, /Where you cannot start sub-agents, run the units yourself in the order above/);
+    assert.match(audit, /Run again any unit that came back without one/);
+    for (const letter of ["A", "B", "C", "D", "E"]) {
+      assert.ok(audit.includes(`Count line: \`${letter}`), `section ${letter} has no count line`);
+    }
+    // A real item is proven, and one that is not proven is not in the fix list.
+    assert.match(audit, /quotes the source line that makes it real/);
+    assert.match(audit, /A group you have not proven to the end is never DIVERGED/);
+    // A "different result" nobody is shown is unused code: every member needs a caller the index names.
+    assert.ok(audit.includes(`get_callers(${argument}, function_name: "<name>", file: "<file>")`), "DIVERGED does not ask who calls each member");
+    assert.match(audit, /is unused code, which nobody sees a result from: the group is then VARIANT/);
+    assert.match(audit, /Name a caller, a count or what a file mounts only from a row or a line you hold/);
+    assert.match(audit, /constants and helpers it reads/);
+    assert.match(audit, /different call signature/);
     const notCovered = /Not covered yet: ([^]*?) Say so in the report/.exec(audit);
     assert.ok(notCovered, "the Not covered yet line is missing");
     assert.doesNotMatch(notCovered[1] ?? "", /calls that reach no route/);
