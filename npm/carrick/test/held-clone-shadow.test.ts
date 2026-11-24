@@ -246,6 +246,57 @@ test("a dependency input outside the service's folders is not part of the guard"
   ok(clone(b));
 });
 
+/** Put a dependency input in main's disk only, re-stamp (main's shadow was built with it), and optionally git-ignore it. */
+function mainOnlyInput(b: Bed, rel: string, ignore: boolean): void {
+  const svc = path.join(b.main, SCAN_REL);
+  if (ignore) fs.appendFileSync(path.join(b.main, ".git", "info", "exclude"), `${rel}\n`);
+  put(path.join(svc, rel), '{"name":"build-output"}\n');
+  assert.equal(writeShadowStamp(b.mainOut, b.answer, svc, BUILD), true);
+}
+
+test("a package.json that git ignores in main only (build output) is not a refusal (#5038)", () => {
+  const b = bed();
+  mainOnlyInput(b, "dist/package.json", true);
+  ok(clone(b));
+});
+
+test("a package.json that main has untracked, absent in the worktree, is not a refusal (#5038)", () => {
+  const b = bed();
+  mainOnlyInput(b, "gen/package.json", false);
+  ok(clone(b));
+});
+
+test("an ignored tsconfig.build.json in main only is not a refusal (#5038)", () => {
+  const b = bed();
+  mainOnlyInput(b, "tsconfig.build.json", true);
+  ok(clone(b));
+});
+
+test("a tracked package.json changed in the worktree is refused and named as changed (#5038)", () => {
+  const b = bed();
+  mainOnlyInput(b, "dist/package.json", true);
+  put(path.join(b.wt, SCAN_REL, "package.json"), '{"name":"orders","dependencies":{"y":"2"}}\n');
+  const r = refused(clone(b));
+  assert.equal(r.refused, "worktree_deps_differ");
+  assert.ok(r.detail.includes(`${SCAN_REL}/package.json`) && r.detail.includes("changed"), r.detail);
+});
+
+test("a new untracked package.json in the worktree is refused and named as added (#5038)", () => {
+  const b = bed();
+  put(path.join(b.wt, SCAN_REL, "tools/package.json"), '{"name":"tools"}\n');
+  const r = refused(clone(b));
+  assert.equal(r.refused, "worktree_deps_differ");
+  assert.ok(r.detail.includes(`${SCAN_REL}/tools/package.json`) && r.detail.includes("added in the worktree"), r.detail);
+});
+
+test("a tracked package.json deleted in the worktree is refused and named as deleted (#5038)", () => {
+  const b = bed();
+  fs.rmSync(path.join(b.wt, SCAN_REL, "package.json"));
+  const r = refused(clone(b));
+  assert.equal(r.refused, "worktree_deps_differ");
+  assert.ok(r.detail.includes(`${SCAN_REL}/package.json`) && r.detail.includes("deleted in the worktree"), r.detail);
+});
+
 test("a v/ file that imports a w/ file is refused", () => {
   const b = bed({ vendoredReachesOwn: true });
   assert.equal(refused(clone(b)).refused, "vendored_reaches_own");
