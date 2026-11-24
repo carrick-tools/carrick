@@ -60,8 +60,8 @@ function differText(placed: Placed): string {
   const judge = placed.options?.judge;
   const named = own === undefined || judge === undefined ? [] : FIT_OPTIONS.filter((key) => own[key] !== judge[key]);
   if (own === undefined || judge === undefined || named.length === 0) return "in a service whose compiler options differ from Carrick's";
-  const values = named.map((key) => `${key} is ${own[key] ? "on" : "off"} here and ${judge[key] ? "on" : "off"} in Carrick's check`).join("; ");
-  return `in a service whose TypeScript options differ from the ones Carrick compares under: ${values}. The service's values come from ${placed.tsconfig ?? "its tsconfig"}`;
+  const values = named.map((key) => `${key} is ${own[key] ? "on" : "off"} in this service and ${judge[key] ? "on" : "off"} in Carrick's check`).join(". ");
+  return `due to TypeScript options that differ from Carrick's check. ${values}. This service's values come from ${placed.tsconfig ?? "its tsconfig"}`;
 }
 
 function engineText(state: ServiceState): string {
@@ -112,7 +112,7 @@ function recorded(root: string, home: string | undefined): Map<string, Filed> {
 }
 
 /** No engine has started here, and the fact file holds no response row for the service: none ever will. */
-const NO_TYPED_ROUTE = "no typed route to check.";
+const NO_TYPED_ROUTE = "no route here has a known reply type, so nothing will be checked.";
 
 function serviceLine(head: string, { placed, state }: Held, typed: boolean | null = null): string {
   const engine = state === null ? "" : ` ${engineText(state)}`;
@@ -167,7 +167,7 @@ export function compilerCoverage(
   emit(workspace.label, [...held.keys()].filter((name) => !mine.has(name)));
   if (nothing.length > MAX_NOTHING_LINES) {
     const first = nothing.slice(0, 3).map((entry) => entry.name).join(", ");
-    lines.push(`${workspace.label}: compiler check, ${NO_TYPED_ROUTE.replace(/\.$/, "")} in ${nothing.length} services (${first} and ${nothing.length - 3} more).`);
+    lines.push(`${workspace.label}: compiler check, ${nothing.length} services have no route with a known reply type (${first} and ${nothing.length - 3} more), so nothing will be checked there.`);
   } else for (const { label, name } of nothing) lines.push(`${label}: compiler check, service "${name}": ${NO_TYPED_ROUTE}`);
   return lines;
 }
