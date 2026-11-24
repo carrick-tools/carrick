@@ -226,7 +226,7 @@ export async function editFlow(
       if (input.timing && facts !== null && factsEnabled()) input.timing.usesFallback = true;
     }
     // A break whose other side this session edited is the whole-change check's to state (late.ts).
-    const own = session ? withoutStaleCopyBreaks(result, session, Date.now()) : { result, held: 0 };
+    const own = session ? withoutStaleCopyBreaks(result, session, Date.now(), undefined, edited[index]) : { result, held: 0 };
     if (own.held > 0) owedWholeChange(session!, choice.root, edited[index]!, Date.now());
     const context = renderPostToolUse(own.result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
