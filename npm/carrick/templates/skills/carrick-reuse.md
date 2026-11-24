@@ -1,6 +1,6 @@
 ---
 name: carrick-reuse
-description: Use at the end of a task that added or changed functions, and whenever the ask is whether something already exists, whether this duplicates code elsewhere, or where this project has built the same thing twice. Compares against the Carrick function index rather than by name.
+description: Use at the end of a task that added or changed functions, and whenever the ask is whether something already exists or whether this code duplicates code elsewhere. Compares against the Carrick function index rather than by name. For where the whole project has built the same thing twice, use carrick-audit.
 ---
 
 # What already does this
@@ -45,28 +45,20 @@ name sits in front of the sentence, a renamed copy scores lower, and
 `intent_text` is the signal that still finds it. Read every score against the
 floor and the basis in the answer you got.
 
-## Audit: the whole project
+## The whole project
 
-```
-find_similar({{SCOPE}}, audit: true)
-```
-
-`clusters` groups functions that describe the same behaviour, ordered by size.
-Call again with `offset: <next_offset>` for as long as the response carries
-`has_more`, and class what every page returned.
-
-Where the project is larger than one pass, the response carries `window`: the
-functions it compared, in path order, each against every function after them.
-Call again with `scan_from: <next_scan_from>` until a response carries no
-`next_scan_from`; the windows together compare every pair once. `path` narrows
-an audit to one directory. Where `truncated` is present the audit is partial,
-and its `scanned_functions` of `of` says by how much.
+Where the ask is where the whole project has built the same thing twice, or
+which duplicates are worth fixing, this skill is the wrong tool: one run cannot
+page the whole list and open every member. Load the carrick-audit skill, which
+reads every group in units, finds routes written twice and jobs done several
+ways, and says what it will cost first. `find_similar({{SCOPE}}, audit: true,
+limit: 1)` gives the number of groups, in `total_clusters`, if you want it
+before you hand over.
 
 ## Class every row
 
-Every row the answer returned is classed here. In an audit the first member of a
-cluster is what the rest of that cluster is classed against; in a targeted call
-it is the function you asked about. Read that span at the file and line the
+Every row the answer returned is classed here, against the function you asked
+about. Read that span at the file and line the
 response gave, read each other row the same way, and take the first of these
 that holds:
 
@@ -81,26 +73,19 @@ that holds:
 - **DUPLICATE**: one contract, and nothing left to name. Two bodies that run
   the same once the identifiers are renamed land here.
 
-A cluster is transitive, so `lowest_similarity` can sit under the floor and a
-large group can hold more than one idea. A member that shares no contract with
-the first is FALSE POSITIVE on its own row, and stays in the table.
-
 `matched_on` says which signal joined a row. `similarity` is the intent vectors;
 `intent_text` is two identical intent sentences, which is the signal that still
 finds a copy somebody renamed.
 
 ## Report
 
-One row per match, and per cluster member beyond the first. The class column
-carries one of the three words and is never empty.
+One row per match. The class column carries one of the three words and is
+never empty.
 
 | class | member | file:line | against | why |
 |---|---|---|---|---|
 | DUPLICATE | slugify | src/util/url.ts:4 | src/text.ts:12 | same replacement rules |
 | VARIANT | slugTag | src/tags.ts:20 | src/text.ts:12 | documented mirror |
-
-State `total_clusters` from the response against the number of clusters carrying
-rows above. Where the two differ, name the clusters left out.
 
 Then relay the counts the response stated, in its numbers: `compared_functions`,
 and every key the answer carries under `not_compared` and under `excluded`.

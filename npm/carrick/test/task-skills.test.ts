@@ -133,10 +133,34 @@ test("the reuse body classes every row find_similar returned, by tests that deci
   const report = body.slice(body.indexOf("\n## Report"), body.indexOf("\n## Act"));
   const flat = report.replace(/\s+/g, " ");
   assert.match(flat, /The class column carries one of the three words and is never empty\./);
-  assert.match(
-    flat,
-    /State `total_clusters` from the response against the number of clusters carrying rows above\./,
-  );
+});
+
+test("the whole-project duplicate ask belongs to the audit skill, and reuse says so", () => {
+  // Measured (carrick#5129): asked where the project had built the same thing
+  // twice, reuse read 15 of 74 groups in three texts running, while the audit's
+  // units read 74 of 74. So the ask loads the audit, which runs its duplicate
+  // sections only.
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const reuse = renderTaskSkill("carrick-reuse", scope);
+    const audit = renderTaskSkill("carrick-audit", scope);
+    const reuseDescription = /^description: (.*)$/m.exec(reuse)?.[1] ?? "";
+    const auditDescription = /^description: (.*)$/m.exec(audit)?.[1] ?? "";
+    // One skill claims the ask, so an agent has one to load.
+    assert.match(auditDescription, /or where the whole project has built the same thing twice/);
+    assert.doesNotMatch(reuseDescription, /where this project has built the same thing twice/);
+    assert.match(reuseDescription, /For where the whole project has built the same thing twice, use carrick-audit\./);
+    const reuseFlat = reuse.replace(/\s+/g, " ");
+    assert.match(reuseFlat, /## The whole project/);
+    assert.match(reuseFlat, /this skill is the wrong tool: one run cannot page the whole list and open every member/);
+    assert.match(reuseFlat, /Load the carrick-audit skill/);
+    assert.doesNotMatch(reuseFlat, /class what every page returned/);
+    // The audit narrows itself for that ask, and still handles a project larger than one window.
+    const auditFlat = audit.replace(/\s+/g, " ");
+    assert.match(auditFlat, /the audit is sections C, D and E: count and estimate those three/);
+    assert.match(auditFlat, /It is still the whole of C, D and E\. Every unit of the three runs/);
+    assert.match(auditFlat, /Any other ask runs all five/);
+    assert.match(auditFlat, /scan_from: <next_scan_from>/);
+  }
 });
 
 test("impact and drift bind their verdict words to the rows their tools returned", () => {
@@ -266,7 +290,7 @@ test("the audit skill renders for both scopes, counts first and states its estim
 test("the audit skill's description keeps the words that load it for a plain question", () => {
   const audit = renderTaskSkill("carrick-audit", { slug: "acme-index" });
   const description = /^description: (.*)$/m.exec(audit)?.[1] ?? "";
-  assert.match(description, /what is wrong in this codebase, what to clean up, or a health check/);
+  assert.match(description, /what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice/);
   assert.match(description, /estimated tokens and minutes before it reads any source/);
 });
 
@@ -486,6 +510,6 @@ test("every find_similar call in the reuse skill names its mode: `functions` or 
   // written as a bare call stops working (carrick-cloud#2851).
   const body = renderTaskSkill("carrick-reuse", { slug: "acme-index" });
   const calls = body.match(/find_similar\([^\n]*/g) ?? [];
-  assert.ok(calls.length >= 2, `expected the targeted and audit calls, got ${calls.length}`);
+  assert.ok(calls.length >= 2, `expected the targeted call and the group count, got ${calls.length}`);
   for (const call of calls) assert.match(call, /functions:|audit: true/, call);
 });
