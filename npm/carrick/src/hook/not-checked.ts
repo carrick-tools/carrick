@@ -23,7 +23,32 @@ function why(note: NotChecked): string {
     case "error":
       return note.reason === undefined ? "it could not start" : `it could not start: ${note.reason.replace(/[.\s]+$/, "")}`;
     case "worktree":
-      return "the file is in a git worktree and the compiler engine reads only the main checkout";
+      return worktreeWhy(note.reason);
+  }
+}
+
+/**
+ * Why a worktree edit was not checked, by the refusal the daemon carried (T2 F6, #5038). Proposed wording: it goes through the
+ * wording pass before it ships. No reason: the service's folders are not under the main checkout, so no worktree copy is made.
+ */
+function worktreeWhy(reason: string | undefined): string {
+  switch (reason) {
+    case "worktree_deps_differ":
+      return "the file is in a git worktree whose package or config files differ from the main checkout";
+    case "vendored_repo_file_differs":
+      return "the file is in a git worktree that changed a file the service reads as an installed package";
+    case "vendored_reaches_own":
+      return "the file is in a git worktree, and an installed package imports the service's own files";
+    case "no_saved_answer":
+    case "stale_build":
+    case "stale_main_inputs":
+      return "the file is in a git worktree, and the main checkout's compiler engine could not be started first";
+    case "worktree_unreadable":
+      return "the file is in a git worktree that could not be read";
+    case "destination_in_main":
+      return "the file is in a git worktree whose engine folder would sit inside the main checkout's";
+    default:
+      return "the file is in a git worktree outside the folders the main checkout's engine reads";
   }
 }
 

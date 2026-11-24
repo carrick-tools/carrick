@@ -48,12 +48,17 @@ const FAKE_ENGINE = `
 import fs from "node:fs";
 import path from "node:path";
 const lines = fs.readFileSync(0, "utf8").split("\\n").filter(Boolean).map((l) => JSON.parse(l));
+let scanRoot = "";
 for (const r of lines) {
-  if (r.action === "init") { console.log(JSON.stringify({ request_id: r.request_id, status: "ready" })); continue; }
+  if (r.action === "init") { scanRoot = r.scan_root; console.log(JSON.stringify({ request_id: r.request_id, status: "ready" })); continue; }
   if (r.action !== "write_shadow") continue;
   if (process.env.FAKE_EDIT_FILE) fs.writeFileSync(process.env.FAKE_EDIT_FILE, process.env.FAKE_EDIT_TEXT);
   fs.mkdirSync(path.join(r.out_dir, "w"), { recursive: true });
   fs.writeFileSync(path.join(r.out_dir, "w", "tsconfig.json"), "{}");
+  for (const own of ${JSON.stringify([ORDERS, HTTP])}) {
+    fs.mkdirSync(path.dirname(path.join(r.out_dir, "w", own)), { recursive: true });
+    fs.copyFileSync(path.join(scanRoot, own), path.join(r.out_dir, "w", own));
+  }
   const fit = { strictNullChecks: true, strictFunctionTypes: true, exactOptionalPropertyTypes: false };
   console.log(JSON.stringify({
     request_id: r.request_id, status: "success", tsconfig: path.join(r.out_dir, "w", "tsconfig.json"),
@@ -216,5 +221,75 @@ test("a start with no edit during it places the same rows", async (t) => {
   const r = await begin(t, {});
   assert.equal(r.placed().armed.length, 2);
   assert.deepEqual(r.placed().unarmed, []);
+  assert.deepEqual(await r.ask(), []);
+});
+
+// A linked worktree's engine started BY an edit (#5038 T2 F1): its first gate judges the edited files at the worktree's HEAD,
+// so the edit that started it is judged as an edit and a break in it is stated.
+
+/** Main checkout as `begin` makes it, main's shadow written, then a nested worktree whose ORDERS file is `head` at its HEAD (committed) and `edit` on disk. */
+async function beginWorktree(t: { after: (fn: () => void | Promise<void>) => void }, opts: { head?: string; edit: string; edited: boolean }) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-start-worktree-")));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const root = path.join(dir, "ws");
+  const home = path.join(dir, "home");
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, ORDERS), ORDERS_TEXT);
+  fs.writeFileSync(path.join(root, HTTP), HTTP_TEXT);
+  fs.writeFileSync(path.join(root, ".gitignore"), ".claude/worktrees/\n.carrick/\n");
+  git(root, "init", "-q", "-b", "main");
+  git(root, "add", "-A");
+  git(root, "commit", "-q", "-m", "index");
+  const commit = git(root, "rev-parse", "HEAD");
+  fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "shop" }] } }));
+  const header = { schema: 1, writer: 12, project_id: "p", project_slug: "shop", digest: "d", built_at: "2026-01-01T00:00:00Z", repos: [{ repo: REPO, service: SERVICE, commit }] };
+  await buildFacts([header, ...socketRows()].map((l) => JSON.stringify(l)).join("\n") + "\n", factsPath(root), [{ repo: REPO, path: root }], new Date().toISOString());
+  const entry = path.join(dir, "engine.mjs");
+  fs.writeFileSync(entry, FAKE_ENGINE);
+  const main: ServiceInit = { repo: REPO, service: SERVICE, repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
+  const runtime = createRuntime({ root, home, entry, env: { ...process.env }, makeEngine: () => new FakeCompiler() });
+  const mainStart = await runtime.start(main);
+  assert.ok("engine" in mainStart, JSON.stringify(mainStart));
+  t.after(() => mainStart.engine.close());
+  git(root, "worktree", "add", "-q", ".claude/worktrees/b", "-b", "b");
+  const top = path.join(root, ".claude", "worktrees", "b");
+  if (opts.head !== undefined) {
+    fs.writeFileSync(path.join(top, ORDERS), opts.head);
+    git(top, "commit", "-q", "-am", "branch");
+  }
+  fs.writeFileSync(path.join(top, ORDERS), opts.edit);
+  const file = path.join(top, ORDERS);
+  const init: ServiceInit = { ...main, repo_path: top, sidecar_root: top, scan_root: top, checkout: top };
+  const started = await runtime.start(init, opts.edited ? { edited: [file] } : {});
+  assert.ok("engine" in started, JSON.stringify(started));
+  const service: ServiceEngine = started.engine;
+  t.after(() => service.close());
+  const placed = (): { armed: Wire[]; unarmed: Wire[] } => JSON.parse(fs.readFileSync(placedPath(top, SERVICE, home), "utf8")) as { armed: Wire[]; unarmed: Wire[] };
+  const ask = async (): Promise<Array<Record<string, unknown>>> => {
+    const answer = await service.answer([file], { session: "s1", files: [file], kind: "edit", edited_at: Date.now() });
+    await answer.after?.();
+    return answer.lines as unknown as Array<Record<string, unknown>>;
+  };
+  return { placed, ask, file };
+}
+
+test("T2 F1: a break that is a worktree's first edit, and starts its engine, is stated at the first answer", async (t) => {
+  const r = await beginWorktree(t, { edit: BROKEN, edited: true });
+  assert.equal(r.placed().armed.length, 2, JSON.stringify(r.placed()));
+  const lines = await r.ask();
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  assert.equal(lines[0]!["row_path"], r.file, "the worktree's file");
+});
+
+test("T2 F1: a start that no edit asked for gates the disk text, as before (the break stays unarmed)", async (t) => {
+  const r = await beginWorktree(t, { edit: BROKEN, edited: false });
+  assert.match(String(r.placed().unarmed[0]?.["reason"]), /^clean_check_fails/);
+  assert.deepEqual(await r.ask(), []);
+});
+
+test("T2 F1: a row already broken at the worktree's HEAD stays unarmed and says nothing new", async (t) => {
+  const r = await beginWorktree(t, { head: BROKEN, edit: `${BROKEN}// another edit\n`, edited: true });
+  assert.match(String(r.placed().unarmed[0]?.["reason"]), /^clean_check_fails/);
   assert.deepEqual(await r.ask(), []);
 });

@@ -16,7 +16,7 @@ import { readJson, releaseLock, takeLock, touchLock } from "../hook/lock.ts";
 import { answerEarly, supersededEntry } from "../hook/rechecks.ts";
 import { linkedCheckoutTop, mainCheckoutOf } from "../hook/worktree.ts";
 import { heldBuildId } from "./build.ts";
-import { heldDir, heldRootOf, helloPath, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
+import { heldDir, heldRootOf, helloPath, lockPath, LOCK_CAP_MS, logPath, placedPath, serviceFilesDir, socketPath, statePath } from "./paths.ts";
 import { readState, writeState, type NotChecked, type ServiceState } from "./state.ts";
 import { addSteps, tenth, type Steps } from "./steps.ts";
 import {
@@ -146,9 +146,15 @@ export interface ServiceEngine {
  */
 export type StartResult = { engine: ServiceEngine } | { state: "no_compiler" | "error"; reason: string } | { state: "refused"; refused: string; detail: string };
 
+/**
+ * `edited`: the files (absolute) of the edit ask that started a linked worktree's engine. Its first gate judges their text
+ * at the worktree's `HEAD`, so the edit itself is then judged as an edit (#5038, T2 F1). A main-checkout start gets none.
+ */
+export type StartOptions = { edited?: string[] };
+
 /** Starts a service's engine: the program, the compiler, the gate. */
 export interface ServiceRuntime {
-  start(init: ServiceInit): Promise<StartResult>;
+  start(init: ServiceInit, options?: StartOptions): Promise<StartResult>;
   /**
    * How many fact rows `start` would read for the service. A service with none gets no
    * engine, so it asks for no admission and leaves no "not checked" note.
@@ -197,7 +203,11 @@ const WORKTREE_PARK_MS = 2 * MIN;
 /** The note a worktree ask gets when every worktree slot is busy and the cap or budget has no room. */
 const SLOTS_BUSY = "worktree slots busy";
 /** A worktree clone refused for one of these is tried once more after the main checkout's service has started (it writes a fresh shadow and stamp). */
-const STALE_MAIN = new Set(["no_saved_answer", "stale_main_head", "stale_build", "stale_main_inputs"]);
+const STALE_MAIN = new Set(["no_saved_answer", "stale_build", "stale_main_inputs"]);
+/** ...and for these the main checkout's engine is stale too: a ready one is closed and started again first (T2 F3). */
+const RESTART_MAIN = new Set(["stale_build", "stale_main_inputs"]);
+/** T2 F5: a main start waits at most this long for a worktree engine's ask in flight before it closes that engine. */
+const MAIN_START_WAIT_MS = 2_000;
 
 type Slot = {
   init: ServiceInit;
@@ -221,6 +231,8 @@ type Slot = {
   started: Promise<void>;
   /** A worktree slot whose start, inside the service's chain, has given an engine over its clone (set before `started` marks it ready). */
   cloned?: true;
+  /** The files of the edit ask that began a worktree slot: its first gate reads them at the worktree's HEAD (T2 F1). */
+  edited?: string[];
   settle: () => void;
 };
 
@@ -398,7 +410,7 @@ export class HeldDaemon {
     if (slot === undefined) {
       if ((await this.deps.runtime.rowCount?.(init)) === 0) return { state: "none", lines: [], steps: {} };
       if (init.checkout !== undefined) {
-        if (await this.admitWorktree(init, request.wait_ms ?? 0)) return this.serveService(init, files, request);
+        if (await this.admitWorktree(init, request.wait_ms ?? 0, request.kind === "edit" ? files : undefined)) return this.serveService(init, files, request);
         this.park(init, files, request);
         this.slotLog("capped", init);
         return this.notChecked(init, "capped", SLOTS_BUSY);
@@ -615,12 +627,12 @@ export class HeldDaemon {
   }
 
   /** One attempt to admit a worktree slot, after every earlier attempt: true when the slot exists (made here or before). */
-  private admitOnce(init: ServiceInit): Promise<boolean> {
+  private admitOnce(init: ServiceInit, edited?: string[]): Promise<boolean> {
     const attempt = this.admitChain.then(async () => {
       if (this.closed) return false;
       if (this.slots.has(key(init))) return true;
       if (!(await this.makeRoom(init))) return false;
-      this.begin(init, this.now());
+      this.begin(init, this.now(), edited);
       this.slotLog("admit", init);
       return true;
     });
@@ -633,11 +645,11 @@ export class HeldDaemon {
   }
 
   /** Admit a worktree slot, waiting up to `waitMs` for the cap or the budget to free. False when it did not. */
-  private async admitWorktree(init: ServiceInit, waitMs: number): Promise<boolean> {
+  private async admitWorktree(init: ServiceInit, waitMs: number, edited?: string[]): Promise<boolean> {
     const began = performance.now();
     let queued = false;
     for (;;) {
-      if (await this.admitOnce(init)) return true;
+      if (await this.admitOnce(init, edited)) return true;
       const left = waitMs - (performance.now() - began);
       if (left <= 0 || this.closed || this.admissionMb(init) > this.budget()) return false;
       if (!queued) {
@@ -667,7 +679,8 @@ export class HeldDaemon {
     try {
       while (!this.closed && performance.now() < until) {
         await this.sleep(this.deps.queuePollMs ?? 250);
-        if (!(await this.admitOnce(parked.init))) continue;
+        const edited = [...new Set(parked.asks.flatMap((a) => a.files))];
+        if (!(await this.admitOnce(parked.init, edited))) continue;
         const slot = this.slots.get(k);
         for (const { files, request } of parked.asks) this.remember(slot, files, request);
         if (slot?.status === "ready" && slot.engine !== null) void this.askAgain(slot, slot.engine);
@@ -678,11 +691,11 @@ export class HeldDaemon {
     }
   }
 
-  private begin(init: ServiceInit, now: number): void {
+  private begin(init: ServiceInit, now: number, edited?: string[]): void {
     const settledMb = readState(heldRootOf(init, this.root), init.service, this.deps.home)?.settled_mb;
     let settle: () => void = () => undefined;
     const started = new Promise<void>((resolve) => (settle = resolve));
-    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), busy: 0, cold: new Map(), started, settle, ...(settledMb === undefined ? {} : { settledMb }) };
+    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), busy: 0, cold: new Map(), started, settle, ...(settledMb === undefined ? {} : { settledMb }), ...(edited === undefined ? {} : { edited }) };
     this.slots.set(key(init), slot);
     this.keep(init, { state: "starting" });
     this.emptySince = null;
@@ -720,29 +733,35 @@ export class HeldDaemon {
       return this.serial(init, async () => {
         // A worktree slot whose start already gave an engine is closed, ready or not yet marked so: it read the `v/` this start rewrites.
         for (const other of [...this.slots.values()]) {
-          if (other.init.checkout !== undefined && serviceKey(other.init) === serviceKey(init) && (other.status === "ready" || other.cloned)) await this.closeSlot(other, "main_start", true);
+          if (other.init.checkout !== undefined && serviceKey(other.init) === serviceKey(init) && (other.status === "ready" || other.cloned)) await this.closeSlot(other, "main_start", true, MAIN_START_WAIT_MS);
         }
         return this.deps.runtime.start(init);
       });
     }
     const clone = (): Promise<StartResult> =>
       this.serial(init, async () => {
-        const result = await this.deps.runtime.start(init);
+        const result = await this.deps.runtime.start(init, slot.edited === undefined ? {} : { edited: slot.edited });
         if ("engine" in result) slot.cloned = true;
         return result;
       });
     const first = await clone();
     if (!("refused" in first) || !STALE_MAIN.has(first.refused)) return first;
     log(`worktree clone of ${init.service} refused (${first.refused}); starting the main checkout's engine first`);
-    if (!(await this.startMain(init))) return first;
+    if (!(await this.startMain(init, first.refused))) return first;
     return clone();
   }
 
   /** Start the main checkout's slot of a worktree init's service, unless it has one, and wait for its start to end. False when it cannot be admitted. */
-  private async startMain(worktree: ServiceInit): Promise<boolean> {
+  private async startMain(worktree: ServiceInit, refused: string): Promise<boolean> {
     const main = (await this.loadPrograms()).find(({ init }) => init.checkout === undefined && serviceKey(init) === serviceKey(worktree))?.init;
     if (main === undefined) return false;
     let slot = this.slots.get(key(main));
+    // Main's own engine read the same stale inputs or build: close it and start it again (T2 F3).
+    if (slot?.status === "ready" && RESTART_MAIN.has(refused)) {
+      log(`restarting ${main.service} in the main checkout: its shadow is stale (${refused})`);
+      await this.closeSlot(slot, "stale");
+      slot = undefined;
+    }
     if (slot === undefined) {
       if (!(await this.makeRoom(main))) return false;
       this.begin(main, this.now());
@@ -781,6 +800,8 @@ export class HeldDaemon {
       slot.reason = result.refused;
       this.keep(slot.init, { state: "failed", reason: oneLine(`${result.refused}: ${result.detail}`) });
       removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
+      // A refused slot holds nothing: it does not keep the daemon from its empty exit (T2 F4).
+      if (this.holding() === 0) this.emptySince ??= this.now();
       return;
     }
     log(`no engine for ${slot.init.service}: ${result.reason}`);
@@ -805,15 +826,38 @@ export class HeldDaemon {
    * `chained`: the caller already runs in the service's start chain. A worktree engine's close otherwise
    * joins that chain, so a new start of the same worktree never clones while the old clone is removed.
    */
-  private async closeSlot(slot: Slot, reason: "idle" | "size" | "evicted" | "exit" | "main_start", chained = false): Promise<void> {
+  private async closeSlot(slot: Slot, reason: "idle" | "size" | "evicted" | "exit" | "main_start" | "stale", chained = false, waitMs?: number): Promise<void> {
     this.write({ at: new Date(this.now()).toISOString(), kind: "close", service: slot.init.service, reason });
     this.slots.delete(key(slot.init));
     removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
-    if (this.slots.size === 0) this.emptySince = this.now();
+    if (this.holding() === 0) this.emptySince = this.now();
     const engine = slot.engine;
-    // After the call in flight, never under it.
-    const close = (): Promise<void> => slot.queue.then(() => engine?.close()).catch((error: unknown) => log("engine close failed", String(error)));
+    // After the call in flight, never under it; with `waitMs`, no longer than that (T2 F5).
+    const done = slot.queue.catch(() => undefined);
+    const waited = waitMs === undefined ? done : Promise.race([done, new Promise<void>((resolve) => setTimeout(resolve, waitMs).unref())]);
+    const close = (): Promise<void> =>
+      waited
+        .then(() => engine?.close())
+        .catch((error: unknown) => log("engine close failed", String(error)))
+        .then(() => this.forget(slot));
     await (slot.init.checkout === undefined || chained ? close() : this.serial(slot.init, close));
+  }
+
+  /** A closed worktree slot's placed and state files go with its clone, unless a new slot of that worktree holds them now (T2 F4). */
+  private forget(slot: Slot): void {
+    if (slot.init.checkout === undefined || this.slots.has(key(slot.init))) return;
+    const root = heldRootOf(slot.init, this.root);
+    for (const file of [placedPath(root, slot.init.service, this.deps.home), statePath(root, slot.init.service, this.deps.home)]) fs.rmSync(file, { force: true });
+    try {
+      fs.rmdirSync(serviceFilesDir(root, this.deps.home));
+    } catch {
+      // Another service of that worktree still has files there.
+    }
+  }
+
+  /** Slots that hold or wait for an engine: a refused worktree slot holds nothing. */
+  private holding(): number {
+    return [...this.slots.values()].filter((s) => s.status !== "refused").length;
   }
 
   /** Housekeeping: close idle or oversized engines, refresh the registry. */
@@ -838,7 +882,7 @@ export class HeldDaemon {
   wantsExit(): boolean {
     const now = this.now();
     if (now - this.lastRequest >= DAEMON_IDLE_MS) return true;
-    return this.slots.size === 0 && this.emptySince !== null && now - this.emptySince >= EMPTY_EXIT_MS;
+    return this.holding() === 0 && this.emptySince !== null && now - this.emptySince >= EMPTY_EXIT_MS;
   }
 
   async close(): Promise<void> {

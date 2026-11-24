@@ -387,13 +387,22 @@ test("each not-checked state prints one line with its reason, once per session p
   }
 });
 
+test("a refused worktree clone's line says why, by its reason (#5038 T2 F6)", async (t) => {
+  const ws = await workspace(t);
+  const checkout = path.join(ws.root, ".claude", "worktrees", "a");
+  const daemon = await fakeDaemon(ws, { state: "worktree", lines: [], ms: 1, not_checked: [note("worktree", { checkout, reason: "worktree_deps_differ" })] });
+  t.after(() => daemon.close());
+  const said = context((await edit(ws, "n-wt-deps")).stdout);
+  assert.ok(said.includes("did not check this edit of api: the file is in a git worktree whose package or config files differ from the main checkout."), said);
+});
+
 test("the worktree line has no doctor tail and comes once per session, service and worktree (#5038)", async (t) => {
   const ws = await workspace(t);
   const checkout = path.join(ws.root, ".claude", "worktrees", "a");
   const daemon = await fakeDaemon(ws, { state: "worktree", lines: [], ms: 1, not_checked: [note("worktree", { checkout })] });
   t.after(() => daemon.close());
   const WANT =
-    "Carrick: the compiler engine did not check this edit of api: the file is in a git worktree and the compiler engine reads only the main checkout.";
+    "Carrick: the compiler engine did not check this edit of api: the file is in a git worktree outside the folders the main checkout's engine reads.";
   const first = context((await edit(ws, "n-wt")).stdout);
   assert.ok(first.includes(WANT), first);
   assert.ok(!first.includes("doctor"), first);

@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { HeldDaemon, type HeldAnswer, type HeldRequest, type ServiceEngine, type ServiceInit, type ServiceRuntime } from "../src/held/daemon.ts";
+import { HeldDaemon, type HeldAnswer, type HeldRequest, type ServiceEngine, type ServiceInit, type ServiceRuntime, type StartOptions, type StartResult } from "../src/held/daemon.ts";
 import { WORKTREE_SLOTS_MAX, worktreeSlotsMax, worktreesEnabled } from "../src/held/registry.ts";
 import { logPath } from "../src/held/paths.ts";
 import { enqueue, readEarly } from "../src/hook/rechecks.ts";
@@ -53,9 +53,13 @@ function world(env: Record<string, string> = {}, rss = 100) {
       closed.push(init.checkout ?? "main");
     },
   });
+  const options: Array<StartOptions | undefined> = [];
+  const refuse = new Set<string>();
   const runtime: ServiceRuntime = {
-    start: async (init) => {
+    start: async (init, opts): Promise<StartResult> => {
       started.push(init);
+      options.push(opts);
+      if (refuse.has(init.checkout ?? "main")) return { state: "refused", refused: "worktree_deps_differ", detail: "test" };
       return { engine: engineFor(init) };
     },
   };
@@ -81,7 +85,7 @@ function world(env: Record<string, string> = {}, rss = 100) {
     block.clear();
     for (const resolve of waiting.splice(0)) resolve();
   };
-  return { dir, root, home, tops, clock, started, closed, block, settings, daemon, ask, up, rows, release, sizes, done: () => (release(), fs.rmSync(dir, { recursive: true, force: true })) };
+  return { dir, root, home, tops, clock, started, closed, block, settings, options, refuse, daemon, ask, up, rows, release, sizes, done: () => (release(), fs.rmSync(dir, { recursive: true, force: true })) };
 }
 
 test("settings: the switch reads off, 0 and false in any case; the cap is a positive integer, else 3", () => {
@@ -282,6 +286,41 @@ test("main unchanged: the cap does not touch a main-checkout slot, and main is a
     await pause(100);
     assert.equal((await w.ask(null)).state, "ready");
     assert.ok(w.rows().every((r) => r["checkout"] !== undefined), "no decision row is written for a main-checkout slot");
+  } finally {
+    w.done();
+  }
+});
+
+test("a slot admitted after a wait still starts with the edited files (F1)", async () => {
+  const w = world();
+  try {
+    for (const top of w.tops.slice(0, 3)) {
+      await w.up(top);
+      w.block.add(top);
+      void w.ask(top);
+    }
+    await pause();
+    setTimeout(() => w.release(), 60);
+    await w.ask(w.tops[3]!, { wait_ms: 2000 });
+    await pause();
+    assert.equal(w.started.length, 4);
+    assert.deepEqual(w.options[3], { edited: [path.join(w.tops[3]!, "src", "x.ts")] });
+  } finally {
+    w.done();
+  }
+});
+
+test("a refused worktree slot is not counted as a live slot", async () => {
+  const w = world({ CARRICK_HELD_WORKTREE_SLOTS: "1" });
+  try {
+    w.refuse.add(w.tops[0]!);
+    assert.equal((await w.ask(w.tops[0]!)).state, "cold");
+    await pause();
+    assert.equal((await w.ask(w.tops[0]!)).state, "worktree", "refused");
+    assert.equal((await w.ask(w.tops[1]!)).state, "cold", "the cap of 1 is not held by the refused slot");
+    await pause();
+    assert.equal(w.started.length, 2);
+    assert.deepEqual(w.closed, [], "nothing was closed for it");
   } finally {
     w.done();
   }
