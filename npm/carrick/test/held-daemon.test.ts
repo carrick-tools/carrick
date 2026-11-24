@@ -20,7 +20,7 @@ import {
 } from "../src/held/daemon.ts";
 import { askHeld, ensureHeld } from "../src/held/client.ts";
 import { liveEntries, writeEntry } from "../src/held/registry.ts";
-import { lockPath as heldLockPath, logPath, socketPath } from "../src/held/paths.ts";
+import { lockPath as heldLockPath, logPath, rootKey, socketPath, statePath } from "../src/held/paths.ts";
 import { readState, writeState } from "../src/held/state.ts";
 import { compilerLinesEnabled } from "../src/facts/enabled.ts";
 import { takeLock } from "../src/hook/lock.ts";
@@ -905,6 +905,67 @@ test("a worktree that holds its own program (its own init) is served as today", 
     });
     const answer = await daemon.handle(w.req(w.twin));
     assert.equal(answer.state, "cold");
+  } finally {
+    w.done();
+  }
+});
+
+// Every per-engine key and file names its checkout (#5038, W1): an init that names a linked worktree gets its own slot, state file and registry entry.
+
+function twoCheckouts() {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "co")));
+  const root = path.join(dir, "repo");
+  const top = path.join(dir, "other-checkout");
+  const home = path.join(dir, "home");
+  for (const base of [root, top]) {
+    fs.mkdirSync(path.join(base, "src"), { recursive: true });
+    fs.writeFileSync(path.join(base, "src", "x.ts"), "export const x = 1;\n");
+  }
+  const main: ServiceInit = { repo: "shop", service: "api", repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
+  const other: ServiceInit = { ...main, repo_path: top, sidecar_root: top, scan_root: top, checkout: top };
+  const started: ServiceInit[] = [];
+  const runtime: ServiceRuntime = {
+    start: async (init) => {
+      started.push(init);
+      return { engine: { answer: async () => ({ lines: [] }), rss: () => 100, close: async () => undefined } };
+    },
+  };
+  const daemon = new HeldDaemon({ root, home, env: { ...ON }, totalmem: () => 64 * 1024 ** 3, programs: async () => [main, other], runtime });
+  const req = (file: string): HeldRequest => ({ session: "s1", files: [file], kind: "edit", edited_at: 1 });
+  return { dir, root, top, home, daemon, started, req, mainFile: path.join(root, "src", "x.ts"), otherFile: path.join(top, "src", "x.ts"), done: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+test("W1: two inits of one service, one naming a checkout, get two slots, two state files and two registry entries", async () => {
+  const w = twoCheckouts();
+  try {
+    await w.daemon.handle(w.req(w.mainFile));
+    await settle();
+    await w.daemon.handle(w.req(w.otherFile));
+    await settle();
+    assert.equal(w.started.length, 2, "one start each");
+    assert.deepEqual(w.started.map((i) => i.checkout), [undefined, w.top]);
+    assert.equal(readState(w.root, "api", w.home)?.state, "ready");
+    assert.equal(readState(w.top, "api", w.home)?.state, "ready");
+    assert.deepEqual(liveEntries(w.home).map((e) => e.root).sort(), [w.root, w.top].sort());
+    // Asks reach each slot's own engine: both now answer ready.
+    assert.equal((await w.daemon.handle(w.req(w.mainFile))).state, "ready");
+    assert.equal((await w.daemon.handle(w.req(w.otherFile))).state, "ready");
+    assert.equal(w.started.length, 2, "no third start");
+  } finally {
+    w.done();
+  }
+});
+
+test("W1: a main-only run writes its state and registry entry under the daemon's own checkout", async () => {
+  const w = twoCheckouts();
+  try {
+    await w.daemon.handle(w.req(w.mainFile));
+    await settle();
+    assert.deepEqual(liveEntries(w.home).map((e) => e.root), [w.root]);
+    assert.equal(readState(w.root, "api", w.home)?.state, "ready");
+    assert.equal(readState(w.top, "api", w.home), null);
+    assert.ok(fs.existsSync(statePath(w.root, "api", w.home)));
+    assert.equal(fs.existsSync(path.join(w.home, ".carrick", "held", rootKey(w.top))), false, "nothing written under another checkout");
   } finally {
     w.done();
   }

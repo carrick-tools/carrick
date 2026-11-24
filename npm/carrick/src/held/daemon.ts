@@ -16,7 +16,7 @@ import { readJson, releaseLock, takeLock, touchLock } from "../hook/lock.ts";
 import { answerEarly, supersededEntry } from "../hook/rechecks.ts";
 import { linkedCheckoutTop, mainCheckoutOf } from "../hook/worktree.ts";
 import { heldBuildId } from "./build.ts";
-import { heldDir, helloPath, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
+import { heldDir, heldRootOf, helloPath, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
 import { readState, writeState, type NotChecked, type ServiceState } from "./state.ts";
 import { addSteps, tenth, type Steps } from "./steps.ts";
 import {
@@ -40,6 +40,8 @@ export type ServiceInit = {
   sidecar_root: string;
   tsconfig: string | null;
   scan_root: string;
+  /** The real path of the linked worktree's top this init belongs to. Absent for every main-checkout service. */
+  checkout?: string;
 };
 
 export type HeldRequest = {
@@ -197,7 +199,7 @@ type Slot = {
 /** A reason as one short line. */
 const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim().slice(0, 160);
 
-const key = (init: ServiceInit): string => `${init.repo}\0${init.service}`;
+const key = (init: ServiceInit): string => `${init.repo}\0${init.service}${init.checkout === undefined ? "" : `\0${init.checkout}`}`;
 
 const within = (file: string, dir: string): boolean => file === dir || file.startsWith(dir + path.sep);
 
@@ -375,7 +377,7 @@ export class HeldDaemon {
       this.keep(init, { state: "capped", budget_mb: note.budget_mb, holders });
     }
     if (state === "cold") {
-      const took = readState(this.root, init.service, this.deps.home)?.last_start_ms;
+      const took = readState(heldRootOf(init, this.root), init.service, this.deps.home)?.last_start_ms;
       if (took !== undefined) note.took_s = Math.round(took / 1000);
     }
     return { state, lines: [], steps: {}, note };
@@ -383,10 +385,10 @@ export class HeldDaemon {
 
   /** Write the service's state record (`state.ts`); a start's duration carries over to the next one. */
   private keep(init: ServiceInit, change: Pick<ServiceState, "state"> & Partial<ServiceState>): void {
-    const before = readState(this.root, init.service, this.deps.home);
+    const before = readState(heldRootOf(init, this.root), init.service, this.deps.home);
     const lastStart = change.start_ms ?? before?.start_ms ?? before?.last_start_ms;
     const settled = change.settled_mb ?? before?.settled_mb;
-    writeState(this.root, init.service, { at: new Date(this.now()).toISOString(), service: init.service, repo: init.repo, ...(settled === undefined ? {} : { settled_mb: settled }), ...change, ...(lastStart === undefined || change.state === "ready" ? {} : { last_start_ms: lastStart }) }, this.deps.home);
+    writeState(heldRootOf(init, this.root), init.service, { at: new Date(this.now()).toISOString(), service: init.service, repo: init.repo, ...(settled === undefined ? {} : { settled_mb: settled }), ...change, ...(lastStart === undefined || change.state === "ready" ? {} : { last_start_ms: lastStart }) }, this.deps.home);
   }
 
   /** Asked through the slot's queue; `null` when the engine could not answer. */
@@ -458,7 +460,7 @@ export class HeldDaemon {
   private async makeRoom(init: ServiceInit): Promise<boolean> {
     const budget = this.budget();
     const now = this.now();
-    const need = readState(this.root, init.service, this.deps.home)?.settled_mb ?? ADMISSION_MB;
+    const need = readState(heldRootOf(init, this.root), init.service, this.deps.home)?.settled_mb ?? ADMISSION_MB;
     if (need > budget) return false;
     for (;;) {
       if (admits(liveEntries(this.deps.home), budget, need)) return true;
@@ -471,7 +473,7 @@ export class HeldDaemon {
   }
 
   private begin(init: ServiceInit, now: number): void {
-    const settledMb = readState(this.root, init.service, this.deps.home)?.settled_mb;
+    const settledMb = readState(heldRootOf(init, this.root), init.service, this.deps.home)?.settled_mb;
     const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), cold: new Map(), ...(settledMb === undefined ? {} : { settledMb }) };
     this.slots.set(key(init), slot);
     this.keep(init, { state: "starting" });
@@ -505,7 +507,7 @@ export class HeldDaemon {
       if (settled !== undefined) slot.settledMb = settled;
       this.keep(slot.init, { state: "ready", start_ms: this.now() - slot.begunAt, ...(settled === undefined ? {} : { settled_mb: settled }) });
       // Give back the admission slot; the slot stays ready so its asks still answer.
-      if (result.engine.holdsCompiler === false) removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
+      if (result.engine.holdsCompiler === false) removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
       void this.askAgain(slot, result.engine);
       return;
     }
@@ -514,13 +516,13 @@ export class HeldDaemon {
     slot.failedAt = this.now();
     slot.reason = oneLine(result.reason);
     this.keep(slot.init, { state: slot.status === "no_compiler" ? "no_compiler" : "failed", reason: slot.reason });
-    removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
+    removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
   }
 
   private entry(slot: Slot, rssMb: number): void {
     writeEntry(this.deps.home, {
       pid: process.pid,
-      root: this.root,
+      root: heldRootOf(slot.init, this.root),
       service: slot.init.service,
       rss_mb: rssMb,
       last_used: slot.lastUsed,
@@ -530,7 +532,7 @@ export class HeldDaemon {
   private async closeSlot(slot: Slot, reason: "idle" | "size" | "evicted" | "exit"): Promise<void> {
     this.write({ at: new Date(this.now()).toISOString(), kind: "close", service: slot.init.service, reason });
     this.slots.delete(key(slot.init));
-    removeEntry(this.deps.home, process.pid, this.root, slot.init.service);
+    removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
     if (this.slots.size === 0) this.emptySince = this.now();
     const engine = slot.engine;
     // After the call in flight, never under it.
