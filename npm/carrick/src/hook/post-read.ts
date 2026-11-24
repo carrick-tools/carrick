@@ -17,7 +17,8 @@ import { readStdin } from "./stdin.ts";
 import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { hasOwed, markFacts, wasRead } from "./reuse.ts";
+import { hasOwed, markFacts, markTold, wasRead } from "./reuse.ts";
+import { worktreeRulesLine } from "./worktree-rules.ts";
 import { sessionKey } from "./session-key.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLateFirst, emitPostToolUse as emit } from "./late.ts";
@@ -63,6 +64,12 @@ async function main(timing: Timing): Promise<void> {
   // is: delivered before the early returns below, in the same one object.
   const session = sessionKey(payload);
   const late = await deliverLateFirst(session);
+  // A sub-agent in a linked worktree has no session start: its first Read says where the rules are (#5134).
+  const rules = worktreeRulesLine(session, payload.cwd);
+  if (rules && session) {
+    late.push(rules.line);
+    markTold(session, [rules.key]);
+  }
   const named = payload.tool_input?.file_path;
   if (!named || !CHECKED.test(named)) return emit(late);
   const file = path.isAbsolute(named) ? named : path.resolve(payload.cwd ?? process.cwd(), named);
