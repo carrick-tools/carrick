@@ -20,7 +20,7 @@ function rowsFor(found: Partial<SimilarFunction>): string[] {
       ],
     },
   } as unknown as CheckResult;
-  const block = similarLines(result, "a.ts", "/w/app", () => true).lines[0] ?? "";
+  const block = similarLines(result, "a.ts", "/w/app", () => true, undefined, { whole: true }).lines[0] ?? "";
   return block.split("\n").slice(1, -1);
 }
 
@@ -64,7 +64,7 @@ function placeOf(found: Partial<SimilarFunction>, cwd: string | null): string {
       ],
     },
   } as unknown as CheckResult;
-  const row = similarLines(result, "a.ts", cwd, () => true).lines[0]!.split("\n")[1]!;
+  const row = similarLines(result, "a.ts", cwd, () => true, undefined, { whole: true }).lines[0]!.split("\n")[1]!;
   return row.slice(row.indexOf(" at ") + 4, row.indexOf(" (exported"));
 }
 
