@@ -6,6 +6,8 @@
 
 import path from "node:path";
 import type { CheckResult, SimilarFunction } from "../contract.ts";
+import { fileOf, isAdded } from "./added.ts";
+import type { Added } from "./added.ts";
 
 /** What one answer's similar blocks need to print: the blocks, and the keys to claim on delivery. */
 export type SimilarLines = { lines: string[]; keys: string[] };
@@ -54,8 +56,10 @@ function row(position: number, found: SimilarFunction, place: string): string {
 }
 
 /**
- * One block for each new function of `result` that has similar rows and has not
- * been shown (`isNew`). The score goes to the log, never into the text.
+ * One block for each function this edit added (`added`, `isAdded`: the
+ * binary's list also holds functions the index is merely behind on) that has
+ * similar rows and has not been shown (`isNew`). The score goes to the log,
+ * never into the text.
  */
 export function similarLines(
   result: CheckResult,
@@ -63,6 +67,7 @@ export function similarLines(
   cwd: string | null,
   isNew: (key: string) => boolean,
   log: (...parts: string[]) => void = () => {},
+  added?: Added,
 ): SimilarLines {
   const out: SimilarLines = { lines: [], keys: [] };
   if (result.error) return out;
@@ -71,6 +76,8 @@ export function similarLines(
   for (const made of result.recheck?.new_functions ?? []) {
     const rows = made.similar ?? [];
     if (rows.length === 0) continue;
+    if (added === undefined && ownRoot === null) continue;
+    if (!isAdded(added, fileOf(ownRoot ?? "", result.file ?? relative), made.name, made.line)) continue;
     const key = similarKey(result, relative, made.name);
     if (out.keys.includes(key) || !isNew(key)) continue;
     out.lines.push(

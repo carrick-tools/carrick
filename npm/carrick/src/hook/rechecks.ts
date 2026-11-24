@@ -47,6 +47,7 @@ import type { HeldLine } from "../held/daemon.ts";
 import { earlyResult } from "../held/early.ts";
 import { compareEarly, hasEarlyBreak, heldRecord } from "./confirm.ts";
 import type { HeldRecord } from "./confirm.ts";
+import type { Added } from "./added.ts";
 
 const log = createLogger("carrick-recheck");
 
@@ -119,6 +120,8 @@ export type QueueEntry = {
   instead_of_probe?: true;
   /** The agent's folder when it edited, so a late list prints paths from it (`similar.ts`). */
   cwd?: string;
+  /** What the edit added (`added.ts`), so a late similar-function block speaks only for a function it added. */
+  added?: Added;
 };
 
 export type Answer = {
@@ -140,6 +143,8 @@ export type Answer = {
   instead_of_probe?: true;
   /** Carried from the entry. */
   cwd?: string;
+  /** Carried from the entry. */
+  added?: Added;
   result?: CheckResult;
   /** What a `changed` entry's `check --changed` answered. */
   changed?: ChangedResult;
@@ -172,7 +177,7 @@ type ChangedOptions = Options & { named?: string[] };
  * probe still runs and its similar-function block prints now). Main session and
  * sub-agent alike.
  */
-type EnqueueOptions = Options & { factsCallers?: ReadonlySet<string>; insteadOfProbe?: boolean; cwd?: string | null };
+type EnqueueOptions = Options & { factsCallers?: ReadonlySet<string>; insteadOfProbe?: boolean; cwd?: string | null; added?: ReadonlyMap<string, Added> };
 
 export function rechecksDir(root: string): string {
   return path.join(root, ".carrick", "rechecks");
@@ -245,6 +250,7 @@ export function enqueue(
       ...(options.factsCallers?.has(file) ? { facts_callers: true as const } : {}),
       ...(options.insteadOfProbe ? { instead_of_probe: true as const } : {}),
       ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.added?.has(file) ? { added: options.added.get(file)! } : {}),
     };
     const pending = sessionPart(session, seq, "pending.json", options.home);
     if (pending === null) continue;
@@ -636,6 +642,7 @@ function writeAnswer(
     ...(entry.facts_callers ? { facts_callers: true as const } : {}),
     ...(entry.instead_of_probe ? { instead_of_probe: true as const } : {}),
     ...(entry.cwd ? { cwd: entry.cwd } : {}),
+    ...(entry.added ? { added: entry.added } : {}),
     ...body,
   };
   const file = sessionPart(entry.session, entry.seq, "answer.json", home);
