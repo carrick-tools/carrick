@@ -32,6 +32,7 @@
 //     for a reproducible run or an air-gapped machine.
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -353,7 +354,7 @@ export function scheduleUpdateCheck(
       // `windowsHide` because a detached child on Windows gets its own console
       // window otherwise, and win32-x64 is a platform this package publishes:
       // a window flashing up once every four hours is not a version notice.
-      { detached: true, stdio: "ignore", env, windowsHide: true },
+      { detached: true, stdio: "ignore", env, windowsHide: true, cwd: os.homedir() },
     );
     child.unref();
     return true;

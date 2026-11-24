@@ -521,7 +521,7 @@ export type EnsureOptions = {
   env?: NodeJS.ProcessEnv;
   now?: number;
   /** Injected in tests; the real one detaches a child and forgets it. */
-  start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
+  start?: (command: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) => void;
 };
 
 /** The command that runs `runQueue` for a workspace: the runner script beside this module. */
@@ -552,7 +552,8 @@ export function ensureRunner(root: string, options: EnsureOptions = {}): boolean
     CARRICK_RECHECK_SPAWNER: String(process.pid),
   };
   try {
-    (options.start ?? startDetached)(command, args, runnerEnv);
+    // The runner works on this checkout, so it starts in its root, not in the hook's directory (carrick#5038).
+    (options.start ?? startDetached)(command, args, runnerEnv, root);
   } catch (error) {
     releaseLock(lockPath(root), process.pid);
     log("could not start the re-check runner", String(error));

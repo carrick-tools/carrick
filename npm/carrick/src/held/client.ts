@@ -14,7 +14,7 @@ import { backedOff } from "./backoff.ts";
 import { heldBuildId } from "./build.ts";
 import type { HeldAnswer, HeldHello, HeldRequest } from "./daemon.ts";
 import type { NotChecked } from "./state.ts";
-import { helloPath, lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
+import { heldDir, helloPath, lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
 
 const log = createLogger("carrick-held-client");
 
@@ -34,7 +34,7 @@ export type EnsureOptions = {
   home?: string;
   now?: number;
   /** Injected in tests; the real one detaches a child and forgets it. */
-  start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
+  start?: (command: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) => void;
   /** This client's build id; the hash of the package's own files by default. */
   buildId?: string;
 };
@@ -57,7 +57,11 @@ export function ensureHeld(root: string, options: EnsureOptions = {}): boolean {
   const { command, args } = scriptBeside(import.meta.url, "run", root);
   const daemonEnv = { ...env, CARRICK_NO_KEEP_AWAKE: "1", CARRICK_HELD_SPAWNER: String(process.pid) };
   try {
-    (options.start ?? startDetached)(command, args, daemonEnv);
+    // The daemon outlives this hook, so it never starts in the hook's directory: that may be a worktree
+    // removed later (carrick#5038). It runs from its own state folder, which no checkout owns.
+    const cwd = heldDir(options.home);
+    fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
+    (options.start ?? startDetached)(command, args, daemonEnv, cwd);
   } catch (error) {
     releaseLock(lock, process.pid);
     log("could not start the held-compiler daemon", String(error));

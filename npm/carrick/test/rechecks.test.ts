@@ -78,7 +78,10 @@ test("a lock naming a dead pid is replaced and one runner starts", () => {
     fs.writeFileSync(lockPath(s.root), JSON.stringify({ pid: deadPid(), started: stamp, touched: stamp }));
     const started: string[][] = [];
     const start = (_command: string, args: string[]) => void started.push(args);
-    assert.equal(ensureRunner(s.root, { start }), true);
+    const cwds: Array<string | undefined> = [];
+    const startCwd = (_command: string, args: string[], _env: NodeJS.ProcessEnv, cwd?: string) => void (started.push(args), cwds.push(cwd));
+    assert.equal(ensureRunner(s.root, { start: startCwd }), true);
+    assert.deepEqual(cwds, [s.root], "the runner starts in the checkout it works on, not the hook's folder (#5038)");
     assert.equal(started.length, 1);
     assert.equal(JSON.parse(fs.readFileSync(lockPath(s.root), "utf8")).pid, process.pid);
     // The holder (this process) is alive and fresh: no second runner.

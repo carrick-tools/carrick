@@ -126,7 +126,7 @@ export type RefreshOptions = {
   env?: NodeJS.ProcessEnv;
   now?: number;
   /** Injected in tests; the real one detaches a child and forgets it. */
-  start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
+  start?: (command: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) => void;
 };
 
 /**
@@ -139,8 +139,13 @@ export function scriptBeside(moduleUrl: string, name: string, root: string): { c
   return { command: process.execPath, args: [path.join(path.dirname(here), `${name}${path.extname(here)}`), root] };
 }
 
-export function startDetached(command: string, args: string[], env: NodeJS.ProcessEnv): void {
-  const child = spawn(command, args, { detached: true, stdio: "ignore", env });
+/**
+ * Detach `command` and forget it. `cwd` is where the child runs: always pass one that cannot be removed
+ * (a checkout root the child works on, the held dir, the home dir), because a child that outlives the hook
+ * otherwise keeps the hook's own directory, which may be a worktree that is deleted later (carrick#5038).
+ */
+export function startDetached(command: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string): void {
+  const child = spawn(command, args, { detached: true, stdio: "ignore", env, ...(cwd === undefined ? {} : { cwd }) });
   child.unref();
 }
 

@@ -6,12 +6,14 @@
 // whatever happens.
 
 import { execFile } from "node:child_process";
+import fs from "node:fs";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { binary } from "../cli.ts";
 import { createLogger } from "../log.ts";
 import { recordCrash } from "./backoff.ts";
 import { heldBuildId } from "./build.ts";
 import { serve, type DaemonDeps, type ServiceInit } from "./daemon.ts";
+import { heldDir } from "./paths.ts";
 import { createRuntime } from "./runtime.ts";
 
 const log = createLogger("carrick-held-run");
@@ -53,6 +55,12 @@ async function main(): Promise<void> {
   }
   const env = process.env;
   if (!compilerLinesEnabled(env)) return;
+  // First step once the switch is on (a switch-off run touches nothing): leave whatever directory started this process. A daemon that keeps a worktree as its
+  // working directory fails every engine start once that worktree is removed (carrick#5038). Every
+  // path the daemon uses is absolute or built from `root`, never from the working directory.
+  const stateDir = heldDir();
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  process.chdir(stateDir);
   rootForCrash = root;
   const buildId = heldBuildId();
   idForCrash = buildId;

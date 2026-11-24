@@ -321,7 +321,7 @@ export type StartOptions = {
   env?: NodeJS.ProcessEnv;
   now?: number;
   home?: string;
-  start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
+  start?: (command: string, args: string[], env: NodeJS.ProcessEnv, cwd?: string) => void;
 };
 
 /**
@@ -338,7 +338,7 @@ export function startUsageSend(root: string, options: StartOptions = {}): boolea
     const held = claimedAt(markerPath(root, USAGE_MARKER));
     if (held !== null && (options.now ?? Date.now()) - held < USAGE_COOLDOWN_MS) return false;
     const { command, args } = scriptBeside(import.meta.url, "usage-run", root);
-    (options.start ?? startDetached)(command, args, { ...env, CARRICK_NO_KEEP_AWAKE: "1" });
+    (options.start ?? startDetached)(command, args, { ...env, CARRICK_NO_KEEP_AWAKE: "1" }, root);
     return true;
   } catch (error) {
     log("usage send not started", String(error));

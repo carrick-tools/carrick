@@ -93,6 +93,14 @@ test("an older npm global with a newer cached latest starts the child once and s
   assert.match(second[0]!, /is installed and 0\.3\.149 is published\. Update with/);
 });
 
+test("the upgrade child starts in the home folder, not the folder of the session", () => {
+  const env = machineEnv();
+  const cwds: Array<string | undefined> = [];
+  writeUpdateState({ checked_at: new Date().toISOString(), latest: "0.3.149" }, env);
+  upgradeLines({ env, root: globalRoot(), current: "0.3.148", now: Date.now(), start: (_c, _a, _e, cwd) => void cwds.push(cwd) });
+  assert.deepEqual(cwds, [os.homedir()]);
+});
+
 test("a project dependency starts nothing and prints today's notice", () => {
   const env = machineEnv();
   const starts: Start[] = [];
