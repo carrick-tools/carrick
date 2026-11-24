@@ -1871,8 +1871,10 @@ export interface InferredType {
    * expression a response joined, the annotation or schema a declared
    * contract came from, or the one body read a request was taken from.
    * `source_location` still names the one node the answer is located at (on
-   * a producer, usually the handler). Absent on a decided abstain and on an
-   * answer whose text is bare `any` or `unknown`: there is no value to place.
+   * a producer, usually the handler). Absent on an answer whose text is bare
+   * `any` or `unknown` and on a decided abstain: there is no value to place.
+   * One abstain is the exception (carrick#5133): `serialised_body_unread`
+   * names the sends it found, while its text stays `unknown`.
    */
   read_spans?: ReadSpan[];
   /** The kind of inference that was performed */
