@@ -1023,7 +1023,7 @@ test("T2: a main-checkout ask starts and writes the same with and without a work
       const files = fs.readdirSync(dir).sort().map((name) => `${name}\n${fs.readFileSync(path.join(dir, name), "utf8")}`);
       const entry = liveEntries(w.home).filter((e) => e.root === w.root).map((e) => ({ ...e, pid: 0 }));
       const rows = fs.readFileSync(logPath(w.root, w.home), "utf8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
-      const mainRows = rows.filter((r) => r["kind"] !== "close").slice(withWorktree ? 2 : 0).map((r) => ({ ...r, ms: 0, steps: undefined }));
+      const mainRows = rows.filter((r) => r["kind"] !== "close" && r["kind"] !== "slot").slice(withWorktree ? 2 : 0).map((r) => ({ ...r, ms: 0, steps: undefined }));
       const main = w.started.find((i) => i.checkout === undefined);
       return { answer: { ...answer, ms: 0 }, ready: { ...ready, ms: 0 }, main, files, entry, mainRows };
     } finally {

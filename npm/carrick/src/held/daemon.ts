@@ -27,6 +27,9 @@ import {
   memoryBudgetMb,
   removeEntry,
   closeCeilingMb,
+  isWorktreeEntry,
+  worktreeSlotsMax,
+  worktreesEnabled,
   writeEntry,
 } from "./registry.ts";
 
@@ -162,6 +165,8 @@ export type DaemonDeps = {
   clock?: () => number;
   programs: () => Promise<ServiceInit[]>;
   runtime: ServiceRuntime;
+  /** How often a worktree ask waiting for a slot looks again, in ms (250 by default). */
+  queuePollMs?: number;
   /** The id the daemon answers `hello` with; the hash of its own build files by default. */
   buildId?: string;
 };
@@ -187,6 +192,10 @@ const RETRY_MS = 5 * MIN;
  * clone of main's shadow in seconds, so it gives its memory back sooner than a main-checkout engine.
  */
 export const WORKTREE_IDLE_MS = 60_000;
+/** A worktree ask that waited out its `wait_ms` is kept this long, and answered late if a slot frees (#5038, T3). */
+const WORKTREE_PARK_MS = 2 * MIN;
+/** The note a worktree ask gets when every worktree slot is busy and the cap or budget has no room. */
+const SLOTS_BUSY = "worktree slots busy";
 /** A worktree clone refused for one of these is tried once more after the main checkout's service has started (it writes a fresh shadow and stamp). */
 const STALE_MAIN = new Set(["no_saved_answer", "stale_main_head", "stale_build", "stale_main_inputs"]);
 
@@ -204,6 +213,8 @@ type Slot = {
   reason?: string;
   /** Engine calls run one at a time, in arrival order. */
   queue: Promise<void>;
+  /** Engine calls asked of this slot and not yet finished: a slot with none is idle (T3). */
+  busy: number;
   /** The newest edit ask per session and file answered `cold` while the engine started (N2); each is asked again once it is ready. */
   cold: Map<string, { request: HeldRequest; files: string[] }>;
   /** Settles once the start has given its result. */
@@ -259,6 +270,10 @@ export class HeldDaemon {
   private lastRequest: number;
   private emptySince: number | null = null;
   private closed = false;
+  /** Worktree admissions run one at a time, so the cap and the budget are counted before each start, never beside it (T3). */
+  private admitChain: Promise<unknown> = Promise.resolve();
+  /** Worktree edit asks that waited out their `wait_ms`, per slot key: answered late once a slot frees (T3). */
+  private readonly parked = new Map<string, { init: ServiceInit; asks: Array<{ files: string[]; request: HeldRequest }> }>();
 
   constructor(deps: DaemonDeps) {
     this.deps = deps;
@@ -347,7 +362,7 @@ export class HeldDaemon {
       const twin = path.join(mainTop, path.relative(realPath(top), file));
       for (const { init, dir } of programs) {
         if (!within(twin, dir)) continue;
-        const theirs = initInWorktree(init, mainTop, realPath(top));
+        const theirs = worktreesEnabled(this.env()) ? initInWorktree(init, mainTop, realPath(top)) : null;
         if (theirs !== null) {
           const group = worktrees.get(key(theirs)) ?? { init: theirs, files: [] };
           if (!group.files.includes(file)) group.files.push(file);
@@ -371,6 +386,8 @@ export class HeldDaemon {
 
   private async serveService(init: ServiceInit, files: string[], request: HeldRequest): Promise<Served> {
     const now = this.now();
+    // The off switch is read per request: no worktree slot starts, and a worktree file is answered `worktree` (T3).
+    if (init.checkout !== undefined && !worktreesEnabled(this.env())) return this.notChecked(init, "worktree");
     let slot = this.slots.get(key(init));
     if ((slot?.status === "failed" || slot?.status === "refused") && now - slot.failedAt >= RETRY_MS) {
       this.slots.delete(key(init));
@@ -378,6 +395,12 @@ export class HeldDaemon {
     }
     if (slot === undefined) {
       if ((await this.deps.runtime.rowCount?.(init)) === 0) return { state: "none", lines: [], steps: {} };
+      if (init.checkout !== undefined) {
+        if (await this.admitWorktree(init, request.wait_ms ?? 0)) return this.serveService(init, files, request);
+        this.park(init, files, request);
+        this.slotLog("capped", init);
+        return this.notChecked(init, "capped", SLOTS_BUSY);
+      }
       if (!(await this.makeRoom(init))) return this.notChecked(init, "capped");
       this.begin(init, now);
       this.remember(this.slots.get(key(init)), files, request);
@@ -448,39 +471,55 @@ export class HeldDaemon {
   /** Asked through the slot's queue; `null` when the engine could not answer. */
   private ask(slot: Slot, engine: ServiceEngine, files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps; engine?: string; commits?: Array<() => void> } | null> {
     const queued = performance.now();
+    slot.busy += 1;
     return new Promise((resolve) => {
       slot.queue = slot.queue.then(async () => {
-        const begun = performance.now();
-        // A newer edit of the file asked again while this waited: its answer is
-        // the one to give, and this one would only be stale.
-        if (this.superseded(request)) {
-          resolve({ lines: [], steps: { queue_wait: tenth(begun - queued) } });
-          return;
-        }
-        let after: (() => Promise<Steps | void>) | undefined;
         try {
-          const answered = await engine.answer(files, request);
-          after = answered.after;
-          const engineMs = performance.now() - begun;
-          resolve({
-            lines: answered.lines,
-            steps: { queue_wait: tenth(begun - queued), engine: tenth(engineMs), ...answered.steps },
-            ...(answered.commit ? { commits: [answered.commit] } : {}),
-            ...(answered.engine === undefined ? {} : { engine: answered.engine }),
-          });
-        } catch (error) {
-          log("engine could not answer", String(error));
-          resolve(null);
-        }
-        const afterBegun = performance.now();
-        try {
-          const afterSteps = await after?.();
-          if (afterSteps !== undefined) this.recordAfter(request, slot.init.service, Math.round(performance.now() - afterBegun), afterSteps);
-        } catch (error) {
-          log("after-answer step failed", String(error));
+          await this.askNow(slot, engine, files, request, queued, resolve);
+        } finally {
+          slot.busy -= 1;
         }
       });
     });
+  }
+
+  private async askNow(
+    slot: Slot,
+    engine: ServiceEngine,
+    files: string[],
+    request: HeldRequest,
+    queued: number,
+    resolve: (value: { lines: HeldLine[]; steps: Steps; engine?: string; commits?: Array<() => void> } | null) => void,
+  ): Promise<void> {
+    const begun = performance.now();
+    // A newer edit of the file asked again while this waited: its answer is
+    // the one to give, and this one would only be stale.
+    if (this.superseded(request)) {
+      resolve({ lines: [], steps: { queue_wait: tenth(begun - queued) } });
+      return;
+    }
+    let after: (() => Promise<Steps | void>) | undefined;
+    try {
+      const answered = await engine.answer(files, request);
+      after = answered.after;
+      const engineMs = performance.now() - begun;
+      resolve({
+        lines: answered.lines,
+        steps: { queue_wait: tenth(begun - queued), engine: tenth(engineMs), ...answered.steps },
+        ...(answered.commit ? { commits: [answered.commit] } : {}),
+        ...(answered.engine === undefined ? {} : { engine: answered.engine }),
+      });
+    } catch (error) {
+      log("engine could not answer", String(error));
+      resolve(null);
+    }
+    const afterBegun = performance.now();
+    try {
+      const afterSteps = await after?.();
+      if (afterSteps !== undefined) this.recordAfter(request, slot.init.service, Math.round(performance.now() - afterBegun), afterSteps);
+    } catch (error) {
+      log("after-answer step failed", String(error));
+    }
   }
 
   private superseded(request: HeldRequest): boolean {
@@ -503,26 +542,137 @@ export class HeldDaemon {
     }
   }
 
+  private env(): NodeJS.ProcessEnv {
+    return this.deps.env ?? process.env;
+  }
+
   private budget(): number {
     return memoryBudgetMb(this.deps.env, this.deps.totalmem?.());
   }
 
   /**
-   * Free room for one more engine, counted at the service's last settled size: close idle
-   * engines, least recently used first. A service that alone exceeds the budget is never started.
+   * What a new slot is counted at in the budget. A main-checkout slot: its service's last settled size, else
+   * the plateau. A worktree slot: its own settled size when known, else the main checkout's for that service
+   * (the same program), else the plateau (#5038, T3).
+   */
+  private admissionMb(init: ServiceInit): number {
+    const own = readState(heldRootOf(init, this.root), init.service, this.deps.home)?.settled_mb;
+    if (own !== undefined || init.checkout === undefined) return own ?? ADMISSION_MB;
+    return readState(this.root, init.service, this.deps.home)?.settled_mb ?? ADMISSION_MB;
+  }
+
+  /**
+   * Free room for one more engine, counted at its admission size. A main-checkout start closes idle engines,
+   * least recently used first. A worktree start must also keep the live worktree slots on the machine under the
+   * cap: it closes the least recently used idle worktree slot first (whatever its idle age), then, for the
+   * budget only, an idle main slot by the usual rule; a busy slot is never closed for it (#5038, T3).
+   * A service that alone exceeds the budget is never started.
    */
   private async makeRoom(init: ServiceInit): Promise<boolean> {
     const budget = this.budget();
     const now = this.now();
-    const need = readState(heldRootOf(init, this.root), init.service, this.deps.home)?.settled_mb ?? ADMISSION_MB;
+    const need = this.admissionMb(init);
     if (need > budget) return false;
+    const worktree = init.checkout !== undefined;
+    const cap = worktreeSlotsMax(this.env());
     for (;;) {
-      if (admits(liveEntries(this.deps.home), budget, need)) return true;
-      const victim = [...this.slots.values()]
-        .filter((s) => s.status === "ready" && now - s.lastUsed >= EVICT_IDLE_MS)
-        .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+      const entries = liveEntries(this.deps.home);
+      const overCap = worktree && entries.filter(isWorktreeEntry).length >= cap;
+      if (!overCap && admits(entries, budget, need)) return true;
+      const ready = [...this.slots.values()].filter((s) => s.status === "ready");
+      const byUse = (a: Slot, b: Slot): number => a.lastUsed - b.lastUsed;
+      let victim: Slot | undefined;
+      if (!worktree) {
+        victim = ready.filter((s) => now - s.lastUsed >= EVICT_IDLE_MS).sort(byUse)[0];
+      } else {
+        victim = ready.filter((s) => s.init.checkout !== undefined && s.busy === 0).sort(byUse)[0];
+        if (victim === undefined && !overCap) victim = ready.filter((s) => s.init.checkout === undefined && s.busy === 0 && now - s.lastUsed >= EVICT_IDLE_MS).sort(byUse)[0];
+      }
       if (victim === undefined) return false;
+      if (worktree) this.slotLog("evict", init, { victim: victim.init.checkout ?? "main", victim_service: victim.init.service });
       await this.closeSlot(victim, "evicted");
+    }
+  }
+
+  /** One row in the held log per worktree admit, evict, queue or capped decision, with the counts a soak test reads. */
+  private slotLog(decision: "admit" | "evict" | "queue" | "capped", init: ServiceInit, more: Record<string, unknown> = {}): void {
+    const entries = liveEntries(this.deps.home);
+    this.write({
+      at: new Date(this.now()).toISOString(),
+      kind: "slot",
+      decision,
+      service: init.service,
+      checkout: init.checkout,
+      worktrees: entries.filter(isWorktreeEntry).length,
+      cap: worktreeSlotsMax(this.env()),
+      held_mb: Math.round(entries.reduce((sum, e) => sum + e.rss_mb, 0)),
+      budget_mb: this.budget(),
+      need_mb: this.admissionMb(init),
+      ...more,
+    });
+  }
+
+  /** One attempt to admit a worktree slot, after every earlier attempt: true when the slot exists (made here or before). */
+  private admitOnce(init: ServiceInit): Promise<boolean> {
+    const attempt = this.admitChain.then(async () => {
+      if (this.closed) return false;
+      if (this.slots.has(key(init))) return true;
+      if (!(await this.makeRoom(init))) return false;
+      this.begin(init, this.now());
+      this.slotLog("admit", init);
+      return true;
+    });
+    this.admitChain = attempt.catch(() => undefined);
+    return attempt;
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms).unref());
+  }
+
+  /** Admit a worktree slot, waiting up to `waitMs` for the cap or the budget to free. False when it did not. */
+  private async admitWorktree(init: ServiceInit, waitMs: number): Promise<boolean> {
+    const began = performance.now();
+    let queued = false;
+    for (;;) {
+      if (await this.admitOnce(init)) return true;
+      const left = waitMs - (performance.now() - began);
+      if (left <= 0 || this.closed || this.admissionMb(init) > this.budget()) return false;
+      if (!queued) {
+        queued = true;
+        this.slotLog("queue", init, { wait_ms: waitMs });
+      }
+      await this.sleep(Math.min(left, this.deps.queuePollMs ?? 250));
+    }
+  }
+
+  /** Keep a capped worktree edit ask, so its answer still lands late through the early-answer path once a slot frees. */
+  private park(init: ServiceInit, files: string[], request: HeldRequest): void {
+    if (request.kind !== "edit" || request.seq === undefined) return;
+    const k = key(init);
+    const held = this.parked.get(k);
+    if (held !== undefined) {
+      held.asks.push({ files, request });
+      return;
+    }
+    const parked = { init, asks: [{ files, request }] };
+    this.parked.set(k, parked);
+    void this.drain(k, parked);
+  }
+
+  private async drain(k: string, parked: { init: ServiceInit; asks: Array<{ files: string[]; request: HeldRequest }> }): Promise<void> {
+    const until = performance.now() + WORKTREE_PARK_MS;
+    try {
+      while (!this.closed && performance.now() < until) {
+        await this.sleep(this.deps.queuePollMs ?? 250);
+        if (!(await this.admitOnce(parked.init))) continue;
+        const slot = this.slots.get(k);
+        for (const { files, request } of parked.asks) this.remember(slot, files, request);
+        if (slot?.status === "ready" && slot.engine !== null) void this.askAgain(slot, slot.engine);
+        return;
+      }
+    } finally {
+      this.parked.delete(k);
     }
   }
 
@@ -530,11 +680,11 @@ export class HeldDaemon {
     const settledMb = readState(heldRootOf(init, this.root), init.service, this.deps.home)?.settled_mb;
     let settle: () => void = () => undefined;
     const started = new Promise<void>((resolve) => (settle = resolve));
-    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), cold: new Map(), started, settle, ...(settledMb === undefined ? {} : { settledMb }) };
+    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), busy: 0, cold: new Map(), started, settle, ...(settledMb === undefined ? {} : { settledMb }) };
     this.slots.set(key(init), slot);
     this.keep(init, { state: "starting" });
     this.emptySince = null;
-    this.entry(slot, slot.settledMb ?? ADMISSION_MB);
+    this.entry(slot, init.checkout === undefined ? (slot.settledMb ?? ADMISSION_MB) : this.admissionMb(init));
     // The next turn of the event loop: a start's synchronous work (it clears the old shadow folder before its
     // first await) must not hold back the `cold` answer this ask is about to return.
     setImmediate(() => {
