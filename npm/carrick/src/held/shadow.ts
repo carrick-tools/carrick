@@ -198,7 +198,8 @@ function scanTree(top: string, scanRel: string, published: PublishedInputs): Tre
     for (const entry of entries) {
       const abs = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (!SKIPPED_DIRS.has(entry.name)) walk(abs);
+        // A folder holding `.git` is another checkout (a nested linked worktree, a submodule): never this one's files.
+        if (!SKIPPED_DIRS.has(entry.name) && !defaultExists(path.join(abs, ".git"))) walk(abs);
       } else if (entry.isFile()) {
         if (isDependencyInput(entry.name, published.names)) inputs.set(posix(path.relative(top, abs)), sha(abs));
         if (published.extensions.has(path.extname(entry.name).slice(1))) sources.add(posix(path.relative(service, abs)));

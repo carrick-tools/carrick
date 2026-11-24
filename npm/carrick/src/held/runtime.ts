@@ -24,6 +24,7 @@ import { contractKey } from "../facts/lines.ts";
 import { commitsOf, indexedCommit, localCheckouts } from "../facts/peers.ts";
 import { localNames, localRepos } from "../facts/repo-match.ts";
 import { factsPath, openFacts, type ContractGroup, type ContractRow, type GraphqlTypeTable, type FactStore } from "../facts/store.ts";
+import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit, ServiceRuntime, StartResult } from "./daemon.ts";
 import { StalePull, Ts7Lsp, type Diag as LspDiag, type Engine } from "./engine.ts";
@@ -47,7 +48,7 @@ import {
 import { runOf } from "./early.ts";
 import { messageSendRows } from "./message-rows.ts";
 import { heldBuildId } from "./build.ts";
-import { engineEntry, writeShadow, writeShadowStamp, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
+import { cloneShadow, engineEntry, writeShadow, writeShadowStamp, type CloneRefused, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
 import { StepTimer, type Steps } from "./steps.ts";
 
 const log = createLogger("carrick-held-runtime");
@@ -965,7 +966,16 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
   };
   // The rows `start` reads for a service, counted once per fact-file stamp.
   let counted: { stamp: string; counts: Map<string, number> } | null = null;
-  return {
+  /**
+   * A linked worktree's shadow (#5038, T2): a clone of the main checkout's shadow for the same service,
+   * never a write of its own. The clone's tsconfig reads main's `v/` in place.
+   */
+  const cloneOf = (init: ServiceInit & { checkout: string }, out: string): ShadowAnswer | CloneRefused => {
+    const top = realPath(init.checkout);
+    const scanRel = path.relative(top, realPath(init.scan_root));
+    return cloneShadow(shadowDir(options.root, init.service, options.home), top, scanRel, out, { buildId: heldBuildId() });
+  };
+  const runtime = {
     async rowCount(init: ServiceInit): Promise<number> {
       const stamp = deps.stamp();
       if (counted === null || counted.stamp !== stamp) {
@@ -994,22 +1004,28 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       const ask: ShadowGraphql | undefined = table === null ? undefined : { types: table, roots: rootsOf(mine) };
       let graphqlReason = mine.some(isGraphql) && table === null ? GRAPHQL_TABLE_UNUSABLE : null;
       let shadow: ShadowAnswer;
-      try {
-        shadow = await writeShadow(entry, init, out, env, options.home, ask);
-      } catch (error) {
-        if (ask === undefined) throw error;
-        log(`the compiler engine refused ${init.service}'s GraphQL table; its GraphQL rows stay unarmed`, String(error));
-        fs.rmSync(out, { recursive: true, force: true });
-        shadow = await writeShadow(entry, init, out, env, options.home);
-        graphqlReason = GRAPHQL_TABLE_UNUSABLE;
+      if (init.checkout !== undefined) {
+        const cloned = cloneOf({ ...init, checkout: init.checkout }, out);
+        if ("refused" in cloned) return { state: "refused", refused: cloned.refused, detail: cloned.detail };
+        shadow = cloned;
+      } else {
+        try {
+          shadow = await writeShadow(entry, init, out, env, options.home, ask);
+        } catch (error) {
+          if (ask === undefined) throw error;
+          log(`the compiler engine refused ${init.service}'s GraphQL table; its GraphQL rows stay unarmed`, String(error));
+          fs.rmSync(out, { recursive: true, force: true });
+          shadow = await writeShadow(entry, init, out, env, options.home);
+          graphqlReason = GRAPHQL_TABLE_UNUSABLE;
+        }
+        // Main's answer and its stamp, saved beside the shadow for a worktree's clone (carrick#5038). Never fails a start.
+        try {
+          writeShadowStamp(out, shadow, init.scan_root, heldBuildId());
+        } catch {
+          // No saved answer: a worktree clone is refused until the next start.
+        }
       }
       if (ask !== undefined && shadow.graphql === undefined) graphqlReason = GRAPHQL_TABLE_UNUSABLE;
-      // Main's answer and its stamp, saved beside the shadow for a worktree's clone (carrick#5038). Never fails a start.
-      try {
-        writeShadowStamp(out, shadow, init.scan_root, heldBuildId());
-      } catch {
-        // No saved answer: a worktree clone is refused until the next start.
-      }
       if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
       if (!sameFitOptions(shadow.options.service, shadow.options.judge)) {
         writePlaced(placedPath(heldRootOf(init, options.root), init.service, options.home), init.service, [], allUnarmed(mine, () => "options_differ"));
@@ -1043,6 +1059,36 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
         return { state: "error", reason: String(error) };
       }
       return { engine: service };
+    },
+  };
+  return {
+    rowCount: runtime.rowCount,
+    async start(init: ServiceInit): Promise<StartResult> {
+      if (init.checkout === undefined) return runtime.start(init);
+      // A worktree's clone lives only as long as its engine: removed when the start gives no engine, and when the engine closes.
+      const out = shadowDir(heldRootOf(init, options.root), init.service, options.home);
+      const drop = (): void => fs.rmSync(out, { recursive: true, force: true });
+      let result: StartResult;
+      try {
+        result = await runtime.start(init);
+      } catch (error) {
+        drop();
+        throw error;
+      }
+      if (!("engine" in result)) {
+        drop();
+        return result;
+      }
+      const engine = result.engine;
+      const close = engine.close.bind(engine);
+      engine.close = async () => {
+        try {
+          await close();
+        } finally {
+          drop();
+        }
+      };
+      return result;
     },
   };
 }

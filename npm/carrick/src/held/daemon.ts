@@ -137,7 +137,11 @@ export interface ServiceEngine {
   close(): Promise<void>;
 }
 
-export type StartResult = { engine: ServiceEngine } | { state: "no_compiler" | "error"; reason: string };
+/**
+ * `refused`: a linked worktree's start found no clone of the main checkout's shadow it may use (#5038, T2):
+ * the refusal code `cloneShadow` gave (`held/shadow.ts` `CloneRefusal`) and what it names.
+ */
+export type StartResult = { engine: ServiceEngine } | { state: "no_compiler" | "error"; reason: string } | { state: "refused"; refused: string; detail: string };
 
 /** Starts a service's engine: the program, the compiler, the gate. */
 export interface ServiceRuntime {
@@ -178,10 +182,18 @@ const DAEMON_IDLE_MS = 30 * MIN;
 const EMPTY_EXIT_MS = 5 * MIN;
 /** A start that failed is tried again after this long. */
 const RETRY_MS = 5 * MIN;
+/**
+ * A linked worktree's engine closes after this long with no request (#5038, T2): it starts again from a
+ * clone of main's shadow in seconds, so it gives its memory back sooner than a main-checkout engine.
+ */
+export const WORKTREE_IDLE_MS = 60_000;
+/** A worktree clone refused for one of these is tried once more after the main checkout's service has started (it writes a fresh shadow and stamp). */
+const STALE_MAIN = new Set(["no_saved_answer", "stale_main_head", "stale_build", "stale_main_inputs"]);
 
 type Slot = {
   init: ServiceInit;
-  status: "starting" | "ready" | "no_compiler" | "failed";
+  /** `refused`: a worktree slot whose clone of main's shadow was refused (`reason` holds the refusal code). */
+  status: "starting" | "ready" | "no_compiler" | "failed" | "refused";
   engine: ServiceEngine | null;
   lastUsed: number;
   failedAt: number;
@@ -194,14 +206,37 @@ type Slot = {
   queue: Promise<void>;
   /** The newest edit ask per session and file answered `cold` while the engine started (N2); each is asked again once it is ready. */
   cold: Map<string, { request: HeldRequest; files: string[] }>;
+  /** Settles once the start has given its result. */
+  started: Promise<void>;
+  settle: () => void;
 };
 
 /** A reason as one short line. */
 const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim().slice(0, 160);
 
 const key = (init: ServiceInit): string => `${init.repo}\0${init.service}${init.checkout === undefined ? "" : `\0${init.checkout}`}`;
+/** One service, whichever checkout: its starts (and its worktree engines' closes) run one at a time. */
+const serviceKey = (init: ServiceInit): string => `${init.repo}\0${init.service}`;
 
 const within = (file: string, dir: string): boolean => file === dir || file.startsWith(dir + path.sep);
+
+/**
+ * The main checkout's init for a service, re-pointed at a linked worktree (#5038, T2): the same service,
+ * with its folders at the same place under the worktree's top, and `checkout` naming that top. Null when
+ * a folder of the init is not under the main checkout's top.
+ */
+function initInWorktree(init: ServiceInit, mainTop: string, top: string): ServiceInit | null {
+  const move = (p: string): string | null => {
+    const rel = path.relative(mainTop, realPath(p));
+    return rel.startsWith("..") || path.isAbsolute(rel) ? null : path.join(top, rel);
+  };
+  const repoPath = move(init.repo_path);
+  const sidecarRoot = move(init.sidecar_root);
+  const scanRoot = move(init.scan_root);
+  if (repoPath === null || sidecarRoot === null || scanRoot === null) return null;
+  const tsconfig = init.tsconfig !== null && path.isAbsolute(init.tsconfig) ? (move(init.tsconfig) ?? init.tsconfig) : init.tsconfig;
+  return { ...init, repo_path: repoPath, sidecar_root: sidecarRoot, scan_root: scanRoot, tsconfig, checkout: top };
+}
 
 /**
  * Whether a program serves a file: the file is inside the program's folder AND in the
@@ -218,6 +253,8 @@ export class HeldDaemon {
   private readonly deps: DaemonDeps;
   private readonly root: string;
   private readonly slots = new Map<string, Slot>();
+  /** Per service (`serviceKey`): the tail of its starts and worktree closes, run one at a time. */
+  private readonly chains = new Map<string, Promise<unknown>>();
   private programs: Promise<Array<{ init: ServiceInit; dir: string }>> | null = null;
   private lastRequest: number;
   private emptySince: number | null = null;
@@ -281,11 +318,7 @@ export class HeldDaemon {
     const commits: Array<() => void> = [];
     const steps: Steps = { programs: tenth(performance.now() - started) };
     const served = new Set<string>();
-    for (const { init, dir } of programs) {
-      const mine = files.filter((f) => serves(f, dir));
-      if (mine.length === 0) continue;
-      for (const f of mine) served.add(f);
-      const answer = await this.serveService(init, mine, request);
+    const take = (init: ServiceInit, answer: Served): void => {
       states.push(answer.state);
       if (answer.state === "ready") ready.push(`${init.repo}/${init.service}`);
       lines.push(...answer.lines);
@@ -293,23 +326,42 @@ export class HeldDaemon {
       commits.push(...(answer.commits ?? []));
       if (answer.engine !== undefined) engines.push(answer.engine);
       addSteps(steps, answer.steps);
+    };
+    for (const { init, dir } of programs) {
+      const mine = files.filter((f) => serves(f, dir));
+      if (mine.length === 0) continue;
+      for (const f of mine) served.add(f);
+      take(init, await this.serveService(init, mine, request));
     }
-    // A worktree file no program serves is not checked: say so, and start nothing (T2, #5038).
+    // A worktree file no program serves goes to that worktree's own slot of its twin's service: an engine
+    // over a clone of main's shadow with the worktree's files (T2, #5038). Where the init cannot be
+    // re-pointed at the worktree, it is not checked: say so, and start nothing.
+    const worktrees = new Map<string, { init: ServiceInit; files: string[] }>();
     const told = new Set<string>();
     for (const file of files) {
       if (served.has(file)) continue;
       const top = linkedCheckoutTop(file);
       const main = top === null ? null : mainCheckoutOf(top);
       if (top === null || main === null) continue;
-      const twin = path.join(realPath(main), path.relative(realPath(top), file));
+      const mainTop = realPath(main);
+      const twin = path.join(mainTop, path.relative(realPath(top), file));
       for (const { init, dir } of programs) {
-        if (!within(twin, dir) || told.has(`${init.service}\0${top}`)) continue;
+        if (!within(twin, dir)) continue;
+        const theirs = initInWorktree(init, mainTop, realPath(top));
+        if (theirs !== null) {
+          const group = worktrees.get(key(theirs)) ?? { init: theirs, files: [] };
+          if (!group.files.includes(file)) group.files.push(file);
+          worktrees.set(key(theirs), group);
+          continue;
+        }
+        if (told.has(`${init.service}\0${top}`)) continue;
         if (((await this.deps.runtime.rowCount?.(init)) ?? 1) === 0) continue;
         told.add(`${init.service}\0${top}`);
         notes.push({ service: init.service, state: "worktree", checkout: top });
         states.push("worktree");
       }
     }
+    for (const { init, files: theirs } of worktrees.values()) take(init, await this.serveService(init, theirs, request));
     // One state for the whole request: the most useful one any service gave.
     const order: HeldState[] = ["ready", "cold", "capped", "no_compiler", "error", "worktree"];
     const state = order.find((s) => states.includes(s)) ?? "none";
@@ -320,7 +372,7 @@ export class HeldDaemon {
   private async serveService(init: ServiceInit, files: string[], request: HeldRequest): Promise<Served> {
     const now = this.now();
     let slot = this.slots.get(key(init));
-    if (slot?.status === "failed" && now - slot.failedAt >= RETRY_MS) {
+    if ((slot?.status === "failed" || slot?.status === "refused") && now - slot.failedAt >= RETRY_MS) {
       this.slots.delete(key(init));
       slot = undefined;
     }
@@ -337,6 +389,7 @@ export class HeldDaemon {
       return this.notChecked(init, "cold");
     }
     if (slot.status === "no_compiler") return this.notChecked(init, "no_compiler");
+    if (slot.status === "refused") return this.notChecked(init, "worktree", slot.reason);
     if (slot.status === "failed" || slot.engine === null) return this.notChecked(init, "error", slot.reason);
     const asked = await this.ask(slot, slot.engine, files, request);
     return asked === null ? this.notChecked(init, "error", "the engine could not answer") : { state: "ready", ...asked };
@@ -370,6 +423,7 @@ export class HeldDaemon {
   private notChecked(init: ServiceInit, state: NotChecked["state"], reason?: string): Served {
     const note: NotChecked = { service: init.service, state };
     if (reason !== undefined) note.reason = reason;
+    if (state === "worktree" && init.checkout !== undefined) note.checkout = init.checkout;
     if (state === "capped") {
       const holders = liveEntries(this.deps.home).length;
       note.budget_mb = this.budget();
@@ -474,7 +528,9 @@ export class HeldDaemon {
 
   private begin(init: ServiceInit, now: number): void {
     const settledMb = readState(heldRootOf(init, this.root), init.service, this.deps.home)?.settled_mb;
-    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), cold: new Map(), ...(settledMb === undefined ? {} : { settledMb }) };
+    let settle: () => void = () => undefined;
+    const started = new Promise<void>((resolve) => (settle = resolve));
+    const slot: Slot = { init, status: "starting", engine: null, lastUsed: now, failedAt: 0, begunAt: now, queue: Promise.resolve(), cold: new Map(), started, settle, ...(settledMb === undefined ? {} : { settledMb }) };
     this.slots.set(key(init), slot);
     this.keep(init, { state: "starting" });
     this.emptySince = null;
@@ -483,12 +539,57 @@ export class HeldDaemon {
     // first await) must not hold back the `cold` answer this ask is about to return.
     setImmediate(() => {
       void Promise.resolve()
-        .then(() => this.deps.runtime.start(init))
+        .then(() => this.run(init))
         .then(
           (result) => this.started(slot, result),
           (error: unknown) => this.started(slot, { state: "error", reason: String(error) }),
-        );
+        )
+        .finally(() => slot.settle());
     });
+  }
+
+  /** Run `fn` after every earlier start (and worktree close) of the same service has ended. */
+  private serial<T>(init: ServiceInit, fn: () => Promise<T>): Promise<T> {
+    const k = serviceKey(init);
+    const run = (this.chains.get(k) ?? Promise.resolve()).then(fn, fn);
+    this.chains.set(k, run.catch(() => undefined));
+    return run;
+  }
+
+  /**
+   * A start, one at a time per service. A main-checkout start rewrites the shadow its service's worktree
+   * clones read packages from (`v/`), so it first closes those worktree engines; they clone again on their
+   * next ask. A worktree start whose clone was refused for a stale or missing main shadow starts the main
+   * checkout's service first, through its normal path, and clones once more (#5038, T2).
+   */
+  private async run(init: ServiceInit): Promise<StartResult> {
+    if (init.checkout === undefined) {
+      return this.serial(init, async () => {
+        for (const other of [...this.slots.values()]) {
+          if (other.init.checkout !== undefined && serviceKey(other.init) === serviceKey(init) && other.status === "ready") await this.closeSlot(other, "main_start", true);
+        }
+        return this.deps.runtime.start(init);
+      });
+    }
+    const first = await this.serial(init, () => this.deps.runtime.start(init));
+    if (!("refused" in first) || !STALE_MAIN.has(first.refused)) return first;
+    log(`worktree clone of ${init.service} refused (${first.refused}); starting the main checkout's engine first`);
+    if (!(await this.startMain(init))) return first;
+    return this.serial(init, () => this.deps.runtime.start(init));
+  }
+
+  /** Start the main checkout's slot of a worktree init's service, unless it has one, and wait for its start to end. False when it cannot be admitted. */
+  private async startMain(worktree: ServiceInit): Promise<boolean> {
+    const main = (await this.loadPrograms()).find(({ init }) => init.checkout === undefined && serviceKey(init) === serviceKey(worktree))?.init;
+    if (main === undefined) return false;
+    let slot = this.slots.get(key(main));
+    if (slot === undefined) {
+      if (!(await this.makeRoom(main))) return false;
+      this.begin(main, this.now());
+      slot = this.slots.get(key(main));
+    }
+    await slot?.started;
+    return true;
   }
 
   private started(slot: Slot, result: StartResult): void {
@@ -511,6 +612,15 @@ export class HeldDaemon {
       void this.askAgain(slot, result.engine);
       return;
     }
+    if (result.state === "refused") {
+      log(`no engine for ${slot.init.service} in ${slot.init.checkout ?? "the main checkout"}: clone refused (${result.refused}): ${result.detail}`);
+      slot.status = "refused";
+      slot.failedAt = this.now();
+      slot.reason = result.refused;
+      this.keep(slot.init, { state: "failed", reason: oneLine(`${result.refused}: ${result.detail}`) });
+      removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
+      return;
+    }
     log(`no engine for ${slot.init.service}: ${result.reason}`);
     slot.status = result.state === "no_compiler" ? "no_compiler" : "failed";
     slot.failedAt = this.now();
@@ -529,14 +639,19 @@ export class HeldDaemon {
     });
   }
 
-  private async closeSlot(slot: Slot, reason: "idle" | "size" | "evicted" | "exit"): Promise<void> {
+  /**
+   * `chained`: the caller already runs in the service's start chain. A worktree engine's close otherwise
+   * joins that chain, so a new start of the same worktree never clones while the old clone is removed.
+   */
+  private async closeSlot(slot: Slot, reason: "idle" | "size" | "evicted" | "exit" | "main_start", chained = false): Promise<void> {
     this.write({ at: new Date(this.now()).toISOString(), kind: "close", service: slot.init.service, reason });
     this.slots.delete(key(slot.init));
     removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
     if (this.slots.size === 0) this.emptySince = this.now();
     const engine = slot.engine;
     // After the call in flight, never under it.
-    await slot.queue.then(() => engine?.close()).catch((error: unknown) => log("engine close failed", String(error)));
+    const close = (): Promise<void> => slot.queue.then(() => engine?.close()).catch((error: unknown) => log("engine close failed", String(error)));
+    await (slot.init.checkout === undefined || chained ? close() : this.serial(slot.init, close));
   }
 
   /** Housekeeping: close idle or oversized engines, refresh the registry. */
@@ -549,7 +664,8 @@ export class HeldDaemon {
       const ceiling = closeCeilingMb(slot.settledMb);
       const oversized = rss !== null && rss > ceiling;
       if (oversized) log(`closing ${slot.init.service} for size: ${Math.round(rss)} MB is above ${ceiling} MB (1.5 x ${slot.settledMb ?? "the floor"})`);
-      if (now - slot.lastUsed >= ENGINE_IDLE_MS || oversized) {
+      const idleMs = slot.init.checkout === undefined ? ENGINE_IDLE_MS : WORKTREE_IDLE_MS;
+      if (now - slot.lastUsed >= idleMs || oversized) {
         await this.closeSlot(slot, oversized ? "size" : "idle");
       } else if (holdsEntry && rss !== null) {
         this.entry(slot, rss);
