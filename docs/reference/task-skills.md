@@ -19,7 +19,7 @@ and is untouched by everything below.
 | Skill | When it fires | What it calls |
 |---|---|---|
 | `carrick-impact` | Before changing or removing a route, a handler, a response shape, an event, or a function other code calls. Also on "who calls this" and "what breaks if I change it" | `get_operation`, `get_callers`, `check_compatibility`, and `carrick check <file> --recheck --json` for a file already edited in the working tree |
-| `carrick-reuse` | At the end of a task that added or changed functions, and on "does this already exist" or "where have we built this twice" | `find_similar`, targeted with up to 20 entries, or in audit mode with none |
+| `carrick-reuse` | At the end of a task that added or changed functions, and on "does this already exist" | `find_similar`, targeted with up to 20 entries |
 | `carrick-drift` | Before changing a request or response type, and when a compatibility verdict names a problem with no location | `get_project_map` for the pairs, then `get_contract_pair` per pair |
 | `carrick-census` | "Every place that does X" questions | `search_by_intent` asked in two wordings, purpose and mechanism, paged to the end |
 
@@ -41,9 +41,8 @@ leaves off the hard rows, which is what carrick#1349 measured. Three properties
 hold the class column to the tool's answer, and the skill tests pin them.
 
 Every row the tool returned carries a class, and the column is never empty. In
-`carrick-reuse` the rows are the matches of a targeted call and every cluster
-member beyond the first, classed against the function asked about or against the
-cluster's first member. In `carrick-impact` they are the consumer call sites, and
+`carrick-reuse` the rows are the matches of a targeted call, classed against the
+function asked about. In `carrick-impact` they are the consumer call sites, and
 in `carrick-drift` the operations.
 
 The tests are mechanical and ordered, so the first that holds decides and two
