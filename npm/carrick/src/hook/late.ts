@@ -18,6 +18,7 @@ import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, enqueueChanged, ens
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
 import { confirmedResult, earlyRows, keepRows, readStaleCopy, standingEarly, standsAsRun, toldBreak, withoutTold } from "./confirm.ts";
 import { markLed, markTold, readSession, toldKey, wasLed, wasTold } from "./reuse.ts";
+import { notCheckedLines } from "./not-checked.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
 import { linkedCheckoutTop, mainCheckoutOf } from "./worktree.ts";
@@ -212,7 +213,10 @@ export function deliverEarly(
     markTold(reader, earlyRows(fresh).map((row) => toldBreak(row.listed, row.run)), options.home);
     log(`early answer ${early.relative} delivered ${Math.round((now - Date.parse(early.enqueued_at)) / 1000)} s after the edit`);
   }
-  return text ? [text] : [];
+  // The engine could not check the edit after all (a worktree slot refused or failed after the ask was kept): said once (T10).
+  const unchecked = early.not_checked === undefined ? { lines: [], keys: [] } : notCheckedLines(reader, early.root, early.not_checked, options.home);
+  if (unchecked.keys.length > 0) markTold(reader, unchecked.keys, options.home);
+  return [...(text ? [text] : []), ...unchecked.lines];
 }
 
 /** Every early answer `session` is owed, printed oldest first (`deliverEarly`). */

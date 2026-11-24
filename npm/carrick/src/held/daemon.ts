@@ -437,9 +437,16 @@ export class HeldDaemon {
     return asked === null ? this.notChecked(init, "error", "the engine could not answer") : { state: "ready", ...asked };
   }
 
-  /** N2: keep an edit ask that named its entry and was answered `cold`; a read, or an ask with no entry, files nothing to answer later. */
+  /**
+   * N2: keep an edit ask that named its entry and was answered `cold`; a read, or an ask with no entry, files nothing to
+   * answer later. On a worktree slot still starting, the ask's files join the files its start reads at the worktree's
+   * HEAD (T2 F1): a start that waits for the main checkout's engine snapshots the files only after that wait, and an
+   * edit made during it would otherwise be the gate's own text, its break left unarmed and never stated (T10, #5038).
+   */
   private remember(slot: Slot | undefined, files: string[], request: HeldRequest): void {
-    if (slot === undefined || request.kind !== "edit" || request.seq === undefined) return;
+    if (slot === undefined || request.kind !== "edit") return;
+    if (slot.init.checkout !== undefined && slot.status === "starting") slot.edited = [...new Set([...(slot.edited ?? []), ...files])];
+    if (request.seq === undefined) return;
     slot.cold.set(`${request.session}\0${files.join("\0")}`, { request, files });
   }
 
@@ -546,14 +553,14 @@ export class HeldDaemon {
   }
 
   /** File the early answer for an ask that named its entry, unless a newer edit superseded it: true when filed. Never throws. */
-  private file(request: HeldRequest, state: HeldState, lines: HeldLine[], ms: number, by: { service?: string | undefined; engine?: string | undefined }): boolean {
+  private file(request: HeldRequest, state: HeldState, lines: HeldLine[], ms: number, by: { service?: string | undefined; engine?: string | undefined; notes?: NotChecked[] }): boolean {
     if (request.seq === undefined || request.kind !== "edit") return false;
     try {
       if (this.superseded(request)) {
         log("held ask superseded by a newer edit; nothing filed");
         return false;
       }
-      const named = { ...(by.service === undefined ? {} : { service: by.service }), ...(by.engine === undefined ? {} : { engine: by.engine }) };
+      const named = { ...(by.service === undefined ? {} : { service: by.service }), ...(by.engine === undefined ? {} : { engine: by.engine }), ...(by.notes === undefined ? {} : { not_checked: by.notes }) };
       return answerEarly(request.session, request.seq, { state, lines, ms, ...named }, this.now(), this.deps.home);
     } catch (error) {
       log("could not file the held answer", String(error));
@@ -803,6 +810,7 @@ export class HeldDaemon {
       slot.status = "refused";
       slot.failedAt = this.now();
       slot.reason = result.refused;
+      this.tellKept(slot, this.notChecked(slot.init, "worktree", result.refused).note!);
       this.keep(slot.init, { state: "failed", reason: oneLine(`${result.refused}: ${result.detail}`) });
       removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
       // A refused slot holds nothing: it does not keep the daemon from its empty exit (T2 F4).
@@ -813,8 +821,19 @@ export class HeldDaemon {
     slot.status = result.state === "no_compiler" ? "no_compiler" : "failed";
     slot.failedAt = this.now();
     slot.reason = oneLine(result.reason);
+    if (slot.init.checkout !== undefined) this.tellKept(slot, this.notChecked(slot.init, slot.status === "no_compiler" ? "no_compiler" : "error", slot.status === "no_compiler" ? undefined : slot.reason).note!);
     this.keep(slot.init, { state: slot.status === "no_compiler" ? "no_compiler" : "failed", reason: slot.reason });
     removeEntry(this.deps.home, process.pid, heldRootOf(slot.init, this.root), slot.init.service);
+  }
+
+  /**
+   * A worktree slot that will never answer: each edit ask it kept while starting gets the not-checked note in its
+   * early answer, so the next carrier says why instead of nothing (T10, #5038). Only ever a worktree slot's.
+   */
+  private tellKept(slot: Slot, note: NotChecked): void {
+    const kept = [...slot.cold.values()];
+    slot.cold.clear();
+    for (const { request } of kept) this.file(request, note.state === "worktree" ? "worktree" : note.state === "no_compiler" ? "no_compiler" : "error", [], 0, { service: `${slot.init.repo}/${slot.init.service}`, notes: [note] });
   }
 
   private entry(slot: Slot, rssMb: number): void {

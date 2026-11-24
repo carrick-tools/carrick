@@ -25,6 +25,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { binary, check, checkChanged, refresh } from "../cli.ts";
 import { inLinkedWorktree } from "./worktree.ts";
+import type { NotChecked } from "../held/state.ts";
 import { heldDir } from "../held/paths.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
@@ -370,6 +371,11 @@ export type EarlyAnswer = {
   engine?: string;
   /** No items and no moved rows: the daemon answered and found no break. */
   result: CheckResult;
+  /**
+   * Present when the engine could not check the edit after all: a worktree slot whose start was refused or failed
+   * after this ask was kept for it (T10, #5038). The carrier says each note once, as the edit hook would have.
+   */
+  not_checked?: NotChecked[];
 };
 
 /** Whether a newer per-file entry of the same file was filed after `seq`: its answers are the ones to give. */
@@ -386,19 +392,21 @@ export function supersededEntry(session: string, seq: string, home?: string): bo
 
 /**
  * File the daemon's answer to the ask for entry `seq` as its early answer: for
- * every `ready` answer, with no rows when it found no break. Nothing is filed
- * for any other state, for an entry that is gone or is not a file's, or when a
- * newer entry of the same file was filed since. When the full answer is
- * already there, the differ record is written here. False when nothing was filed.
+ * every `ready` answer, with no rows when it found no break, and for an answer
+ * that carries not-checked notes (T10). Nothing is filed for any other state,
+ * for an entry that is gone or is not a file's, or when a newer entry of the
+ * same file was filed since. When the full answer is already there, the differ
+ * record is written here. False when nothing was filed.
  */
 export function answerEarly(
   session: string,
   seq: string,
-  answer: { state: string; lines: readonly HeldLine[]; ms: number; service?: string; engine?: string },
+  answer: { state: string; lines: readonly HeldLine[]; ms: number; service?: string; engine?: string; not_checked?: NotChecked[] },
   now: number,
   home?: string,
 ): boolean {
-  if (answer.state !== "ready") return false;
+  const notes = answer.not_checked ?? [];
+  if (answer.state !== "ready" && notes.length === 0) return false;
   const entry = readJson<QueueEntry>(sessionPart(session, seq, "pending.json", home) ?? "");
   if (entry === null || isChanged(entry)) return false;
   if (supersededEntry(session, seq, home)) return false;
@@ -415,6 +423,7 @@ export function answerEarly(
     ...(answer.service === undefined ? {} : { service: answer.service }),
     ...(answer.engine === undefined ? {} : { engine: answer.engine }),
     result: earlyResult(entry, answer.lines),
+    ...(notes.length > 0 ? { not_checked: notes } : {}),
   };
   const file = sessionPart(session, seq, "early.json", home);
   if (file === null || !writeAtomic(file, `${JSON.stringify(early, null, 2)}\n`)) return false;
