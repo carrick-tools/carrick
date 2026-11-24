@@ -234,9 +234,25 @@ function hashInputs(inputs: Map<string, string>): string {
   return hash.digest("hex");
 }
 
-/** The first path whose hash differs between two input maps, or one present on one side only; null when equal. */
-function firstDifference(a: Map<string, string>, b: Map<string, string>): string | null {
-  for (const rel of [...new Set([...a.keys(), ...b.keys()])].sort()) if (a.get(rel) !== b.get(rel)) return rel;
+/**
+ * The first dependency input whose difference git can explain, as `<path> (<case>)`, or null (carrick#5038).
+ * Main's disk holds files git ignores or does not track (build output, codegen) that a fresh worktree never has, and
+ * main's shadow was built from them, so a file only main has is a difference only where main tracks it.
+ * `mainTracked` says which paths main's git tracks. A file both sides hold must have the same bytes; one only the worktree holds
+ * (tracked or new) is a difference; one only main holds is a difference only where main tracks it.
+ */
+function firstDifference(main: Map<string, string>, worktree: Map<string, string>, mainTracked: Set<string>): string | null {
+  for (const rel of [...new Set([...main.keys(), ...worktree.keys()])].sort()) {
+    const mine = main.get(rel);
+    const theirs = worktree.get(rel);
+    if (theirs === undefined) {
+      if (mainTracked.has(rel)) return `${rel} (deleted in the worktree)`;
+    } else if (mine === undefined) {
+      return `${rel} (added in the worktree)`;
+    } else if (mine !== theirs) {
+      return `${rel} (changed)`;
+    }
+  }
   return null;
 }
 
@@ -381,7 +397,11 @@ export function cloneShadow(mainOut: string, worktreeTop: string, scanRel: strin
     return refuse("worktree_unreadable", String(error));
   }
   if (hashInputs(main.inputs) !== stamp.inputs_hash) return refuse("stale_main_inputs", "a dependency input of main changed since the shadow was written");
-  const differs = firstDifference(main.inputs, worktree.inputs);
+  // One git run in main answers both questions that need it: which dependency inputs and which absent own files it tracks.
+  const absent = answer.own_files.filter((file) => !defaultExists(path.join(path.join(worktreeTop, rel), file)));
+  const tracked = trackedPaths(stamp.main_top, [...main.inputs.keys(), ...absent.map((file) => path.join(stamp.scan_rel, file))]);
+  if (tracked === null) return refuse("worktree_unreadable", `git ls-files failed in ${stamp.main_top}`);
+  const differs = firstDifference(main.inputs, worktree.inputs, tracked);
   if (differs !== null) return refuse("worktree_deps_differ", differs);
   if (stamp.v_reaches_w !== null) return refuse("vendored_reaches_own", stamp.v_reaches_w);
   for (const file of vendoredRepoFiles(mainOut, stamp.main_top)) {
@@ -393,9 +413,6 @@ export function cloneShadow(mainOut: string, worktreeTop: string, scanRel: strin
   const own = new Set(answer.own_files);
   // An own file the worktree lacks is gone from the clone only when git tracks it in main. One git ignores or does not track
   // (generated clients, codegen output) is never in a fresh worktree, so the clone keeps main's copy.
-  const absent = answer.own_files.filter((file) => !defaultExists(path.join(path.join(worktreeTop, rel), file)));
-  const tracked = absent.length === 0 ? new Set<string>() : trackedPaths(stamp.main_top, absent.map((file) => path.join(stamp.scan_rel, file)));
-  if (tracked === null) return refuse("worktree_unreadable", `git ls-files failed in ${stamp.main_top}`);
   const removed = new Set(absent.filter((file) => tracked.has(path.join(stamp.scan_rel, file))));
   const added = [...worktree.sources].filter((file) => !own.has(file) && !sameBytes(path.join(mainService, file), path.join(service, file))).sort();
 
