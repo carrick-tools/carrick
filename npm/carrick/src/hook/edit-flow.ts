@@ -34,6 +34,7 @@ import { askHeld } from "../held/client.ts";
 import type { AskAnswer } from "../held/client.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
 import { notCheckedLines, worktreeSkipLines } from "./not-checked.ts";
+import { worktreeRulesLine } from "./worktree-rules.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
 
 const log = createLogger("carrick-hook");
@@ -345,6 +346,12 @@ export async function editFlow(
   // An early line is ADDED to part 1's: it never replaces a contract line.
   contexts.push(...earlyNow);
   contexts.push(...unchecked.lines);
+  // Where the rules are, for an agent in a linked worktree that has none (#5134).
+  const rules = worktreeRulesLine(session, input.cwd);
+  if (rules) {
+    contexts.push(rules.line);
+    told.push(rules.key);
+  }
   contexts.push(...facts.lines);
   // Files this session read before the fact file landed get their Read lines
   // here, once, after the edit's own and under the same cap (`owed.ts`).

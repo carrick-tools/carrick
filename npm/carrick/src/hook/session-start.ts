@@ -40,6 +40,9 @@ import { slowHookLines, timed } from "./timings.ts";
 import { startFactsRefresh } from "../facts/fetch.ts";
 import { ensureHeld } from "../held/client.ts";
 import { sessionGenerationSentence } from "./generation.ts";
+import { sessionKey } from "./session-key.ts";
+import { worktreeRulesLine } from "./worktree-rules.ts";
+import { markTold } from "./reuse.ts";
 import { markNoticed, startUsageSend, USAGE_NOTICE, usageGate } from "./usage.ts";
 
 const log = createLogger("carrick-session");
@@ -96,7 +99,8 @@ async function main(): Promise<void> {
     return;
   }
   const lines: string[] = [];
-  const codex = runByCodex(process.env, await readStdinUnlessTty());
+  const stdin = await readStdinUnlessTty();
+  const codex = runByCodex(process.env, stdin);
   const choice = resolveRoot({
     clientRoot: process.cwd(),
     projectDir: process.env["CLAUDE_PROJECT_DIR"] ?? null,
@@ -114,6 +118,17 @@ async function main(): Promise<void> {
   // have nothing to report: a machine with no index yet is a machine about to
   // run its first scan, which is the worst moment to be on a stale build.
   lines.push(...versionLines());
+  // A whole session that starts inside a linked worktree: where the rules are (#5134).
+  try {
+    const session = sessionKey(JSON.parse(stdin || "{}") as { session_id?: string });
+    const rules = worktreeRulesLine(session, process.cwd());
+    if (rules && session) {
+      lines.push(rules.line);
+      markTold(session, [rules.key]);
+    }
+  } catch {
+    // An unreadable payload carries no session: nothing is said.
+  }
   if (choice.markerFound) lines.push(...slowHookLines(choice.root));
 
   // And the other mismatch: not "a newer one is published" but "the one
