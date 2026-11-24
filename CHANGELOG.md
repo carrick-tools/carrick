@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.186](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.185...carrick-v0.3.186) (2026-11-24)
+
+
+### Features
+
+* **doctor:** tell why the compiler check holds nothing ([#5133](https://github.com/carrick-tools/carrick/issues/5133) T1) ([#5138](https://github.com/carrick-tools/carrick/issues/5138)) ([705d525](https://github.com/carrick-tools/carrick/commit/705d52531f8a7ca060f3dcd642c666e95fcc0696))
+
+
+### Bug Fixes
+
+* **sidecar:** an unread serialised-body handler keeps the sends it found ([#5139](https://github.com/carrick-tools/carrick/issues/5139)) ([8e36961](https://github.com/carrick-tools/carrick/commit/8e36961e0ed9d820e990fe1d60721d00c59b9348)), closes [#5133](https://github.com/carrick-tools/carrick/issues/5133)
+
 ## [0.3.185](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.184...carrick-v0.3.185) (2026-11-24)
 
 
