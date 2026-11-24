@@ -31,7 +31,8 @@ export type ServiceState = {
 /** One edit the engine did not check, for the hook's line. `state` is the answer's state. */
 export type NotChecked = {
   service: string;
-  state: "cold" | "capped" | "no_compiler" | "error" | "worktree";
+  /** `busy`: no daemon took the ask (one is starting, backed off, or closed mid-ask), T5. */
+  state: "cold" | "capped" | "no_compiler" | "error" | "worktree" | "busy";
   reason?: string;
   /** `worktree`: the top folder of the linked worktree the edited file sits in. */
   checkout?: string;

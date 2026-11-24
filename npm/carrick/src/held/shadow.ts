@@ -5,6 +5,8 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { defaultExists, isRecord, realPath } from "../fs-util.ts";
 import { writeAtomic } from "../hook/reuse.ts";
 import { checkoutOf } from "../hook/worktree.ts";
@@ -434,4 +436,22 @@ export function cloneShadow(mainOut: string, worktreeTop: string, scanRel: strin
 
   const gonePaths = new Set(deleted);
   return { ...answer, tsconfig, own_files: [...answer.own_files.filter((file) => !gonePaths.has(file)), ...added].sort() };
+}
+
+/**
+ * `cloneShadow` in a worker thread, so the held daemon keeps answering hellos and asks while a worktree's shadow
+ * is cloned (T5, #5038). Same answer as `cloneShadow`; the copy cannot be injected here.
+ */
+export function cloneShadowOffLoop(mainOut: string, worktreeTop: string, scanRel: string, out: string, options: Omit<CloneOptions, "copyTree">): Promise<ShadowAnswer | CloneRefused> {
+  // `clone-worker.ts` beside this file in a dev tree, `clone-worker.js` in the built package.
+  const worker = new Worker(new URL(`./clone-worker${path.extname(fileURLToPath(import.meta.url))}`, import.meta.url), {
+    workerData: { mainOut, worktreeTop, scanRel, out, options },
+  });
+  return new Promise((resolve, reject) => {
+    worker.once("message", (answer: ShadowAnswer | CloneRefused) => resolve(answer));
+    worker.once("error", reject);
+    worker.once("exit", (code) => {
+      if (code !== 0) reject(new Error(`the shadow clone worker exited with code ${code}`));
+    });
+  });
 }

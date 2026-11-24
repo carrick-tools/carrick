@@ -22,6 +22,9 @@ function why(note: NotChecked): string {
       return "no TypeScript 7 compiler is installed";
     case "error":
       return note.reason === undefined ? "it could not start" : `it could not start: ${note.reason.replace(/[.\s]+$/, "")}`;
+    case "busy":
+      // Proposed wording (T5, #5038): goes through the wording pass.
+      return "the compiler engine was busy and did not take this edit";
     case "worktree":
       return worktreeWhy(note.reason);
   }

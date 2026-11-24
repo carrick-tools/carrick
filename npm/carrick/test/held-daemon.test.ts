@@ -605,10 +605,10 @@ test("an ask that finds no daemon starts one and answers cold with a note naming
     assert.deepEqual(first.not_checked, [{ service: path.join("api", "src", "a.ts"), state: "cold" }]);
     assert.equal(started.length, 1);
     assert.equal(started[0]!.at(-1), w.root);
-    // The lock this ask took is live: a second ask in its window starts nothing and says nothing.
+    // The lock this ask took is live: a second ask in its window starts nothing, and is told busy, never silent (T5).
     const second = await askHeld(w.root, [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit", start });
     assert.equal(second.state, "unavailable");
-    assert.equal(second.not_checked, undefined);
+    assert.deepEqual(second.not_checked, [{ service: path.join("api", "src", "a.ts"), state: "busy" }]);
     assert.equal(started.length, 1);
     // Switch off: nothing is asked or started.
     assert.equal((await askHeld(w.root, [w.file("api")], { env: { CARRICK_COMPILER_LINES: "0" }, home: w.home, session: "s", kind: "edit", start })).state, "off");

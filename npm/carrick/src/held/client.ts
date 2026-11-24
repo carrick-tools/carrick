@@ -123,11 +123,13 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
         conn.destroy();
         return;
       }
-      // An ask the daemon files an answer for outlives its wait: once the hello
-      // matches, the request is written and the connection let go gracefully
-      // (below); a daemon that never says hello is let go after a moment.
-      if (greeted) conn.end();
-      else setTimeout(() => conn.destroy(), 2_000).unref();
+      // An ask the daemon files an answer for outlives its wait (T5, #5038): it was written with the hello, so the
+      // connection is ended gracefully and let go once the bytes are out. A daemon busy past the wait reads it when
+      // its loop is free and files the early answer, which the next carrier prints.
+      if (!replacing) {
+        conn.end();
+        conn.once("finish", () => conn.unref());
+      }
     };
     const conn = net.createConnection(socketPath(root, options.home));
     const timer = setTimeout(() => finish(none("late", started)), waitMs);
@@ -170,12 +172,18 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
     }, HELLO_WAIT_MS);
     helloTimer.unref();
     conn.write(`${JSON.stringify({ hello: true })}\n`);
+    // The ask goes with the hello, stamped with this build: a daemon of another build never answers it (T5).
+    conn.write(`${JSON.stringify({ ask: request, build_id: buildId })}\n`);
     conn.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
-      const end = buffer.indexOf("\n");
-      if (end < 0) return;
-      const line = buffer.slice(0, end);
-      buffer = buffer.slice(end + 1);
+      // The hello and the answer can arrive in one chunk now that the ask goes with the hello (T5): read every line.
+      for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+        const line = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        onLine(line);
+      }
+    });
+    const onLine = (line: string): void => {
       let parsed: { hello?: Partial<HeldHello>; bye?: boolean } & Partial<AskAnswer>;
       try {
         parsed = JSON.parse(line) as typeof parsed;
@@ -198,10 +206,8 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
       else {
         greeted = true;
         clearTimeout(helloTimer);
-        conn.write(`${JSON.stringify(request)}\n`);
-        if (settled) conn.end();
       }
-    });
+    };
     /**
      * No daemon said hello: none listens (it left after its idle time,
      * `daemon.ts` `wantsExit`, or it crashed), or one closed before its hello.
@@ -212,9 +218,11 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
      * service; otherwise (a daemon is starting or backed off) `unavailable`.
      * An ask whose wait ran out first (`late`) still starts it.
      */
+    // An ask no daemon took is told, never silent (T5): the service is not known here, so the file is named.
+    const busy = (): AskAnswer => ({ ...none("unavailable", started), not_checked: files.map((file) => ({ service: path.relative(root, file), state: "busy" as const })) });
     const noDaemon = (): void => {
       if (greeted || replacing) {
-        finish(none("unavailable", started));
+        finish(busy());
         return;
       }
       // Nothing is there to say hello, so the hello timeout must not take this
@@ -223,7 +231,7 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
       clearTimeout(helloTimer);
       const startedOne = ensureHeld(root, { env, buildId, ...(options.home === undefined ? {} : { home: options.home }), ...(options.start === undefined ? {} : { start: options.start }) });
       if (!startedOne) {
-        finish(none("unavailable", started));
+        finish(busy());
         return;
       }
       const notes: NotChecked[] = files.map((file) => ({ service: path.relative(root, file), state: "cold" }));

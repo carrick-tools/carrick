@@ -134,21 +134,23 @@ async function fakeDaemon(ws: Ws, answer: HeldAnswer, delayMs = 0, root: string 
     let buffer = "";
     conn.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
-      const end = buffer.indexOf("\n");
-      if (end < 0) return;
-      const frame = buffer.slice(0, end);
-      buffer = buffer.slice(end + 1);
-      // The client says hello first; the fake is of the client's own build.
-      if ((JSON.parse(frame) as { hello?: boolean }).hello === true) {
-        conn.write(`${JSON.stringify({ hello: { build_id: heldBuildId(), pid: process.pid, root } })}\n`);
-        return;
+      for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+        const frame = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        // The client says hello first; the fake is of the client's own build.
+        const parsed = JSON.parse(frame) as { hello?: boolean; ask?: HeldRequest };
+        if (parsed.hello === true) {
+          conn.write(`${JSON.stringify({ hello: { build_id: heldBuildId(), pid: process.pid, root } })}\n`);
+          continue;
+        }
+        // The ask comes with the hello, stamped with the client's build (T5).
+        const request = parsed.ask ?? (parsed as unknown as HeldRequest);
+        requests.push(request as unknown as Record<string, unknown>);
+        setTimeout(() => {
+          if (request.kind === "edit" && request.seq) answerEarly(request.session, request.seq, answer, Date.now(), ws.home);
+          if (conn.writable) conn.write(`${JSON.stringify(answer)}\n`);
+        }, delayMs);
       }
-      const request = JSON.parse(frame) as HeldRequest;
-      requests.push(request as unknown as Record<string, unknown>);
-      setTimeout(() => {
-        if (request.kind === "edit" && request.seq) answerEarly(request.session, request.seq, answer, Date.now(), ws.home);
-        if (conn.writable) conn.write(`${JSON.stringify(answer)}\n`);
-      }, delayMs);
     });
     conn.on("error", () => undefined);
   });
