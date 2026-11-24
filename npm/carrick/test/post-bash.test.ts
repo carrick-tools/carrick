@@ -1,6 +1,7 @@
 // The Bash hook (carrick hook post-bash): a shell command that reads a
 // TypeScript file gets the Read hook's answer.
 
+import { WORKTREE_CHECK_LINE } from "../src/hook/not-checked.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -235,7 +236,8 @@ test("a heredoc write of a TS file whose check is clean prints nothing", async (
   });
   assert.equal(run.code, 0);
   assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), [".claude/worktrees/wt/src/argv.ts"]);
-  assert.equal(run.stdout, "");
+  // Clean: only the once-per-session worktree line (#5038 T4).
+  assert.equal(JSON.parse(run.stdout).hookSpecificOutput.additionalContext, WORKTREE_CHECK_LINE);
 });
 
 test("a python heredoc rewrite of a TS file runs the post-edit flow once for it", async (t) => {
