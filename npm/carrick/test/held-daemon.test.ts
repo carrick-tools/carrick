@@ -930,7 +930,7 @@ function twoCheckouts() {
       return { engine: { answer: async () => ({ lines: [] }), rss: () => 100, close: async () => undefined } };
     },
   };
-  const daemon = new HeldDaemon({ root, home, env: { ...ON }, programs: async () => [main, other], runtime });
+  const daemon = new HeldDaemon({ root, home, env: { ...ON }, totalmem: () => 64 * 1024 ** 3, programs: async () => [main, other], runtime });
   const req = (file: string): HeldRequest => ({ session: "s1", files: [file], kind: "edit", edited_at: 1 });
   return { dir, root, top, home, daemon, started, req, mainFile: path.join(root, "src", "x.ts"), otherFile: path.join(top, "src", "x.ts"), done: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
@@ -939,6 +939,7 @@ test("W1: two inits of one service, one naming a checkout, get two slots, two st
   const w = twoCheckouts();
   try {
     await w.daemon.handle(w.req(w.mainFile));
+    await settle();
     await w.daemon.handle(w.req(w.otherFile));
     await settle();
     assert.equal(w.started.length, 2, "one start each");
