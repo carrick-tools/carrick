@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.187](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.186...carrick-v0.3.187) (2026-11-25)
+
+
+### Documentation
+
+* add carrick-audit to the task skills reference ([#5147](https://github.com/carrick-tools/carrick/issues/5147)) ([1a290e1](https://github.com/carrick-tools/carrick/commit/1a290e1dc046e145715c09aaaed56b0429356f2a))
+* the audit covers the whole project and waits for a go-ahead ([#5150](https://github.com/carrick-tools/carrick/issues/5150)) ([35fae19](https://github.com/carrick-tools/carrick/commit/35fae19e3670db9db0998d2d87b3c31c12b5c57a))
+
 ## [0.3.186](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.185...carrick-v0.3.186) (2026-11-24)
 
 
