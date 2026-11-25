@@ -40,25 +40,10 @@ get_findings({{SCOPE}}, limit: 1)
 Read these counts out of the answers:
 
 - **Calls that reach no route**: in the graph's `unmatched_by_reason`, the sum
-  of `no_matching_producer`, `no_case_answers` and `procedure_unserved`. Keep
-  `unmatched_by_service` counts every unmatched call, third-party and
-  unplaced-base calls included, so it does not say where the no-route rows are.
-  Where the sum is above 0, list the rows themselves: page the whole-project
-  graph and read `unmatched_calls` and nothing else.
-
-  ```
-  get_service_graph({{SCOPE}}, limit: 200)
-  ```
-
-  Continue from the `next_offset` each answer names (the server may cut a page
-  below `limit`) until you hold as many unmatched rows as `unmatched_count`.
-  Keep only the rows whose `reason` is `no_matching_producer`, `no_case_answers`
-  or `procedure_unserved`, each as method, path, file and line, with its
-  `services`. A row is one call site: where `services` names several, the call
-  sits in a shared file and counts once. The services that hold no-route rows
-  are the ones named in the rows you kept. Where the paging is refused or
-  stops short of `unmatched_count`, say so in the report and use the single
-  fallback unit in section 2.
+  of `no_matching_producer`, `no_case_answers` and `procedure_unserved`. Take
+  the count only: do not page `unmatched_calls` now, and do not use
+  `unmatched_by_service`, which counts every unmatched call, third-party and
+  unplaced-base calls included. Section A lists the rows after the go-ahead.
 - **Pairs**: each consumer and producer pair under the map's CONSUMERS. Where
   the map cuts the list short, call it again with `detail: true`.
 - **Groups of similar functions**: `total_clusters` from `find_similar`.
@@ -82,7 +67,7 @@ time plus output:
 | Section | Per item | New tokens |
 |---|---|---|
 | Counting and the report | once | 80,000 |
-| A. Calls that reach no route | each unit of 30 no-route calls | 20,000 |
+| A. Calls that reach no route | each 30 no-route calls, rounded up | 20,000 |
 | | each call that reaches no route | 6,000 |
 | B. Type verdicts | each pair | 16,000 |
 | C. Functions written twice | each group | 3,500 |
@@ -103,7 +88,7 @@ once the first units have started and before any has returned.
 
 ```
 Carrick audit: estimate, before any source is read
-- Calls that reach no route: <n>, in <n> services
+- Calls that reach no route: <n>
 - Consumer and producer pairs: <n>
 - Groups of similar functions: <n>
 - Operations served: <n>
@@ -133,14 +118,11 @@ After the block, take the first case that fits:
 
 Sections A to E do not depend on each other. Split them into units:
 
-- **A**: one unit for every 30 no-route rows from step 1 (13 rows are one unit,
-  31 are two), each unit given its rows by method, path, file and line. A
-  service with no no-route row gets no unit, and no source is opened for it. With
-  no no-route row, section A has no unit. Where step 1 could not list the rows,
-  use one unit for the whole of A: it asks each service in `unmatched_by_service`
-  for its no-route rows and proves them, and where it finds more than 30 it
-  returns the rows at once, and you split them into units of 30 as above. Never
-  start one sub-agent for each service.
+- **A**: one unit, for the whole of A. It lists the no-route rows itself. With
+  30 rows or fewer it proves them. With more than 30 it returns the row list at
+  once and you split the rows into units of 30, each given its rows inline. With
+  no no-route calls from step 1, section A has no unit and its count line says
+  so. Never start one sub-agent for each service.
 - **B**: one unit for every 10 pairs.
 - **C**: one unit for every 20 groups: offsets 0 to 19, 20 to 39, and so on to
   `total_clusters`.
@@ -154,8 +136,9 @@ yet. The brief for each is these words with the unit filled in, and nothing
 else:
 
 > Load the carrick-audit skill. Run only section <letter> of it, for <the
-> unit: its no-route rows, or its pairs, each named as the index spells it,
-> or its offsets>. Work to the end of the unit
+> unit: the whole project for the one unit that lists the rows, or its
+> no-route rows, or its pairs, each named as the index spells it, or its
+> offsets>. Work to the end of the unit
 > and return its table, its count line and any refused calls. Run no other
 > section. Do not estimate, do not ask the user anything and do not start
 > sub-agents.
@@ -169,23 +152,27 @@ are equal. Run again any unit that came back without one.
 
 ## A. Calls that reach no route
 
-Take the rows the unit was given and read no others. Each is a call the index
-says reaches no route: it names an operation no indexed service serves.
-
-In the fallback unit there are no given rows. For each service in
-`unmatched_by_service`:
+If the unit was given rows, take those and read no others. Otherwise list them
+from the index:
 
 ```
-get_service_graph({{SCOPE}}, service: "<service>", limit: 200)
+get_service_graph({{SCOPE}}, limit: 200)
 ```
 
-Read `unmatched_calls` and nothing else: the other arrays are for other
-questions, so never page for them. Page with `offset` until you have seen as
-many unmatched rows as `unmatched_count`. Take only the rows whose `reason` is
-`no_matching_producer`, `no_case_answers` or `procedure_unserved`. The other
-reasons go to third parties or to a base Carrick has not placed, and are not
-evidence of a broken call. A call site that two services both list is one row:
-count it once, by its file, line and path.
+Pass no `service`: the whole-project listing holds every row once, and a listing
+per service reads the same rows again. Read `unmatched_calls` and nothing else:
+the other arrays are for other questions, so never page for them. Follow the
+`next_offset` each answer names
+until there is none, and never work out an offset yourself: the server cuts a
+page below `limit`. Keep only the rows whose `reason` is `no_matching_producer`,
+`no_case_answers` or `procedure_unserved`: each names an operation no indexed
+service serves. The other reasons go to third parties or to a base Carrick has
+not placed, and are not evidence of a broken call. A row is one call site: where
+its `services` names several, the call sits in a shared file and counts once.
+Do not ask the index again for each service for rows you already hold, unless a
+row lacks a field you need. Where you hold more than 30 rows, return them at
+once as method, path, file, line and service, and stop: the caller splits them
+into units.
 
 For each row you took, open the call site at its file and line. Then ask the
 index for the nearest thing that does exist, once for each service that serves
