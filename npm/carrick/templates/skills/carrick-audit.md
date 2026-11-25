@@ -1,6 +1,6 @@
 ---
 name: carrick-audit
-description: Use when the ask is what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice. A full audit from the Carrick index on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice, routes written twice, one job done several ways), with each item proven in source and a fix list at the end. It states its estimated tokens and minutes before it reads any source, then waits for a go-ahead.
+description: Use when the ask is what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice. A full audit from the Carrick index on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice, routes written twice, one job done several ways), with each item proven in source and a fix list at the end. It states its estimated tokens and minutes, and the leads the index already holds, before it reads any source, then waits for a go-ahead.
 ---
 
 # A full audit from the index, proven in source
@@ -62,24 +62,38 @@ line: the duplicates most worth fixing sit low on the list, so its first page
 does not answer the question. Any other ask runs all five.
 
 Work out the estimate from the counts. New tokens are input read for the first
-time plus output:
+time plus output. First count the sub-agents the audit will start, with the
+unit rules of section 2: A is 1 unit, or 0 with no calls that reach no route
+(and with more than 30 of them, 1 more for each 30); B is 1 for every 10 pairs;
+C is 1 for every 20 groups; D is 1; E is 1. Where you cannot start sub-agents
+the count is 0.
 
 | Section | Per item | New tokens |
 |---|---|---|
 | Counting and the report | once | 80,000 |
-| A. Calls that reach no route | each 30 no-route calls, rounded up | 20,000 |
+| Start-up of each sub-agent | each sub-agent the audit starts | 40,000 |
+| A. Calls that reach no route | listing the rows, once (none with no such calls) | 97,500 |
 | | each call that reaches no route | 6,000 |
-| B. Type verdicts | each pair | 16,000 |
-| C. Functions written twice | each group | 3,500 |
-| D. Routes written twice | each 100 operations served | 90,000 |
-| E. One job, several answers | once | 110,000 |
+| B. Type verdicts | each pair | 5,500 |
+| C. Functions written twice | each group | 5,000 |
+| D. Routes written twice | each 100 operations served | 132,500 |
+| E. One job, several answers | once | 73,500 |
 
-Each turn also re-reads what the run already holds from the cache: about six
-times the new tokens again, at a tenth of the price. Time is about 13 minutes
-for each million new tokens when the sections run one after another, and about
-half of that with sub-agents. These figures were measured with Claude Sonnet
-on a monorepo of 17 packages, 208 operations and 4,500 functions (24 Nov 2026):
-about 1 million new tokens and 5 minutes a run with sub-agents.
+The rates for A to E leave start-up out: it has its own line. Start-up is what
+a sub-agent loads before it does anything, and it depends on how much the
+user's own setup puts into every sub-agent (long instruction files, many
+tools, many skills): about 27,500 new tokens on a bare setup and about 57,000
+on a heavy one, so 40,000 is the middle. Each turn also re-reads what the run
+already holds from the cache: about 6 to 10 times the new tokens again (the
+lower figure on the bare setup, the higher on the heavy one), at a tenth of the
+price. Time is about 13 minutes for each million new tokens when the sections
+run one after another, and about half of that with sub-agents. The rates come
+from two measurements with Claude Sonnet on 25 Nov 2026: one full audit with
+sub-agents on a project of 21 services (13 calls that reach no route, 6 pairs,
+114 groups, 115 operations served) on a heavy setup, which took 8 minutes and
+3.4 million new tokens; and one run of section A on a
+bare test monorepo (6 calls that reach no route). D and E rest on one
+measurement each, and the listing term of A on one.
 
 The first thing the user reads from you is this block, filled in. Write it as
 text in your reply, not only in your reasoning, before any source is opened:
@@ -92,27 +106,52 @@ Carrick audit: estimate, before any source is read
 - Consumer and producer pairs: <n>
 - Groups of similar functions: <n>
 - Operations served: <n>
-Estimate: about <total> new tokens (A <n>, B <n>, C <n>, D <n>, E <n>, counting and report <n>)
-Cached re-reads add about 6 times that again, at a tenth of the price.
+Sub-agents to start: <k>, about 40,000 new tokens each to start up: <n>
+Estimate: about <total> new tokens (A <n>, B <n>, C <n>, D <n>, E <n>, counting and report <n>, start-up <n>)
+Cached re-reads add about 6 to 10 times that again, at a tenth of the price.
 Time: about <n> minutes with sub-agents, about <n> one section after another
 ```
 
-After the block, take the first case that fits:
+Directly after the block, in the same text and whichever case below applies,
+write what the index already shows, as three to five lines under this heading,
+word for word: `What the index shows so far, before any source has been read.
+These are leads, not verdicts:`. Build the lines only from the answers of the
+four calls above: make no further tool call and open no source for them. Each
+line gives a count and, where an answer carries one, one example with its
+file and line. Take, in this order, the lines the answers can fill, and leave
+out one whose answer holds nothing:
+
+- Type mismatches between a route, event or procedure and its callers: the
+  count, and the first one with its endpoint and its caller's file and line.
+- Calls that reach no route: the count from above, set against the calls to
+  third parties and to bases not yet placed that the map counts under
+  UNMATCHED.
+- Groups of similar functions: the count, and the first group with one
+  member's name, file and line.
+- Routes, events or procedures with no recorded caller: the count where an
+  answer gives one, and the first row with its file and line.
+- Call sites the index could not resolve: the count.
+
+Say each in plain words, as what the index holds. Do not class, rank or
+recommend anything, do not call a lead a finding, and do not suggest narrowing
+the audit: the audit proper has not run. Then follow with the case below.
+
+After the leads, take the first case that fits:
 
 - **The ask already says to go ahead**: it says to run the audit after seeing
   the cost or without asking (for example "run the full audit", "go ahead",
   "yes, run it", "don't ask, just run"). Carry on with section 2 in the same
   turn. An ask the user has narrowed to one service or some sections is not a
-  go-ahead: work out the estimate for that scope, write the block, then take
-  one of the cases below.
+  go-ahead: work out the estimate for that scope, write the block and the
+  leads, then take one of the cases below.
 - **You have a tool for putting a question to the user** (such as
   `AskUserQuestion`): use it to ask whether to go ahead, and wait for the
   answer.
-- **You have no such tool**: end your turn after the block with one closing
-  line: `Say "go" to run the audit.` Open no source, start no sub-agent and
-  make no further tool call in that turn. When the user's next message says go,
-  run from section 2 with the counts you already read, and do not count again.
-  Any other reply is the user's new ask.
+- **You have no such tool**: end your turn after the block and the leads with
+  one closing line: `Say "go" to run the audit.` Open no source, start no
+  sub-agent and make no further tool call in that turn. When the user's next
+  message says go, run from section 2 with the counts you already read, and do
+  not count again. Any other reply is the user's new ask.
 
 ## 2. Run every section
 

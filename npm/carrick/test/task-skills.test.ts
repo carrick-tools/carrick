@@ -274,8 +274,8 @@ test("the audit skill renders for both scopes, counts first and states its estim
     assert.match(audit, /Estimate: about <total> new tokens/);
     assert.match(audit, /Time: about <n> minutes with sub-agents/);
     // A run nobody can answer stops after the estimate unless the ask already said to go.
-    assert.match(audit, /Cached re-reads add about 6 times that again, at a tenth of the price\./);
-    assert.match(audit, /end your turn after the block with one closing line/);
+    assert.match(audit, /Cached re-reads add about 6 to 10 times that again, at a tenth of the price\./);
+    assert.match(audit, /end your turn after the block and the leads with one closing line/);
     assert.match(audit, /`Say "go" to run the audit\.`/);
     assert.match(audit, /Open no source, start no sub-agent and make no further tool call in that turn/);
     assert.match(audit, /do not count again/);
@@ -300,7 +300,74 @@ test("the audit skill's description keeps the words that load it for a plain que
   const audit = renderTaskSkill("carrick-audit", { slug: "acme-index" });
   const description = /^description: (.*)$/m.exec(audit)?.[1] ?? "";
   assert.match(description, /what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice/);
-  assert.match(description, /estimated tokens and minutes before it reads any source, then waits for a go-ahead\.$/);
+  assert.match(description, /estimated tokens and minutes, and the leads the index already holds, before it reads any source, then waits for a go-ahead\.$/);
+});
+
+test("the audit skill sizes section A by no-route rows, never by services", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    const argument = scope.slug === null ? 'repo: "<owner/repo>"' : 'project: "acme-index"';
+    // Step 1 counts only: it does not page the unmatched rows.
+    assert.match(audit, /Take the count only: do not page `unmatched_calls` now/);
+    assert.match(audit, /- Calls that reach no route: <n> - Consumer and producer pairs/);
+    // Section A is one unit that lists the rows itself, after the go-ahead.
+    assert.ok(audit.includes(`get_service_graph(${argument}, limit: 200)`), "section A lacks the whole-project listing");
+    assert.match(audit, /\*\*A\*\*: one unit, for the whole of A\. It lists the no-route rows itself\./);
+    assert.match(audit, /With more than 30 it returns the row list at once and you split the rows into units of 30, each given its rows inline/);
+    assert.match(audit, /Never start one sub-agent for each service/);
+    assert.match(audit, /never work out an offset yourself/);
+    assert.match(audit, /Pass no `service`: the whole-project listing holds every row once/);
+    assert.match(audit, /where its `services` names several, the call sits in a shared file and counts once/);
+    assert.match(audit, /Do not ask the index again for each service for rows you already hold/);
+    assert.match(audit, /<rows read> of <rows given> no-route rows read/);
+    assert.match(audit, /add up to the no-route count from step 1, with a call site counted once/);
+    assert.match(audit, /listing the rows, once \(none with no such calls\) \| 97,500 \| \| \| each call that reaches no route \| 6,000/);
+    assert.doesNotMatch(audit, /one unit for each service in `unmatched_by_service`/);
+    assert.doesNotMatch(audit, /one unit for every 30 no-route rows from step 1/);
+    assert.doesNotMatch(audit, /each service with unmatched calls/);
+    assert.doesNotMatch(audit, /unmatched rows seen> of <unmatched_count>/);
+    assert.doesNotMatch(audit, /services with unmatched calls/);
+  }
+});
+
+test("the audit skill's estimate counts sub-agent start-up, and step 1 shows the leads the index already holds", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    // Start-up: a line in the table, a line in the printed block, and the sub-agent count rule.
+    assert.match(audit, /\| Start-up of each sub-agent \| each sub-agent the audit starts \| 40,000 \|/);
+    assert.match(audit, /Sub-agents to start: <k>, about 40,000 new tokens each to start up: <n>/);
+    assert.match(audit, /counting and report <n>, start-up <n>\)/);
+    assert.match(audit, /First count the sub-agents the audit will start/);
+    assert.match(audit, /about 27,500 new tokens on a bare setup and about 57,000 on a heavy one/);
+    assert.match(audit, /it depends on how much the user's own setup puts into every sub-agent/);
+    // Rates measured after start-up was taken out.
+    assert.match(audit, /\| each pair \| 5,500 \|/);
+    assert.match(audit, /\| each group \| 5,000 \|/);
+    assert.match(audit, /\| each 100 operations served \| 132,500 \|/);
+    assert.match(audit, /\| E\. One job, several answers \| once \| 73,500 \|/);
+    // The cache line: a range, still at a tenth of the price; the old single figure is gone.
+    assert.match(audit, /Cached re-reads add about 6 to 10 times that again, at a tenth of the price\./);
+    assert.doesNotMatch(audit, /about 6 times that again/);
+    assert.doesNotMatch(audit, /about six times the new tokens/);
+    // The calibration sentence names both measurements and no project.
+    assert.match(audit, /The rates come from two measurements with Claude Sonnet on 25 Nov 2026/);
+    assert.doesNotMatch(audit, /monorepo of 17 packages/);
+    // The leads: three to five lines from the four answers, no extra call, no narrowing, all protocols.
+    assert.match(audit, /What the index shows so far, before any source has been read\. These are leads, not verdicts:/);
+    assert.match(audit, /three to five lines/);
+    assert.match(audit, /Build the lines only from the answers of the four calls above: make no further tool call and open no source for them/);
+    assert.match(audit, /Each line gives a count and, where an answer carries one, one example with its file and line/);
+    assert.match(audit, /Routes, events or procedures with no recorded caller/);
+    assert.match(audit, /do not suggest narrowing the audit: the audit proper has not run/);
+    assert.match(audit, /After the leads, take the first case that fits/);
+    assert.match(audit, /end your turn after the block and the leads with one closing line: `Say "go" to run the audit\.`/);
+    assert.match(audit, /write the block and the leads, then take one of the cases below/);
+    // The leads sit between the block and the three cases.
+    const block = audit.indexOf("Time: about <n> minutes with sub-agents");
+    const leads = audit.indexOf("What the index shows so far");
+    const cases = audit.indexOf("After the leads, take the first case that fits");
+    assert.ok(block > 0 && block < leads && leads < cases, "the leads are not between the block and the cases");
+  }
 });
 
 test("the audit skill sizes section A by no-route rows, never by services", () => {
