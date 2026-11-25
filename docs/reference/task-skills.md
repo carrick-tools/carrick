@@ -1,6 +1,6 @@
 # Task skills
 
-The four skills `carrick init` installs, what each one does, and when it fires.
+The five skills `carrick init` installs, what each one does, and when it fires.
 
 Governed code: `npm/carrick/src/init/task-skills.ts` (the install, the stamp and
 the removal) and `npm/carrick/templates/skills/` (the bodies, one markdown file
@@ -14,7 +14,7 @@ explore instead is not one of these.
 The reminder skill at `.claude/skills/carrick/SKILL.md` is the cloud scaffold's
 and is untouched by everything below.
 
-## The four
+## The five
 
 | Skill | When it fires | What it calls |
 |---|---|---|
@@ -22,8 +22,9 @@ and is untouched by everything below.
 | `carrick-reuse` | At the end of a task that added or changed functions, and on "does this already exist" | `find_similar`, targeted with up to 20 entries |
 | `carrick-drift` | Before changing a request or response type, and when a compatibility verdict names a problem with no location | `get_project_map` for the pairs, then `get_contract_pair` per pair |
 | `carrick-census` | "Every place that does X" questions | `search_by_intent` asked in two wordings, purpose and mechanism, paged to the end |
+| `carrick-audit` | "What is wrong in this codebase", "what should we clean up", project health checks, and where the whole project has built the same thing twice | For the estimate: `get_project_map`, `get_service_graph`, `find_similar` with `audit: true`, and `get_findings`. Per section: `get_api_endpoints`, `check_compatibility`, `get_contract_pair`, `get_operation`, `get_callers`, and `search_by_intent` |
 
-Each one reports a table first, with a file and line on every row and a fixed
+Each of the four task-scoped skills reports a table first, with a file and line on every row and a fixed
 set of class words (DUPLICATE, VARIANT, FALSE POSITIVE; MATCH, DRIFT,
 UNRESOLVED, NOT JUDGED, CONSUMER UNTYPED, PRODUCER UNTYPED; COMPATIBLE,
 INCOMPATIBLE, UNRESOLVED, NOT COMPARED). Every verdict state a tool can return
@@ -33,6 +34,11 @@ no verdict at all, is classed, and its two type texts are read against each
 other and reported as "type texts differ" rather than as a verdict.
 Each relays the counts its tool stated about what it did not look at. None of
 them edits code unless asked, and each ends by offering one issue per finding.
+
+`carrick-audit` estimates tokens and minutes before reading any source. It runs
+its five sections (A to E) in sub-agents where possible, proves each item in
+source, and ends with a fix list. It edits only items you choose. To narrow the
+run, name one service.
 
 ## Classing, and what makes it unskippable
 
