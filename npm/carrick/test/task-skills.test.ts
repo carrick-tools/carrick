@@ -476,7 +476,7 @@ test("the audit skill runs D as one sub-agent unit, never as a listing in the ma
     assert.match(audit, /lists per service with callbacks included \(section D says how\), keeps only the groups with two or more route handlers in different files/);
     assert.match(audit, /proves each candidate itself/);
     assert.match(audit, /Its listing never sits in the main agent/);
-    assert.match(audit, /with no candidate it returns `D: no candidate` and has opened no source/);
+    assert.match(audit, /With no candidate it returns `D: no candidate` and has opened no source/);
     assert.match(audit, /Count line: `D: <services listed> services listed/);
     assert.doesNotMatch(audit, /units of 10/);
     assert.doesNotMatch(audit, /D starts no sub-agent/);
