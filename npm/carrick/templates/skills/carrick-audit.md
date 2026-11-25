@@ -124,9 +124,18 @@ Sections A to E do not depend on each other. Split them into units:
   no no-route calls from step 1, section A has no unit and its count line says
   so. Never start one sub-agent for each service.
 - **B**: one unit for every 10 pairs.
-- **C**: one unit for every 20 groups: offsets 0 to 19, 20 to 39, and so on to
-  `total_clusters`.
-- **D**: one unit.
+- **C**: one listing unit, for the whole of C's list. It walks the list to its
+  end itself (section C says how) and returns each group once, as a number, a
+  key and its members. With 20 groups or fewer it proves them. With more than 20
+  it returns the list at once and you split it into units of 20 groups in the
+  order it came back, each given its groups inline. A unit never works out an
+  offset and never asks the index for the list again. With no groups, section C
+  has no unit and its count line says so.
+- **D**: one listing unit, for the whole of D's list (section D says how). It
+  keeps only the groups that can be a route written twice, which are the
+  candidates. With no candidate, D starts no sub-agent and its count line says
+  so. With candidates it proves up to 10 itself; with more it returns them at
+  once and you split them into units of 10, each given its candidates inline.
 - **E**: one unit.
 
 Where you can start sub-agents, give each unit to its own sub-agent and start
@@ -136,9 +145,11 @@ yet. The brief for each is these words with the unit filled in, and nothing
 else:
 
 > Load the carrick-audit skill. Run only section <letter> of it, for <the
-> unit: the whole project for the one unit that lists the rows, or its
-> no-route rows, or its pairs, each named as the index spells it, or its
-> offsets>. Work to the end of the unit
+> unit: the whole project for a unit that lists the rows, or its no-route
+> rows, its pairs, its groups or its candidates, each named as the index
+> spells it and given inline>. Where the unit is given rows, pairs, groups or
+> candidates, take those and list nothing: call no listing tool for them.
+> Work to the end of the unit
 > and return its table, its count line and any refused calls. Run no other
 > section. Do not estimate, do not ask the user anything and do not start
 > sub-agents.
@@ -256,17 +267,47 @@ which is not agreement.
 
 ## C. Functions written twice
 
+If the unit was given groups, take those and read no others: call
+`find_similar` for none of them. Otherwise list the groups from the index, once:
+
 ```
-find_similar({{SCOPE}}, audit: true, offset: <first offset of the unit>, limit: 20)
+find_similar({{SCOPE}}, audit: true, limit: 50)
 ```
 
-A page can come back shorter than its limit. Follow `next_offset` until you
-hold every group of the unit. Where an answer carries `window`, the project is
-larger than one pass: run the units for that window, then call again with
-`scan_from: <next_scan_from>` and run them for the next, until an answer
-carries no `next_scan_from`. Read every member of every group at its file and
-line, also in a group that lists its members as locators only, and diff the
-bodies. Class each group:
+How the list pages (measured on a project of 9,643 functions and on one of
+2,221): on a large project the answer covers one window of functions, in path
+order, within a time budget (`window`, with `next_scan_from`), and on a small
+one it covers the whole project (no `window`). Inside a window the groups are
+paged with `offset`; offsets start again at 0 in every window. A page is cut to
+what one answer holds (13 to 16 groups, whatever `limit` asks), and `next_offset`
+continues it. `total_clusters` is the group count of this window alone: it
+differs from window to window and call to call, so size nothing from it once
+the walk has started. A group has no id of its own, and a function that matched
+one earlier in the path order appears again, in part, in a later window.
+
+Walk it like this and no other way:
+
+- Follow `next_offset` while the answer has `has_more`. Never work out an
+  offset.
+- When the window's pages end and the answer carries `window.next_scan_from`,
+  call again with `scan_from: <next_scan_from>` and offset 0, and page that
+  window the same way.
+- The walk is done when an answer has no `has_more` and no `next_scan_from`.
+- A group's key is its members' `file_path:line_number`, sorted and joined with
+  `;`. Keep one entry for each key: a key seen again in a later window or page
+  is the same group, dropped from the list and counted as a repeat. Two groups
+  with different keys that share a member are two groups: keep both, and note
+  the shared member on the second.
+- Keep from each group only its number (the order the walk first saw it), its
+  key and its members as name, file and line span. Read no source in the
+  listing.
+
+Where you hold more than 20 groups, return the list at once as `<number> |
+<key> | <name file:line-end>; ...` and stop: the caller splits it. Where you
+hold 20 or fewer, prove them yourself.
+
+For each group you hold, read every member at its file and line, also in a
+group that lists its members as locators only, and diff the bodies. Class each group:
 
 - **DUPLICATE**: the same job and the same result. Nothing to name apart.
 - **DIVERGED**: the same job, the same kind of input and the same kind of
@@ -304,25 +345,39 @@ their package.json files for a package they already share. Where one exists,
 the fix is to move the function there and import it; where none does, say so:
 the fix is a new shared package.
 
-Count line: `C <first offset>-<last offset>: <groups returned> groups,
-<groups classed> classed`.
+Count line: `C listing: <groups listed> groups listed
+(<windows> windows, <pages> pages, <repeats> repeats dropped)`; for a unit: `C
+<first number>-<last number>: <groups given> given, <groups classed> classed`.
+Across section C the three numbers are equal: groups listed, groups given to
+units, groups classed. A group seen twice is counted once, and a number that
+differs names the group that went missing.
 
 ## D. Routes written twice
 
-Route handlers are left out of section C's list. Ask for them, once for each
-service that serves operations:
+Route handlers are left out of section C's list on purpose: the default list
+drops anonymous callbacks, and every route handler the index names is one (on
+one project the same service lists 27 groups by default and 68 with callbacks,
+and a route twin sits only in the 68). The tool has no filter for route-handler
+rows and its rows carry no role, so section C's walk cannot give D its
+candidates. List them from the narrowest call the tool has, once for each
+service that serves operations, unless the unit was given candidates, in which
+case take those and list nothing:
 
 ```
-find_similar({{SCOPE}}, audit: true, include_callbacks: true, service: "<producer>", limit: 20)
+find_similar({{SCOPE}}, audit: true, include_callbacks: true, service: "<producer>", limit: 50)
 ```
 
-Page with `next_offset` to the end. Take only the groups where two or more
-members are route handlers in different files: a route handler's name starts
-with its method or operation kind and ends in `_handler`, such as
-`post_orders_handler`. Leave every other group: section C covers the named
-functions, and callbacks inside one function are not routes.
+Page each service with `next_offset` to the end, and follow `next_scan_from`
+as section C does where an answer carries a `window`. Keep only the groups
+where two or more members are route handlers in different files: a route
+handler's name starts with its method or operation kind and ends in `_handler`,
+such as `post_orders_handler`. Drop every other group unread: section C covers
+the named functions, and callbacks inside one function are not routes. These
+are the candidates; give each a number and a key as section C does, and keep
+each as its members' names, files and lines. Where you hold none, stop: D has
+no proof unit and no sub-agent, and the count line says so.
 
-For each group you took, find the full path of each handler and who calls it:
+For each candidate, find the full path of each handler and who calls it:
 
 ```
 get_api_endpoints({{SCOPE}}, service: "<producer>", path_contains: "<a word of the route's path>")
@@ -334,7 +389,7 @@ is not a copy. `consumer_count` on each operation says which copy the apps
 call. Then read both handlers to their last line and diff them line by line.
 Name a difference only where you quote the line from each copy; a line that is
 only a comment or a log in one copy is not a difference in what the route
-does. Class each group:
+does. Class each candidate:
 
 - **WRITTEN TWICE, DIFFERS**: two handlers serve the same thing and the bodies
   differ in what they do. Quote a line that differs, and say which copy the
@@ -342,8 +397,11 @@ does. Class each group:
 - **WRITTEN TWICE, SAME**: the same logic in two files.
 - **NOT A COPY**: the handlers serve different things.
 
-Count line: `D: <groups returned> groups read, <handler groups> with route
-handlers in two files, <groups classed> classed`.
+Count line: `D listing: <services listed> services listed,
+<groups returned> groups read, <candidates> candidates`; with no candidate it
+ends: `D: no candidate, no unit`; for a unit: `D <first number>-<last number>:
+<candidates given> given, <candidates classed> classed`. Across section D the
+candidates listed, given and classed are equal.
 
 ## E. One job, several answers
 
