@@ -279,7 +279,9 @@ test("the audit skill renders for both scopes, counts first and states its estim
     assert.match(audit, /Say "go" to run the full audit, or name one service or sections \(A to E\) to run less\./);
     assert.match(audit, /Open no source, start no sub-agent and make no further tool call in that turn/);
     assert.match(audit, /do not count again/);
-    assert.match(audit, /it names one service or named sections\. Your next output is the filled-in block, written as text before any further tool call\. Then carry on with section 2 in the same turn/);
+    assert.match(audit, /don't ask, just run"\)\. Carry on with section 2 in the same turn\./);
+    assert.match(audit, /An ask that only names one service or some sections is not a go-ahead/);
+    assert.match(audit, /For an ask that is already narrowed, `Say "go" to run it\.` is enough/);
     assert.doesNotMatch(audit, /There is no cap/);
     assert.doesNotMatch(audit, /do not end your turn on a question/);
     assert.doesNotMatch(audit, /caps each section/);

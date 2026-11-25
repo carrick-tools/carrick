@@ -99,15 +99,17 @@ After the block, take the first case that fits:
 
 - **The ask already says to go ahead**: it says to run the audit after seeing
   the cost or without asking (for example "run the full audit", "go ahead",
-  "yes, run it", "don't ask, just run"), or it names one service or named
-  sections. Your next output is the filled-in block, written as text before any
-  further tool call. Then carry on with section 2 in the same turn.
+  "yes, run it", "don't ask, just run"). Carry on with section 2 in the same
+  turn. An ask that only names one service or some sections is not a go-ahead:
+  work out the estimate for that narrower scope, write the block, then take
+  one of the cases below.
 - **You have a tool for putting a question to the user** (such as
   `AskUserQuestion`): use it to ask whether to go ahead, to narrow the audit to
   one service, or to run some sections, and wait for the answer.
 - **You have no such tool**: end your turn after the block with one closing
   line that tells the user how to continue, such as: `Say "go" to run the full
-  audit, or name one service or sections (A to E) to run less.` Open no source,
+  audit, or name one service or sections (A to E) to run less.` For an ask
+  that is already narrowed, `Say "go" to run it.` is enough. Open no source,
   start no sub-agent and make no further tool call in that turn. When the
   user's next message says go, or narrows the audit, run from section 2 with
   the counts you already read, and do not count again.
