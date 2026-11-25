@@ -388,7 +388,7 @@ test("the audit skill sizes section A by no-route rows, never by services", () =
     assert.match(audit, /Do not ask the index again for each service for rows you already hold/);
     assert.match(audit, /<rows read> of <rows given> no-route rows read/);
     assert.match(audit, /add up to the no-route count from step 1, with a call site counted once/);
-    assert.match(audit, /listing the rows, once (none with no such calls) \| 97,500/);
+    assert.match(audit, /listing the rows, once \(none with no such calls\) \| 97,500/);
     assert.doesNotMatch(audit, /one unit for each service in `unmatched_by_service`/);
     assert.doesNotMatch(audit, /one unit for every 30 no-route rows from step 1/);
     assert.doesNotMatch(audit, /each service with unmatched calls/);
