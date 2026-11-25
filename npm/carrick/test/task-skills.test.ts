@@ -414,8 +414,8 @@ test("the audit skill runs five sections, each from an index call, and none can 
     for (const call of [
       `get_service_graph(${argument}, limit: 200)`,
       `check_compatibility(${argument}, consumer_service: "<consumer>", producer_service: "<producer>", limit: 50)`,
-      `find_similar(${argument}, audit: true, offset: <first offset of the unit>, limit: 20)`,
-      `find_similar(${argument}, audit: true, include_callbacks: true, service: "<producer>", limit: 20)`,
+      `find_similar(${argument}, audit: true, limit: 50)`,
+      `find_similar(${argument}, audit: true, include_callbacks: true, service: "<producer>", limit: 50)`,
       `search_by_intent(${argument}, query: "<job>", also_phrased_as: ["<the same job in other words>"], top_k: 30, compact: true)`,
     ]) {
       assert.ok(audit.includes(call), `missing or unscoped: ${call}`);
@@ -441,6 +441,34 @@ test("the audit skill runs five sections, each from an index call, and none can 
     const notCovered = /Not covered yet: ([^]*?) Say so in the report/.exec(audit);
     assert.ok(notCovered, "the Not covered yet line is missing");
     assert.doesNotMatch(notCovered[1] ?? "", /calls that reach no route/);
+  }
+});
+
+test("the audit skill reads every similar-function group once and starts no route unit without a candidate", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    // C: one listing unit walks the windows, units get their groups inline.
+    assert.match(audit, /\*\*C\*\*: one listing unit, for the whole of C's list\./);
+    assert.match(audit, /split it into units of 20 groups in the order it came back, each given its groups inline/);
+    assert.match(audit, /A unit never works out an offset and never asks the index for the list again/);
+    assert.doesNotMatch(audit, /offsets 0 to 19/);
+    assert.doesNotMatch(audit, /first offset of the unit/);
+    assert.match(audit, /offsets start again at 0 in every window/);
+    assert.match(audit, /`total_clusters` is the group count of this window alone/);
+    assert.match(audit, /call again with `scan_from: <next_scan_from>` and offset 0/);
+    assert.match(audit, /The walk is done when an answer has no `has_more` and no `next_scan_from`/);
+    assert.match(audit, /page that window again from offset 0 and keep the union by key, until a whole pass adds no new key/);
+    assert.match(audit, /A group's key is its members' `file_path:line_number`, sorted and joined/);
+    assert.match(audit, /a key seen again in a later window or page is the same group/);
+    assert.match(audit, /Across section C the three numbers are equal: groups listed, groups given to units, groups classed/);
+    assert.match(audit, /take those and list nothing: call no listing tool for them/);
+    // D: its candidates cannot come from C's list; with none, no unit starts.
+    assert.match(audit, /section C's walk cannot give D its candidates/);
+    assert.match(audit, /Drop every other group unread/);
+    assert.match(audit, /With no candidate, D starts no sub-agent and its count line says so/);
+    assert.match(audit, /`D: no candidate, no unit`/);
+    assert.match(audit, /candidates listed, given and classed are equal/);
+    assert.doesNotMatch(audit, /\*\*D\*\*: one unit\./);
   }
 });
 
