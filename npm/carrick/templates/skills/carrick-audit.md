@@ -1,6 +1,6 @@
 ---
 name: carrick-audit
-description: Use when the ask is what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice. A full audit from the Carrick index on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice, routes written twice, one job done several ways), with each item proven in source and a fix list at the end. It states its estimated tokens and minutes before it reads any source; narrow it to one service to spend less.
+description: Use when the ask is what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice. A full audit from the Carrick index on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice, routes written twice, one job done several ways), with each item proven in source and a fix list at the end. It states its estimated tokens and minutes before it reads any source, then waits for a go-ahead; narrow it to one service to spend less.
 ---
 
 # A full audit from the index, proven in source
@@ -91,18 +91,28 @@ Carrick audit: estimate, before any source is read
 - Groups of similar functions: <n>
 - Operations served: <n>
 Estimate: about <total> new tokens (A <n>, B <n>, C <n>, D <n>, E <n>, counting and report <n>)
+Cached re-reads add about 6 times that again, at a tenth of the price.
 Time: about <n> minutes with sub-agents, about <n> one section after another
 ```
 
-After the block, one of two things:
+After the block, take the first case that fits:
 
-- You have a tool for putting a question to the user (such as
-  `AskUserQuestion`): use it to ask whether to go ahead or to narrow the audit
-  to one service or to some sections, and wait for the answer.
-- You have no such tool: nobody can answer, so do not end your turn on a
-  question. Carry on with every section in the same turn.
-
-There is no cap in either case.
+- **The ask already says to go ahead**: it says to run the audit after seeing
+  the cost or without asking (for example "run the full audit", "go ahead",
+  "yes, run it", "don't ask, just run"). Carry on with section 2 in the same
+  turn. An ask that only names one service or some sections is not a go-ahead:
+  work out the estimate for that narrower scope, write the block, then take
+  one of the cases below.
+- **You have a tool for putting a question to the user** (such as
+  `AskUserQuestion`): use it to ask whether to go ahead, to narrow the audit to
+  one service, or to run some sections, and wait for the answer.
+- **You have no such tool**: end your turn after the block with one closing
+  line that tells the user how to continue, such as: `Say "go" to run the full
+  audit, or name one service or sections (A to E) to run less.` For an ask
+  that is already narrowed, `Say "go" to run it.` is enough. Open no source,
+  start no sub-agent and make no further tool call in that turn. When the
+  user's next message says go, or narrows the audit, run from section 2 with
+  the counts you already read, and do not count again.
 
 ## 2. Run every section
 
