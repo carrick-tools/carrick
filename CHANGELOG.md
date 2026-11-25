@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.188](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.187...carrick-v0.3.188) (2026-11-25)
+
+
+### Bug Fixes
+
+* **skills:** the audit's estimate is honest, every group is read once, and section D is one unit ([#5158](https://github.com/carrick-tools/carrick/issues/5158)) ([c58736f](https://github.com/carrick-tools/carrick/commit/c58736f24d20e16dd2dee4092506b56f55722284))
+
 ## [0.3.187](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.186...carrick-v0.3.187) (2026-11-25)
 
 
