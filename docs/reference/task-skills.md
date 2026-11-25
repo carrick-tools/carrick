@@ -35,10 +35,10 @@ other and reported as "type texts differ" rather than as a verdict.
 Each relays the counts its tool stated about what it did not look at. None of
 them edits code unless asked, and each ends by offering one issue per finding.
 
-`carrick-audit` estimates tokens and minutes before reading any source. It runs
-its five sections (A to E) in sub-agents where possible, proves each item in
-source, and ends with a fix list. It edits only items you choose. To narrow the
-run, name one service.
+`carrick-audit` covers the whole project. It estimates tokens and minutes
+before reading any source, then waits for a go-ahead. It runs its five sections
+(A to E) in sub-agents where possible, proves each item in source, and ends
+with a fix list. It edits only items you choose.
 
 ## Classing, and what makes it unskippable
 
