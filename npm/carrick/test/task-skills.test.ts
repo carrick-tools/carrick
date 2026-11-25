@@ -274,8 +274,8 @@ test("the audit skill renders for both scopes, counts first and states its estim
     assert.match(audit, /Estimate: about <total> new tokens/);
     assert.match(audit, /Time: about <n> minutes with sub-agents/);
     // A run nobody can answer stops after the estimate unless the ask already said to go.
-    assert.match(audit, /Cached re-reads add about 6 times that again, at a tenth of the price\./);
-    assert.match(audit, /end your turn after the block with one closing line/);
+    assert.match(audit, /Cached re-reads add about 6 to 10 times that again, at a tenth of the price\./);
+    assert.match(audit, /end your turn after the block and the leads with one closing line/);
     assert.match(audit, /`Say "go" to run the audit\.`/);
     assert.match(audit, /Open no source, start no sub-agent and make no further tool call in that turn/);
     assert.match(audit, /do not count again/);
@@ -300,7 +300,7 @@ test("the audit skill's description keeps the words that load it for a plain que
   const audit = renderTaskSkill("carrick-audit", { slug: "acme-index" });
   const description = /^description: (.*)$/m.exec(audit)?.[1] ?? "";
   assert.match(description, /what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice/);
-  assert.match(description, /estimated tokens and minutes before it reads any source, then waits for a go-ahead\.$/);
+  assert.match(description, /estimated tokens and minutes, and the leads the index already holds, before it reads any source, then waits for a go-ahead\.$/);
 });
 
 test("the audit skill sizes section A by no-route rows, never by services", () => {
@@ -321,7 +321,74 @@ test("the audit skill sizes section A by no-route rows, never by services", () =
     assert.match(audit, /Do not ask the index again for each service for rows you already hold/);
     assert.match(audit, /<rows read> of <rows given> no-route rows read/);
     assert.match(audit, /add up to the no-route count from step 1, with a call site counted once/);
-    assert.match(audit, /each 30 no-route calls, rounded up \| 20,000/);
+    assert.match(audit, /listing the rows, once \(none with no such calls\) \| 97,500 \| \| \| each call that reaches no route \| 6,000/);
+    assert.doesNotMatch(audit, /one unit for each service in `unmatched_by_service`/);
+    assert.doesNotMatch(audit, /one unit for every 30 no-route rows from step 1/);
+    assert.doesNotMatch(audit, /each service with unmatched calls/);
+    assert.doesNotMatch(audit, /unmatched rows seen> of <unmatched_count>/);
+    assert.doesNotMatch(audit, /services with unmatched calls/);
+  }
+});
+
+test("the audit skill's estimate counts sub-agent start-up, and step 1 shows the leads the index already holds", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    // Start-up: a line in the table, a line in the printed block, and the sub-agent count rule.
+    assert.match(audit, /\| Start-up of each sub-agent \| each sub-agent the audit starts \| 40,000 \|/);
+    assert.match(audit, /Sub-agents to start: <k>, about 40,000 new tokens each to start up: <n>/);
+    assert.match(audit, /counting and report <n>, start-up <n>\)/);
+    assert.match(audit, /First count the sub-agents the audit will start/);
+    assert.match(audit, /about 27,500 new tokens on a bare setup and about 57,000 on a heavy one/);
+    assert.match(audit, /it depends on how much the user's own setup puts into every sub-agent/);
+    // Rates measured after start-up was taken out.
+    assert.match(audit, /\| each pair \| 5,500 \|/);
+    assert.match(audit, /\| each group \| 5,000 \|/);
+    assert.match(audit, /\| listing, each service that serves operations \| 11,000 \|/);
+    assert.match(audit, /\| E\. One job, several answers \| once \| 73,500 \|/);
+    // The cache line: a range, still at a tenth of the price; the old single figure is gone.
+    assert.match(audit, /Cached re-reads add about 6 to 10 times that again, at a tenth of the price\./);
+    assert.doesNotMatch(audit, /about 6 times that again/);
+    assert.doesNotMatch(audit, /about six times the new tokens/);
+    // The calibration sentence names both measurements and no project.
+    assert.match(audit, /The rates come from two measurements with Claude Sonnet on 25 Nov 2026/);
+    assert.doesNotMatch(audit, /monorepo of 17 packages/);
+    // The leads: three to five lines from the four answers, no extra call, no narrowing, all protocols.
+    assert.match(audit, /What the index shows so far, before any source has been read\. These are leads, not verdicts:/);
+    assert.match(audit, /three to five lines/);
+    assert.match(audit, /Build the lines only from the answers of the four calls above: make no further tool call and open no source for them/);
+    assert.match(audit, /Each line gives a count and, where an answer carries one, one example with its file and line/);
+    assert.match(audit, /Routes, events or procedures with no recorded caller/);
+    assert.match(audit, /do not suggest narrowing the audit: the audit proper has not run/);
+    assert.match(audit, /After the leads, take the first case that fits/);
+    assert.match(audit, /end your turn after the block and the leads with one closing line: `Say "go" to run the audit\.`/);
+    assert.match(audit, /write the block and the leads, then take one of the cases below/);
+    // The leads sit between the block and the three cases.
+    const block = audit.indexOf("Time: about <n> minutes with sub-agents");
+    const leads = audit.indexOf("What the index shows so far");
+    const cases = audit.indexOf("After the leads, take the first case that fits");
+    assert.ok(block > 0 && block < leads && leads < cases, "the leads are not between the block and the cases");
+  }
+});
+
+test("the audit skill sizes section A by no-route rows, never by services", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    const argument = scope.slug === null ? 'repo: "<owner/repo>"' : 'project: "acme-index"';
+    // Step 1 counts only: it does not page the unmatched rows.
+    assert.match(audit, /Take the count only: do not page `unmatched_calls` now/);
+    assert.match(audit, /- Calls that reach no route: <n> - Consumer and producer pairs/);
+    // Section A is one unit that lists the rows itself, after the go-ahead.
+    assert.ok(audit.includes(`get_service_graph(${argument}, limit: 200)`), "section A lacks the whole-project listing");
+    assert.match(audit, /\*\*A\*\*: one unit, for the whole of A\. It lists the no-route rows itself\./);
+    assert.match(audit, /With more than 30 it returns the row list at once and you split the rows into units of 30, each given its rows inline/);
+    assert.match(audit, /Never start one sub-agent for each service/);
+    assert.match(audit, /never work out an offset yourself/);
+    assert.match(audit, /Pass no `service`: the whole-project listing holds every row once/);
+    assert.match(audit, /where its `services` names several, the call sits in a shared file and counts once/);
+    assert.match(audit, /Do not ask the index again for each service for rows you already hold/);
+    assert.match(audit, /<rows read> of <rows given> no-route rows read/);
+    assert.match(audit, /add up to the no-route count from step 1, with a call site counted once/);
+    assert.match(audit, /listing the rows, once \(none with no such calls\) \| 97,500/);
     assert.doesNotMatch(audit, /one unit for each service in `unmatched_by_service`/);
     assert.doesNotMatch(audit, /one unit for every 30 no-route rows from step 1/);
     assert.doesNotMatch(audit, /each service with unmatched calls/);
@@ -347,8 +414,8 @@ test("the audit skill runs five sections, each from an index call, and none can 
     for (const call of [
       `get_service_graph(${argument}, limit: 200)`,
       `check_compatibility(${argument}, consumer_service: "<consumer>", producer_service: "<producer>", limit: 50)`,
-      `find_similar(${argument}, audit: true, offset: <first offset of the unit>, limit: 20)`,
-      `find_similar(${argument}, audit: true, include_callbacks: true, service: "<producer>", limit: 20)`,
+      `find_similar(${argument}, audit: true, limit: 50)`,
+      `find_similar(${argument}, audit: true, include_callbacks: true, service: "<producer>", limit: 50)`,
       `search_by_intent(${argument}, query: "<job>", also_phrased_as: ["<the same job in other words>"], top_k: 30, compact: true)`,
     ]) {
       assert.ok(audit.includes(call), `missing or unscoped: ${call}`);
@@ -374,6 +441,82 @@ test("the audit skill runs five sections, each from an index call, and none can 
     const notCovered = /Not covered yet: ([^]*?) Say so in the report/.exec(audit);
     assert.ok(notCovered, "the Not covered yet line is missing");
     assert.doesNotMatch(notCovered[1] ?? "", /calls that reach no route/);
+  }
+});
+
+test("the audit skill reads every similar-function group once and starts no route unit without a candidate", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    // C: one listing unit walks the windows, units get their groups inline.
+    assert.match(audit, /\*\*C\*\*: one listing unit, for the whole of C's list\./);
+    assert.match(audit, /split it into units of 20 groups in the order it came back, each given its groups inline/);
+    assert.match(audit, /A unit never works out an offset and never asks the index for the list again/);
+    assert.doesNotMatch(audit, /offsets 0 to 19/);
+    assert.doesNotMatch(audit, /first offset of the unit/);
+    assert.match(audit, /offsets start again at 0 in every window/);
+    assert.match(audit, /`total_clusters` is the group count of this window alone/);
+    assert.match(audit, /call again with `scan_from: <next_scan_from>` and offset 0/);
+    assert.match(audit, /The walk is done when an answer has no `has_more` and no `next_scan_from`/);
+    assert.match(audit, /page that window again from offset 0 and keep the union by key, until a whole pass adds no new key/);
+    assert.match(audit, /A group's key is its members' `file_path:line_number`, sorted and joined/);
+    assert.match(audit, /a key seen again in a later window or page is the same group/);
+    assert.match(audit, /Across section C the three numbers are equal: groups listed, groups given to units, groups classed/);
+    assert.match(audit, /take those and list nothing: call no listing tool for them/);
+    // D: its candidates cannot come from C's list; with none, no unit starts.
+    assert.match(audit, /section C's walk cannot give D its candidates/);
+    assert.match(audit, /Drop every other group unread/);
+    assert.match(audit, /Across section D the candidates found and classed are equal/);
+  }
+});
+
+test("the audit skill runs D as one sub-agent unit, never as a listing in the main agent", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    assert.match(audit, /\*\*D\*\*: one unit, for the whole of D\./);
+    assert.match(audit, /lists per service with callbacks included \(section D says how\), keeps only the groups with two or more route handlers in different files/);
+    assert.match(audit, /proves each candidate itself/);
+    assert.match(audit, /Its listing never sits in the main agent/);
+    assert.match(audit, /With no candidate it returns `D: no candidate` and has opened no source/);
+    assert.match(audit, /Count line: `D: <services listed> services listed/);
+    assert.doesNotMatch(audit, /units of 10/);
+    assert.doesNotMatch(audit, /D starts no sub-agent/);
+    assert.doesNotMatch(audit, /`D: no candidate, no unit`/);
+    assert.doesNotMatch(audit, /unless the unit was given candidates/);
+  }
+});
+
+test("the audit skill's estimate charges C by the groups it can see, D by its listing only, and counts the sub-agents of C and D", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    assert.match(audit, /\| C\. Functions written twice \| each group \| 5,000 \|/);
+    assert.match(audit, /\| D\. Routes written twice \| listing, each service that serves operations \| 11,000 \|/);
+    assert.match(audit, /\| \| proof, each candidate: not known before the listing, so the estimate leaves it out \| 15,000 \|/);
+    assert.doesNotMatch(audit, /each 100 operations served/);
+    assert.doesNotMatch(audit, /132,500/);
+    assert.match(audit, /where the answer carries `window\.next_scan_from`, the project has further windows/);
+    assert.match(audit, /Groups of similar functions: at least <n> \(first of several windows\)/);
+    assert.match(audit, /Estimate: at least about <total> new tokens/);
+    assert.match(audit, /C is 1 for the listing, and 1 more for every 20 groups/);
+    assert.match(audit, /D is 1; E is 1/);
+    assert.match(audit, /D <n> \(the listing only; proof is 15,000 for each candidate the listing finds\)/);
+  }
+});
+
+test("the audit skill gives a second fair warning when the C listing finds far more groups than step 1 saw", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    const second = /Second fair warning([^]*?)A unit is done when/.exec(audit);
+    assert.ok(second, "the second fair warning is missing");
+    const text = second[1] ?? "";
+    assert.match(text, /returns more than 1\.5 times the group count step 1 printed/);
+    assert.match(text, /do not start C's proof units yet/);
+    assert.match(text, /let the units already running finish/);
+    assert.match(text, /The listing found <n> groups of similar functions, not <m>: proving them is about <t> new tokens more, in <k> sub-agents\./);
+    assert.match(text, /`Say "go" to run the audit\.`/);
+    assert.match(text, /start the C units with the list you already hold, listing nothing again/);
+    assert.match(text, /At or under 1\.5 times, carry on without asking/);
+    assert.match(text, /leaves C unproven and the report says so in C's count line/);
+    assert.doesNotMatch(text, /narrow/i);
   }
 });
 

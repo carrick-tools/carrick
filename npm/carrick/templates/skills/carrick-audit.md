@@ -1,6 +1,6 @@
 ---
 name: carrick-audit
-description: Use when the ask is what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice. A full audit from the Carrick index on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice, routes written twice, one job done several ways), with each item proven in source and a fix list at the end. It states its estimated tokens and minutes before it reads any source, then waits for a go-ahead.
+description: Use when the ask is what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice. A full audit from the Carrick index on main (calls that reach no route, type mismatches between endpoints and their callers, functions written twice, routes written twice, one job done several ways), with each item proven in source and a fix list at the end. It states its estimated tokens and minutes, and the leads the index already holds, before it reads any source, then waits for a go-ahead.
 ---
 
 # A full audit from the index, proven in source
@@ -46,7 +46,12 @@ Read these counts out of the answers:
   unplaced-base calls included. Section A lists the rows after the go-ahead.
 - **Pairs**: each consumer and producer pair under the map's CONSUMERS. Where
   the map cuts the list short, call it again with `detail: true`.
-- **Groups of similar functions**: `total_clusters` from `find_similar`.
+- **Groups of similar functions**: `total_clusters` from `find_similar`. It
+  counts the first window of the list only: where the answer carries
+  `window.next_scan_from`, the project has further windows, so the number is a
+  floor (`has_more` alone does not say so: it only means this window has more
+  pages). Write it as `at least <n> (first of several windows)` and state the
+  estimate as `at least`. With no `window.next_scan_from` the number is exact.
 - **Operations served**: the endpoint count per service in the map's SERVICES.
 - The first line of the `get_findings` answer (`FINDINGS · project <slug> ·
   index at <commits> · built <day>`): copy it to the top of the report, word
@@ -62,24 +67,42 @@ line: the duplicates most worth fixing sit low on the list, so its first page
 does not answer the question. Any other ask runs all five.
 
 Work out the estimate from the counts. New tokens are input read for the first
-time plus output:
+time plus output. First count the sub-agents the audit will start, with the
+unit rules of section 2: A is 1 unit, or 0 with no calls that reach no route
+(and with more than 30 of them, 1 more for each 30); B is 1 for every 10 pairs;
+C is 1 for the listing, and 1 more for every 20 groups
+when there are more than 20 (none at all with no groups); D is 1; E is 1. Where you cannot start sub-agents
+the count is 0.
 
 | Section | Per item | New tokens |
 |---|---|---|
 | Counting and the report | once | 80,000 |
-| A. Calls that reach no route | each 30 no-route calls, rounded up | 20,000 |
+| Start-up of each sub-agent | each sub-agent the audit starts | 40,000 |
+| A. Calls that reach no route | listing the rows, once (none with no such calls) | 97,500 |
 | | each call that reaches no route | 6,000 |
-| B. Type verdicts | each pair | 16,000 |
-| C. Functions written twice | each group | 3,500 |
-| D. Routes written twice | each 100 operations served | 90,000 |
-| E. One job, several answers | once | 110,000 |
+| B. Type verdicts | each pair | 5,500 |
+| C. Functions written twice | each group | 5,000 |
+| D. Routes written twice | listing, each service that serves operations | 11,000 |
+| | proof, each candidate: not known before the listing, so the estimate leaves it out | 15,000 |
+| E. One job, several answers | once | 73,500 |
 
-Each turn also re-reads what the run already holds from the cache: about six
-times the new tokens again, at a tenth of the price. Time is about 13 minutes
-for each million new tokens when the sections run one after another, and about
-half of that with sub-agents. These figures were measured with Claude Sonnet
-on a monorepo of 17 packages, 208 operations and 4,500 functions (24 Nov 2026):
-about 1 million new tokens and 5 minutes a run with sub-agents.
+The listing of D is all the estimate charges for D: how many candidates it
+finds is known only once it has run, and the report states what the proof
+cost. The rates for A to E leave start-up out: it has its own line. Start-up is what
+a sub-agent loads before it does anything, and it depends on how much the
+user's own setup puts into every sub-agent (long instruction files, many
+tools, many skills): about 27,500 new tokens on a bare setup and about 57,000
+on a heavy one, so 40,000 is the middle. Each turn also re-reads what the run
+already holds from the cache: about 6 to 10 times the new tokens again (the
+lower figure on the bare setup, the higher on the heavy one), at a tenth of the
+price. Time is about 13 minutes for each million new tokens when the sections
+run one after another, and about half of that with sub-agents. The rates come
+from two measurements with Claude Sonnet on 25 Nov 2026: one full audit with
+sub-agents on a project of 21 services (13 calls that reach no route, 6 pairs,
+114 groups, 115 operations served) on a heavy setup, which took 8 minutes and
+3.4 million new tokens; and one run of section A on a
+bare test monorepo (6 calls that reach no route). D and E rest on one
+measurement each, and the listing term of A on one.
 
 The first thing the user reads from you is this block, filled in. Write it as
 text in your reply, not only in your reasoning, before any source is opened:
@@ -92,27 +115,60 @@ Carrick audit: estimate, before any source is read
 - Consumer and producer pairs: <n>
 - Groups of similar functions: <n>
 - Operations served: <n>
-Estimate: about <total> new tokens (A <n>, B <n>, C <n>, D <n>, E <n>, counting and report <n>)
-Cached re-reads add about 6 times that again, at a tenth of the price.
+Sub-agents to start: <k>, about 40,000 new tokens each to start up: <n>
+Estimate: about <total> new tokens (A <n>, B <n>, C <n>, D <n> (the listing only; proof is 15,000 for each candidate the listing finds), E <n>, counting and report <n>, start-up <n>)
+```
+
+Where the answer carries `window.next_scan_from`, the groups line reads
+`Groups of similar functions: at least <n> (first of several windows)` and the
+estimate line reads `Estimate: at least about <total> new tokens (...)`, with
+the same parts.
+
+```
+Cached re-reads add about 6 to 10 times that again, at a tenth of the price.
 Time: about <n> minutes with sub-agents, about <n> one section after another
 ```
 
-After the block, take the first case that fits:
+Directly after the block, in the same text and whichever case below applies,
+write what the index already shows, as three to five lines under this heading,
+word for word: `What the index shows so far, before any source has been read.
+These are leads, not verdicts:`. Build the lines only from the answers of the
+four calls above: make no further tool call and open no source for them. Each
+line gives a count and, where an answer carries one, one example with its
+file and line. Take, in this order, the lines the answers can fill, and leave
+out one whose answer holds nothing:
+
+- Type mismatches between a route, event or procedure and its callers: the
+  count, and the first one with its endpoint and its caller's file and line.
+- Calls that reach no route: the count from above, set against the calls to
+  third parties and to bases not yet placed that the map counts under
+  UNMATCHED.
+- Groups of similar functions: the count, and the first group with one
+  member's name, file and line.
+- Routes, events or procedures with no recorded caller: the count where an
+  answer gives one, and the first row with its file and line.
+- Call sites the index could not resolve: the count.
+
+Say each in plain words, as what the index holds. Do not class, rank or
+recommend anything, do not call a lead a finding, and do not suggest narrowing
+the audit: the audit proper has not run. Then follow with the case below.
+
+After the leads, take the first case that fits:
 
 - **The ask already says to go ahead**: it says to run the audit after seeing
   the cost or without asking (for example "run the full audit", "go ahead",
   "yes, run it", "don't ask, just run"). Carry on with section 2 in the same
   turn. An ask the user has narrowed to one service or some sections is not a
-  go-ahead: work out the estimate for that scope, write the block, then take
-  one of the cases below.
+  go-ahead: work out the estimate for that scope, write the block and the
+  leads, then take one of the cases below.
 - **You have a tool for putting a question to the user** (such as
   `AskUserQuestion`): use it to ask whether to go ahead, and wait for the
   answer.
-- **You have no such tool**: end your turn after the block with one closing
-  line: `Say "go" to run the audit.` Open no source, start no sub-agent and
-  make no further tool call in that turn. When the user's next message says go,
-  run from section 2 with the counts you already read, and do not count again.
-  Any other reply is the user's new ask.
+- **You have no such tool**: end your turn after the block and the leads with
+  one closing line: `Say "go" to run the audit.` Open no source, start no
+  sub-agent and make no further tool call in that turn. When the user's next
+  message says go, run from section 2 with the counts you already read, and do
+  not count again. Any other reply is the user's new ask.
 
 ## 2. Run every section
 
@@ -124,9 +180,19 @@ Sections A to E do not depend on each other. Split them into units:
   no no-route calls from step 1, section A has no unit and its count line says
   so. Never start one sub-agent for each service.
 - **B**: one unit for every 10 pairs.
-- **C**: one unit for every 20 groups: offsets 0 to 19, 20 to 39, and so on to
-  `total_clusters`.
-- **D**: one unit.
+- **C**: one listing unit, for the whole of C's list. It walks the list to its
+  end itself (section C says how) and returns each group once, as a number, a
+  key and its members. With 20 groups or fewer it proves them. With more than 20
+  it returns the list at once and you split it into units of 20 groups in the
+  order it came back, each given its groups inline. A unit never works out an
+  offset and never asks the index for the list again. With no groups, section C
+  has no unit and its count line says so.
+- **D**: one unit, for the whole of D. Its sub-agent runs it. Its listing never
+  sits in the main agent: the unit lists per service with callbacks included
+  (section D says how), keeps only the groups with two or more route handlers
+  in different files, proves each candidate itself (both handlers opened, and
+  `get_operation` on the path) and returns its table. With
+  no candidate it returns `D: no candidate` and has opened no source.
 - **E**: one unit.
 
 Where you can start sub-agents, give each unit to its own sub-agent and start
@@ -136,9 +202,13 @@ yet. The brief for each is these words with the unit filled in, and nothing
 else:
 
 > Load the carrick-audit skill. Run only section <letter> of it, for <the
-> unit: the whole project for the one unit that lists the rows, or its
-> no-route rows, or its pairs, each named as the index spells it, or its
-> offsets>. Work to the end of the unit
+> unit: the whole project for a unit that lists for itself (A, C's listing, D
+> and E), or its no-route rows, its pairs or its groups, each named as the
+> index spells it and given inline>. Where the unit is given rows, pairs or
+> groups, take those and list nothing: call no listing tool for them. A unit
+> that lists keeps the listing to itself and returns only its table and count
+> line, or, for C's listing, its groups.
+> Work to the end of the unit
 > and return its table, its count line and any refused calls. Run no other
 > section. Do not estimate, do not ask the user anything and do not start
 > sub-agents.
@@ -146,6 +216,23 @@ else:
 Where you cannot start sub-agents, run the units yourself in the order above,
 and write each unit's table and count line to the user before you start the
 next unit.
+
+**Second fair warning (C).** The listing unit can return far more groups than
+step 1 could see. When it returns more than 1.5 times the group count step 1
+printed, do not start C's proof units yet: let the units already running
+finish, then write a short restated estimate for the rest of C: `The listing
+found <n> groups of similar functions, not <m>: proving them is about <t> new
+tokens more, in <k> sub-agents.` Here <n> is the number listed, <m> the number
+step 1 printed, <k> is 1 for every 20 groups, rounded up, and <t> is <n> times
+5,000 plus <k> times 40,000. Then take the first case that fits, as in step 1:
+the user's first ask already said to go ahead or not to ask, so carry on; you
+have a tool for putting a question to the user, so ask and wait; or you have
+none, so end your turn with the restated estimate and one closing line, `Say
+"go" to run the audit.`, make no further tool call in that turn, and, when the
+next message says go, start the C units with the list you already hold,
+listing nothing again. At or under 1.5 times, carry on without asking. A no
+leaves C unproven and the report says so in C's count line; it changes
+nothing else in the audit.
 
 A unit is done when it has returned its count line and the two numbers in it
 are equal. Run again any unit that came back without one.
@@ -256,17 +343,53 @@ which is not agreement.
 
 ## C. Functions written twice
 
+If the unit was given groups, take those and read no others: call
+`find_similar` for none of them. Otherwise list the groups from the index, once:
+
 ```
-find_similar({{SCOPE}}, audit: true, offset: <first offset of the unit>, limit: 20)
+find_similar({{SCOPE}}, audit: true, limit: 50)
 ```
 
-A page can come back shorter than its limit. Follow `next_offset` until you
-hold every group of the unit. Where an answer carries `window`, the project is
-larger than one pass: run the units for that window, then call again with
-`scan_from: <next_scan_from>` and run them for the next, until an answer
-carries no `next_scan_from`. Read every member of every group at its file and
-line, also in a group that lists its members as locators only, and diff the
-bodies. Class each group:
+How the list pages (measured on a project of 9,643 functions and on one of
+2,221): on a large project the answer covers one window of functions, in path
+order, within a time budget (`window`, with `next_scan_from`), and on a small
+one it covers the whole project (no `window`). Inside a window the groups are
+paged with `offset`; offsets start again at 0 in every window. A page is cut to
+what one answer holds (13 to 16 groups, whatever `limit` asks), and `next_offset`
+continues it. `total_clusters` is the group count of this window alone: it
+differs from window to window and call to call, so size nothing from it once
+the walk has started. A group has no id of its own, and a function that matched
+one earlier in the path order appears again, in part, in a later window.
+
+Walk it like this and no other way:
+
+- Follow `next_offset` while the answer has `has_more`. Never work out an
+  offset.
+- When the window's pages end and the answer carries `window.next_scan_from`,
+  call again with `scan_from: <next_scan_from>` and offset 0, and page that
+  window the same way.
+- The walk is done when an answer has no `has_more` and no `next_scan_from`.
+- The time budget can end a window at a different function on each call
+  (`window.functions_to`), so a window's later pages may not match its first.
+  Where `functions_to` or `total_clusters` changed between the pages of one
+  window, page that window again from offset 0 and keep the union by key,
+  until a whole pass adds no new key. Keep the `scan_from` chain unbroken
+  from one window to the next.
+- A group's key is its members' `file_path:line_number`, sorted and joined with
+  `;`. Keep one entry for each key: a key seen again in a later window or page
+  is the same group, dropped from the list and counted as a repeat. Two groups
+  with different keys that share a member are two groups: keep both, and note
+  the shared member on the second.
+- Keep from each group only its number (the order the walk first saw it), its
+  key and its members as name, file and line span. Read no source in the
+  listing.
+
+Where you hold more than 20 groups, return the list at once as `<number> |
+<key> | <name file:line-end>; ...` and stop: the caller splits it. Where you
+hold 20 or fewer, prove them yourself.
+
+For each group you hold, read every member at its file and line, also in a
+group that lists its members as locators only, and diff the bodies. Class each group:
 
 - **DUPLICATE**: the same job and the same result. Nothing to name apart.
 - **DIVERGED**: the same job, the same kind of input and the same kind of
@@ -304,25 +427,40 @@ their package.json files for a package they already share. Where one exists,
 the fix is to move the function there and import it; where none does, say so:
 the fix is a new shared package.
 
-Count line: `C <first offset>-<last offset>: <groups returned> groups,
-<groups classed> classed`.
+Count line: `C listing: <groups listed> groups listed
+(<windows> windows, <pages> pages, <repeats> repeats dropped)`; for a unit: `C
+<first number>-<last number>: <groups given> given, <groups classed> classed`.
+Across section C the three numbers are equal: groups listed, groups given to
+units, groups classed. A group seen twice is counted once, and a number that
+differs names the group that went missing.
 
 ## D. Routes written twice
 
-Route handlers are left out of section C's list. Ask for them, once for each
-service that serves operations:
+This section is one unit and runs in one place: the unit's own sub-agent, or,
+where you cannot start sub-agents, you as D's unit. Route handlers are left out
+of section C's list on purpose: the default list drops anonymous callbacks,
+and every route handler the index names is one (on one project the same
+service lists 27 groups by default and 68 with callbacks, and a route twin
+sits only in the 68). The tool has no filter for route-handler rows and its
+rows carry no role, so section C's walk cannot give D its candidates. List
+them from the narrowest call the tool has, once for each service that serves
+operations:
 
 ```
-find_similar({{SCOPE}}, audit: true, include_callbacks: true, service: "<producer>", limit: 20)
+find_similar({{SCOPE}}, audit: true, include_callbacks: true, service: "<producer>", limit: 50)
 ```
 
-Page with `next_offset` to the end. Take only the groups where two or more
-members are route handlers in different files: a route handler's name starts
-with its method or operation kind and ends in `_handler`, such as
-`post_orders_handler`. Leave every other group: section C covers the named
-functions, and callbacks inside one function are not routes.
+Page each service with `next_offset` to the end, and follow `next_scan_from`
+as section C does where an answer carries a `window`. Keep only the groups
+where two or more members are route handlers in different files: a route
+handler's name starts with its method or operation kind and ends in `_handler`,
+such as `post_orders_handler`. Drop every other group unread: section C covers
+the named functions, and callbacks inside one function are not routes. These
+are the candidates; give each a number and a key as section C does, and keep
+each as its members' names, files and lines. Where you hold none, stop and open
+no source: return `D: no candidate`.
 
-For each group you took, find the full path of each handler and who calls it:
+For each candidate, find the full path of each handler and who calls it:
 
 ```
 get_api_endpoints({{SCOPE}}, service: "<producer>", path_contains: "<a word of the route's path>")
@@ -334,7 +472,7 @@ is not a copy. `consumer_count` on each operation says which copy the apps
 call. Then read both handlers to their last line and diff them line by line.
 Name a difference only where you quote the line from each copy; a line that is
 only a comment or a log in one copy is not a difference in what the route
-does. Class each group:
+does. Class each candidate:
 
 - **WRITTEN TWICE, DIFFERS**: two handlers serve the same thing and the bodies
   differ in what they do. Quote a line that differs, and say which copy the
@@ -342,8 +480,10 @@ does. Class each group:
 - **WRITTEN TWICE, SAME**: the same logic in two files.
 - **NOT A COPY**: the handlers serve different things.
 
-Count line: `D: <groups returned> groups read, <handler groups> with route
-handlers in two files, <groups classed> classed`.
+Count line: `D: <services listed> services listed, <groups returned> groups
+read, <candidates> candidates, <candidates classed> classed`; with no candidate
+it is `D: no candidate`. Across section D the candidates found and classed are
+equal.
 
 ## E. One job, several answers
 
@@ -379,7 +519,7 @@ classed`.
 ## 3. Report
 
 Before you write, check that you hold a count line for every unit of every
-section and that its numbers are equal. Run now any unit that is missing.
+section and that its numbers are equal. Run now any unit that is missing, except C's proof units after a no to the second fair warning.
 
 The report, in this order:
 
