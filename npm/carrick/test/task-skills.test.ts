@@ -390,6 +390,7 @@ test("the audit skill reads every similar-function group once and starts no rout
     assert.match(audit, /`total_clusters` is the group count of this window alone/);
     assert.match(audit, /call again with `scan_from: <next_scan_from>` and offset 0/);
     assert.match(audit, /The walk is done when an answer has no `has_more` and no `next_scan_from`/);
+    assert.match(audit, /page that window again from offset 0 and keep the union by key, until a whole pass adds no new key/);
     assert.match(audit, /A group's key is its members' `file_path:line_number`, sorted and joined/);
     assert.match(audit, /a key seen again in a later window or page is the same group/);
     assert.match(audit, /Across section C the three numbers are equal: groups listed, groups given to units, groups classed/);

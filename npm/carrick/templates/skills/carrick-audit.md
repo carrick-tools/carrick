@@ -293,6 +293,12 @@ Walk it like this and no other way:
   call again with `scan_from: <next_scan_from>` and offset 0, and page that
   window the same way.
 - The walk is done when an answer has no `has_more` and no `next_scan_from`.
+- The time budget can end a window at a different function on each call
+  (`window.functions_to`), so a window's later pages may not match its first.
+  Where `functions_to` or `total_clusters` changed between the pages of one
+  window, page that window again from offset 0 and keep the union by key,
+  until a whole pass adds no new key. Keep the `scan_from` chain unbroken
+  from one window to the next.
 - A group's key is its members' `file_path:line_number`, sorted and joined with
   `;`. Keep one entry for each key: a key seen again in a later window or page
   is the same group, dropped from the list and counted as a repeat. Two groups
