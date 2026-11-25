@@ -276,12 +276,13 @@ test("the audit skill renders for both scopes, counts first and states its estim
     // A run nobody can answer stops after the estimate unless the ask already said to go.
     assert.match(audit, /Cached re-reads add about 6 times that again, at a tenth of the price\./);
     assert.match(audit, /end your turn after the block with one closing line/);
-    assert.match(audit, /Say "go" to run the full audit, or name one service or sections \(A to E\) to run less\./);
+    assert.match(audit, /`Say "go" to run the audit\.`/);
     assert.match(audit, /Open no source, start no sub-agent and make no further tool call in that turn/);
     assert.match(audit, /do not count again/);
     assert.match(audit, /don't ask, just run"\)\. Carry on with section 2 in the same turn\./);
-    assert.match(audit, /An ask that only names one service or some sections is not a go-ahead/);
-    assert.match(audit, /For an ask that is already narrowed, `Say "go" to run it\.` is enough/);
+    assert.match(audit, /An ask the user has narrowed to one service or some sections is not a go-ahead/);
+    assert.match(audit, /Any other reply is the user's new ask/);
+    assert.doesNotMatch(audit, /to run less|narrow it to one service|to narrow the audit/);
     assert.doesNotMatch(audit, /There is no cap/);
     assert.doesNotMatch(audit, /do not end your turn on a question/);
     assert.doesNotMatch(audit, /caps each section/);
@@ -299,7 +300,7 @@ test("the audit skill's description keeps the words that load it for a plain que
   const audit = renderTaskSkill("carrick-audit", { slug: "acme-index" });
   const description = /^description: (.*)$/m.exec(audit)?.[1] ?? "";
   assert.match(description, /what is wrong in this codebase, what to clean up, a health check of the project, or where the whole project has built the same thing twice/);
-  assert.match(description, /estimated tokens and minutes before it reads any source, then waits for a go-ahead/);
+  assert.match(description, /estimated tokens and minutes before it reads any source, then waits for a go-ahead\.$/);
 });
 
 test("the audit skill runs five sections, each from an index call, and none can be skipped", () => {
