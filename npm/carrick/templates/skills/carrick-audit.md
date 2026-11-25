@@ -46,7 +46,12 @@ Read these counts out of the answers:
   unplaced-base calls included. Section A lists the rows after the go-ahead.
 - **Pairs**: each consumer and producer pair under the map's CONSUMERS. Where
   the map cuts the list short, call it again with `detail: true`.
-- **Groups of similar functions**: `total_clusters` from `find_similar`.
+- **Groups of similar functions**: `total_clusters` from `find_similar`. It
+  counts the first window of the list only: where the answer carries
+  `window.next_scan_from`, the project has further windows, so the number is a
+  floor (`has_more` alone does not say so: it only means this window has more
+  pages). Write it as `at least <n> (first of several windows)` and state the
+  estimate as `at least`. With no `window.next_scan_from` the number is exact.
 - **Operations served**: the endpoint count per service in the map's SERVICES.
 - The first line of the `get_findings` answer (`FINDINGS · project <slug> ·
   index at <commits> · built <day>`): copy it to the top of the report, word
@@ -65,7 +70,8 @@ Work out the estimate from the counts. New tokens are input read for the first
 time plus output. First count the sub-agents the audit will start, with the
 unit rules of section 2: A is 1 unit, or 0 with no calls that reach no route
 (and with more than 30 of them, 1 more for each 30); B is 1 for every 10 pairs;
-C is 1 for every 20 groups; D is 1; E is 1. Where you cannot start sub-agents
+C is 1 for the listing, and 1 more for every 20 groups
+when there are more than 20 (none at all with no groups); D is 1; E is 1. Where you cannot start sub-agents
 the count is 0.
 
 | Section | Per item | New tokens |
@@ -76,10 +82,13 @@ the count is 0.
 | | each call that reaches no route | 6,000 |
 | B. Type verdicts | each pair | 5,500 |
 | C. Functions written twice | each group | 5,000 |
-| D. Routes written twice | each 100 operations served | 132,500 |
+| D. Routes written twice | listing, each service that serves operations | 11,000 |
+| | proof, each candidate: not known before the listing, so the estimate leaves it out | 15,000 |
 | E. One job, several answers | once | 73,500 |
 
-The rates for A to E leave start-up out: it has its own line. Start-up is what
+The listing of D is all the estimate charges for D: how many candidates it
+finds is known only once it has run, and the report states what the proof
+cost. The rates for A to E leave start-up out: it has its own line. Start-up is what
 a sub-agent loads before it does anything, and it depends on how much the
 user's own setup puts into every sub-agent (long instruction files, many
 tools, many skills): about 27,500 new tokens on a bare setup and about 57,000
@@ -107,7 +116,15 @@ Carrick audit: estimate, before any source is read
 - Groups of similar functions: <n>
 - Operations served: <n>
 Sub-agents to start: <k>, about 40,000 new tokens each to start up: <n>
-Estimate: about <total> new tokens (A <n>, B <n>, C <n>, D <n>, E <n>, counting and report <n>, start-up <n>)
+Estimate: about <total> new tokens (A <n>, B <n>, C <n>, D <n> (the listing only; proof is 15,000 for each candidate the listing finds), E <n>, counting and report <n>, start-up <n>)
+```
+
+Where the answer carries `window.next_scan_from`, the groups line reads
+`Groups of similar functions: at least <n> (first of several windows)` and the
+estimate line reads `Estimate: at least about <total> new tokens (...)`, with
+the same parts.
+
+```
 Cached re-reads add about 6 to 10 times that again, at a tenth of the price.
 Time: about <n> minutes with sub-agents, about <n> one section after another
 ```
@@ -170,11 +187,12 @@ Sections A to E do not depend on each other. Split them into units:
   order it came back, each given its groups inline. A unit never works out an
   offset and never asks the index for the list again. With no groups, section C
   has no unit and its count line says so.
-- **D**: one listing unit, for the whole of D's list (section D says how). It
-  keeps only the groups that can be a route written twice, which are the
-  candidates. With no candidate, D starts no sub-agent and its count line says
-  so. With candidates it proves up to 10 itself; with more it returns them at
-  once and you split them into units of 10, each given its candidates inline.
+- **D**: one unit, for the whole of D. Its sub-agent runs it. Its listing never
+  sits in the main agent: the unit lists per service with callbacks included
+  (section D says how), keeps only the groups with two or more route handlers
+  in different files, proves each candidate itself (both handlers opened, and
+  `get_operation` on the path) and returns its table. With
+  no candidate it returns `D: no candidate` and has opened no source.
 - **E**: one unit.
 
 Where you can start sub-agents, give each unit to its own sub-agent and start
@@ -184,10 +202,12 @@ yet. The brief for each is these words with the unit filled in, and nothing
 else:
 
 > Load the carrick-audit skill. Run only section <letter> of it, for <the
-> unit: the whole project for a unit that lists the rows, or its no-route
-> rows, its pairs, its groups or its candidates, each named as the index
-> spells it and given inline>. Where the unit is given rows, pairs, groups or
-> candidates, take those and list nothing: call no listing tool for them.
+> unit: the whole project for a unit that lists for itself (A, C's listing, D
+> and E), or its no-route rows, its pairs or its groups, each named as the
+> index spells it and given inline>. Where the unit is given rows, pairs or
+> groups, take those and list nothing: call no listing tool for them. A unit
+> that lists keeps the listing to itself and returns only its table and count
+> line, or, for C's listing, its groups.
 > Work to the end of the unit
 > and return its table, its count line and any refused calls. Run no other
 > section. Do not estimate, do not ask the user anything and do not start
@@ -196,6 +216,23 @@ else:
 Where you cannot start sub-agents, run the units yourself in the order above,
 and write each unit's table and count line to the user before you start the
 next unit.
+
+**Second fair warning (C).** The listing unit can return far more groups than
+step 1 could see. When it returns more than 1.5 times the group count step 1
+printed, do not start C's proof units yet: let the units already running
+finish, then write a short restated estimate for the rest of C: `The listing
+found <n> groups of similar functions, not <m>: proving them is about <t> new
+tokens more, in <k> sub-agents.` Here <n> is the number listed, <m> the number
+step 1 printed, <k> is 1 for every 20 groups, rounded up, and <t> is <n> times
+5,000 plus <k> times 40,000. Then take the first case that fits, as in step 1:
+the user's first ask already said to go ahead or not to ask, so carry on; you
+have a tool for putting a question to the user, so ask and wait; or you have
+none, so end your turn with the restated estimate and one closing line, `Say
+"go" to run the audit.`, make no further tool call in that turn, and, when the
+next message says go, start the C units with the list you already hold,
+listing nothing again. At or under 1.5 times, carry on without asking. A no
+leaves C unproven and the report says so in C's count line; it changes
+nothing else in the audit.
 
 A unit is done when it has returned its count line and the two numbers in it
 are equal. Run again any unit that came back without one.
@@ -399,14 +436,15 @@ differs names the group that went missing.
 
 ## D. Routes written twice
 
-Route handlers are left out of section C's list on purpose: the default list
-drops anonymous callbacks, and every route handler the index names is one (on
-one project the same service lists 27 groups by default and 68 with callbacks,
-and a route twin sits only in the 68). The tool has no filter for route-handler
-rows and its rows carry no role, so section C's walk cannot give D its
-candidates. List them from the narrowest call the tool has, once for each
-service that serves operations, unless the unit was given candidates, in which
-case take those and list nothing:
+This section is one unit and runs in one place: the unit's own sub-agent, or,
+where you cannot start sub-agents, you as D's unit. Route handlers are left out
+of section C's list on purpose: the default list drops anonymous callbacks,
+and every route handler the index names is one (on one project the same
+service lists 27 groups by default and 68 with callbacks, and a route twin
+sits only in the 68). The tool has no filter for route-handler rows and its
+rows carry no role, so section C's walk cannot give D its candidates. List
+them from the narrowest call the tool has, once for each service that serves
+operations:
 
 ```
 find_similar({{SCOPE}}, audit: true, include_callbacks: true, service: "<producer>", limit: 50)
@@ -419,8 +457,8 @@ handler's name starts with its method or operation kind and ends in `_handler`,
 such as `post_orders_handler`. Drop every other group unread: section C covers
 the named functions, and callbacks inside one function are not routes. These
 are the candidates; give each a number and a key as section C does, and keep
-each as its members' names, files and lines. Where you hold none, stop: D has
-no proof unit and no sub-agent, and the count line says so.
+each as its members' names, files and lines. Where you hold none, stop and open
+no source: return `D: no candidate`.
 
 For each candidate, find the full path of each handler and who calls it:
 
@@ -442,11 +480,10 @@ does. Class each candidate:
 - **WRITTEN TWICE, SAME**: the same logic in two files.
 - **NOT A COPY**: the handlers serve different things.
 
-Count line: `D listing: <services listed> services listed,
-<groups returned> groups read, <candidates> candidates`; with no candidate it
-ends: `D: no candidate, no unit`; for a unit: `D <first number>-<last number>:
-<candidates given> given, <candidates classed> classed`. Across section D the
-candidates listed, given and classed are equal.
+Count line: `D: <services listed> services listed, <groups returned> groups
+read, <candidates> candidates, <candidates classed> classed`; with no candidate
+it is `D: no candidate`. Across section D the candidates found and classed are
+equal.
 
 ## E. One job, several answers
 
@@ -482,7 +519,7 @@ classed`.
 ## 3. Report
 
 Before you write, check that you hold a count line for every unit of every
-section and that its numbers are equal. Run now any unit that is missing.
+section and that its numbers are equal. Run now any unit that is missing, except C's proof units after a no to the second fair warning.
 
 The report, in this order:
 

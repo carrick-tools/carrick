@@ -343,7 +343,7 @@ test("the audit skill's estimate counts sub-agent start-up, and step 1 shows the
     // Rates measured after start-up was taken out.
     assert.match(audit, /\| each pair \| 5,500 \|/);
     assert.match(audit, /\| each group \| 5,000 \|/);
-    assert.match(audit, /\| each 100 operations served \| 132,500 \|/);
+    assert.match(audit, /\| listing, each service that serves operations \| 11,000 \|/);
     assert.match(audit, /\| E\. One job, several answers \| once \| 73,500 \|/);
     // The cache line: a range, still at a tenth of the price; the old single figure is gone.
     assert.match(audit, /Cached re-reads add about 6 to 10 times that again, at a tenth of the price\./);
@@ -465,10 +465,58 @@ test("the audit skill reads every similar-function group once and starts no rout
     // D: its candidates cannot come from C's list; with none, no unit starts.
     assert.match(audit, /section C's walk cannot give D its candidates/);
     assert.match(audit, /Drop every other group unread/);
-    assert.match(audit, /With no candidate, D starts no sub-agent and its count line says so/);
-    assert.match(audit, /`D: no candidate, no unit`/);
-    assert.match(audit, /candidates listed, given and classed are equal/);
-    assert.doesNotMatch(audit, /\*\*D\*\*: one unit\./);
+    assert.match(audit, /Across section D the candidates found and classed are equal/);
+  }
+});
+
+test("the audit skill runs D as one sub-agent unit, never as a listing in the main agent", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    assert.match(audit, /\*\*D\*\*: one unit, for the whole of D\./);
+    assert.match(audit, /lists per service with callbacks included \(section D says how\), keeps only the groups with two or more route handlers in different files/);
+    assert.match(audit, /proves each candidate itself/);
+    assert.match(audit, /Its listing never sits in the main agent/);
+    assert.match(audit, /with no candidate it returns `D: no candidate` and has opened no source/);
+    assert.match(audit, /Count line: `D: <services listed> services listed/);
+    assert.doesNotMatch(audit, /units of 10/);
+    assert.doesNotMatch(audit, /D starts no sub-agent/);
+    assert.doesNotMatch(audit, /`D: no candidate, no unit`/);
+    assert.doesNotMatch(audit, /unless the unit was given candidates/);
+  }
+});
+
+test("the audit skill's estimate charges C by the groups it can see, D by its listing only, and counts the sub-agents of C and D", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    assert.match(audit, /\| C\. Functions written twice \| each group \| 5,000 \|/);
+    assert.match(audit, /\| D\. Routes written twice \| listing, each service that serves operations \| 11,000 \|/);
+    assert.match(audit, /\| \| proof, each candidate: not known before the listing, so the estimate leaves it out \| 15,000 \|/);
+    assert.doesNotMatch(audit, /each 100 operations served/);
+    assert.doesNotMatch(audit, /132,500/);
+    assert.match(audit, /where the answer carries `window\.next_scan_from`, the project has further windows/);
+    assert.match(audit, /Groups of similar functions: at least <n> \(first of several windows\)/);
+    assert.match(audit, /Estimate: at least about <total> new tokens/);
+    assert.match(audit, /C is 1 for the listing, and 1 more for every 20 groups/);
+    assert.match(audit, /D is 1; E is 1/);
+    assert.match(audit, /D <n> \(the listing only; proof is 15,000 for each candidate the listing finds\)/);
+  }
+});
+
+test("the audit skill gives a second fair warning when the C listing finds far more groups than step 1 saw", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    const second = /Second fair warning([^]*?)A unit is done when/.exec(audit);
+    assert.ok(second, "the second fair warning is missing");
+    const text = second[1] ?? "";
+    assert.match(text, /returns more than 1\.5 times the group count step 1 printed/);
+    assert.match(text, /do not start C's proof units yet/);
+    assert.match(text, /let the units already running finish/);
+    assert.match(text, /The listing found <n> groups of similar functions, not <m>: proving them is about <t> new tokens more, in <k> sub-agents\./);
+    assert.match(text, /`Say "go" to run the audit\.`/);
+    assert.match(text, /start the C units with the list you already hold, listing nothing again/);
+    assert.match(text, /At or under 1\.5 times, carry on without asking/);
+    assert.match(text, /leaves C unproven and the report says so in C's count line/);
+    assert.doesNotMatch(text, /narrow/i);
   }
 });
 
