@@ -303,6 +303,24 @@ test("the audit skill's description keeps the words that load it for a plain que
   assert.match(description, /estimated tokens and minutes before it reads any source, then waits for a go-ahead\.$/);
 });
 
+test("the audit skill sizes section A by no-route rows, never by services", () => {
+  for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
+    const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
+    const argument = scope.slug === null ? 'repo: "<owner/repo>"' : 'project: "acme-index"';
+    assert.ok(audit.includes(`get_service_graph(${argument}, limit: 200)`), "step 1 lacks the whole-project listing of unmatched rows");
+    assert.match(audit, /one unit for every 30 no-route rows from step 1 \(13 rows are one unit, 31 are two\)/);
+    assert.match(audit, /A service with no no-route row gets no unit, and no source is opened for it/);
+    assert.match(audit, /Never start one sub-agent for each service/);
+    assert.match(audit, /where `services` names several, the call sits in a shared file and counts once/);
+    assert.match(audit, /<rows read> of <rows given> no-route rows read/);
+    assert.match(audit, /add up to the no-route count from step 1, with a call site counted once/);
+    assert.match(audit, /each unit of 30 no-route calls \| 20,000/);
+    assert.doesNotMatch(audit, /one unit for each service in `unmatched_by_service`/);
+    assert.doesNotMatch(audit, /each service with unmatched calls/);
+    assert.doesNotMatch(audit, /unmatched rows seen> of <unmatched_count>/);
+  }
+});
+
 test("the audit skill runs five sections, each from an index call, and none can be skipped", () => {
   for (const scope of [{ slug: "acme-index" }, { slug: null }]) {
     const audit = renderTaskSkill("carrick-audit", scope).replace(/\s+/g, " ");
