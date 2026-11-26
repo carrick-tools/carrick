@@ -1602,7 +1602,8 @@ function unbuiltPart(claim: LibraryClaim): string | undefined {
       }
     }
     if (formUnbuilt(claim)) return `form.${claim.form}`;
-    if (claim.when !== undefined) return 'when';
+    // A request op's `when` is judged (`whenFailure`); on any other op it still is not.
+    if (claim.when !== undefined && claim.op !== 'request') return 'when';
   }
   for (const slot of slots) {
     if (slot === undefined) continue;
@@ -1913,6 +1914,7 @@ type PartName =
   | 'handler'
   | 'ack'
   | 'method'
+  | 'when'
   | 'runs'
   | 'mounts';
 
@@ -1924,6 +1926,8 @@ interface ClaimLayout {
   keyed: Map<number, Map<string, PartName>>;
   /** Where a `handler` slot carries `or_file` (`slotKey`). */
   orFile?: ReadonlySet<string>;
+  /** The literal a `when` slot must be able to hold (V1b). */
+  whenLiteral?: string;
 }
 
 /** One slot's place in a `ClaimLayout`: its argument, and its key when it has one. */
@@ -3276,9 +3280,11 @@ class DeclarationReader {
       ack: claim.ack,
       base: claim.base,
       method: claim.method_key,
+      when: claim.when,
       runs: runs && !boundRuns ? { arg: runs.arg, ...(runs.key === undefined ? {} : { key: runs.key }) } : undefined,
     });
     if ('failure' in layout) return layout.failure;
+    if (claim.when !== undefined) layout.value.whenLiteral = claim.when.literal;
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, form === 'new' ? 'new' : 'call');
     if ('failure' in callee) return callee.failure;
     const labels = claim.key_labels ?? {};
@@ -4097,6 +4103,13 @@ class DeclarationReader {
         if (!this.acceptsMethod(declared)) return { rank: 1, outcome: this.slotFailure(declared, 'method_not_string') };
         continue;
       }
+      if (part === 'when') {
+        const declared = this.keyParameterAt(signature, arg);
+        if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
+        const bad = this.whenFailure(declared, layout.whenLiteral);
+        if (bad) return { rank: 1, outcome: bad };
+        continue;
+      }
       if (part === 'document' || part === 'ref') {
         const declared = this.keyParameterAt(signature, arg);
         if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
@@ -4138,7 +4151,7 @@ class DeclarationReader {
     for (const [arg, keys] of layout.keyed) {
       const slot = this.keyParameterAt(signature, arg);
       if (slot === undefined) return { rank: 1, outcome: failed('param_missing') };
-      const view = this.viewFor(slot, keys, runsFailure, key => layout.orFile?.has(slotKey(arg, key)) === true);
+      const view = this.viewFor(slot, keys, runsFailure, key => layout.orFile?.has(slotKey(arg, key)) === true, layout.whenLiteral);
       if ('rank' in view) return view;
       views.set(arg, view.view);
     }
@@ -4156,7 +4169,8 @@ class DeclarationReader {
     slot: Slot,
     keys: ReadonlyMap<string, PartName>,
     runsFailure: RunsPredicate,
-    orFile: (key: string) => boolean = () => false
+    orFile: (key: string) => boolean = () => false,
+    whenLiteral?: string
   ): { view: ts.Type } | RankedFailure {
     if (slot === VARIADIC || !this.isObjectType(slot)) {
       return { rank: 1, outcome: this.slotFailure(slot, 'param_missing') };
@@ -4188,6 +4202,13 @@ class DeclarationReader {
         if (part === 'payload' && this.isFunctionSlot(type)) {
           failure = { rank: 3, outcome: failed('payload_is_function') };
           break;
+        }
+        if (part === 'when') {
+          const bad = this.whenFailure(type, whenLiteral);
+          if (bad) {
+            failure = { rank: 3, outcome: bad };
+            break;
+          }
         }
         if (part === 'method' && !this.acceptsMethod(type)) {
           failure = { rank: 3, outcome: this.slotFailure(type, 'method_not_string') };
@@ -4428,8 +4449,18 @@ class DeclarationReader {
    * B6, the `index_key_generic_map` reading, now the only one).
    */
   private isIndexMap(map: ts.Type): boolean {
-    if (map.flags & ts.TypeFlags.TypeParameter) return false;
+    if (this.rootsInTypeParameter(map)) return false;
     return this.hasIndexSignature(map);
+  }
+
+  /**
+   * The map is a type parameter, or reads a member of one (`S["Tables"]`):
+   * the service's own type argument decides its keys, as for an event map.
+   */
+  private rootsInTypeParameter(map: ts.Type): boolean {
+    let current = map;
+    while (current.flags & ts.TypeFlags.IndexedAccess) current = (current as ts.IndexedAccessType).objectType;
+    return (current.flags & ts.TypeFlags.TypeParameter) !== 0;
   }
 
   private hasIndexSignature(type: ts.Type): boolean {
@@ -5225,7 +5256,7 @@ class DeclarationReader {
         const callee = this.ownCallee(holder, [], member.name, 'call');
         if (!('signatures' in callee)) continue;
         if (!callee.signatures.some(signature => this.takesString(signature))) continue;
-        const type = this.scopeTypeOf(callee.signatures, built(source.export, id), source.type, source.home);
+        const type = this.scopeTypeOf(pkg, callee.signatures, built(source.export, id), source.type, source.home);
         if (type === undefined || !take()) continue;
         const home = this.homeOf(pkg, [source.target, ...typeSymbols(type)]);
         this.typeContext = source.export;
@@ -5433,7 +5464,7 @@ class DeclarationReader {
     for (const property of sortedByName(this.namedProperties(type))) {
       if (!this.mayScope(property)) continue;
       const callee = this.ownCallee(holder, [], property.getName(), 'call');
-      if ('signatures' in callee && this.scopeTypeOf(callee.signatures, undefined, type, home) !== undefined) {
+      if ('signatures' in callee && this.scopeTypeOf(pkg, callee.signatures, undefined, type, home) !== undefined) {
         names.push(property.getName());
       }
     }
@@ -5456,7 +5487,8 @@ class DeclarationReader {
    *   object parameter;
    * - the returns (at `built`'s defaults, less those that say nothing) are
    *   all object types, none thenable, sharing one declared symbol that is
-   *   declared in the receiver's home and has a callable member of its own;
+   *   declared in the receiver's home, or in a package the listed package
+   *   declares as a dependency, and has a callable member of its own;
    * - that symbol and the receiver's share no declaration in the home
    *   (`family`): the receiver itself (`basePath(): this`), a sibling or a
    *   wrapper of one base is a builder's next link, not an object routes
@@ -5465,6 +5497,7 @@ class DeclarationReader {
    * one of the signatures that take a string, else the first of them.
    */
   private scopeTypeOf(
+    pkg: string,
     signatures: readonly ts.Signature[],
     built: ts.Signature | undefined,
     receiver: ts.Type,
@@ -5486,12 +5519,36 @@ class DeclarationReader {
     for (const { type } of returns) {
       if (!this.isObjectType(type) || symbolOf(type) !== symbol || this.isThenable(type)) return undefined;
     }
-    if (!(symbol.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), home))) return undefined;
+    const declared = this.declaredDependencies(pkg, receiver);
+    if (
+      !(symbol.declarations ?? []).some(declaration => {
+        const file = declaration.getSourceFile();
+        if (this.isOwnFile(file, home)) return true;
+        const owner = this.packageOf(file);
+        return owner !== undefined && declared.has(owner);
+      })
+    ) {
+      return undefined;
+    }
     const chosen = returns.find(({ signature }) => built !== undefined && this.instantiates(built, signature)) ?? returns[0];
     const callable = this.namedProperties(chosen.type).some(
       member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0
     );
     return callable ? chosen.type : undefined;
+  }
+
+  /**
+   * The packages the listed package declares as dependencies, read from the
+   * manifest of the installed package that declares the receiver's type
+   * (empty when no declaration of it is in the listed package).
+   */
+  private declaredDependencies(pkg: string, receiver: ts.Type): ReadonlySet<string> {
+    const named = packageNameOf(pkg);
+    for (const declaration of (receiver.getSymbol() ?? receiver.aliasSymbol)?.declarations ?? []) {
+      const installed = this.installedPackage(declaration.getSourceFile().fileName);
+      if (installed !== undefined && (installed.packageName ?? installed.directoryName) === named) return installed.dependencies;
+    }
+    return new Set();
   }
 
   /** The type's own declaration and every base it extends or implements that its home declares. */
@@ -6435,6 +6492,29 @@ class DeclarationReader {
     return fallback !== undefined && this.acceptsString(fallback) ? fallback : slot;
   }
 
+  /**
+   * A `when` slot can hold the literal the claim names: a boolean slot holds
+   * `true` and `false`, a number slot a number, a string slot any text, and a
+   * literal type its own value. A slot that says nothing is `member_untyped`.
+   * Undefined when it holds (V1b).
+   */
+  private whenFailure(declared: Slot, literal: string | undefined): Outcome | undefined {
+    // The schema requires the literal (`validators.ts`, `when.literal`), so this is never read.
+    if (literal === undefined) return unchecked('claim_invalid');
+    const slot = this.throughConstraint(declared);
+    if (slot === VARIADIC || this.saysNothing(slot)) return unchecked('member_untyped');
+    const flags = (literal === 'true' || literal === 'false' ? ts.TypeFlags.BooleanLike : 0) |
+      (literal.trim() !== '' && Number.isFinite(Number(literal)) ? ts.TypeFlags.NumberLike : 0) |
+      ts.TypeFlags.StringLike;
+    const holds = this.parts(slot).some(part => {
+      if (part.isStringLiteral()) return part.value === literal;
+      if (part.isNumberLiteral()) return String(part.value) === literal;
+      if (part.flags & ts.TypeFlags.BooleanLiteral) return (part as ts.Type & { intrinsicName?: string }).intrinsicName === literal;
+      return (part.flags & flags) !== 0;
+    });
+    return holds ? undefined : failed('when_literal_unaccepted');
+  }
+
   /** Accepts string, or names an HTTP method as a literal in either case. */
   private acceptsMethod(declared: Slot): boolean {
     const slot = this.throughConstraint(declared);
@@ -6777,6 +6857,8 @@ interface InstalledPackage {
   directoryName: string;
   packageName: string | undefined;
   version: string | undefined;
+  /** The names its manifest declares under dependencies, peerDependencies and optionalDependencies. */
+  dependencies: ReadonlySet<string>;
 }
 
 function readInstalledPackage(
@@ -6788,14 +6870,19 @@ function readInstalledPackage(
   if (!host.fileExists(manifest)) return null;
   let packageName: string | undefined;
   let version: string | undefined;
+  const dependencies = new Set<string>();
   try {
-    const parsed = JSON.parse(host.readFile(manifest) ?? '') as { name?: unknown; version?: unknown } | null;
+    const parsed = JSON.parse(host.readFile(manifest) ?? '') as Record<string, unknown> | null;
     if (typeof parsed?.name === 'string') packageName = parsed.name;
     if (typeof parsed?.version === 'string') version = parsed.version;
+    for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+      const declared = parsed?.[field];
+      if (declared && typeof declared === 'object') for (const name of Object.keys(declared)) dependencies.add(name);
+    }
   } catch {
     // An unreadable manifest still marks an installed directory; it names no package.
   }
-  return { directoryName, packageName, version };
+  return { directoryName, packageName, version, dependencies };
 }
 
 function isNullish(type: ts.Type): boolean {
