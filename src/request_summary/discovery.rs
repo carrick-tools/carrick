@@ -9868,6 +9868,11 @@ export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
             (5, ["bill-closed", "bill-opened"]),
             (6, ["ship-cancelled", "ship-created"]),
             (9, ["bill-closed", "bill-opened"]),
+            // One function makes the queue for two lists: each send states
+            // the names its own opener call made (QW-2b, R-QW2a; was a
+            // SeveralOperations lead, carrick#4418).
+            (14, ["ship-cancelled", "ship-created"]),
+            (15, ["bill-closed", "bill-opened"]),
         ] {
             let record = record_at(line);
             assert_eq!(record.state.asked, vec![Slot::Kind], "{line}: {shown:#?}");
@@ -9901,28 +9906,6 @@ export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
             Some(super::super::stop::Stop::UnreadExpression),
             "{shown:#?}"
         );
-        // One function makes the queue for two lists: its parameter's
-        // values are decided at two calls, so neither send states the
-        // other list's names: no record states any, and a lead says why
-        // (carrick#4418).
-        for line in [14, 15] {
-            let point = at(line);
-            assert!(
-                !records.iter().any(|record| record.state.point.at == point),
-                "{line}: {shown:#?}"
-            );
-            let reasons: Vec<_> = decided
-                .leads
-                .iter()
-                .filter(|lead| lead.file == "src/sends.ts" && lead.line == line)
-                .map(|lead| lead.reason)
-                .collect();
-            assert_eq!(
-                reasons,
-                [super::super::stop::Stop::SeveralOperations],
-                "{line}: {shown:#?}"
-            );
-        }
         // A maker in another file: its argument is read in that file, one
         // row per branch of the choice it writes.
         assert_eq!(record_at(16).names, ["flip-even", "flip-odd"], "{shown:#?}");
@@ -10119,37 +10102,73 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             let point = format!("src/pooled.ts:{line}");
             records.iter().any(|record| record.state.point.at == point)
         };
+        let names_at = |line: u32| -> Vec<String> {
+            let point = format!("src/pooled.ts:{line}");
+            let mut names: Vec<String> = records
+                .iter()
+                .filter(|record| record.state.point.at == point)
+                .flat_map(|record| record.names.iter().cloned())
+                .collect();
+            names.sort();
+            names
+        };
+        let forced_at = |line: u32| -> Option<String> {
+            let point = format!("src/pooled.ts:{line}");
+            records
+                .iter()
+                .find(|record| record.state.point.at == point)
+                .and_then(|record| {
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned()
+                })
+        };
         // One opener, one caller: the names are read at that call.
         assert!(has_record(5), "{shown:#?}");
         assert_eq!(reason_at(5), None, "{shown:#?}");
-        // Two loops over different lists through one opener, and the same
-        // list looped twice: the send states no name, and several
-        // operations say why.
-        for line in [7, 8, 14, 15] {
-            assert!(!has_record(line), "{line}: {shown:#?}");
-            assert_eq!(
-                reason_at(line),
-                Some(Stop::SeveralOperations),
-                "{line}: {shown:#?}"
-            );
+        // Each send's queue is the one its own opener call made, so each
+        // is named by that call's text (carrick#3504 QW-2b): two loops over
+        // different lists through one opener, and the same list looped
+        // twice, name each list's elements at their own send.
+        for (line, names) in [
+            (7, ["ship-cancelled", "ship-created"]),
+            (8, ["bill-closed", "bill-opened"]),
+            (14, ["ship-cancelled", "ship-created"]),
+            (15, ["ship-cancelled", "ship-created"]),
+        ] {
+            assert_eq!(names_at(line), names, "{line}: {shown:#?}");
+            assert_eq!(reason_at(line), None, "{line}: {shown:#?}");
         }
-        // A field of a call result at two calls: the resolver cannot read it.
+        // A field of a call result at two calls: the resolver cannot read
+        // it. The send is a lead with a record and no name (QW-2b: a record
+        // now stands there, as the filter reads past the unread sibling).
         for line in [11, 12] {
-            assert!(!has_record(line), "{line}: {shown:#?}");
+            assert!(has_record(line), "{line}: {shown:#?}");
+            assert!(names_at(line).is_empty(), "{line}: {shown:#?}");
             assert_eq!(
                 reason_at(line),
                 Some(Stop::UnreadExpression),
                 "{line}: {shown:#?}"
             );
         }
-        // Two literals and two different identifiers through one opener stay
-        // several operations.
-        for line in [17, 18, 20, 21] {
+        // Two literals and two different identifiers through one opener are
+        // one name each.
+        for (line, name) in [(17, "lit-a"), (18, "lit-b")] {
             assert_eq!(
-                reason_at(line),
-                Some(Stop::SeveralOperations),
+                forced_at(line),
+                Some(name.to_string()),
                 "{line}: {shown:#?}"
             );
+            assert_eq!(reason_at(line), None, "{line}: {shown:#?}");
+        }
+        for (line, names) in [
+            (20, ["ship-cancelled", "ship-created"]),
+            (21, ["bill-closed", "bill-opened"]),
+        ] {
+            assert_eq!(names_at(line), names, "{line}: {shown:#?}");
+            assert_eq!(reason_at(line), None, "{line}: {shown:#?}");
         }
         // An environment read keeps its own word, at two calls and at one.
         for line in [24, 25, 27] {
@@ -10162,6 +10181,86 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         {
             assert_ne!(call.unread.reason, Stop::Unanswered, "{shown:#?}");
         }
+    }
+
+    /// A maker-bound name is the one the own-factory calls its instance came
+    /// through spell (carrick#3504 QW-2b). `makeQueue` is the one factory,
+    /// called by two getters, and each send is on the queue its own getter's
+    /// call made: `alphaQueue().add` names `alpha-q`, `betaQueue().add`
+    /// `beta-q`. Before, each send read both calls and was a
+    /// `several_operations` lead.
+    #[test]
+    fn a_maker_name_is_read_at_the_factory_call_its_instance_came_through() {
+        let getters = "import { Queue } from 'bullmq';\n\
+function makeQueue(name: string) { return new Queue(name); }\n\
+function alphaQueue() { return makeQueue('alpha-q'); }\n\
+function betaQueue() { return makeQueue('beta-q'); }\n\
+export async function pushAlpha() { await alphaQueue().add('task', { n: 1 }); }\n\
+export async function pushBeta() { await betaQueue().add('task', { n: 1 }); }\n";
+        let (shown, forced) = factory_sends(getters);
+        for (line, name) in [(5, "alpha-q"), (6, "beta-q")] {
+            assert_eq!(forced(line), Some(name.to_string()), "{line}: {shown:#?}");
+        }
+    }
+
+    /// One unread sibling caller of the factory does not unname another
+    /// instance (carrick#3504 QW-2b): a third getter spells its name from a
+    /// value nothing states, and `alphaQueue().add` is still `alpha-q`.
+    #[test]
+    fn one_unread_sibling_caller_does_not_unname_another_instance() {
+        let getters = "import { Queue } from 'bullmq';\n\
+declare function loadConfig(): { name: string };\n\
+function makeQueue(name: string) { return new Queue(name); }\n\
+function alphaQueue() { return makeQueue('alpha-q'); }\n\
+function cfgQueue() { const cfg = loadConfig(); return makeQueue(cfg.name); }\n\
+export async function pushAlpha() { await alphaQueue().add('task', { n: 1 }); }\n\
+export async function pushCfg() { await cfgQueue().add('task', { n: 1 }); }\n";
+        let (shown, forced) = factory_sends(getters);
+        assert_eq!(forced(6), Some("alpha-q".to_string()), "{shown:#?}");
+        assert_eq!(forced(7), None, "{shown:#?}");
+    }
+
+    /// The `src/getters.ts` of one of the tests above, scanned: what each
+    /// send's record forces as its name, by line, beside the records shown.
+    fn factory_sends(source: &str) -> (Vec<String>, impl Fn(u32) -> Option<String>) {
+        use crate::site_questions::Slot;
+        let Some((on, exports, declarations)) = traced_fixture_files(
+            "queue-enum-base-class-one",
+            ".",
+            "jobs",
+            &[("src/getters.ts", source)],
+            |_| {},
+        ) else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let shown: Vec<String> = records
+            .iter()
+            .filter(|record| record.state.point.at.starts_with("src/getters.ts:"))
+            .map(|record| {
+                format!(
+                    "{} {:?} asked={:?} forced={:?} unread={:?}",
+                    record.state.point.at,
+                    record.bucket,
+                    record.state.asked,
+                    record.state.forced.get(&Slot::Name),
+                    record.unread
+                )
+            })
+            .collect();
+        let forced = move |line: u32| {
+            let point = format!("src/getters.ts:{line}");
+            records
+                .iter()
+                .find(|record| record.state.point.at == point)
+                .and_then(|record| record.state.forced.get(&Slot::Name).cloned())
+        };
+        (shown, forced)
     }
 
     /// A maker-bound name a parameter's default states, at a caller that
