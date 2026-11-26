@@ -108,6 +108,7 @@ pub mod time_limits;
 pub(crate) mod tsconfig_program;
 pub mod type_home;
 pub mod type_manifest;
+pub mod type_resources;
 pub mod unfollowed_calls;
 pub mod unread_sites;
 pub mod untrusted_yarn;

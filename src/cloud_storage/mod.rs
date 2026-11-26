@@ -1531,6 +1531,7 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
         handler_span: endpoint.handler_span,
         handler_file: endpoint.handler_file.clone(),
         declared_at: endpoint.declared_at.clone(),
+        resource: endpoint.resource.clone(),
         ..Default::default()
     }
 }
@@ -2688,6 +2689,53 @@ mod tests {
         );
     }
 
+    /// A row a type states carries its `resource` through the one projection
+    /// to the wire (`endpoints[].resource`, snake_case kind), and no other row
+    /// writes the key at all: a blob stays byte-for-byte what it was for every
+    /// repository with no such row.
+    #[test]
+    fn mount_graph_projection_carries_the_resource_only_where_a_type_states_one() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::mount_graph::ResolvedEndpoint;
+        use crate::type_resources::{Resource, ResourceKind};
+
+        let row = |path: &str, resource: Option<Resource>| ResolvedEndpoint {
+            method: "ALL".to_string(),
+            path: path.to_string(),
+            full_path: path.to_string(),
+            owner: "__type_resource__".to_string(),
+            file_location: "src/types.ts:4".to_string(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(ResolutionSource::TypeResource),
+            resource,
+            ..Default::default()
+        };
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(row(
+            "/rest/v1/accounts",
+            Some(Resource {
+                schema: "public".to_string(),
+                name: "accounts".to_string(),
+                kind: ResourceKind::Table,
+            }),
+        ));
+        graph.endpoints.push(row("/rest/v1/other", None));
+        let (endpoints, _) = mount_graph_to_api_details(&graph);
+        let wire = serde_json::to_value(&endpoints[0]).unwrap();
+        assert_eq!(wire["resolution_source"], "type_resource");
+        assert_eq!(
+            wire["resource"],
+            serde_json::json!({"schema": "public", "name": "accounts", "kind": "table"})
+        );
+        assert!(
+            serde_json::to_value(&endpoints[1])
+                .unwrap()
+                .get("resource")
+                .is_none(),
+            "a row with no resource writes no key"
+        );
+    }
+
     /// carrick#831: the dispatch case survives the one projection both cloud
     /// paths go through, on the producer side and the consumer side, and
     /// reaches the wire only where a row has one.
@@ -3580,6 +3628,11 @@ mod tests {
         let graph = data.mount_graph.expect("the blob carries its mount graph");
         assert!(graph.endpoints[0].resolution_source.is_none());
         assert!(graph.data_calls[0].resolution_source.is_none());
+
+        // The `resource` field the same way: a blob written before it
+        // existed reads with none, on the operation and the mount-graph row.
+        assert!(data.endpoints[0].resource.is_none());
+        assert!(graph.endpoints[0].resource.is_none());
 
         // carrick#704's field the same way: a blob with no `view_module` key
         // reads as "not a view module" on the operation and on the mount-graph
