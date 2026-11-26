@@ -495,6 +495,8 @@ mod tests {
             yields: None,
             name_scope: None,
             name_at_maker: false,
+            name_prefix: None,
+            path: Vec::new(),
             package: "fixture-router".into(),
             export: "Router".into(),
             member: Some("get".into()),
@@ -536,6 +538,7 @@ mod tests {
             new: false,
             scope: scope.map(str::to_string),
             procedure: None,
+            path: Vec::new(),
         };
         (
             label(None, 1, true, 0),
