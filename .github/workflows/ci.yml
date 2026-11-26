@@ -355,6 +355,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: python3 scripts/ci-wired-check.py
 
+      # Installed dependencies are never committed: the ignore rules held
+      # when 2,621 files of src/sidecar/node_modules were force-added (#4018)
+      # and shipped in every tag. Only fixture trees may track one.
+      - name: No tracked node_modules outside fixtures
+        run: |
+          BAD=$(git ls-files | grep '(^|/)node_modules/' -E | grep -vE '(^|/)(test|tests)/fixtures/|^examples/' || true)
+          if [ -n "$BAD" ]; then echo "$BAD" | head -20; echo "tracked node_modules outside fixtures (git rm -r --cached)"; exit 1; fi
+
   # The one required check. A matrix job reports as many checks as it has
   # shards, and a ruleset pins each name, so a shard rename or a new job
   # would need a ruleset edit; this job fails unless every job it needs
