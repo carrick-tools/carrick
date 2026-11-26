@@ -1483,11 +1483,75 @@ impl SiteReader<'_> {
                     out,
                 );
             }
+            if let Some(key) = key
+                && let Some(restated) = self.restate_as_decorator(ir, site, &library, key)
+            {
+                out.push(restated);
+            }
             out.push(library);
         }
         for nested in ir.nested.iter().chain(&ir.detached) {
             self.collect(nested, None, out, keyed);
         }
+    }
+
+    /// The library call `site` of the function `key` (whose body is `ir`),
+    /// read as `library`, restated as the decorator a method gets
+    /// (carrick#3781, ruling R4): a call-form use of an export, written in
+    /// what the function hands back (an arrow's expression body or a
+    /// `return` argument, at any depth of call arguments:
+    /// [`super::FnIr::held_return`]), where every call of the function is a
+    /// method decorator's. The same call in the decorate form, its name
+    /// read through what each decorator passes and stated at each method's
+    /// name, as any library call a caller fills (the text reader's callers
+    /// mode). The export's call-form uses of the same member are that
+    /// decorator's use. A function any other call reaches restates
+    /// nothing: what it hands back is no decorator a method is known to
+    /// get.
+    fn restate_as_decorator(
+        &self,
+        ir: &FnIr,
+        site: &LibrarySiteIr,
+        library: &LibrarySite,
+        key: &str,
+    ) -> Option<LibrarySite> {
+        if site.form != MakerForm::Call {
+            return None;
+        }
+        let returned = ir
+            .held_return
+            .bare
+            .iter()
+            .chain(&ir.held_return.held)
+            .any(|span| span.lo.0 == site.site.lo && span.hi.0 == site.site.hi);
+        if !returned {
+            return None;
+        }
+        let callers = self.callers.of(self.file, key);
+        if callers.is_empty() || !callers.iter().all(|caller| caller.decorates) {
+            return None;
+        }
+        let as_decorator = |uses: &BTreeSet<MemberUse>| -> BTreeSet<MemberUse> {
+            uses.iter()
+                .map(|used| match used.form {
+                    MakerForm::Call
+                        if used.path == library.path && used.member == library.member =>
+                    {
+                        MemberUse {
+                            form: MakerForm::Decorate,
+                            ..used.clone()
+                        }
+                    }
+                    _ => used.clone(),
+                })
+                .collect()
+        };
+        Some(LibrarySite {
+            form: MakerForm::Decorate,
+            uses: as_decorator(&library.uses),
+            export_uses: as_decorator(&library.export_uses),
+            ..library.clone()
+        })
     }
 
     /// The function of the service the call at `site` in `file` reaches,
@@ -1626,6 +1690,12 @@ impl SiteReader<'_> {
         chain.push((function.0.to_path_buf(), function.1.to_string()));
         let (builders, via) = on_the_way;
         for caller in self.callers.of(function.0, function.1) {
+            // A decorator's call fills no call of the library: the call it
+            // reaches hands back the decorator, which
+            // [`Self::restate_as_decorator`] reads (carrick#3781).
+            if caller.decorates {
+                continue;
+            }
             let Some(written) = &caller.call.site_args else {
                 continue;
             };
@@ -2156,6 +2226,10 @@ struct Caller<'a> {
     /// its parameters are what its own callers pass. `None` for a call at
     /// module level or in a function written inside another.
     key: Option<&'a str>,
+    /// The call is a method decorator's ([`super::FileIr::decorator_calls`],
+    /// carrick#3781): a module-level caller whose value is the decorator
+    /// the method gets.
+    decorates: bool,
 }
 
 impl<'a> Callers<'a> {
@@ -2169,10 +2243,12 @@ impl<'a> Callers<'a> {
         ) {
             for call in &ir.calls {
                 if let Some(target) = inputs.call_target(file, call.site.lo, call.site.hi) {
-                    by_target
-                        .entry(target)
-                        .or_default()
-                        .push(Caller { file, call, key });
+                    by_target.entry(target).or_default().push(Caller {
+                        file,
+                        call,
+                        key,
+                        decorates: false,
+                    });
                 }
             }
             for nested in ir.nested.iter().chain(&ir.detached) {
@@ -2196,6 +2272,16 @@ impl<'a> Callers<'a> {
                 );
             }
             walk(inputs, path, &file.module_level, None, &mut by_target);
+            for call in file.decorator_calls() {
+                if let Some(target) = inputs.call_target(path, call.site.lo, call.site.hi) {
+                    by_target.entry(target).or_default().push(Caller {
+                        file: path,
+                        call,
+                        key: None,
+                        decorates: true,
+                    });
+                }
+            }
         }
         Callers { by_target }
     }
@@ -2515,11 +2601,14 @@ impl<'a> SiteNames<'a> {
                 })
         }
         let ir = self.inputs.files.get(file)?;
+        // A method decorator's call is placed at the method's name
+        // (carrick#3781).
         let call = ir
             .functions
             .values()
             .chain(std::iter::once(&ir.module_level))
-            .find_map(|body| find(body, is))?;
+            .find_map(|body| find(body, is))
+            .or_else(|| ir.decorator_calls().into_iter().find(|call| is(&call.site)))?;
         Some(NamePlace {
             file: file.to_path_buf(),
             span_start: call.site.span_start,

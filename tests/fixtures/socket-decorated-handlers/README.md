@@ -14,8 +14,9 @@ cassette `__llm__/library-claims/default.json`:
 - `Link` (role socket, side client, made with `new`): `send` names the event in
   argument 0.
 - `OnEvent<T = string>(message: T)` and `OnNothing<T>(message: T)` (same role, side and op as `OnMessage`): the first states `lobby.leave` at `gateway.ts:20`, the second states nothing (no default to read).
-- `Traced(label): MethodDecorator`, `Gateway(): ClassDecorator` and
-  `Peer(): ParameterDecorator` are not labelled.
+- `Traced(label): MethodDecorator`, `combine(...decorators): MethodDecorator`,
+  `Gateway(): ClassDecorator` and `Peer(): ParameterDecorator` are not
+  labelled.
 
 Two services, `lobby` and `player`. Answer key:
 
@@ -28,5 +29,13 @@ Two services, `lobby` and `player`. Answer key:
 | `lobby/src/gateway.ts:16` | nothing: `@Traced("lobby.idle")` is not labelled |
 | `player/src/client.ts:6` | call `CLIENT->SERVER` `lobby.enter` |
 | `player/src/client.ts:10` | call `CLIENT->SERVER` `lobby.chat` |
-| `lobby/src/wrapped.ts:20` | no row; one unread site (`own_function`, slot `name`, callee `Handles`): the method is decorated through an in-repo factory whose body applies `OnMessage` (carrick#3688 C1) |
+| `lobby/src/wrapped.ts:20` | endpoint `CLIENT->SERVER` `w:wrapped`, nothing saved: the method is decorated through an in-repo factory whose returned value applies `OnMessage` (carrick#3781) |
 | `lobby/src/wrapped.ts:23` | nothing: `Tagged` wraps the unlabelled `Traced`, so its body holds no labelled site |
+| `lobby/src/wrapped.ts:13` | nothing saved: every method decorated through `Handles` is read |
+| `lobby/src/composed.ts:27` | endpoint `CLIENT->SERVER` `w:combined` (the factory hands back the unlabelled `combine` over `OnMessage`) |
+| `lobby/src/composed.ts:30` | no row; one unread site (`own_function`, slot `name`, callee `Logs`): `Logs` calls `OnMessage` but hands back `Traced` |
+| `lobby/src/composed.ts:33` | endpoint `CLIENT->SERVER` `w:const` (the decorator passes a module constant) |
+| `lobby/src/composed.ts:4`, `:21` | nothing saved: `Listens` and `Named` are read at every method |
+| `lobby/src/imported.ts:5` | endpoint `CLIENT->SERVER` `w:imported` (the factory is in `decorators.ts`, imported) |
+| `lobby/src/decorators.ts:12` | nothing saved |
+| `player/src/client.ts:14`, `:18`, `:22`, `:26` | calls `CLIENT->SERVER` `w:wrapped`, `w:combined`, `w:const`, `w:imported` |
