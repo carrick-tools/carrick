@@ -56,6 +56,7 @@ process.stdin.on("data", (chunk) => {
     else if (m.method === "textDocument/didOpen") {
       texts.set(m.params.textDocument.uri, m.params.textDocument.text);
       note(`open ${m.params.textDocument.version}`);
+      if (logFile) appendFileSync(`${logFile}.lang`, `${m.params.textDocument.uri.split("/").pop()} ${m.params.textDocument.languageId}\n`);
     } else if (m.method === "textDocument/didChange") {
       texts.set(m.params.textDocument.uri, m.params.contentChanges[0].text);
       note(`change ${m.params.textDocument.version}`);

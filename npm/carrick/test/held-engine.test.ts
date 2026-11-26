@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -125,6 +125,53 @@ test("declaration and JavaScript files are sent and pulled unmarked, as they sta
     const pulled = await engine.pull(files);
     for (const f of files) assert.deepEqual((pulled.get(f) ?? []).map((d) => d.message), ["fake error"]);
     assert.deepEqual(log(), ["open 1", "open 1", "open 1", "pull", "pull", "pull"]);
+  } finally {
+    await engine.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("each file is opened under the language id its extension names", async () => {
+  const { engine, cwd } = fakeEngine("fresh");
+  try {
+    const names = ["a.ts", "b.tsx", "c.jsx", "d.js", "e.mjs", "f.cjs", "g.mts", "h.d.ts"];
+    const files = names.map((f) => path.join(cwd, f));
+    for (const f of files) engine.set(f, "const x = 1;\n");
+    await engine.pull(files);
+    const opened = readFileSync(path.join(cwd, "server.log.lang"), "utf8").trim().split("\n").sort();
+    assert.deepEqual(
+      opened,
+      [
+        "a.ts typescript",
+        "b.tsx typescriptreact",
+        "c.jsx javascriptreact",
+        "d.js javascript",
+        "e.mjs javascript",
+        "f.cjs javascript",
+        "g.mts typescript",
+        "h.d.ts typescript",
+      ].sort(),
+    );
+  } finally {
+    await engine.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a .tsx file with JSX opens with no syntax diagnostics on TypeScript 7", async () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "held-engine-"));
+  cpSync(shadowFixture, cwd, { recursive: true });
+  writeFileSync(
+    path.join(cwd, "tsconfig.json"),
+    JSON.stringify({ compilerOptions: { strict: true, noEmit: true, target: "es2022", module: "esnext", moduleResolution: "bundler", jsx: "preserve", types: [] }, include: ["*.ts", "*.tsx"] }),
+  );
+  const engine = new Ts7Lsp(nativeTsc(), cwd);
+  try {
+    const file = path.join(cwd, "view.tsx");
+    engine.set(file, "const a = <div id=\"x\">{1 + 1}</div>;\nexport const b = (n: number) => <span>{n}</span>;\nexport { a };\n");
+    const items = (await engine.pull([file])).get(file) ?? [];
+    // Syntax errors are the 1xxx codes; a missing JSX type namespace is a later, semantic code.
+    assert.deepEqual(items.filter((d) => typeof d.code === "number" && d.code < 2000), [], JSON.stringify(items));
   } finally {
     await engine.close();
     rmSync(cwd, { recursive: true, force: true });

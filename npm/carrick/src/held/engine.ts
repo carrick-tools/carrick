@@ -52,6 +52,14 @@ function marks(file: string): boolean {
   return /\.(ts|tsx|mts|cts)$/.test(file) && !/\.d(\.[^./\\]+)?\.[cm]?ts$/.test(file);
 }
 
+/** The language id the server must read `file` under: JSX parses only as `typescriptreact` or `javascriptreact`. */
+export function languageId(file: string): string {
+  if (/\.tsx$/.test(file)) return "typescriptreact";
+  if (/\.jsx$/.test(file)) return "javascriptreact";
+  if (/\.[cm]?js$/.test(file)) return "javascript";
+  return "typescript";
+}
+
 /**
  * The caller's view of a marked report: the marker's own diagnostics dropped,
  * and any other diagnostic that lies past the caller's text (an end-of-file
@@ -177,7 +185,7 @@ export class Ts7Lsp implements Engine {
     const sent = marks(file) ? text + marker(version) : text;
     this.write(
       version === 1
-        ? { method: "textDocument/didOpen", params: { textDocument: { uri, languageId: "typescript", version, text: sent } } }
+        ? { method: "textDocument/didOpen", params: { textDocument: { uri, languageId: languageId(file), version, text: sent } } }
         : { method: "textDocument/didChange", params: { textDocument: { uri, version }, contentChanges: [{ text: sent }] } },
     );
     return version;
