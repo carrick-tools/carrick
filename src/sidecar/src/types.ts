@@ -713,6 +713,11 @@ export interface ClaimSlot extends SlotPosition {
    */
   handle?: boolean;
   /**
+   * On a `method_key` slot of a `bound: 'binding'` op only (amendment 13): the
+   * slot is on the maker's call, not the op's. `false` is no flag.
+   */
+  maker?: boolean;
+  /**
    * On a `handler` slot only (QW-1): the slot takes the function that runs,
    * or the path of a file that exports it (a string or the platform `URL`).
    * The file parts are dropped and the rest is judged by the handler rule.
@@ -764,10 +769,11 @@ export type OpNameSource = BoundName | NameParts | NameLiteral | NameFirst | Nam
  * the instance (`maker`), the one the scope member bound (`scope`), or the
  * key path the op's value sits under in a `collects` object (`key`, #2474
  * R6a), or the name of the class member a decorator is applied to
- * (`decorated`, amendment 8).
+ * (`decorated`, amendment 8), or the variable that holds the op call's
+ * value, a procedure (`binding`, amendment 13 of carrick#2434).
  */
 export interface BoundName {
-  bound: 'maker' | 'scope' | 'key' | 'path' | 'export' | 'subscribed' | 'decorated';
+  bound: 'maker' | 'scope' | 'key' | 'path' | 'export' | 'subscribed' | 'decorated' | 'binding';
   /** `path`: the property names walked on the receiver are joined by this (amendment 7). */
   join?: string;
   /** `subscribed`: the handler parameter that is handed the name. */
