@@ -176,6 +176,17 @@ pub(in crate::request_summary) struct CallAt {
     pub(in crate::request_summary) fills: (PathBuf, String),
 }
 
+/// One call of an own builder whose return the text reader is reading
+/// (carrick#3815): the builder (the file that writes it and its body), and
+/// the call, with the file it is written in. The builder's parameters hold
+/// what this call passes, never what every caller does.
+#[derive(Clone, Copy)]
+pub(in crate::request_summary) struct BoundCall<'a> {
+    builder: (&'a Path, &'a FnIr),
+    file: &'a Path,
+    call: &'a CallIr,
+}
+
 /// What the resolver reads of an argument of a maker call
 /// ([`Resolver::keyed_text_set`], `NameFold::arg_texts`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -819,6 +830,7 @@ impl<'a> Resolver<'a> {
                 let keys: Vec<String> = key.iter().cloned().collect();
                 self.text_of_each(file, list, *at, &keys, *loop_at)
             }
+            ValueAt::Unstated { lo, hi } => self.text_of_builder_call(file, (*lo, *hi)),
             _ => hole(UnreadExpression),
         }
     }
@@ -1264,13 +1276,18 @@ impl<'a> Resolver<'a> {
                 in_repo_declaration(row).into_iter().collect(),
             )];
         }
-        // Read through callers, a parameter is what its callers pass: asked
+        // A parameter of an own builder whose call is being read is what
+        // that call passes (carrick#3815), in every mode. Read through
+        // callers, any other parameter is what its callers pass: asked
         // before the binding table, which holds a defaulted parameter as the
         // choice of its default (carrick#3504 B10-1b).
-        if self.callers_mode.get() != CallersRead::Off
-            && let Some((at, param)) = self.declared_param(row)
-        {
-            return self.param_texts(at, param, &[], None);
+        if let Some((at, param)) = self.declared_param(row) {
+            if let Some(out) = self.bound_param(&at, param, &[]) {
+                return out;
+            }
+            if self.callers_mode.get() != CallersRead::Off {
+                return self.param_texts(at, param, &[], None);
+            }
         }
         let Some((at, binding, declared)) = self.declared_entry(row) else {
             return hole(self.unread_declaration(row));
@@ -1426,12 +1443,17 @@ impl<'a> Resolver<'a> {
             Ok(row) => row,
             Err(reason) => return hole(reason),
         };
-        // Read through callers, an entry of a parameter (`opts.topic`) is
-        // what each caller passes at that key (carrick#3504 B10-1b).
-        if self.callers_mode.get() != CallersRead::Off
-            && let Some((at, param)) = self.declared_param(row)
-        {
-            let mut out = self.param_texts(at, param, std::slice::from_ref(&key), None);
+        // An entry of a parameter (`opts.topic`) is what the builder call
+        // being read passes at that key (carrick#3815), else, read through
+        // callers, what each caller passes there (carrick#3504 B10-1b).
+        let param = self.declared_param(row).and_then(|(at, param)| {
+            self.bound_param(&at, param, std::slice::from_ref(&key))
+                .or_else(|| {
+                    (self.callers_mode.get() != CallersRead::Off)
+                        .then(|| self.param_texts(at, param, std::slice::from_ref(&key), None))
+                })
+        });
+        if let Some(mut out) = param {
             for entry in &mut out {
                 if let TextValue::Text {
                     read_from: from, ..
@@ -1829,10 +1851,11 @@ impl<'a> Resolver<'a> {
         let file = at.0;
         let keys: Vec<String> = param.keys.iter().chain(more).cloned().collect();
         let callers = self.callers().callers_of(file, function).to_vec();
+        let definition = self.function(file, function);
         let mut out: Vec<TextValue> = Vec::new();
         if callers.is_empty() {
             out.push(TextValue::hole(NameNeverBound));
-            for value in self.default_texts(file, function, param.index, &keys) {
+            for value in self.default_texts(definition, param.index, &keys) {
                 if !out.contains(&value) {
                     out.push(value);
                 }
@@ -1847,30 +1870,10 @@ impl<'a> Resolver<'a> {
                 hi: caller.call.site.hi,
                 fills: fills.clone(),
             };
-            let args = caller.call.passed_texts();
-            // A spread at or before the position moves it; a JSX element
-            // passes its props as no positional argument, so it is never an
-            // omitted one that takes the default (P2, P6).
-            let values = if caller.call.jsx
-                || args.iter().take(param.index + 1).any(Option::is_none)
-            {
-                hole(CallerArgMissing)
-            } else {
-                let written = args.get(param.index).and_then(Option::as_ref);
-                match written.and_then(|term| handed(term, &keys)) {
-                    _ if written.is_some_and(|term| self.passes_on(caller.file, term)) => continue,
-                    Some(term) if self.passes_on(caller.file, &term) => continue,
-                    Some(term) => self.text_values(caller.file, &term),
-                    // Nothing passed there: the default, else nothing read.
-                    None => {
-                        let defaults = self.default_texts(file, function, param.index, &keys);
-                        if defaults.is_empty() {
-                            hole(CallerArgMissing)
-                        } else {
-                            defaults
-                        }
-                    }
-                }
+            let Some(values) =
+                self.passed_at(caller.file, caller.call, definition, param.index, &keys)
+            else {
+                continue;
             };
             for value in values {
                 let value = value.read_at(&call, read);
@@ -1883,19 +1886,225 @@ impl<'a> Resolver<'a> {
         out
     }
 
-    /// What the default of the parameter at `index` of the definition
-    /// `function` of `file` states at `keys` (a whole parameter's default
-    /// read down the keys, or a destructured key's own), read where the
-    /// definition is written. A default read from another parameter is
-    /// none a caller passes here.
+    /// What the one call `call`, written in `caller`, passes the parameter
+    /// at `index` of `definition` (the file that writes it and its body),
+    /// `keys` further in: the term there, read where the call is written;
+    /// the default where it passes nothing there. `None` where it hands on
+    /// a parameter being read unchanged (soundness rule 7). Read per caller
+    /// by [`Self::param_texts`] and per builder call by
+    /// [`Self::bound_param`].
+    fn passed_at(
+        &self,
+        caller: &'a Path,
+        call: &'a CallIr,
+        definition: Option<(&'a Path, &'a FnIr)>,
+        index: usize,
+        keys: &[String],
+    ) -> Option<Vec<TextValue>> {
+        use guards::HoleReason::*;
+        let hole = |reason| vec![TextValue::hole(reason)];
+        let args = call.passed_texts();
+        // A spread at or before the position moves it; a JSX element
+        // passes its props as no positional argument, so it is never an
+        // omitted one that takes the default (P2, P6).
+        if call.jsx || args.iter().take(index + 1).any(Option::is_none) {
+            return Some(hole(CallerArgMissing));
+        }
+        let written = args.get(index).and_then(Option::as_ref);
+        Some(match written.and_then(|term| handed(term, keys)) {
+            _ if written.is_some_and(|term| self.passes_on(caller, term)) => return None,
+            Some(term) if self.passes_on(caller, &term) => return None,
+            Some(term) => self.text_values(caller, &term),
+            // Nothing passed there: the default, else nothing read.
+            None => {
+                let defaults = self.default_texts(definition, index, keys);
+                if defaults.is_empty() {
+                    hole(CallerArgMissing)
+                } else {
+                    defaults
+                }
+            }
+        })
+    }
+
+    /// The parameter `param`, declared at `at`, `more` keys further in,
+    /// where it is one of an own builder whose call's return is being read
+    /// ([`Self::text_of_builder_call`], carrick#3815): what that one call
+    /// passes there, read where the call is written with only the builder
+    /// calls around it bound. The call goes on no value's caller chain, so
+    /// a builder called twice in one function is two reads, each placed
+    /// where its own value settles. `None` where no open builder call
+    /// declares the parameter: it reads as any parameter does.
+    fn bound_param(
+        &self,
+        at: &(&'a Path, u32, String),
+        param: &ParamAt,
+        more: &[String],
+    ) -> Option<Vec<TextValue>> {
+        let (index, bound) = {
+            let open = self.bound_calls.borrow();
+            let index = open.iter().rposition(|bound| {
+                bound.builder.0 == at.0
+                    && bound.builder.1.param_names.iter().any(|name| {
+                        name.line == at.1 && name.key.0 == at.2 && name.index == param.index
+                    })
+            })?;
+            (index, open[index])
+        };
+        if param.collides || param.written {
+            return Some(vec![TextValue::hole(guards::HoleReason::Reassigned)]);
+        }
+        let keys: Vec<String> = param.keys.iter().chain(more).cloned().collect();
+        // The call's own arguments are read with only the builder calls it
+        // is written inside bound.
+        let inner = self.bound_calls.borrow_mut().split_off(index);
+        let values = self.passed_at(
+            bound.file,
+            bound.call,
+            Some(bound.builder),
+            param.index,
+            &keys,
+        );
+        self.bound_calls.borrow_mut().extend(inner);
+        Some(values.unwrap_or_else(|| vec![TextValue::hole(guards::HoleReason::Recursion)]))
+    }
+
+    /// The call spanning `lo..hi` of `file`, read as what the own function
+    /// it calls returns (carrick#3815): each `return`'s text
+    /// ([`FnIr::returned_texts`]), read where the function is written with
+    /// its parameters bound to this call's arguments
+    /// ([`Self::bound_param`]). A call of no own function, of one that
+    /// returns no text (an `async` function, a generator, one with no
+    /// `return`), or one that reads itself, is the hole it was.
+    fn text_of_builder_call(&self, file: &Path, (lo, hi): (u32, u32)) -> Vec<TextValue> {
+        use guards::HoleReason::*;
+        let hole = |reason| vec![TextValue::hole(reason)];
+        let Some((file, _)) = self.inputs_for(file).files.get_key_value(file) else {
+            return hole(UnreadExpression);
+        };
+        let file: &'a Path = file.as_path();
+        let Some(call) = self
+            .written_call(file, lo)
+            .filter(|call| call.site.hi == hi)
+        else {
+            return hole(UnreadExpression);
+        };
+        let Some((path, builder)) = self.builder_of(file, call) else {
+            return hole(UnreadExpression);
+        };
+        if builder.returned_texts.is_empty() {
+            return hole(UnreadExpression);
+        }
+        let Some(_reading) = self.reading_text(&(file, lo, "()".to_string())) else {
+            return hole(Recursion);
+        };
+        if self.bound_calls.borrow().len() >= MAX_VALUES {
+            return hole(FanOutCap);
+        }
+        self.bound_calls.borrow_mut().push(BoundCall {
+            builder: (path, builder),
+            file,
+            call,
+        });
+        let mut out: Vec<TextValue> = Vec::new();
+        for returned in &builder.returned_texts {
+            for value in self.text_values(path, returned) {
+                if !out.contains(&value) {
+                    out.push(value);
+                }
+            }
+        }
+        self.bound_calls.borrow_mut().pop();
+        cap_each_chain(&mut out);
+        out
+    }
+
+    /// The one own function `call`, written in `file`, runs, with the file
+    /// that writes it: the one the maker reads ([`Self::factory_of`], the
+    /// definition the call's row reaches), else the one function the key of
+    /// a module object its callee reads holds (`ROUTES.byId(…)` on a `const`
+    /// no importer changes, [`Self::key_values`]), as discovery reads such a
+    /// callee. `None` for any other callee, or one that may run more than
+    /// one function. Pinned with both readers by
+    /// `one_call_runs_one_function_for_every_reader`.
+    fn builder_of(&self, file: &'a Path, call: &'a CallIr) -> Option<(&'a Path, &'a FnIr)> {
+        if let Some(found) = self.factory_of(file, call.site.lo, call.site.hi, &[]) {
+            return Some(found);
+        }
+        let invoke = Invoke {
+            file,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        let held = self.key_values(&mut Bodies, file, call.callee_key.as_ref()?, invoke)?;
+        let mut found: Option<(&'a Path, &'a FnIr)> = None;
+        for held in held {
+            let Held::Reached(reached) = held else {
+                return None;
+            };
+            let body = match reached {
+                Body::Definition(target, key) => self.function(&target, &key)?,
+                Body::Written(path, function) => (path, function),
+                Body::Nothing => return None,
+            };
+            match found {
+                Some(one) if !std::ptr::eq(one.1, body.1) => return None,
+                _ => found = Some(body),
+            }
+        }
+        found
+    }
+}
+
+/// A function a callee holds, as [`Resolver::builder_of`] follows one.
+#[derive(Default)]
+enum Body<'a> {
+    /// Nothing followed (the trait's default, never reached here).
+    #[default]
+    Nothing,
+    Definition(PathBuf, String),
+    Written(&'a Path, &'a FnIr),
+}
+
+/// Follows a callee to the functions it holds, knowing no labels.
+struct Bodies;
+
+impl<'a> Follow<'a> for Bodies {
+    type Reached = Body<'a>;
+
+    fn export(&mut self, _: &'a Path, _: u32, _: u32, _: Kind, _: Invoke<'a>) -> Option<Body<'a>> {
+        None
+    }
+
+    fn definition(&mut self, target: PathBuf, key: String, _: Invoke<'a>) -> Body<'a> {
+        Body::Definition(target, key)
+    }
+
+    fn written(
+        &mut self,
+        file: &'a Path,
+        function: &'a FnIr,
+        _: Invoke<'a>,
+        _: Option<Maker<'a>>,
+    ) -> Body<'a> {
+        Body::Written(file, function)
+    }
+}
+
+impl<'a> Resolver<'a> {
+    /// What the default of the parameter at `index` of `definition` (the
+    /// file that writes it and its body) states at `keys` (a whole
+    /// parameter's default read down the keys, or a destructured key's
+    /// own), read where the definition is written. A default read from
+    /// another parameter is none a caller passes here.
     fn default_texts(
         &self,
-        file: &'a Path,
-        function: &str,
+        definition: Option<(&'a Path, &'a FnIr)>,
         index: usize,
         keys: &[String],
     ) -> Vec<TextValue> {
-        let Some((path, ir)) = self.function(file, function) else {
+        let Some((path, ir)) = definition else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -2949,6 +3158,105 @@ mod tests {
             flat(&on, &resolver.text_values(&path, &term)),
             [("orders.typed".to_string(), Vec::new())]
         );
+    }
+
+    // Names an own builder returns (carrick#3815). Fixture `resolve-text`,
+    // `builders.ts`; its README holds the key.
+
+    /// carrick#3815: a call of an own builder reads as the text the builder
+    /// returns, its parameters bound to that one call's arguments. The
+    /// builder call goes on no caller chain: of two calls of one builder in
+    /// one function, the literal one reads with no calls and the one handed
+    /// the function's parameter with that function's caller alone. Read
+    /// with no callers, the same, but a parameter of the function around
+    /// the call stays unread.
+    #[test]
+    fn an_own_builder_s_call_reads_as_what_it_returns_for_that_call() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let read = |callee: &str| through_callers_in(&resolver, &on, "src/builders.ts", callee);
+        let off = |callee: &str| {
+            let (path, term) = arg_in(&on, "src/builders.ts", callee);
+            let mut got = flat(&on, &resolver.text_values(&path, &term));
+            got.sort();
+            got
+        };
+        let stated: [(&str, &str); 5] = [
+            ("p_build_lit", "svc.x"),
+            ("p_build_local", "two.z"),
+            ("p_build_member", "jobs.7"),
+            ("p_build_nested", "svc.n.q"),
+            ("p_build_keyed", "area.west"),
+        ];
+        for (callee, text) in stated {
+            assert_eq!(read(callee), rows(&[(text, &[])]), "{callee}");
+            assert_eq!(off(callee), rows(&[(text, &[])]), "{callee}");
+        }
+        assert_eq!(
+            read("p_build_param"),
+            rows(&[("svc.filled", &["both(\"filled\")"])])
+        );
+        assert_eq!(
+            off("p_build_param"),
+            rows(&[("hole:parameter_unread", &[])])
+        );
+        assert_eq!(
+            read("p_build_async"),
+            rows(&[("hole:unread_expression", &[])])
+        );
+        assert_eq!(read("p_build_self"), rows(&[("hole:recursion", &[])]));
+    }
+
+    /// carrick#3815 (review D2): one call of an own function is run through
+    /// every reader of "which own function does this call run" and gets one
+    /// answer: the maker's (`factory_of`) for a call whose row reaches a
+    /// definition, the key read discovery uses (`key_values`) for a callee
+    /// that is a key of a module object, and the text reader's, which asks
+    /// those two and no lookup of its own.
+    #[test]
+    fn one_call_runs_one_function_for_every_reader() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        for (probe, keyed) in [("p_build_lit", false), ("p_build_member", true)] {
+            let (path, term) = arg_in(&on, "src/builders.ts", probe);
+            let ValueAt::Unstated { lo, hi } = term else {
+                panic!("{probe}: {term:?}");
+            };
+            let (path, _) = resolver
+                .inputs_for(&path)
+                .files
+                .get_key_value(&path)
+                .unwrap();
+            let path: &Path = path.as_path();
+            let call = resolver.written_call(path, lo).unwrap();
+            let own = resolver.builder_of(path, call).expect(probe);
+            let maker = resolver.factory_of(path, lo, hi, &[]);
+            let invoke = Invoke {
+                file: path,
+                call,
+                construction: false,
+                bound: 0,
+            };
+            let key = call
+                .callee_key
+                .as_ref()
+                .and_then(|key| resolver.key_values(&mut Bodies, path, key, invoke));
+            if keyed {
+                assert!(maker.is_none(), "{probe}: the maker reads no key");
+                let held = key.unwrap();
+                let [Held::Reached(Body::Written(file, function))] = held.as_slice() else {
+                    panic!("{probe}: discovery's key read holds one written function");
+                };
+                assert!(own.0 == *file && std::ptr::eq(own.1, *function), "{probe}");
+            } else {
+                let maker = maker.expect(probe);
+                assert!(own.0 == maker.0 && std::ptr::eq(own.1, maker.1), "{probe}");
+            }
+        }
     }
 
     /// carrick#3678 S6-2: read as parts, a field is passed through its

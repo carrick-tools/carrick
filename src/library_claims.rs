@@ -1828,11 +1828,11 @@ impl Reading<'_, '_> {
                     self.noted(NameOutcome::TextDiffers);
                     return Some(text);
                 }
-                // The chain stops in a hole today's reading answers (an own
-                // builder written on the way, the step cap), here or one call
-                // nearer the library call: today's reading stands here.
+                // The chain stops in a hole today's reading answers (the
+                // step cap), here or one call nearer the library call:
+                // today's reading stands here.
                 Some((_, Err(reason))) => {
-                    if let Some(answered) = today_answers(self.site, *reason, arg, key) {
+                    if let Some(answered) = today_answers(*reason) {
                         self.noted(answered);
                         return Some(text);
                     }
@@ -1915,8 +1915,7 @@ impl Reading<'_, '_> {
                     // reading states it (see the caller arm above), so no
                     // lead.
                     let kept = self.on_chain(&place, &chain).find_map(|site| {
-                        site.literal(arg, key)
-                            .and_then(|_| today_answers(site, reason, arg, key))
+                        site.literal(arg, key).and_then(|_| today_answers(reason))
                     });
                     match kept {
                         Some(kept) => {
@@ -1929,8 +1928,8 @@ impl Reading<'_, '_> {
                     }
                 }
                 // A hole at the call itself today's reading answers (the
-                // call writes an own builder's call) keeps today's name, here
-                // or at each caller that fills it (the caller arm above).
+                // step cap) keeps today's name, here or at each caller that
+                // fills it (the caller arm above).
                 (None, Err(reason)) => {
                     let today_reads = today().is_some()
                         || self.sites.iter().any(|site| {
@@ -1939,7 +1938,7 @@ impl Reading<'_, '_> {
                                     && origin.span_start == self.site.span_start
                             }) && site.literal(arg, key).is_some()
                         });
-                    match today_answers(self.site, reason, arg, key).filter(|_| today_reads) {
+                    match today_answers(reason).filter(|_| today_reads) {
                         Some(answered) => {
                             outcome.get_or_insert(answered);
                             here = today();
@@ -2155,26 +2154,13 @@ fn read_args(args: &[SiteArg], arg: usize, key: Option<&str>) -> SlotRead {
     }
 }
 
-/// Whether today's reading answers a hole the text reader read at `site`'s
-/// slot `arg` (its entry `key`), and as what (B10-3): the step cap stopped
-/// the chain (`capped`), or the library call or a caller on the way writes
-/// the slot as a call of an own builder (`r1_builder`, Q-B3a's builder
-/// rule, until F4). Any other hole is a lead. The one place the builder
-/// rule is decided: at the library call (`site` the call) and per caller
-/// chain (`site` the chain's caller-filled site).
-fn today_answers(
-    site: &LibrarySite,
-    reason: Stop,
-    arg: usize,
-    key: Option<&str>,
-) -> Option<NameOutcome> {
-    if reason == Stop::FanOutCap {
-        Some(NameOutcome::Capped)
-    } else if site.builder_written(arg, key) {
-        Some(NameOutcome::R1Builder)
-    } else {
-        None
-    }
+/// Whether today's reading answers a hole the text reader read, and as
+/// what (B10-3): the step cap stopped the chain (`capped`). Any other hole
+/// is a lead; an own builder's call is the text reader's to read
+/// (carrick#3815). The one place the rule is decided, at the library call
+/// and per caller chain.
+fn today_answers(reason: Stop) -> Option<NameOutcome> {
+    (reason == Stop::FanOutCap).then_some(NameOutcome::Capped)
 }
 
 /// Whether the text reader's `text` differs from what today's reading
@@ -2955,7 +2941,7 @@ mod tests {
         let names = read(&sites, &[bus()], None, verifier(&asked, all)).names;
         assert_eq!(
             names.line(),
-            "literal=1 linked=1 filled=1 made=0 no_rows=0 r1_builder=0 stop_spread=1 stop_unread=2 lead=0 lead_today_stated=0 kind_asked=0 capped=0 caller_today=0 text_differs=0",
+            "literal=1 linked=1 filled=1 made=0 no_rows=0 stop_spread=1 stop_unread=2 lead=0 lead_today_stated=0 kind_asked=0 capped=0 caller_today=0 text_differs=0",
             "{names:?}"
         );
     }
@@ -4841,8 +4827,8 @@ mod tests {
         assert!(rows.leads.is_empty(), "{:?}", rows.leads);
     }
 
-    /// A name an own builder returns keeps today's reading where the text
-    /// reader holes the call (carrick#3504 B10-3, `r1_builder`, until F4),
+    /// A name an own builder returns is the one today's reading states,
+    /// read by the text reader (carrick#3815),
     /// with the compiler's rows: a builder, a builder function, a builder in
     /// an object, one that declares a constant first, and one handed a
     /// parameter, filled at its caller.
@@ -4892,14 +4878,6 @@ mod tests {
             ],
             "{rows:#?}"
         );
-        // The five calls, and the caller that fills the one handed a
-        // parameter.
-        assert_eq!(
-            rows.names.count(NameOutcome::R1Builder),
-            6,
-            "{:?}",
-            rows.names
-        );
         assert_eq!(rows.names.count(NameOutcome::NoRows), 0, "{:?}", rows.names);
         assert!(rows.leads.is_empty(), "{:?}", rows.leads);
     }
@@ -4932,12 +4910,6 @@ mod tests {
         assert_eq!(rows.leads.len(), 1, "{:?}", rows.leads);
         assert_eq!(rows.leads[0].line, 3, "{:?}", rows.leads);
         assert_eq!(rows.names.count(NameOutcome::Lead), 1, "{:?}", rows.names);
-        assert_eq!(
-            rows.names.count(NameOutcome::R1Builder),
-            0,
-            "{:?}",
-            rows.names
-        );
     }
 
     /// `files` read as [`read_walked`] reads them with the compiler's rows,
@@ -5102,11 +5074,6 @@ mod tests {
                 leads_of(&rowed).contains(&("use.ts".to_string(), 2, stop)),
                 "{stop:?}: {:?}",
                 rowed.leads
-            );
-            assert!(
-                rowed.names.count(NameOutcome::R1Builder) >= 1,
-                "{:?}",
-                rowed.names
             );
         }
     }
@@ -5425,8 +5392,8 @@ mod tests {
     }
 
     /// An own builder written at a wrapper's caller (`send(topicFor("x"))`)
-    /// keeps today's name there, counted `r1_builder`, and saves no lead
-    /// (review finding 3; Q-B3a's builder rule, until F4).
+    /// keeps today's name there, read by the text reader (carrick#3815),
+    /// and saves no lead (review finding 3).
     #[test]
     fn a_builder_written_at_a_caller_keeps_today_s_name() {
         let Some((_, today, rowed)) = read_twice(
@@ -5461,8 +5428,78 @@ mod tests {
             "{:?}",
             rowed.leads
         );
-        assert!(
-            rowed.names.count(NameOutcome::R1Builder) >= 1,
+    }
+
+    /// Every row today's reading states through an own builder's call, the
+    /// text reader states too (carrick#3815): a builder held in a local, an
+    /// awaited `async` builder, a method read through `this`, a static
+    /// method, an omitted argument with a default, a re-exported builder, a
+    /// builder two objects deep, and one method with two implementations.
+    #[test]
+    fn every_builder_today_reads_the_text_reader_reads() {
+        let Some((_, today, rowed)) = read_twice(
+            &[
+                (
+                    "src/topics.ts",
+                    "export async function later(n: string) { return `later.${n}`; }\n\
+                     export class T { static of(k: string) { return `st.${k}`; } }\n\
+                     export function withDefault(k: string = \"def\") { return `d.${k}`; }\n\
+                     export const topicFor = (kind: string) => `svc.${kind}`;\n\
+                     export const TOPICS = { orders: { byId: (id: string) => `ord.${id}` } };\n\
+                     export interface Namer { name(k: string): string; }\n\
+                     export class A implements Namer { name(k: string) { return `a.${k}`; } }\n\
+                     export class B implements Namer { name(k: string) { return `b.${k}`; } }\n",
+                ),
+                ("src/index.ts", "export { topicFor } from \"./topics\";\n"),
+                (
+                    "src/use.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { later, T, withDefault, TOPICS, Namer, A, B } from \"./topics\";\n\
+                     import { topicFor } from \"./index\";\n\
+                     export function local() { const t = (k: string) => `loc.${k}`; bus.publish(t(\"l\"), {}); }\n\
+                     export async function awaited() { bus.publish(await later(\"w\"), {}); }\n\
+                     export class Hub {\n\
+                     \x20 topic(k: string) { return `hub.${k}`; }\n\
+                     \x20 go() { bus.publish(this.topic(\"m\"), {}); }\n\
+                     }\n\
+                     export function stat() { bus.publish(T.of(\"s\"), {}); }\n\
+                     export function omitted() { bus.publish(withDefault(), {}); }\n\
+                     export function reexported() { bus.publish(topicFor(\"r\"), {}); }\n\
+                     export function deep() { bus.publish(TOPICS.orders.byId(\"7\"), {}); }\n\
+                     export function either(n: Namer) { bus.publish(n.name(\"i\"), {}); }\n\
+                     export function go() { either(new A()); either(new B()); }\n",
+                ),
+            ],
+            &[bus()],
+            None,
+        ) else {
+            return;
+        };
+        today_stands(&today, &rowed);
+        assert_eq!(
+            placed(&rowed),
+            vec![
+                ("use.ts".to_string(), 12, "svc.r".to_string()),
+                ("use.ts".to_string(), 13, "ord.7".to_string()),
+            ],
+            "{rowed:#?}"
+        );
+        // A builder in a local, an awaited `async` one and a method with two
+        // implementations read no text, here or today: leads. The method
+        // through `this`, the static method and the default read a name
+        // today's reading does not, on a label that does not say topic:
+        // the kind question decides (Q-B3e).
+        assert_eq!(
+            leads_of(&rowed),
+            vec![
+                ("use.ts".to_string(), 4, Stop::UnreadExpression),
+                ("use.ts".to_string(), 5, Stop::UnreadExpression),
+                ("use.ts".to_string(), 14, Stop::UnreadExpression),
+            ]
+        );
+        assert_eq!(
+            rowed.names.count(NameOutcome::KindAsked),
+            3,
             "{:?}",
             rowed.names
         );
@@ -5795,7 +5832,7 @@ mod tests {
     }
 
     /// A constant a builder's call initialises keeps today's reading too:
-    /// its value is a call term the text reader holes (`r1_builder`).
+    /// its value is the builder's return, read for that call (carrick#3815).
     #[test]
     fn rowed_a_constant_a_builder_initialises_keeps_today_s_name() {
         rowed_twin(

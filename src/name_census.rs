@@ -70,9 +70,6 @@ pub enum NameOutcome {
     /// Today's reading, kept: the text reader has no compiler rows for the
     /// slot (B10-3, Q-B3a).
     NoRows,
-    /// Today's reading, kept: the slot calls an own builder the text reader
-    /// holes (B10-3, until F4).
-    R1Builder,
     /// A spread stands where the name is, so nothing is read.
     StopSpread,
     /// Anything else the reader cannot read as text.
@@ -108,7 +105,6 @@ impl Word for NameOutcome {
         NameOutcome::Filled,
         NameOutcome::Made,
         NameOutcome::NoRows,
-        NameOutcome::R1Builder,
         NameOutcome::StopSpread,
         NameOutcome::StopUnread,
         NameOutcome::Lead,
@@ -126,7 +122,6 @@ impl Word for NameOutcome {
             NameOutcome::Filled => "filled",
             NameOutcome::Made => "made",
             NameOutcome::NoRows => "no_rows",
-            NameOutcome::R1Builder => "r1_builder",
             NameOutcome::StopSpread => "stop_spread",
             NameOutcome::StopUnread => "stop_unread",
             NameOutcome::Lead => "lead",
