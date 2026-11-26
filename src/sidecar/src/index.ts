@@ -32,7 +32,7 @@ import {
   runCheck,
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
-import { LibraryClaimsVerifier, httpCheck, type LabelledMembers } from './library-claims.js';
+import { LibraryClaimsVerifier, httpCheck, runInPrograms, type LabelledMembers } from './library-claims.js';
 import { readServerLabels } from './server-labels.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
@@ -768,10 +768,11 @@ function handleVerifyClientSemantics(
   request: SidecarRequest & { action: 'verify_client_semantics' }
 ): VerifyClientSemanticsResponse {
   try {
-    const { claimsVerifier } = projectComponents();
+    const verifiers = serviceVerifiers();
     const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} client-semantics claim(s) from ${fromDir}`);
-    const { semantics, modules } = claimsVerifier.run(
+    const { semantics, modules } = runInPrograms(
+      verifiers,
       fromDir,
       request.checks.map(httpCheck),
       request.budget_ms ?? SEMANTICS_BUDGET_MS
@@ -802,10 +803,29 @@ function probeOnlyVerifier(tsconfigPath: string): LibraryClaimsVerifier {
   const loader = initializedLoader();
   const configPath = path.resolve(loader.getRepoRoot(), tsconfigPath);
   if (!fs.existsSync(configPath)) throw new Error(`tsconfig_path ${configPath} does not exist`);
-  return new LibraryClaimsVerifier(loader.scriptProjectFor(configPath), {
+  return scriptVerifier(configPath);
+}
+
+/** A verifier over the `scripts` program of the project behind `key` (`ProjectLoader.scriptProjectFor`). */
+function scriptVerifier(key: string): LibraryClaimsVerifier {
+  const loader = initializedLoader();
+  return new LibraryClaimsVerifier(loader.scriptProjectFor(key), {
     packageDirectoryOf: (file) => loader.packageDirectoryOf(file),
     resolveModule: (name, from, options) => loader.resolveThroughGraph(name, from, options),
   });
+}
+
+/**
+ * One verifier per program the service's files are typed under
+ * (`ProjectLoader.serviceProjectKeys`, carrick#4932), for `runInPrograms`:
+ * the service's own program where its tsconfig owns files, and a probe-only
+ * program of each other owner's options, dropped with the request. A
+ * solution config owns no file, so its empty options judge nothing.
+ */
+function serviceVerifiers(): LibraryClaimsVerifier[] {
+  return initializedLoader()
+    .serviceProjectKeys()
+    .map((key) => (key === '' ? projectComponents().claimsVerifier : scriptVerifier(key)));
 }
 
 /**
@@ -821,13 +841,14 @@ function handleVerifyLibraryClaims(
     // A named tsconfig is judged in a probe-only program of its own options,
     // built for this request and dropped with it (carrick#4472); the service's
     // own program is not built for it.
-    const claimsVerifier =
-      request.tsconfig_path === undefined ? projectComponents().claimsVerifier : probeOnlyVerifier(request.tsconfig_path);
+    const verifiers =
+      request.tsconfig_path === undefined ? serviceVerifiers() : [probeOnlyVerifier(request.tsconfig_path)];
     // The verifier's budget starts now, and so does the scanner's wait.
     writeProgress(request.request_id, 'verify_library_claims', 'program ready');
     const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} library claim(s) from ${fromDir}`);
-    const { semantics, modules } = claimsVerifier.run(
+    const { semantics, modules } = runInPrograms(
+      verifiers,
       fromDir,
       request.checks,
       request.budget_ms ?? SEMANTICS_BUDGET_MS,

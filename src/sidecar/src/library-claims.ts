@@ -553,6 +553,41 @@ export function httpCheck(check: SemanticsCheck): LibraryCheck {
   }
 }
 
+/**
+ * Judge `checks` once per program the service's files are typed under
+ * (carrick#4932), as `LibraryClaimsVerifier.run` judges them in one: a package
+ * shipping twin declarations (`.d.mts`, `.d.cts`) resolves to the twin each
+ * program's module resolution picks, and a call's position row names that
+ * twin. A check is verified where any program verifies it, naming the
+ * declarations every verifying program reads, each once; a check none
+ * verifies keeps the first program's verdict and reason. The modules are the
+ * first program's. The later programs share what is left of `budgetMs`.
+ */
+export function runInPrograms(
+  verifiers: readonly LibraryClaimsVerifier[],
+  fromDir: string,
+  checks: LibraryCheck[],
+  budgetMs: number,
+  scanRoot?: string
+): VerifyResult {
+  const deadline = performance.now() + budgetMs;
+  const [first, ...rest] = verifiers;
+  const result = first.run(fromDir, checks, budgetMs, scanRoot);
+  for (const verifier of rest) {
+    const left = deadline - performance.now();
+    if (left <= 0) break;
+    const other = verifier.run(fromDir, checks, left, scanRoot).semantics;
+    result.semantics = result.semantics.map((verdict, i) => {
+      const also = other[i];
+      if (also?.verdict !== 'verified') return verdict;
+      if (verdict.verdict !== 'verified') return also;
+      if (!also.declarations?.length) return verdict;
+      return { ...verdict, declarations: sortedDeclarations([...(verdict.declarations ?? []), ...also.declarations]) };
+    });
+  }
+  return result;
+}
+
 /** Declarations in a fixed order, each once. */
 function sortedDeclarations(declarations: readonly DeclaredAt[]): DeclaredAt[] {
   const seen = new Map<string, DeclaredAt>();
