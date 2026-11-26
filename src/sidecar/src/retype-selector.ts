@@ -75,6 +75,18 @@ export function resolvedDeclaration(call: CallExpression): ts.SignatureDeclarati
 }
 
 /**
+ * The name of the language library member a call resolves to (`all` for
+ * `Promise.all(…)`), decided by its declaration in a default library file,
+ * not by the call's text; undefined for anything else.
+ */
+export function defaultLibraryMember(call: CallExpression): string | undefined {
+  const declaration = resolvedDeclaration(call);
+  if (!declaration?.name) return undefined;
+  const program = call.getProject().getProgram().compilerObject;
+  return program.isSourceFileDefaultLibrary(declaration.getSourceFile()) ? declaration.name.getText() : undefined;
+}
+
+/**
  * C0: the declaration the call resolves to, when the callee has one call
  * signature (not a union), that signature has type parameters, and its
  * return type is written.

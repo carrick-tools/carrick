@@ -448,7 +448,7 @@ export class StatedParams {
     return current;
   }
 
-  private isNothing(type: Type): boolean {
+  isNothing(type: Type): boolean {
     return type.isUndefined() || type.isNull() || (type.getFlags() & (ts.TypeFlags.Void | ts.TypeFlags.Never)) !== 0;
   }
 
@@ -545,6 +545,12 @@ export class StatedParams {
   }
 
   /** The payload slot a member set by assignment takes, by any of its declarations. */
+  /** Whether a label names the assigned member (`ctx.body = …`) a body set, matched by declaration. */
+  setsBody(target: Node): boolean {
+    if (this.labels.sets.size === 0 || !Node.isPropertyAccessExpression(target)) return false;
+    return this.setSlotOf((target.getNameNode().getSymbol()?.getDeclarations() ?? []).map((d) => d.compilerNode)) !== undefined;
+  }
+
   private setSlotOf(declarations: readonly ts.Node[]): ClaimSlot | undefined {
     for (const declaration of declarations) {
       const slot = this.labels.sets.get(declarationKey(declaration));
@@ -813,7 +819,7 @@ export class StatedParams {
   }
 
   /** The symbol at the root of a member or call chain (`res.status(201)` is `res`). */
-  private rootSymbol(expression: Node): TsSymbol | undefined {
+  rootSymbol(expression: Node): TsSymbol | undefined {
     let node = expression;
     for (;;) {
       if (Node.isPropertyAccessExpression(node) || Node.isCallExpression(node) || Node.isParenthesizedExpression(node) || Node.isNonNullExpression(node)) {

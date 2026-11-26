@@ -2,7 +2,7 @@
  * The function body a call runs (carrick#3500). One answer for the helpers
  * that ask it: a declaration that has a body is that body; an overloaded
  * function is its one implementation (the signatures carry no body); a
- * variable or property initialised with an arrow or function expression is
+ * variable, property or class field initialised with an arrow or function expression is
  * that function, through the wrappers that leave a value as it is
  * (parentheses, `as`, `<T>`, `!`, `satisfies`).
  *
@@ -40,7 +40,11 @@ function bodyOfDeclaration(declaration: Node, methods: boolean): FunctionBody | 
   if (Node.isFunctionDeclaration(declaration)) return declaration.getBody() ? declaration : undefined;
   if (Node.isMethodDeclaration(declaration)) return methods && declaration.getBody() ? declaration : undefined;
   if (Node.isArrowFunction(declaration) || Node.isFunctionExpression(declaration)) return declaration;
-  if (Node.isVariableDeclaration(declaration) || Node.isPropertyAssignment(declaration)) {
+  if (
+    Node.isVariableDeclaration(declaration) ||
+    Node.isPropertyAssignment(declaration) ||
+    Node.isPropertyDeclaration(declaration)
+  ) {
     const initializer = declaration.getInitializer();
     const value = initializer ? peelValueWrappers(initializer) : undefined;
     if (value && (Node.isArrowFunction(value) || Node.isFunctionExpression(value))) return value;

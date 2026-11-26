@@ -40,7 +40,7 @@ import { statesNoBody } from './capture/index.js';
 import { lineIndex } from './line-index.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import { deferredResultNeedsUndefined } from './retype-deferred.js';
-import { resolvedDeclaration, typeArgumentOnlySelects } from './retype-selector.js';
+import { defaultLibraryMember, resolvedDeclaration, typeArgumentOnlySelects } from './retype-selector.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
 import { JSON_READ } from './platform-body-read.js';
 import { enclosingTypeParameterIn } from './type-parameters.js';
@@ -1246,14 +1246,7 @@ function promiseAllElement(top: Node): Identifier | undefined {
 
 /** `Promise.all` as the language library declares it, not a lookalike. */
 function isLibraryPromiseAll(call: CallExpression): boolean {
-  const callee = call.getExpression();
-  if (!Node.isPropertyAccessExpression(callee) || callee.getName() !== 'all') return false;
-  const declaration = resolvedDeclaration(call);
-  if (!declaration) return false;
-  return call
-    .getProject()
-    .getProgram()
-    .compilerObject.isSourceFileDefaultLibrary(declaration.getSourceFile());
+  return defaultLibraryMember(call) === 'all';
 }
 
 /**
