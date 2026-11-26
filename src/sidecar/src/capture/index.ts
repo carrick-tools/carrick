@@ -91,12 +91,14 @@ export { installedPackageDirectory } from './installed-package-directory.js';
 export { isDeclarationFileName, isRelative, packageNameOf } from './specifiers.js';
 export type { InternalTypeChecker } from './node-builder.js';
 export { toPosix } from './installed-package.js';
-export { constituentsOf } from './result-label.js';
+export { constituentsOf, joinTypes } from './result-label.js';
 export { moduleExport } from './anchors.js';
 // One node locator and one machinery test for the inferrer and the capture
 // (carrick#3500).
 export {
   anchorInHandler,
+  sameType,
+  typeOfSeveralReturns,
   callNamedBy,
   callResultNamesNoCall,
   isFrameworkMachinery,

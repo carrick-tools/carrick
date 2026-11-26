@@ -26,6 +26,8 @@ import {
   callResultNamesNoCall,
   firstExactLocatorMatch,
   isPreferredTarget,
+  typeOfSeveralReturns,
+  type SeveralReturns,
 } from './site-node.js';
 import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
@@ -445,6 +447,7 @@ export function resolveAnchor(
   // elsewhere is replaced by the one node inside them its text names, or the
   // anchor abstains (final: it does not fall through to a later locator).
   let found = located0;
+  let severalType: ts.Type | undefined;
   if (found.by !== 'span' && request.handler_lines) {
     const own = anchorInHandler(
       checker,
@@ -466,6 +469,24 @@ export function resolveAnchor(
     // A node re-found by the locator's text is a text match, whichever
     // locator found the first one.
     if (own.node !== found.node) found = { node: own.node, by: 'text' };
+    // carrick#4778: the function that answers has several returns that
+    // differ. The answer is all of them, or unknown; never the one the
+    // locator landed on.
+    if (own.severalReturns) {
+      const read = typeOfSeveralReturns(checker, own.severalReturns, (type) =>
+        typeIsOrContainsMachinery(program, type, args.repoRoot)
+      );
+      if ('reason' in read) {
+        return {
+          request,
+          aliasText: 'unknown',
+          serialization: 'structural_fallback',
+          abstainReason: read.reason,
+          unreadCause: 'not_located',
+        };
+      }
+      severalType = read.type;
+    }
   }
   // carrick#1785: the line fallback takes the first expression on the line,
   // and a declaration's NAME is an expression to `ts.isExpression`. On a line
@@ -552,9 +573,10 @@ export function resolveAnchor(
     args.placeholder,
     reaimNote,
     args.repoRoot,
-    armsType
+    severalType ?? armsType
   );
 }
+
 
 /**
  * Shared tail of the infer paths (locator-resolved node and #498
