@@ -39,6 +39,12 @@ import {
   type RawDiagnostic,
 } from '../src/capture/check-classify.js';
 
+/** A verdict with the relaxed re-check's evidence set aside (incompatible-rule T1). */
+function withoutEvidence(v: CheckVerdict): Omit<CheckVerdict, 'break_evidence'> {
+  const { break_evidence: _evidence, ...rest } = v;
+  return rest;
+}
+
 function captureLiterals(
   root: string,
   serviceName: string,
@@ -241,7 +247,11 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
   it('a reading with a different literal leaves the published verdict', () => {
     const v = verdicts.get('other-literal')!;
     assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
-    assert.deepStrictEqual(v, control.get('other-literal'));
+    // The verdict is the published one; the relaxed re-check's evidence also
+    // reads the handler's literal, which the consumer's type does not list
+    // (incompatible-rule T1).
+    assert.deepStrictEqual(withoutEvidence(v), withoutEvidence(control.get('other-literal')!));
+    assert.ok(v.break_evidence!.passing.every((set) => set.includes('listed_value')), JSON.stringify(v.break_evidence));
     assert.doesNotMatch(v.diagnostic!, /other/, 'the text is the published line');
   });
 
@@ -286,7 +296,7 @@ describe('check phase: a published mismatch is read again unwidened (carrick#153
     for (const key of ['request-no-reading', 'request-other']) {
       const v = verdicts.get(key)!;
       assert.strictEqual(v.bucket, 'incompatible', `${key}: ${JSON.stringify(v)}`);
-      assert.deepStrictEqual(v, control.get(key), key);
+      assert.deepStrictEqual(withoutEvidence(v), withoutEvidence(control.get(key)!), key);
     }
   });
 });
