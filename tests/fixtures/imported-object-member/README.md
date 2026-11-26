@@ -28,4 +28,4 @@ constant in another module, where the model has only the call site to read.
 | `OrderActions.ts:7` `ordersApi.addNote(...)` | `POST /v1/orders/:orderId/notes` |
 | `OrderActions.ts:12` `ordersApi.setStatus(...)` | `PUT /v1/orders/:orderId/status` |
 | `AdminActions.ts:3` `ordersApi.addNote(...)` | `POST /admin/orders/:orderId/notes` |
-| `viaParam.ts:3` `api.addNote(...)` | the model's row, untouched: the receiver is a parameter |
+| `viaParam.ts:3` `api.addNote(...)` | no row, the site saved unread: the receiver is a parameter, and nothing in the code writes the model's `note` (carrick#4206) |
