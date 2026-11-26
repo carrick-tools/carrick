@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.189](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.188...carrick-v0.3.189) (2026-11-26)
+
+
+### Bug Fixes
+
+* **repo:** untrack src/sidecar/node_modules and fail CI when one is tracked outside fixtures ([#5165](https://github.com/carrick-tools/carrick/issues/5165)) ([b587726](https://github.com/carrick-tools/carrick/commit/b587726b44289672a0ba684fa6edd91039fa87d3))
+
 ## [0.3.188](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.187...carrick-v0.3.188) (2026-11-25)
 
 
