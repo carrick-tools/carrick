@@ -976,6 +976,12 @@ export type LibraryClaim =
        * method the call sends whatever its member is called.
        */
       method_default?: string;
+      /**
+       * HTTP `request` (contract amendment R27 on carrick#2434): the literal
+       * text the library puts before the name slot's value. The picker's
+       * reading of the library's source; never checked.
+       */
+      name_prefix?: string;
       /** HTTP (label v2): where the base URL the path joins sits. */
       base?: ClaimSlot;
       /** Label v2: the function or client the op runs. */

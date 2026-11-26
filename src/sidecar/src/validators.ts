@@ -756,6 +756,8 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       method: z.string().min(1).optional(),
       method_key: ClaimSlotSchema.optional(),
       method_default: z.string().min(1).optional(),
+      // R27: the text the library puts before the name slot's value; never checked.
+      name_prefix: z.string().min(1).optional(),
       base: ClaimSlotSchema.optional(),
       runs: RunsSlotSchema.optional(),
       yields: YieldsSchema.optional(),
