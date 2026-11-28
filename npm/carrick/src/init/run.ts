@@ -227,7 +227,7 @@ function help(): string {
     "carrick init [DIRECTORY] [--repo OWNER/REPO]... [--mcp EDITOR] [--install-global]",
     "",
     "Sign in (here, or beforehand with carrick login), then set up a repository",
-    "or a folder of repos for your agent: the agent hooks, the four task skills",
+    "or a folder of repos for your agent: the agent hooks, the task skills",
     "your agent loads, a short \"Carrick check\" section in AGENTS.md (and in",
     "CLAUDE.md, where the folder already has one), and the MCP",
     "connection. It covers the repos here that your Carrick workspace holds, and",

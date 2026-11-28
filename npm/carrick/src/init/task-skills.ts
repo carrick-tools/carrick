@@ -1,4 +1,4 @@
-// The four task skills `carrick init` installs beside the hooks.
+// The task skills `carrick init` installs beside the hooks.
 //
 // A skill is the body a hook or an agent's own judgement points at, and these
 // four perform a task rather than remind: each one is a sequence of Carrick
